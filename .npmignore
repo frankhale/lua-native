@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+node_modules/
+
+# Development tools and configs
+.vscode/
+.idea/
+*.log
+npm-debug.log
+.DS_Store
+
+# Tests and documentation sources
+test/
+tests/
+docs/
+
+# Miscellaneous
+*.md
+!.gitignore
+!.npmignore
+!README.md
+!LICENSE

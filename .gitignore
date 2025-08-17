@@ -1,3 +1,7 @@
+vendor/
+
+prebuilds/
+
 # Logs
 logs
 *.log

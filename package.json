@@ -1,0 +1,54 @@
+{
+  "name": "lua-native",
+  "description": "A native Node.js module for embedding Lua in your apps",
+  "author": "Frank Hale",
+  "license": "MIT",
+  "type": "module",
+  "version": "1.0.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "gypfile": true,
+  "keywords": [
+    "lua"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/frankhale/lua-native.git"
+  },
+  "scripts": {
+    "prebuild": "cross-env GYP_DEFINES=\"skip_test=1\" prebuildify --strip",
+    "install": "node-gyp-build",
+    "build-debug": "node-gyp rebuild --debug -- -Dskip_test=0",
+    "build-release": "node-gyp rebuild --release -- -Dskip_test=1",
+    "start": "vitest",
+    "test": "vitest",
+    "get-vcpkg-include": "node get_vcpkg_path.js include",
+    "get-vcpkg-lib": "node get_vcpkg_path.js lib"
+  },
+  "files": [
+    "index.js",
+    "src/**/*.cpp",
+    "src/**/*.h",
+    "binding.gyp",
+    "prebuilds/**/*",
+    "types.d.ts",
+    "index.d.ts"
+  ],
+  "binary": {
+    "napi_versions": [
+      3,
+      6,
+      8,
+      9
+    ]
+  },
+  "dependencies": {
+    "node-addon-api": "^8.5.0",
+    "node-gyp-build": "^4.8.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "cross-env": "^10.0.0",
+    "vitest": "^3.2.4"
+  }
+}
