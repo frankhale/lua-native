@@ -4,12 +4,15 @@
   "author": "Frank Hale",
   "license": "MIT",
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "index.js",
   "types": "index.d.ts",
   "gypfile": true,
   "keywords": [
-    "lua"
+    "lua",
+    "scripting",
+    "native",
+    "embedding"
   ],
   "repository": {
     "type": "git",
