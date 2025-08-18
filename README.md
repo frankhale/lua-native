@@ -1,6 +1,9 @@
 # lua-native
 
-A native Node.js module for embedding Lua in your applications. This module provides seamless integration between JavaScript and Lua, allowing you to execute Lua scripts, pass functions between environments, and handle complex data structures.
+A native Node.js module for embedding Lua in your applications. This module 
+provides seamless integration between JavaScript and Lua, allowing you to 
+execute Lua scripts, pass functions between environments, and handle complex 
+data structures.
 
 ## Features
 
@@ -17,6 +20,11 @@ A native Node.js module for embedding Lua in your applications. This module prov
 ```bash
 npm install lua-native
 ```
+
+NOTE: Only Windows is supported as a prebuilt binary. If compiling from source,
+this module requires Lua to be installed via [vcpkg](https://vcpkg.io/en/index.html).
+
+Prebuilt binaries are available for MacOS and Linux coming soon.
 
 ## Building from Source
 
@@ -163,7 +171,8 @@ const result: number = lua.execute_script('return add(10, 20)');
 Creates a new Lua execution context.
 
 **Parameters:**
-- `callbacks` (optional): Object containing JavaScript functions and values to make available in Lua
+- `callbacks` (optional): Object containing JavaScript functions and values to 
+make available in Lua
 
 **Returns:** `LuaContext` instance
 
@@ -174,7 +183,8 @@ Executes a Lua script and returns the result.
 **Parameters:**
 - `script`: String containing Lua code to execute
 
-**Returns:** The result of the script execution (converted to appropriate JavaScript type)
+**Returns:** The result of the script execution (converted to appropriate 
+JavaScript type)
 
 ### `LuaContext.set_global(name, value)`
 
@@ -228,4 +238,4 @@ https://github.com/frankhale/lua-native.git
 
 ## Date
 
-17-Aug-2025
+18-Aug-2025
