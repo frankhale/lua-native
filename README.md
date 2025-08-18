@@ -28,7 +28,11 @@ Prebuilt binaries are available for MacOS and Linux coming soon.
 
 ## Building from Source
 
-If you need to build the module from source:
+If you want to build the module from source:
+
+NOTE: There are two ways to build this module. You can use traditional 
+`bindings.gyp` along with `node-gyp` or you can use `cmake` on
+Windows and MacOS. I have not configured the build for Linux yet.
 
 ```bash
 # Debug build
