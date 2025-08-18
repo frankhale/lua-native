@@ -34,6 +34,24 @@ npm run build-release
 
 ### Basic Script Execution
 
+Hello World:
+
+```javascript
+import lua_native from 'lua-native';
+
+// Create a new Lua context
+const lua = new lua_native.init({
+  print: (msg: string) => {
+    console.log(msg);
+  }
+});
+
+// Execute a simple script
+lua.execute_script('print("Hello, World!")');
+```
+
+Return a value:
+
 ```javascript
 import lua_native from 'lua-native';
 
