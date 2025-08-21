@@ -16,7 +16,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/frankhale/lua-native.git"
+    "url": "git+https://github.com/frankhale/lua-native.git"
   },
   "scripts": {
     "prebuild": "cross-env GYP_DEFINES=\"skip_test=1\" prebuildify --strip",
