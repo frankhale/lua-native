@@ -20,7 +20,7 @@
   },
   "scripts": {
     "prebuild": "cross-env GYP_DEFINES=\"skip_test=1\" prebuildify --strip",
-    "install": "node-gyp-build",
+    "install": "cross-env GYP_DEFINES=\"skip_test=1\" node-gyp-build",
     "build-debug": "node-gyp rebuild --debug -- -Dskip_test=0",
     "build-release": "node-gyp rebuild --release -- -Dskip_test=1",
     "start": "vitest",
