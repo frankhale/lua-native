@@ -1,9 +1,15 @@
 # lua-native
 
-A native Node.js module for embedding Lua in your applications. This module 
-provides seamless integration between JavaScript and Lua, allowing you to 
-execute Lua scripts, pass functions between environments, and handle complex 
+A native Node.js module for embedding Lua in your applications. This module
+provides seamless integration between JavaScript and Lua, allowing you to
+execute Lua scripts, pass functions between environments, and handle complex
 data structures.
+
+## Supported Runtimes
+
+- Node.js
+- Bun
+- Deno
 
 ## Features
 
@@ -21,16 +27,19 @@ data structures.
 npm install lua-native
 ```
 
-NOTE: Only Windows is supported as a prebuilt binary. If compiling from source,
-this module requires Lua to be installed via [vcpkg](https://vcpkg.io/en/index.html).
-
-Prebuilt binaries are available for MacOS and Linux coming soon.
+NOTE: Windows and MacOS are supported as a prebuilt binary. Linux prebuilt
+binaries are coming soon.
 
 ## Building from Source
 
 If you want to build the module from source:
 
-NOTE: There are two ways to build this module. You can use traditional 
+VCPKG is required to build the module. Once installed, you can install Lua via
+`vcpkg install lua`.
+
+VCPKG is available at [vcpkg](https://vcpkg.io/en/index.html)
+
+NOTE: There are two ways to build this module. You can use traditional
 `bindings.gyp` along with `node-gyp` or you can use `cmake` on
 Windows and MacOS. I have not configured the build for Linux yet.
 
@@ -38,7 +47,7 @@ Windows and MacOS. I have not configured the build for Linux yet.
 # Debug build
 npm run build-debug
 
-# Release build  
+# Release build
 npm run build-release
 ```
 
@@ -49,13 +58,13 @@ npm run build-release
 Hello World:
 
 ```javascript
-import lua_native from 'lua-native';
+import lua_native from "lua-native";
 
 // Create a new Lua context
 const lua = new lua_native.init({
   print: (msg: string) => {
     console.log(msg);
-  }
+  },
 });
 
 // Execute a simple script
@@ -65,44 +74,44 @@ lua.execute_script('print("Hello, World!")');
 Return a value:
 
 ```javascript
-import lua_native from 'lua-native';
+import lua_native from "lua-native";
 
 // Create a new Lua context
 const lua = new lua_native.init({});
 
 // Execute a simple script
-const result = lua.execute_script('return 42');
+const result = lua.execute_script("return 42");
 console.log(result); // 42
 ```
 
 ### Passing JavaScript Functions to Lua
 
 ```javascript
-import lua_native from 'lua-native';
+import lua_native from "lua-native";
 
 // Create context with JavaScript function
-const lua = new lua_native.init({ 
-  add: (a, b) => a + b 
+const lua = new lua_native.init({
+  add: (a, b) => a + b,
 });
 
 // Call the JavaScript function from Lua
-const result = lua.execute_script('return add(2, 3)');
+const result = lua.execute_script("return add(2, 3)");
 console.log(result); // 5
 ```
 
 ### Working with Global Variables
 
 ```javascript
-import lua_native from 'lua-native';
+import lua_native from "lua-native";
 
 const lua = new lua_native.init({});
 
 // Set global variables
-lua.set_global('x', 7);
-lua.set_global('times2', (n) => n * 2);
+lua.set_global("x", 7);
+lua.set_global("times2", (n) => n * 2);
 
 // Use globals in Lua script
-const [a, b] = lua.execute_script('return x, times2(x)');
+const [a, b] = lua.execute_script("return x, times2(x)");
 console.log(a, b); // 7, 14
 ```
 
@@ -111,10 +120,10 @@ console.log(a, b); // 7, 14
 The module supports converting complex Lua tables to JavaScript objects:
 
 ```javascript
-import lua_native from 'lua-native';
+import lua_native from "lua-native";
 
-const lua = new lua_native.init({ 
-  greet: (name) => `Hello, ${name}!` 
+const lua = new lua_native.init({
+  greet: (name) => `Hello, ${name}!`,
 });
 
 const result = lua.execute_script(`
@@ -139,14 +148,14 @@ console.log(result);
 Lua errors are automatically converted to JavaScript exceptions:
 
 ```javascript
-import lua_native from 'lua-native';
+import lua_native from "lua-native";
 
 const lua = new lua_native.init({});
 
 try {
   lua.execute_script("error('Something went wrong')");
 } catch (error) {
-  console.error('Lua error:', error.message);
+  console.error("Lua error:", error.message);
 }
 ```
 
@@ -155,17 +164,17 @@ try {
 The module includes comprehensive TypeScript definitions:
 
 ```typescript
-import lua_native from 'lua-native';
-import type { LuaCallbacks, LuaContext } from 'lua-native/types';
+import lua_native from "lua-native";
+import type { LuaCallbacks, LuaContext } from "lua-native/types";
 
 // Type-safe callback definition
 const callbacks: LuaCallbacks = {
   add: (a: number, b: number): number => a + b,
-  greet: (name: string): string => `Hello, ${name}!`
+  greet: (name: string): string => `Hello, ${name}!`,
 };
 
 const lua: LuaContext = new lua_native.init(callbacks);
-const result: number = lua.execute_script('return add(10, 20)');
+const result: number = lua.execute_script("return add(10, 20)");
 ```
 
 ## API Reference
@@ -175,8 +184,9 @@ const result: number = lua.execute_script('return add(10, 20)');
 Creates a new Lua execution context.
 
 **Parameters:**
-- `callbacks` (optional): Object containing JavaScript functions and values to 
-make available in Lua
+
+- `callbacks` (optional): Object containing JavaScript functions and values to
+  make available in Lua
 
 **Returns:** `LuaContext` instance
 
@@ -185,9 +195,10 @@ make available in Lua
 Executes a Lua script and returns the result.
 
 **Parameters:**
+
 - `script`: String containing Lua code to execute
 
-**Returns:** The result of the script execution (converted to appropriate 
+**Returns:** The result of the script execution (converted to appropriate
 JavaScript type)
 
 ### `LuaContext.set_global(name, value)`
@@ -195,20 +206,21 @@ JavaScript type)
 Sets a global variable or function in the Lua environment.
 
 **Parameters:**
+
 - `name`: Name of the global variable
 - `value`: Value to set (function, number, string, boolean, or object)
 
 ## Data Type Conversion
 
-| Lua Type | JavaScript Type | Notes |
-|----------|-----------------|-------|
-| `nil` | `null` | |
-| `boolean` | `boolean` | |
-| `number` | `number` | |
-| `string` | `string` | |
-| `table` (array-like) | `Array` | Sequential numeric indices starting from 1 |
-| `table` (object-like) | `Object` | String or mixed keys |
-| `function` | `Function` | JavaScript functions passed to Lua |
+| Lua Type              | JavaScript Type | Notes                                      |
+| --------------------- | --------------- | ------------------------------------------ |
+| `nil`                 | `null`          |                                            |
+| `boolean`             | `boolean`       |                                            |
+| `number`              | `number`        |                                            |
+| `string`              | `string`        |                                            |
+| `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 |
+| `table` (object-like) | `Object`        | String or mixed keys                       |
+| `function`            | `Function`      | JavaScript functions passed to Lua         |
 
 ## Development
 
@@ -228,6 +240,10 @@ npm test
   - `cpp/lua-native-test.cpp` - C++ unit tests
 - `types.d.ts` - TypeScript type definitions
 
+## Repository
+
+https://github.com/frankhale/lua-native.git
+
 ## License
 
 MIT
@@ -236,10 +252,6 @@ MIT
 
 Frank Hale
 
-## Repository
-
-https://github.com/frankhale/lua-native.git
-
 ## Date
 
-18-Aug-2025
+21 August 2025
