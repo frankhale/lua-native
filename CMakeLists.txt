@@ -32,9 +32,13 @@ endif()
 
 # Set platform-specific compiler and linker flags
 if(WIN32 AND MSVC)
-    # Windows with MSVC - static runtime
-    set(PLATFORM_COMPILER_FLAGS "/MT$<$<CONFIG:Debug>:d>")
-    set(PLATFORM_LINKER_FLAGS "/NODEFAULTLIB:MSVCRT;/NODEFAULTLIB:MSVCRTD;/INCREMENTAL:NO")
+    # Windows with MSVC - static runtime and function-level linking
+    set(PLATFORM_COMPILER_FLAGS /MT$<$<CONFIG:Debug>:d> /Gy)
+    set(PLATFORM_LINKER_FLAGS "/NODEFAULTLIB:MSVCRT" "/NODEFAULTLIB:MSVCRTD" "/INCREMENTAL:NO")
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        list(APPEND PLATFORM_COMPILER_FLAGS "/GL")
+        list(APPEND PLATFORM_LINKER_FLAGS "/OPT:REF" "/OPT:ICF" "/LTCG")
+    endif()
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set(CompilerFlags
             CMAKE_CXX_FLAGS

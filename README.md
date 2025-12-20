@@ -27,7 +27,7 @@ data structures.
 npm install lua-native
 ```
 
-NOTE: Windows and MacOS are supported as a prebuilt binary. Linux prebuilt
+NOTE: Windows and macOS are supported as a prebuilt binary. Linux prebuilt
 binaries are coming soon.
 
 ## Building from Source
@@ -41,7 +41,7 @@ VCPKG is available at [vcpkg](https://vcpkg.io/en/index.html)
 
 NOTE: There are two ways to build this module. You can use traditional
 `bindings.gyp` along with `node-gyp` or you can use `cmake` on
-Windows and MacOS. I have not configured the build for Linux yet.
+Windows and macOS. I have not configured the build for Linux yet.
 
 ```bash
 # Debug build
@@ -198,7 +198,7 @@ Executes a Lua script and returns the result.
 
 - `script`: String containing Lua code to execute
 
-**Returns:** The result of the script execution (converted to appropriate
+**Returns:** The result of the script execution (converted to the appropriate
 JavaScript type)
 
 ### `LuaContext.set_global(name, value)`
@@ -254,4 +254,4 @@ Frank Hale
 
 ## Date
 
-21 August 2025
+19 December 2025

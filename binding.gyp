@@ -49,7 +49,8 @@
                   "DebugInformationFormat": 1,
                   "Optimization": 0,
                   "BasicRuntimeChecks": 3,
-                  "BufferSecurityCheck": "false"
+                  "BufferSecurityCheck": "false",
+                  "EnableFunctionLevelLinking": "true"
                 },
                 "VCLinkerTool": {
                   "GenerateDebugInformation": "true",
@@ -74,7 +75,9 @@
                   "RuntimeLibrary": 0,
                   "ExceptionHandling": 1,
                   "Optimization": 2,
-                  "BufferSecurityCheck": "false"
+                  "BufferSecurityCheck": "false",
+                  "EnableFunctionLevelLinking": "true",
+                  "WholeProgramOptimization": "true"
                 },
                 "VCLinkerTool": {
                   "LinkTimeCodeGeneration": 1,
@@ -86,7 +89,9 @@
                   "AdditionalOptions": [
                     "/NODEFAULTLIB:MSVCRT",
                     "/NODEFAULTLIB:LIBCMT",
-                    "/INCREMENTAL:NO"
+                    "/INCREMENTAL:NO",
+                    "/OPT:REF",
+                    "/OPT:ICF"
                   ]
                 }
               }
@@ -186,7 +191,8 @@
                       "DebugInformationFormat": 1,
                       "Optimization": 0,
                       "BasicRuntimeChecks": 3,
-                      "BufferSecurityCheck": "false"
+                      "BufferSecurityCheck": "false",
+                      "EnableFunctionLevelLinking": "true"
                     },
                     "VCLinkerTool": {
                       "GenerateDebugInformation": "true",
@@ -211,7 +217,9 @@
                       "RuntimeLibrary": 0,
                       "ExceptionHandling": 1,
                       "Optimization": 2,
-                      "BufferSecurityCheck": "false"
+                      "BufferSecurityCheck": "false",
+                      "EnableFunctionLevelLinking": "true",
+                      "WholeProgramOptimization": "true"
                     },
                     "VCLinkerTool": {
                       "LinkTimeCodeGeneration": 1,
@@ -223,7 +231,9 @@
                       "AdditionalOptions": [
                         "/NODEFAULTLIB:MSVCRT",
                         "/NODEFAULTLIB:LIBCMT",
-                        "/INCREMENTAL:NO"
+                        "/INCREMENTAL:NO",
+                        "/OPT:REF",
+                        "/OPT:ICF"
                       ]
                     }
                   }
