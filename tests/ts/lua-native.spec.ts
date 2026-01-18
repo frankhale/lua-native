@@ -686,6 +686,255 @@ describe('lua-native Node adapter', () => {
       expect(value2).toBe(20);
     });
   });
+
+  // ============================================
+  // COROUTINES
+  // ============================================
+  describe('coroutines', () => {
+    it('creates a coroutine from a function', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          return 42
+        end
+      `);
+      expect(coro).toBeDefined();
+      expect(coro.status).toBe('suspended');
+    });
+
+    it('resumes a coroutine and gets return value', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          return 42
+        end
+      `);
+      const result = lua.resume(coro);
+      expect(result.status).toBe('dead');
+      expect(result.values).toEqual([42]);
+    });
+
+    it('passes arguments on first resume', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function(x, y)
+          return x + y
+        end
+      `);
+      const result = lua.resume(coro, 10, 20);
+      expect(result.status).toBe('dead');
+      expect(result.values).toEqual([30]);
+    });
+
+    it('handles yield and resume cycle', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function(x)
+          coroutine.yield(x * 2)
+          coroutine.yield(x * 3)
+          return x * 4
+        end
+      `);
+
+      let result = lua.resume(coro, 10);
+      expect(result.status).toBe('suspended');
+      expect(result.values).toEqual([20]);
+
+      result = lua.resume(coro);
+      expect(result.status).toBe('suspended');
+      expect(result.values).toEqual([30]);
+
+      result = lua.resume(coro);
+      expect(result.status).toBe('dead');
+      expect(result.values).toEqual([40]);
+    });
+
+    it('passes values through yield', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          local a = coroutine.yield("first")
+          local b = coroutine.yield("second")
+          return a + b
+        end
+      `);
+
+      let result = lua.resume(coro);
+      expect(result.values).toEqual(["first"]);
+
+      result = lua.resume(coro, 10);
+      expect(result.values).toEqual(["second"]);
+
+      result = lua.resume(coro, 20);
+      expect(result.status).toBe('dead');
+      expect(result.values).toEqual([30]);
+    });
+
+    it('handles multiple yield values', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          coroutine.yield(1, 2, 3)
+          return 4, 5
+        end
+      `);
+
+      let result = lua.resume(coro);
+      expect(result.status).toBe('suspended');
+      expect(result.values).toEqual([1, 2, 3]);
+
+      result = lua.resume(coro);
+      expect(result.status).toBe('dead');
+      expect(result.values).toEqual([4, 5]);
+    });
+
+    it('coroutine status updates correctly', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          coroutine.yield()
+          return "done"
+        end
+      `);
+
+      expect(coro.status).toBe('suspended');
+
+      lua.resume(coro);
+      expect(coro.status).toBe('suspended');
+
+      lua.resume(coro);
+      expect(coro.status).toBe('dead');
+    });
+
+    it('handles errors in coroutine', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          error("coroutine error")
+        end
+      `);
+
+      const result = lua.resume(coro);
+      expect(result.status).toBe('dead');
+      expect(result.error).toContain('coroutine error');
+    });
+
+    it('cannot resume dead coroutine', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          return 1
+        end
+      `);
+
+      lua.resume(coro);
+      expect(coro.status).toBe('dead');
+
+      const result = lua.resume(coro);
+      expect(result.status).toBe('dead');
+      expect(result.error).toBeDefined();
+    });
+
+    it('coroutine can call JS callbacks', () => {
+      let callCount = 0;
+      const lua = new lua_native.init({
+        increment: () => { callCount++; return callCount; }
+      });
+      const coro = lua.create_coroutine(`
+        return function()
+          local a = increment()
+          coroutine.yield(a)
+          local b = increment()
+          return b
+        end
+      `);
+
+      let result = lua.resume(coro);
+      expect(result.values).toEqual([1]);
+      expect(callCount).toBe(1);
+
+      result = lua.resume(coro);
+      expect(result.values).toEqual([2]);
+      expect(callCount).toBe(2);
+    });
+
+    it('multiple coroutines are independent', () => {
+      const lua = new lua_native.init({});
+      const coro1 = lua.create_coroutine(`
+        return function()
+          coroutine.yield("a")
+          return "b"
+        end
+      `);
+      const coro2 = lua.create_coroutine(`
+        return function()
+          coroutine.yield("x")
+          return "y"
+        end
+      `);
+
+      expect(lua.resume(coro1).values).toEqual(["a"]);
+      expect(lua.resume(coro2).values).toEqual(["x"]);
+      expect(lua.resume(coro1).values).toEqual(["b"]);
+      expect(lua.resume(coro2).values).toEqual(["y"]);
+    });
+
+    it('coroutine with closure preserves state', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function()
+          local counter = 0
+          while true do
+            counter = counter + 1
+            coroutine.yield(counter)
+          end
+        end
+      `);
+
+      expect(lua.resume(coro).values).toEqual([1]);
+      expect(lua.resume(coro).values).toEqual([2]);
+      expect(lua.resume(coro).values).toEqual([3]);
+      expect(lua.resume(coro).values).toEqual([4]);
+    });
+
+    it('generator pattern with coroutine', () => {
+      const lua = new lua_native.init({});
+      const coro = lua.create_coroutine(`
+        return function(n)
+          for i = 1, n do
+            coroutine.yield(i * i)
+          end
+        end
+      `);
+
+      const squares: number[] = [];
+      let result = lua.resume(coro, 5);
+      while (result.status === 'suspended') {
+        squares.push(result.values[0] as number);
+        result = lua.resume(coro);
+      }
+      // Last value comes from final yield
+      if (result.values.length > 0 && result.values[0] !== undefined) {
+        squares.push(result.values[0] as number);
+      }
+
+      expect(squares).toEqual([1, 4, 9, 16, 25]);
+    });
+
+    it('throws error for invalid script', () => {
+      const lua = new lua_native.init({});
+      expect(() => {
+        lua.create_coroutine('invalid lua syntax @@@@');
+      }).toThrow();
+    });
+
+    it('throws error for non-function return', () => {
+      const lua = new lua_native.init({});
+      expect(() => {
+        lua.create_coroutine('return 42');
+      }).toThrow(/function/);
+    });
+  });
 });
 
 

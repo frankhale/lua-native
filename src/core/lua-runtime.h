@@ -32,6 +32,35 @@ struct LuaFunctionRef {
   }
 };
 
+struct LuaThreadRef {
+  int ref;
+  lua_State* L;        // Main state
+  lua_State* thread;   // The coroutine thread
+
+  LuaThreadRef(int r, lua_State* mainState, lua_State* threadState)
+    : ref(r), L(mainState), thread(threadState) {}
+
+  void release() {
+    if (L && ref != LUA_NOREF) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ref);
+      ref = LUA_NOREF;
+      thread = nullptr;
+    }
+  }
+};
+
+enum class CoroutineStatus {
+  Suspended,
+  Running,
+  Dead
+};
+
+struct CoroutineResult {
+  CoroutineStatus status;
+  std::vector<LuaPtr> values;
+  std::optional<std::string> error;
+};
+
 struct LuaValue {
   using Variant = std::variant<
       std::monostate,  // nil
@@ -41,7 +70,8 @@ struct LuaValue {
       std::string,
       LuaArray,
       LuaTable,
-      LuaFunctionRef>;
+      LuaFunctionRef,
+      LuaThreadRef>;
   Variant value;
 };
 
@@ -68,6 +98,12 @@ public:
 
   [[nodiscard]] ScriptResult CallFunction(const LuaFunctionRef& funcRef,
                                           const std::vector<LuaPtr>& args) const;
+
+  // Coroutine support
+  [[nodiscard]] std::variant<LuaThreadRef, std::string> CreateCoroutine(const LuaFunctionRef& funcRef) const;
+  [[nodiscard]] CoroutineResult ResumeCoroutine(const LuaThreadRef& threadRef,
+                                                 const std::vector<LuaPtr>& args) const;
+  [[nodiscard]] CoroutineStatus GetCoroutineStatus(const LuaThreadRef& threadRef) const;
 
   [[nodiscard]] lua_State* RawState() const { return L_; }
 

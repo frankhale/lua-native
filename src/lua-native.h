@@ -21,6 +21,18 @@ struct LuaFunctionData {
   }
 };
 
+struct LuaThreadData {
+  std::shared_ptr<lua_core::LuaRuntime> runtime;
+  lua_core::LuaThreadRef threadRef;
+
+  LuaThreadData(std::shared_ptr<lua_core::LuaRuntime> rt, lua_core::LuaThreadRef ref)
+    : runtime(std::move(rt)), threadRef(ref) {}
+
+  ~LuaThreadData() {
+    threadRef.release();
+  }
+};
+
 class LuaContext final : public Napi::ObjectWrap<LuaContext> {
 public:
     static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -29,12 +41,15 @@ public:
 
     Napi::Value ExecuteScript(const Napi::CallbackInfo& info);
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
+    Napi::Value CreateCoroutine(const Napi::CallbackInfo& info);
+    Napi::Value ResumeCoroutine(const Napi::CallbackInfo& info);
 
 private:
     Napi::Env env;
     std::shared_ptr<lua_core::LuaRuntime> runtime;
     std::unordered_map<std::string, Napi::FunctionReference> js_callbacks;
     std::vector<std::unique_ptr<LuaFunctionData>> lua_function_data_;  // Prevent leaks
+    std::vector<std::unique_ptr<LuaThreadData>> lua_thread_data_;      // Prevent coroutine leaks
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     // Adapter conversion (private)

@@ -217,6 +217,12 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
       const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
       return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{LuaFunctionRef(ref, L)}});
     }
+    case LUA_TTHREAD: {
+      lua_State* thread = lua_tothread(L, abs_index);
+      lua_pushvalue(L, abs_index);
+      const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+      return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{LuaThreadRef(ref, L, thread)}});
+    }
     default:
       return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{std::monostate{}}});
   }
@@ -253,9 +259,103 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
           }
         } else if constexpr (std::is_same_v<T, LuaFunctionRef>) {
           lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
+        } else if constexpr (std::is_same_v<T, LuaThreadRef>) {
+          lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
         }
       },
       value->value);
+}
+
+std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFunctionRef& funcRef) const {
+  // Create a new Lua thread (coroutine)
+  lua_State* thread = lua_newthread(L_);
+  if (!thread) {
+    return std::string("Failed to create coroutine thread");
+  }
+
+  // Store the thread in the registry to prevent GC
+  const int threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);
+
+  // Push the function onto the new thread's stack
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
+  lua_xmove(L_, thread, 1);
+
+  return LuaThreadRef(threadRef, L_, thread);
+}
+
+CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
+                                             const std::vector<LuaPtr>& args) const {
+  CoroutineResult result;
+
+  if (!threadRef.thread) {
+    result.status = CoroutineStatus::Dead;
+    result.error = "Invalid coroutine thread";
+    return result;
+  }
+
+  // Check if coroutine is already dead
+  int status = lua_status(threadRef.thread);
+  if (status != LUA_OK && status != LUA_YIELD) {
+    result.status = CoroutineStatus::Dead;
+    result.error = "Coroutine is dead";
+    return result;
+  }
+
+  // Also check if it's finished (stack is empty and status is OK)
+  if (status == LUA_OK && lua_gettop(threadRef.thread) == 0) {
+    result.status = CoroutineStatus::Dead;
+    result.error = "Coroutine has finished";
+    return result;
+  }
+
+  // Push arguments onto the coroutine's stack
+  for (const auto& arg : args) {
+    PushLuaValue(threadRef.thread, arg);
+  }
+
+  // Resume the coroutine
+  int nresults = 0;
+  int resumeStatus = lua_resume(threadRef.thread, L_, static_cast<int>(args.size()), &nresults);
+
+  if (resumeStatus == LUA_YIELD) {
+    result.status = CoroutineStatus::Suspended;
+    // Collect yielded values
+    for (int i = 1; i <= nresults; ++i) {
+      result.values.push_back(ToLuaValue(threadRef.thread, i));
+    }
+    lua_pop(threadRef.thread, nresults);
+  } else if (resumeStatus == LUA_OK) {
+    result.status = CoroutineStatus::Dead;
+    // Collect return values
+    for (int i = 1; i <= nresults; ++i) {
+      result.values.push_back(ToLuaValue(threadRef.thread, i));
+    }
+    lua_pop(threadRef.thread, nresults);
+  } else {
+    result.status = CoroutineStatus::Dead;
+    result.error = lua_tostring(threadRef.thread, -1);
+    lua_pop(threadRef.thread, 1);
+  }
+
+  return result;
+}
+
+CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) const {
+  if (!threadRef.thread) {
+    return CoroutineStatus::Dead;
+  }
+
+  int status = lua_status(threadRef.thread);
+  if (status == LUA_YIELD) {
+    return CoroutineStatus::Suspended;
+  } else if (status == LUA_OK) {
+    // Check if coroutine has any code to run
+    if (lua_gettop(threadRef.thread) == 0) {
+      return CoroutineStatus::Dead;
+    }
+    return CoroutineStatus::Suspended;
+  }
+  return CoroutineStatus::Dead;
 }
 
 } // namespace lua_core

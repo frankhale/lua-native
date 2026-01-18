@@ -28,6 +28,28 @@ export interface LuaFunction {
 }
 
 /**
+ * Represents a Lua coroutine that can be resumed from JavaScript
+ */
+export interface LuaCoroutine {
+  /** The current status of the coroutine */
+  status: 'suspended' | 'running' | 'dead';
+  /** Internal reference - do not modify */
+  _coroutine: unknown;
+}
+
+/**
+ * Result of resuming a coroutine
+ */
+export interface CoroutineResult {
+  /** The status after resuming */
+  status: 'suspended' | 'running' | 'dead';
+  /** Values yielded or returned by the coroutine */
+  values: LuaValue[];
+  /** Error message if the coroutine failed */
+  error?: string;
+}
+
+/**
  * Callback function that can be passed to the Lua context.
  * Receives Lua values as arguments and should return a Lua-compatible value.
  */
@@ -63,6 +85,33 @@ export interface LuaContext {
    * @param value The value to set (function, number, boolean, string, or object)
    */
   set_global(name: string, value: LuaValue | LuaCallback): void;
+
+  /**
+   * Creates a coroutine from a Lua script that returns a function.
+   * @param script A Lua script that returns a function to be used as the coroutine body
+   * @returns A coroutine object that can be resumed
+   * @example
+   * const coro = lua.create_coroutine(`
+   *   return function(x)
+   *     coroutine.yield(x * 2)
+   *     coroutine.yield(x * 3)
+   *     return x * 4
+   *   end
+   * `);
+   */
+  create_coroutine(script: string): LuaCoroutine;
+
+  /**
+   * Resumes a suspended coroutine with optional arguments.
+   * @param coroutine The coroutine to resume
+   * @param args Arguments to pass to the coroutine (received by yield on resume, or as function args on first resume)
+   * @returns The result containing status and yielded/returned values
+   * @example
+   * const result = lua.resume(coro, 10);
+   * // result.status: 'suspended' | 'dead'
+   * // result.values: yielded or returned values
+   */
+  resume(coroutine: LuaCoroutine, ...args: LuaValue[]): CoroutineResult;
 }
 
 /**

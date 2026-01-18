@@ -1,8 +1,10 @@
 import type { LuaNative } from './types';
 export type {
+  CoroutineResult,
   LuaCallback,
   LuaCallbacks,
   LuaContext,
+  LuaCoroutine,
   LuaFunction,
   LuaNative,
   LuaTable,

@@ -91,7 +91,9 @@ static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   const Napi::Function func = DefineClass(env, "LuaContext", {
     InstanceMethod("execute_script", &LuaContext::ExecuteScript),
-    InstanceMethod("set_global", &LuaContext::SetGlobal)
+    InstanceMethod("set_global", &LuaContext::SetGlobal),
+    InstanceMethod("create_coroutine", &LuaContext::CreateCoroutine),
+    InstanceMethod("resume", &LuaContext::ResumeCoroutine)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -370,8 +372,133 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           auto* dataPtr = data.get();
           lua_function_data_.push_back(std::move(data));
           return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
+        } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
+          // Return a coroutine object with the thread reference
+          auto data = std::make_unique<LuaThreadData>(runtime, v);
+          auto* dataPtr = data.get();
+          lua_thread_data_.push_back(std::move(data));
+          Napi::Object coro = Napi::Object::New(env);
+          coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr));
+          lua_core::CoroutineStatus status = runtime->GetCoroutineStatus(v);
+          coro.Set("status", Napi::String::New(env,
+            status == lua_core::CoroutineStatus::Suspended ? "suspended" :
+            status == lua_core::CoroutineStatus::Running ? "running" : "dead"));
+          return coro;
         }
         return env.Undefined();
       },
       value.value);
+}
+
+Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
+  if (info.Length() < 1) {
+    Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Accept a script string that returns a function
+  if (!info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Execute script and get function
+  const std::string script = info[0].As<Napi::String>().Utf8Value();
+  const auto res = runtime->ExecuteScript(script);
+  if (std::holds_alternative<std::string>(res)) {
+    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
+  if (values.empty() || !std::holds_alternative<lua_core::LuaFunctionRef>(values[0]->value)) {
+    Napi::TypeError::New(env, "Script must return a function").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& funcRef = std::get<lua_core::LuaFunctionRef>(values[0]->value);
+  auto result = runtime->CreateCoroutine(funcRef);
+  if (std::holds_alternative<std::string>(result)) {
+    Napi::Error::New(env, std::get<std::string>(result)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& threadRef = std::get<lua_core::LuaThreadRef>(result);
+  auto threadData = std::make_unique<LuaThreadData>(runtime, threadRef);
+  auto* threadDataPtr = threadData.get();
+  lua_thread_data_.push_back(std::move(threadData));
+
+  Napi::Object coro = Napi::Object::New(env);
+  coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, threadDataPtr));
+  coro.Set("status", Napi::String::New(env, "suspended"));
+  return coro;
+}
+
+Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "Expected a coroutine object as first argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  Napi::Object coroObj = info[0].As<Napi::Object>();
+  if (!coroObj.Has("_coroutine")) {
+    Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  Napi::Value externalVal = coroObj.Get("_coroutine");
+  if (!externalVal.IsExternal()) {
+    Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto* threadData = externalVal.As<Napi::External<LuaThreadData>>().Data();
+  if (!threadData || !threadData->runtime) {
+    Napi::Error::New(env, "Invalid coroutine reference").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Collect arguments (skip the first one which is the coroutine object)
+  std::vector<lua_core::LuaPtr> args;
+  for (size_t i = 1; i < info.Length(); ++i) {
+    args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
+  }
+
+  // Resume the coroutine
+  lua_core::CoroutineResult result = runtime->ResumeCoroutine(threadData->threadRef, args);
+
+  // Build the result object
+  Napi::Object resultObj = Napi::Object::New(env);
+
+  // Set status
+  std::string statusStr;
+  switch (result.status) {
+    case lua_core::CoroutineStatus::Suspended:
+      statusStr = "suspended";
+      break;
+    case lua_core::CoroutineStatus::Running:
+      statusStr = "running";
+      break;
+    case lua_core::CoroutineStatus::Dead:
+      statusStr = "dead";
+      break;
+  }
+  resultObj.Set("status", Napi::String::New(env, statusStr));
+
+  // Update the coroutine object's status too
+  coroObj.Set("status", Napi::String::New(env, statusStr));
+
+  // Set values
+  Napi::Array valuesArr = Napi::Array::New(env, result.values.size());
+  for (size_t i = 0; i < result.values.size(); ++i) {
+    valuesArr.Set(i, CoreToNapi(*result.values[i]));
+  }
+  resultObj.Set("values", valuesArr);
+
+  // Set error if present
+  if (result.error.has_value()) {
+    resultObj.Set("error", Napi::String::New(env, result.error.value()));
+  }
+
+  return resultObj;
 }
