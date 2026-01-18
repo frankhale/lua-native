@@ -39,8 +39,12 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
         std::vector<napi_value> jsArgs;
         jsArgs.reserve(args.size());
         for (const auto& a : args) jsArgs.push_back(CoreToNapi(*a));
-        const Napi::Value result = js_callbacks[name].Call(jsArgs);
-        return std::make_shared<lua_core::LuaValue>(NapiToCore(result));
+        try {
+          const Napi::Value result = js_callbacks[name].Call(jsArgs);
+          return std::make_shared<lua_core::LuaValue>(NapiToCore(result));
+        } catch (const Napi::Error& e) {
+          throw std::runtime_error(e.Message());
+        }
       });
     } else {
       runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCore(val)));
@@ -62,8 +66,12 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
       std::vector<napi_value> jsArgs;
       jsArgs.reserve(args.size());
       for (const auto& a : args) jsArgs.push_back(CoreToNapi(*a));
-      const Napi::Value result = js_callbacks[name].Call(jsArgs);
-      return std::make_shared<lua_core::LuaValue>(NapiToCore(result));
+      try {
+        const Napi::Value result = js_callbacks[name].Call(jsArgs);
+        return std::make_shared<lua_core::LuaValue>(NapiToCore(result));
+      } catch (const Napi::Error& e) {
+        throw std::runtime_error(e.Message());
+      }
     });
   } else {
     runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCore(value)));
@@ -185,4 +193,3 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
       },
       value.value);
 }
-// comment

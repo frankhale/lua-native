@@ -79,8 +79,14 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   LuaPtr resultHolder;
   try {
     resultHolder = it->second(args);
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "Host function '%s' threw an exception: %s",
+                    func_name ? func_name : "<unknown>", e.what());
+    lua_error(L);
+    return 0;
   } catch (...) {
-    lua_pushstring(L, "Host function threw an exception");
+    lua_pushfstring(L, "Host function '%s' threw an unknown exception",
+                    func_name ? func_name : "<unknown>");
     lua_error(L);
     return 0;
   }
