@@ -41,7 +41,8 @@ private:
     Napi::Value CoreToNapi(const lua_core::LuaValue& value);
 
 public:
-    static lua_core::LuaValue NapiToCore(const Napi::Value& value);
+    lua_core::LuaValue NapiToCoreInstance(const Napi::Value& value, int depth = 0);
+    static lua_core::LuaValue NapiToCore(const Napi::Value& value, int depth = 0);
 
 private:
 

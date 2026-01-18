@@ -121,19 +121,19 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
     if (val.IsFunction()) {
       js_callbacks[key_str] = Napi::Persistent(val.As<Napi::Function>());
       runtime->RegisterFunction(key_str, [this, name = key_str](const std::vector<lua_core::LuaPtr>& args) {
-        std::vector<napi_value> jsArgs;
-        jsArgs.reserve(args.size());
-        for (const auto& a : args) jsArgs.push_back(CoreToNapi(*a));
-        try {
-          const Napi::Value result = js_callbacks[name].Call(jsArgs);
-          return std::make_shared<lua_core::LuaValue>(NapiToCore(result));
-        } catch (const Napi::Error& e) {
-          throw std::runtime_error(e.Message());
-        }
-      });
-    } else {
-      runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCore(val)));
-    }
+      std::vector<napi_value> jsArgs;
+      jsArgs.reserve(args.size());
+      for (const auto& a : args) jsArgs.push_back(CoreToNapi(*a));
+      try {
+        const Napi::Value result = js_callbacks[name].Call(jsArgs);
+        return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
+      } catch (const Napi::Error& e) {
+        throw std::runtime_error(e.Message());
+      }
+    });
+  } else {
+    runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
+  }
   }
 }
 
@@ -153,13 +153,13 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
       for (const auto& a : args) jsArgs.push_back(CoreToNapi(*a));
       try {
         const Napi::Value result = js_callbacks[name].Call(jsArgs);
-        return std::make_shared<lua_core::LuaValue>(NapiToCore(result));
+        return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
       } catch (const Napi::Error& e) {
         throw std::runtime_error(e.Message());
       }
     });
   } else {
-    runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCore(value)));
+    runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
   }
 
   return env.Undefined();
@@ -203,14 +203,37 @@ Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
 
 NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)
 
-lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value) {
-  if (value.IsNull() || value.IsUndefined()) {
+lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int depth) {
+  if (depth > 100) {
     return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
   }
-  if (value.IsBoolean()) {
+
+  if (value.IsFunction()) {
+    const std::string name = "__js_callback_" + std::to_string(js_callbacks.size());
+    js_callbacks[name] = Napi::Persistent(value.As<Napi::Function>());
+    runtime->RegisterFunction(name, [this, name](const std::vector<lua_core::LuaPtr>& args) {
+      std::vector<napi_value> jsArgs;
+      jsArgs.reserve(args.size());
+      for (const auto& a : args) jsArgs.push_back(CoreToNapi(*a));
+      try {
+        const Napi::Value result = js_callbacks[name].Call(jsArgs);
+        return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
+      } catch (const Napi::Error& e) {
+        throw std::runtime_error(e.Message());
+      }
+    });
+    // For JS functions passed to Lua, they become globals and we return their name
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{name}};
+  }
+
+  const napi_valuetype type = value.Type();
+  if (type == napi_undefined || type == napi_null) {
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
+  }
+  if (type == napi_boolean) {
     return lua_core::LuaValue{lua_core::LuaValue::Variant{value.As<Napi::Boolean>().Value()}};
   }
-  if (value.IsNumber()) {
+  if (type == napi_number) {
     const double num = value.As<Napi::Number>().DoubleValue();
     if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
         num <= static_cast<double>(std::numeric_limits<int64_t>::max())) {
@@ -221,16 +244,21 @@ lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value) {
     }
     return lua_core::LuaValue{lua_core::LuaValue::Variant{num}};
   }
-  if (value.IsString()) {
+  if (type == napi_string) {
     return lua_core::LuaValue{lua_core::LuaValue::Variant{value.As<Napi::String>().Utf8Value()}};
   }
-  if (value.IsObject()) {
+
+  if (type == napi_object) {
     if (value.IsArray()) {
       const auto arr = value.As<Napi::Array>();
       lua_core::LuaArray coreArr;
       coreArr.reserve(arr.Length());
       for (uint32_t i = 0; i < arr.Length(); ++i) {
-        coreArr.push_back(std::make_shared<lua_core::LuaValue>(NapiToCore(arr.Get(i))));
+        if (depth < 100) {
+          coreArr.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(arr.Get(i), depth + 1)));
+        } else {
+          coreArr.push_back(std::make_shared<lua_core::LuaValue>(lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}}));
+        }
       }
       return lua_core::LuaValue{lua_core::LuaValue::Variant{std::move(coreArr)}};
     }
@@ -239,14 +267,75 @@ lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value) {
     lua_core::LuaTable tbl;
     for (uint32_t i = 0; i < keys.Length(); i++) {
       Napi::Value key = keys[i];
-      std::string keyStr;
-      if (key.IsString()) keyStr = key.As<Napi::String>().Utf8Value();
-      else if (key.IsNumber()) keyStr = std::to_string(key.As<Napi::Number>().Int64Value());
-      else continue;
-      tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(NapiToCore(obj.Get(key))));
+      std::string keyStr = key.ToString().Utf8Value();
+      if (depth < 100) {
+        tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(obj.Get(key), depth + 1)));
+      } else {
+        tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}}));
+      }
     }
     return lua_core::LuaValue{lua_core::LuaValue::Variant{std::move(tbl)}};
   }
+
+  return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
+}
+
+lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
+  if (depth > 100) {
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
+  }
+
+  const napi_valuetype type = value.Type();
+  if (type == napi_undefined || type == napi_null) {
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
+  }
+  if (type == napi_boolean) {
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{value.As<Napi::Boolean>().Value()}};
+  }
+  if (type == napi_number) {
+    const double num = value.As<Napi::Number>().DoubleValue();
+    if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
+        num <= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+      double intpart;
+      if (std::modf(num, &intpart) == 0.0) {
+        return lua_core::LuaValue{lua_core::LuaValue::Variant{static_cast<int64_t>(num)}};
+      }
+    }
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{num}};
+  }
+  if (type == napi_string) {
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{value.As<Napi::String>().Utf8Value()}};
+  }
+
+  if (type == napi_object) {
+    if (value.IsArray()) {
+      const auto arr = value.As<Napi::Array>();
+      lua_core::LuaArray coreArr;
+      coreArr.reserve(arr.Length());
+      for (uint32_t i = 0; i < arr.Length(); ++i) {
+        if (depth < 100) {
+          coreArr.push_back(std::make_shared<lua_core::LuaValue>(NapiToCore(arr.Get(i), depth + 1)));
+        } else {
+          coreArr.push_back(std::make_shared<lua_core::LuaValue>(lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}}));
+        }
+      }
+      return lua_core::LuaValue{lua_core::LuaValue::Variant{std::move(coreArr)}};
+    }
+    const auto obj = value.As<Napi::Object>();
+    Napi::Array keys = obj.GetPropertyNames();
+    lua_core::LuaTable tbl;
+    for (uint32_t i = 0; i < keys.Length(); i++) {
+      Napi::Value key = keys[i];
+      std::string keyStr = key.ToString().Utf8Value();
+      if (depth < 100) {
+        tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(NapiToCore(obj.Get(key), depth + 1)));
+      } else {
+        tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}}));
+      }
+    }
+    return lua_core::LuaValue{lua_core::LuaValue::Variant{std::move(tbl)}};
+  }
+
   return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
 }
 
