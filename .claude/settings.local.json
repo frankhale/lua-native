@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(node-gyp rebuild:*)",
-      "Bash(node-gyp:*)"
+      "Bash(node-gyp:*)",
+      "Bash(node -e \"const {execSync} = require\\(''child_process''\\); try { const out = execSync\\(''npx node-gyp rebuild -- -Dskip_test=1'', {encoding: ''utf8'', stdio: ''pipe''}\\); console.log\\(out\\); } catch\\(e\\) { console.log\\(''STDOUT:'', e.stdout\\); console.log\\(''STDERR:'', e.stderr?.substring\\(0, 2000\\)\\); console.log\\(''STATUS:'', e.status\\); }\")",
+      "Bash(node test-lua-function.mjs:*)",
+      "Bash(node -e \"const {execSync} = require\\(''child_process''\\); try { const out = execSync\\(''npx node-gyp rebuild -- -Dskip_test=1'', {encoding: ''utf8'', stdio: ''pipe''}\\); console.log\\(''Build successful''\\); } catch\\(e\\) { console.log\\(''STDERR:'', e.stderr?.substring\\(0, 1000\\)\\); }\")",
+      "Bash(node -e:*)"
     ]
   }
 }

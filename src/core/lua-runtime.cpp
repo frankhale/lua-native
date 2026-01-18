@@ -11,14 +11,12 @@ struct StackGuard {
 };
 
  bool isSequentialArray(lua_State* L, int index) {
-  // Simple heuristic: treat as array if keys are 1..n with no gaps
   const int abs_index = lua_absindex(L, index);
   lua_Integer expected = 1;
   constexpr bool isArray = true;
   lua_pushnil(L);
   while (lua_next(L, abs_index) != 0) {
     if (!lua_isinteger(L, -2) || lua_tointeger(L, -2) != expected) {
-      // Not a sequential array; pop value and key to balance the stack
       lua_pop(L, 2);
       return false;
     }
@@ -43,6 +41,12 @@ LuaRuntime::LuaRuntime(const bool openStdLibs) {
 }
 
 LuaRuntime::~LuaRuntime() {
+  // Clean up stored function data
+  for (auto& [data, destructor] : stored_function_data_) {
+    if (destructor) destructor(data);
+  }
+  stored_function_data_.clear();
+
   if (L_) {
     lua_close(L_);
     L_ = nullptr;
@@ -131,6 +135,30 @@ std::optional<LuaPtr> LuaRuntime::GetGlobal(const std::string& name) const {
   return v;
 }
 
+ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
+                                      const std::vector<LuaPtr>& args) const {
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
+
+  for (const auto& arg : args) {
+    PushLuaValue(L_, arg);
+  }
+
+  if (lua_pcall(L_, static_cast<int>(args.size()), LUA_MULTRET, 0) != LUA_OK) {
+    std::string error = lua_tostring(L_, -1);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  const int nresults = lua_gettop(L_);
+  std::vector<LuaPtr> results;
+  results.reserve(nresults);
+  for (int i = 1; i <= nresults; ++i) {
+    results.push_back(ToLuaValue(L_, i));
+  }
+  lua_pop(L_, nresults);
+  return results;
+}
+
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
   if (depth > kMaxDepth) return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{std::monostate{}}});
   switch (const int abs_index = lua_absindex(L, index); lua_type(L, abs_index)) {
@@ -184,6 +212,11 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
       }
       return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{std::move(map)}});
     }
+    case LUA_TFUNCTION: {
+      lua_pushvalue(L, abs_index);
+      const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+      return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{LuaFunctionRef(ref, L)}});
+    }
     default:
       return std::make_shared<LuaValue>(LuaValue{LuaValue::Variant{std::monostate{}}});
   }
@@ -218,6 +251,8 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             PushLuaValue(L, val, depth + 1);
             lua_settable(L, -3);
           }
+        } else if constexpr (std::is_same_v<T, LuaFunctionRef>) {
+          lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
         }
       },
       value->value);

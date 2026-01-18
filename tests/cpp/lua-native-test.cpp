@@ -1,4 +1,3 @@
-// Core tests against pure C++ runtime
 #include <gtest/gtest.h>
 
 #include "core/lua-runtime.h"

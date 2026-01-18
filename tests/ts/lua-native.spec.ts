@@ -55,6 +55,58 @@ describe('lua-native Node adapter', () => {
     const lua = new lua_native.init({});
     expect(() => lua.execute_script("error('boom')")).toThrowError(/boom/);
   });
+
+  it('returns Lua functions that can be called from JS', () => {
+    const lua = new lua_native.init({});
+    const add = lua.execute_script('return function(a, b) return a + b end');
+    expect(typeof add).toBe('function');
+    expect(add(5, 3)).toBe(8);
+    expect(add(10, 20)).toBe(30);
+  });
+
+  it('Lua functions can call JS callbacks', () => {
+    const lua = new lua_native.init({
+      jsDouble: (x: number) => x * 2
+    });
+    const luaFunc = lua.execute_script(`
+      return function(n)
+        return jsDouble(n) + 10
+      end
+    `);
+    expect(typeof luaFunc).toBe('function');
+    expect(luaFunc(5)).toBe(20);  // jsDouble(5) = 10, + 10 = 20
+  });
+
+  it('Lua functions can return multiple values', () => {
+    const lua = new lua_native.init({});
+    const multiReturn = lua.execute_script(`
+      return function(a, b)
+        return a + b, a - b, a * b
+      end
+    `);
+    expect(typeof multiReturn).toBe('function');
+    const results = multiReturn(10, 3);
+    expect(results).toEqual([13, 7, 30]);
+  });
+
+  it('supports closures and nested function returns', () => {
+    const lua = new lua_native.init({});
+    const makeCounter = lua.execute_script(`
+      return function(start)
+        local count = start or 0
+        return function()
+          count = count + 1
+          return count
+        end
+      end
+    `);
+    expect(typeof makeCounter).toBe('function');
+    const counter = makeCounter(10);
+    expect(typeof counter).toBe('function');
+    expect(counter()).toBe(11);
+    expect(counter()).toBe(12);
+    expect(counter()).toBe(13);
+  });
 });
 
 

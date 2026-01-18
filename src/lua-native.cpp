@@ -2,6 +2,92 @@
 
 #include <limits>
 
+static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value,
+                                   std::shared_ptr<lua_core::LuaRuntime> runtime);
+
+static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+  auto* data = static_cast<LuaFunctionData*>(info.Data());
+  if (!data || !data->runtime) {
+    Napi::Error::New(env, "Invalid Lua function reference").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Convert JS arguments to Lua values
+  std::vector<lua_core::LuaPtr> args;
+  args.reserve(info.Length());
+  for (size_t i = 0; i < info.Length(); ++i) {
+    args.push_back(std::make_shared<lua_core::LuaValue>(LuaContext::NapiToCore(info[i])));
+  }
+
+  // Call the Lua function
+  const auto result = data->runtime->CallFunction(data->funcRef, args);
+
+  // Handle error case
+  if (std::holds_alternative<std::string>(result)) {
+    Napi::Error::New(env, std::get<std::string>(result)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Convert results back to JS
+  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(result);
+  if (values.empty()) return env.Undefined();
+
+  // For single return value, return it directly
+  if (values.size() == 1) {
+    return LuaValueToNapi(env, *values[0], data->runtime);
+  }
+
+  // For multiple return values, return as array
+  Napi::Array arr = Napi::Array::New(env, values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    arr.Set(i, LuaValueToNapi(env, *values[i], data->runtime));
+  }
+  return arr;
+}
+
+static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value,
+                                   std::shared_ptr<lua_core::LuaRuntime> runtime = nullptr) {
+  return std::visit(
+    [&](const auto& v) -> Napi::Value {
+      using T = std::decay_t<decltype(v)>;
+      if constexpr (std::is_same_v<T, std::monostate>) {
+        return env.Null();
+      } else if constexpr (std::is_same_v<T, bool>) {
+        return Napi::Boolean::New(env, v);
+      } else if constexpr (std::is_same_v<T, int64_t>) {
+        return Napi::Number::New(env, static_cast<double>(v));
+      } else if constexpr (std::is_same_v<T, double>) {
+        return Napi::Number::New(env, v);
+      } else if constexpr (std::is_same_v<T, std::string>) {
+        return Napi::String::New(env, v);
+      } else if constexpr (std::is_same_v<T, lua_core::LuaArray>) {
+        Napi::Array arr = Napi::Array::New(env, v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+          arr.Set(i, LuaValueToNapi(env, *v[i], runtime));
+        }
+        return arr;
+      } else if constexpr (std::is_same_v<T, lua_core::LuaTable>) {
+        Napi::Object obj = Napi::Object::New(env);
+        for (const auto& [k, val] : v) {
+          obj.Set(k, LuaValueToNapi(env, *val, runtime));
+        }
+        return obj;
+      } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
+        if (runtime) {
+          // Create wrapper data and store it in the runtime for cleanup
+          auto* data = new LuaFunctionData(runtime, v);
+          runtime->StoreFunctionData(data, [](void* ptr) { delete static_cast<LuaFunctionData*>(ptr); });
+          return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", data);
+        }
+        return env.Undefined();
+      }
+      return env.Undefined();
+    },
+    value.value);
+}
+
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   const Napi::Function func = DefineClass(env, "LuaContext", {
     InstanceMethod("execute_script", &LuaContext::ExecuteScript),
@@ -34,7 +120,6 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
 
     if (val.IsFunction()) {
       js_callbacks[key_str] = Napi::Persistent(val.As<Napi::Function>());
-      // Register wrapper into core runtime
       runtime->RegisterFunction(key_str, [this, name = key_str](const std::vector<lua_core::LuaPtr>& args) {
         std::vector<napi_value> jsArgs;
         jsArgs.reserve(args.size());
@@ -105,6 +190,10 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
   return array;
 }
 
+Napi::Value LuaContext::LuaFunctionCallback(const Napi::CallbackInfo& info) {
+  return LuaFunctionCallbackStatic(info);
+}
+
 Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
   const auto result = LuaContext::Init(env, exports);
   env.SetInstanceData<Napi::FunctionReference>(
@@ -114,7 +203,6 @@ Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
 
 NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)
 
-// Adapter conversions
 lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value) {
   if (value.IsNull() || value.IsUndefined()) {
     return lua_core::LuaValue{lua_core::LuaValue::Variant{std::monostate{}}};
@@ -188,6 +276,11 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
             obj.Set(k, CoreToNapi(*val));
           }
           return obj;
+        } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
+          auto data = std::make_unique<LuaFunctionData>(runtime, v);
+          auto* dataPtr = data.get();
+          lua_function_data_.push_back(std::move(data));
+          return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
         }
         return env.Undefined();
       },

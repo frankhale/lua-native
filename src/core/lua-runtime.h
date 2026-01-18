@@ -18,6 +18,20 @@ using LuaPtr = std::shared_ptr<LuaValue>;
 using LuaArray = std::vector<LuaPtr>;
 using LuaTable = std::unordered_map<std::string, LuaPtr>;
 
+struct LuaFunctionRef {
+  int ref;
+  lua_State* L;
+
+  LuaFunctionRef(int r, lua_State* state) : ref(r), L(state) {}
+
+  void release() {
+    if (L && ref != LUA_NOREF) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ref);
+      ref = LUA_NOREF;
+    }
+  }
+};
+
 struct LuaValue {
   using Variant = std::variant<
       std::monostate,  // nil
@@ -26,11 +40,11 @@ struct LuaValue {
       double,
       std::string,
       LuaArray,
-      LuaTable>;
+      LuaTable,
+      LuaFunctionRef>;
   Variant value;
 };
 
-// Result type: either values or an error message
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
 
 class LuaRuntime {
@@ -50,18 +64,24 @@ public:
   void SetGlobal(const std::string& name, const LuaPtr& value) const;
   void RegisterFunction(const std::string& name, Function fn);
 
-  // Optional helper for advanced testing
   [[nodiscard]] std::optional<LuaPtr> GetGlobal(const std::string& name) const;
+
+  [[nodiscard]] ScriptResult CallFunction(const LuaFunctionRef& funcRef,
+                                          const std::vector<LuaPtr>& args) const;
 
   [[nodiscard]] lua_State* RawState() const { return L_; }
 
-  // Conversion helpers (exposed for testing)
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
   static void PushLuaValue(lua_State* L, const LuaPtr& value, int depth = 0);
+
+  void StoreFunctionData(void* data, void (*destructor)(void*)) {
+    stored_function_data_.emplace_back(data, destructor);
+  }
 
 private:
   lua_State* L_ { nullptr };
   std::unordered_map<std::string, Function> host_functions_;
+  std::vector<std::pair<void*, void (*)(void*)>> stored_function_data_;
 
   static int LuaCallHostFunction(lua_State* L);
 

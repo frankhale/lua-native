@@ -11,6 +11,9 @@ data structures.
 - Bun
 - Deno
 
+All runtimes use the same API. Bun and Deno support native Node.js modules, so
+the usage is identical across all three runtimes.
+
 ## Features
 
 - Execute Lua scripts from Node.js
@@ -27,17 +30,18 @@ data structures.
 npm install lua-native
 ```
 
-NOTE: Windows and macOS are supported as a prebuilt binary. Linux prebuilt
-binaries are coming soon.
+NOTE: Prebuilt binaries are available for Windows (x64) and macOS (Apple Silicon/arm64).
+Linux prebuilt binaries are coming soon. Intel Mac users will need to build from source.
 
 ## Building from Source
 
-If you want to build the module from source:
+### Prerequisites
 
-VCPKG is required to build the module. Once installed, you can install Lua via
-`vcpkg install lua`.
-
-VCPKG is available at [vcpkg](https://vcpkg.io/en/index.html)
+- **Node.js** (v18 or later recommended)
+- **Python** (required by node-gyp)
+- **VCPKG** with Lua installed (`vcpkg install lua`) - [vcpkg.io](https://vcpkg.io/en/index.html)
+- **Windows**: Visual Studio 2022 or Build Tools with C++ workload
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`)
 
 NOTE: There are two ways to build this module. You can use traditional
 `bindings.gyp` along with `node-gyp` or you can use `cmake` on
@@ -143,6 +147,40 @@ console.log(result);
 // }
 ```
 
+### Returning Lua Functions
+
+Lua functions can be returned to JavaScript and called directly:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({});
+
+// Return a Lua function
+const add = lua.execute_script(`
+  return function(a, b)
+    return a + b
+  end
+`);
+
+console.log(add(5, 3)); // 8
+
+// Closures work too
+const makeCounter = lua.execute_script(`
+  return function(start)
+    local count = start or 0
+    return function()
+      count = count + 1
+      return count
+    end
+  end
+`);
+
+const counter = makeCounter(10);
+console.log(counter()); // 11
+console.log(counter()); // 12
+```
+
 ### Error Handling
 
 Lua errors are automatically converted to JavaScript exceptions:
@@ -156,6 +194,24 @@ try {
   lua.execute_script("error('Something went wrong')");
 } catch (error) {
   console.error("Lua error:", error.message);
+  // Output: Lua error: [string "error('Something went wrong')"]:1: Something went wrong
+}
+```
+
+Errors from JavaScript callbacks include the function name and original error message:
+
+```javascript
+const lua = new lua_native.init({
+  riskyOperation: () => {
+    throw new Error("Database connection failed");
+  },
+});
+
+try {
+  lua.execute_script("riskyOperation()");
+} catch (error) {
+  console.error(error.message);
+  // Output: Host function 'riskyOperation' threw an exception: Database connection failed
 }
 ```
 
@@ -165,7 +221,7 @@ The module includes comprehensive TypeScript definitions:
 
 ```typescript
 import lua_native from "lua-native";
-import type { LuaCallbacks, LuaContext } from "lua-native/types";
+import type { LuaCallbacks, LuaContext } from "lua-native";
 
 // Type-safe callback definition
 const callbacks: LuaCallbacks = {
@@ -220,7 +276,13 @@ Sets a global variable or function in the Lua environment.
 | `string`              | `string`        |                                            |
 | `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 |
 | `table` (object-like) | `Object`        | String or mixed keys                       |
-| `function`            | `Function`      | JavaScript functions passed to Lua         |
+| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS           |
+
+## Limitations
+
+- **No metatable support** - Lua metatables are not accessible or configurable from JavaScript.
+- **No coroutine support** - Lua coroutines cannot be used with this module.
+- **No userdata support** - Lua userdata types are not supported.
 
 ## Development
 
@@ -254,4 +316,4 @@ Frank Hale
 
 ## Date
 
-19 December 2025
+18 January 2026
