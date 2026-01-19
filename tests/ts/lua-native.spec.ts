@@ -13,14 +13,29 @@ describe('lua-native Node adapter', () => {
     });
 
     it('calls a JS function from Lua', () => {
-      const lua = new lua_native.init({ add: (a: number, b: number) => a + b });
+      const lua = new lua_native.init({
+        add: (...args) => {
+          if (typeof args[0] === 'number' && typeof args[1] === 'number') {
+            return args[0] + args[1];
+          }
+          throw new Error('add expects two numbers');
+        }
+      });
       const result = lua.execute_script('return add(2, 3)');
       expect(result).toBe(5);
     });
 
     it('modify JS variable from Lua', () => {
       let b = 42;
-      const lua = new lua_native.init({ setVar: (a: number) => b = a });
+      const lua = new lua_native.init({
+        setVar: (...args) => {
+          if (typeof args[0] === 'number') {
+            b = args[0];
+          } else {
+            throw new Error('setVar expects a number');
+          }
+        }
+      });
       lua.execute_script('setVar(1999)');
       expect(b).toBe(1999);
     });
@@ -28,9 +43,18 @@ describe('lua-native Node adapter', () => {
     it('sets globals and uses them in Lua', () => {
       const lua = new lua_native.init({});
       lua.set_global('x', 7);
-      lua.set_global('times2', (n: number) => n * 2);
+      lua.set_global('times2', (...args) => {
+        if (typeof args[0] === 'number') {
+          return args[0] * 2;
+        }
+        throw new Error('times2 expects a number');
+      });
       lua.set_global('table', { a: 1, b: 42, c: "Hello,World!" })
-      const [a, b, c, d] = lua.execute_script('return x, times2(x), table.b, table.c');
+      const result = lua.execute_script('return x, times2(x), table.b, table.c');
+      if (!Array.isArray(result)) {
+        throw new Error('Expected result to be an array');
+      }
+      const [a, b, c, d] = result;
       expect(a).toBe(7);
       expect(b).toBe(14);
       expect(c).toBe(42);
@@ -38,7 +62,14 @@ describe('lua-native Node adapter', () => {
     });
 
     it('returns nested table structures to JS', () => {
-      const lua = new lua_native.init({ greet: (name: string) => `Hello, ${name}!` });
+      const lua = new lua_native.init({
+        greet: (...args) => {
+          if (typeof args[0] === 'string') {
+            return `Hello, ${args[0]}!`;
+          }
+          throw new Error('greet expects a string');
+        }
+      });
       const result = lua.execute_script(`
         local t = {
           numbers = {1, 2, 3},
@@ -48,16 +79,27 @@ describe('lua-native Node adapter', () => {
         return t
       `);
       expect(result).toBeTypeOf('object');
+      if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+        throw new Error('Expected result to be a table object');
+      }
       expect(result.msg).toBe('Hello, World!');
-      expect(result.flags.on).toBe(true);
-      expect(result.flags.off).toBe(false);
+      const flags = result.flags;
+      if (flags === null || typeof flags !== 'object' || Array.isArray(flags)) {
+        throw new Error('Expected flags to be a table object');
+      }
+      expect(flags.on).toBe(true);
+      expect(flags.off).toBe(false);
       expect(Array.isArray(result.numbers)).toBe(true);
       expect(result.numbers).toEqual([1, 2, 3]);
     });
 
     it('returns multiple values from script', () => {
       const lua = new lua_native.init({});
-      const [a, b, c] = lua.execute_script('return 1, "hello", true');
+      const result = lua.execute_script('return 1, "hello", true');
+      if (!Array.isArray(result)) {
+        throw new Error('Expected result to be an array');
+      }
+      const [a, b, c] = result;
       expect(a).toBe(1);
       expect(b).toBe("hello");
       expect(c).toBe(true);
@@ -87,6 +129,9 @@ describe('lua-native Node adapter', () => {
         lua.set_global('longStr', longStr);
         const result = lua.execute_script('return longStr');
         expect(result).toBe(longStr);
+        if (typeof result !== 'string') {
+          throw new Error('Expected result to be a string');
+        }
         expect(result.length).toBe(10000);
       });
 
@@ -183,7 +228,7 @@ describe('lua-native Node adapter', () => {
 
       it('handles nil in callback argument', () => {
         const lua = new lua_native.init({
-          checkNil: (val: unknown) => val === null
+          checkNil: (...args) => args[0] === null
         });
         const result = lua.execute_script('return checkNil(nil)');
         expect(result).toBe(true);
@@ -257,12 +302,37 @@ describe('lua-native Node adapter', () => {
             }
           }
         `);
-        expect(result.level1.level2.level3.level4.value).toBe("deep");
+        if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+          throw new Error('Expected result to be a table object');
+        }
+        const level1 = result.level1;
+        if (level1 === null || typeof level1 !== 'object' || Array.isArray(level1)) {
+          throw new Error('Expected level1 to be a table object');
+        }
+        const level2 = level1.level2;
+        if (level2 === null || typeof level2 !== 'object' || Array.isArray(level2)) {
+          throw new Error('Expected level2 to be a table object');
+        }
+        const level3 = level2.level3;
+        if (level3 === null || typeof level3 !== 'object' || Array.isArray(level3)) {
+          throw new Error('Expected level3 to be a table object');
+        }
+        const level4 = level3.level4;
+        if (level4 === null || typeof level4 !== 'object' || Array.isArray(level4)) {
+          throw new Error('Expected level4 to be a table object');
+        }
+        if (typeof level4.value !== 'string') {
+          throw new Error('Expected level4.value to be a string');
+        }
+        expect(level4.value).toBe("deep");
       });
 
       it('handles table with numeric string keys', () => {
         const lua = new lua_native.init({});
         const result = lua.execute_script('return {["1"] = "a", ["2"] = "b"}');
+        if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+          throw new Error('Expected result to be a table object');
+        }
         expect(result["1"]).toBe("a");
         expect(result["2"]).toBe("b");
       });
@@ -270,6 +340,9 @@ describe('lua-native Node adapter', () => {
       it('handles table with special key names', () => {
         const lua = new lua_native.init({});
         const result = lua.execute_script('return {["with space"] = 1, ["with-dash"] = 2}');
+        if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+          throw new Error('Expected result to be a table object');
+        }
         expect(result["with space"]).toBe(1);
         expect(result["with-dash"]).toBe(2);
       });
@@ -318,14 +391,21 @@ describe('lua-native Node adapter', () => {
     it('handles errors in returned Lua functions', () => {
       const lua = new lua_native.init({});
       const errorFunc = lua.execute_script('return function() error("func error") end');
+      if (typeof errorFunc !== 'function') {
+        throw new Error('Expected errorFunc to be a function');
+      }
       expect(() => errorFunc()).toThrowError(/func error/);
     });
 
     it('handles pcall for protected calls', () => {
       const lua = new lua_native.init({});
-      const [success, err] = lua.execute_script(`
+      const result = lua.execute_script(`
         return pcall(function() error("caught error") end)
       `);
+      if (!Array.isArray(result)) {
+        throw new Error('Expected result to be an array');
+      }
+      const [success, err] = result;
       expect(success).toBe(false);
       expect(err).toContain("caught error");
     });
@@ -339,13 +419,21 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({});
       const add = lua.execute_script('return function(a, b) return a + b end');
       expect(typeof add).toBe('function');
+      if (typeof add !== 'function') {
+        throw new Error('Expected add to be a function');
+      }
       expect(add(5, 3)).toBe(8);
       expect(add(10, 20)).toBe(30);
     });
 
     it('Lua functions can call JS callbacks', () => {
       const lua = new lua_native.init({
-        jsDouble: (x: number) => x * 2
+        jsDouble: (...args) => {
+          if (typeof args[0] === 'number') {
+            return args[0] * 2;
+          }
+          throw new Error('jsDouble expects a number');
+        }
       });
       const luaFunc = lua.execute_script(`
         return function(n)
@@ -353,6 +441,9 @@ describe('lua-native Node adapter', () => {
         end
       `);
       expect(typeof luaFunc).toBe('function');
+      if (typeof luaFunc !== 'function') {
+        throw new Error('Expected luaFunc to be a function');
+      }
       expect(luaFunc(5)).toBe(20);
     });
 
@@ -364,6 +455,9 @@ describe('lua-native Node adapter', () => {
         end
       `);
       expect(typeof multiReturn).toBe('function');
+      if (typeof multiReturn !== 'function') {
+        throw new Error('Expected multiReturn to be a function');
+      }
       const results = multiReturn(10, 3);
       expect(results).toEqual([13, 7, 30]);
     });
@@ -380,8 +474,14 @@ describe('lua-native Node adapter', () => {
         end
       `);
       expect(typeof makeCounter).toBe('function');
+      if (typeof makeCounter !== 'function') {
+        throw new Error('Expected makeCounter to be a function');
+      }
       const counter = makeCounter(10);
       expect(typeof counter).toBe('function');
+      if (typeof counter !== 'function') {
+        throw new Error('Expected counter to be a function');
+      }
       expect(counter()).toBe(11);
       expect(counter()).toBe(12);
       expect(counter()).toBe(13);
@@ -390,6 +490,9 @@ describe('lua-native Node adapter', () => {
     it('handles function with no arguments', () => {
       const lua = new lua_native.init({});
       const getFortyTwo = lua.execute_script('return function() return 42 end');
+      if (typeof getFortyTwo !== 'function') {
+        throw new Error('Expected getFortyTwo to be a function');
+      }
       expect(getFortyTwo()).toBe(42);
     });
 
@@ -400,12 +503,18 @@ describe('lua-native Node adapter', () => {
           return a + b + c + d + e + f + g + h + i + j
         end
       `);
+      if (typeof sum !== 'function') {
+        throw new Error('Expected sum to be a function');
+      }
       expect(sum(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)).toBe(55);
     });
 
     it('handles function returning nil', () => {
       const lua = new lua_native.init({});
       const returnNil = lua.execute_script('return function() return nil end');
+      if (typeof returnNil !== 'function') {
+        throw new Error('Expected returnNil to be a function');
+      }
       expect(returnNil()).toBeNull();
     });
 
@@ -413,13 +522,22 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({});
       let sideEffect = 0;
       const lua2 = new lua_native.init({
-        setSideEffect: (val: number) => { sideEffect = val; }
+        setSideEffect: (...args) => {
+          if (typeof args[0] === 'number') {
+            sideEffect = args[0];
+          } else {
+            throw new Error('setSideEffect expects a number');
+          }
+        }
       });
       const noReturn = lua2.execute_script(`
         return function(val)
           setSideEffect(val)
         end
       `);
+      if (typeof noReturn !== 'function') {
+        throw new Error('Expected noReturn to be a function');
+      }
       const result = noReturn(42);
       expect(result).toBeUndefined();
       expect(sideEffect).toBe(42);
@@ -429,18 +547,28 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({});
       const double = lua.execute_script('return function(x) return x * 2 end');
       for (let i = 0; i < 100; i++) {
+        if (typeof double !== 'function') {
+          throw new Error('Expected double to be a function');
+        }
         expect(double(i)).toBe(i * 2);
       }
     });
 
     it('multiple functions can coexist', () => {
       const lua = new lua_native.init({});
-      const [add, sub, mul] = lua.execute_script(`
+      const result = lua.execute_script(`
         return
           function(a, b) return a + b end,
           function(a, b) return a - b end,
           function(a, b) return a * b end
       `);
+      if (!Array.isArray(result)) {
+        throw new Error('Expected result to be an array');
+      }
+      const [add, sub, mul] = result;
+      if (typeof add !== 'function' || typeof sub !== 'function' || typeof mul !== 'function') {
+        throw new Error('Expected all functions to be callable');
+      }
       expect(add(10, 5)).toBe(15);
       expect(sub(10, 5)).toBe(5);
       expect(mul(10, 5)).toBe(50);
@@ -469,7 +597,12 @@ describe('lua-native Node adapter', () => {
 
     it('handles setting function as global', () => {
       const lua = new lua_native.init({});
-      lua.set_global('greet', (name: string) => `Hello, ${name}!`);
+      lua.set_global('greet', (...args) => {
+        if (typeof args[0] === 'string') {
+          return `Hello, ${args[0]}!`;
+        }
+        throw new Error('greet expects a string');
+      });
       const result = lua.execute_script('return greet("World")');
       expect(result).toBe('Hello, World!');
     });
@@ -541,6 +674,9 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({});
       const luaTime = lua.execute_script('return os.time()');
       const jsTime = Math.floor(Date.now() / 1000);
+      if (typeof luaTime !== 'number') {
+        throw new Error('Expected luaTime to be a number');
+      }
       expect(Math.abs(luaTime - jsTime)).toBeLessThan(2);
     });
 
@@ -603,9 +739,26 @@ describe('lua-native Node adapter', () => {
         end
         return t
       `);
+      if (!Array.isArray(result)) {
+        throw new Error('Expected result to be an array');
+      }
       expect(result.length).toBe(1000);
-      expect(result[0].index).toBe(1);
-      expect(result[999].value).toBe(2000);
+      const first = result[0];
+      if (first === null || typeof first !== 'object' || Array.isArray(first)) {
+        throw new Error('Expected first element to be a table object');
+      }
+      if (typeof first.index !== 'number') {
+        throw new Error('Expected first.index to be a number');
+      }
+      expect(first.index).toBe(1);
+      const last = result[999];
+      if (last === null || typeof last !== 'object' || Array.isArray(last)) {
+        throw new Error('Expected last element to be a table object');
+      }
+      if (typeof last.value !== 'number') {
+        throw new Error('Expected last.value to be a number');
+      }
+      expect(last.value).toBe(2000);
     });
 
     it('handles large data transfer to Lua', () => {
@@ -625,6 +778,9 @@ describe('lua-native Node adapter', () => {
         end
         return fact
       `);
+      if (typeof factorial !== 'function') {
+        throw new Error('Expected factorial to be a function');
+      }
       expect(factorial(10)).toBe(3628800);
     });
   });
@@ -676,8 +832,24 @@ describe('lua-native Node adapter', () => {
 
     it('callbacks with same name in different contexts are independent', () => {
       let value1 = 0, value2 = 0;
-      const lua1 = new lua_native.init({ setValue: (v: number) => { value1 = v; } });
-      const lua2 = new lua_native.init({ setValue: (v: number) => { value2 = v; } });
+      const lua1 = new lua_native.init({
+        setValue: (...args) => {
+          if (typeof args[0] === 'number') {
+            value1 = args[0];
+          } else {
+            throw new Error('setValue expects a number');
+          }
+        }
+      });
+      const lua2 = new lua_native.init({
+        setValue: (...args) => {
+          if (typeof args[0] === 'number') {
+            value2 = args[0];
+          } else {
+            throw new Error('setValue expects a number');
+          }
+        }
+      });
 
       lua1.execute_script('setValue(10)');
       lua2.execute_script('setValue(20)');
@@ -910,12 +1082,16 @@ describe('lua-native Node adapter', () => {
       const squares: number[] = [];
       let result = lua.resume(coro, 5);
       while (result.status === 'suspended') {
-        squares.push(result.values[0] as number);
+        if (typeof result.values[0] === 'number') {
+          squares.push(result.values[0]);
+        }
         result = lua.resume(coro);
       }
       // Last value comes from final yield
       if (result.values.length > 0 && result.values[0] !== undefined) {
-        squares.push(result.values[0] as number);
+        if (typeof result.values[0] === 'number') {
+          squares.push(result.values[0]);
+        }
       }
 
       expect(squares).toEqual([1, 4, 9, 16, 25]);

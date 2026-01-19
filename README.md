@@ -281,7 +281,6 @@ Sets a global variable or function in the Lua environment.
 ## Limitations
 
 - **No metatable support** - Lua metatables are not accessible or configurable from JavaScript.
-- **No coroutine support** - Lua coroutines cannot be used with this module.
 - **No userdata support** - Lua userdata types are not supported.
 
 ## Development
