@@ -20,6 +20,7 @@ the usage is identical across all three runtimes.
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Global variable management
+- Coroutine support with yield/resume semantics
 - Comprehensive error handling
 - Cross-platform support (Windows, macOS, Linux)
 - TypeScript support with full type definitions
@@ -215,13 +216,93 @@ try {
 }
 ```
 
+### Coroutines
+
+Lua coroutines are supported, allowing you to create pausable/resumable functions:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({});
+
+// Create a coroutine from a function
+const coro = lua.create_coroutine(`
+  return function(x)
+    coroutine.yield(x * 2)
+    coroutine.yield(x * 3)
+    return x * 4
+  end
+`);
+
+// Resume with initial argument
+let result = lua.resume(coro, 10);
+console.log(result.status); // 'suspended'
+console.log(result.values); // [20]
+
+// Continue resuming
+result = lua.resume(coro);
+console.log(result.values); // [30]
+
+result = lua.resume(coro);
+console.log(result.status); // 'dead'
+console.log(result.values); // [40]
+```
+
+Coroutines can receive values on each resume:
+
+```javascript
+const coro = lua.create_coroutine(`
+  return function()
+    local a = coroutine.yield("first")
+    local b = coroutine.yield("second")
+    return a + b
+  end
+`);
+
+let result = lua.resume(coro);
+console.log(result.values); // ['first']
+
+result = lua.resume(coro, 10);
+console.log(result.values); // ['second']
+
+result = lua.resume(coro, 20);
+console.log(result.values); // [30]
+```
+
+Generator pattern with coroutines:
+
+```javascript
+const squares = lua.create_coroutine(`
+  return function(n)
+    for i = 1, n do
+      coroutine.yield(i * i)
+    end
+  end
+`);
+
+// Generate squares from 1 to 5
+let result = lua.resume(squares, 5);
+const values = [result.values[0]];
+while (result.status === "suspended") {
+  result = lua.resume(squares);
+  values.push(result.values[0]);
+}
+console.log(values); // [1, 4, 9, 16, 25]
+```
+
 ## TypeScript Support
 
 The module includes comprehensive TypeScript definitions:
 
 ```typescript
 import lua_native from "lua-native";
-import type { LuaCallbacks, LuaContext } from "lua-native";
+import type {
+  LuaCallbacks,
+  LuaContext,
+  LuaCoroutine,
+  CoroutineResult,
+  LuaFunction,
+} from "lua-native";
 
 // Type-safe callback definition
 const callbacks: LuaCallbacks = {
@@ -231,6 +312,22 @@ const callbacks: LuaCallbacks = {
 
 const lua: LuaContext = new lua_native.init(callbacks);
 const result: number = lua.execute_script("return add(10, 20)");
+
+// Type-safe coroutine usage
+const coro: LuaCoroutine = lua.create_coroutine(`
+  return function(x)
+    coroutine.yield(x * 2)
+    return x * 3
+  end
+`);
+
+const res: CoroutineResult = lua.resume(coro, 10);
+console.log(res.status); // 'suspended' | 'dead'
+console.log(res.values); // LuaValue[]
+
+// Type-safe Lua function return
+const fn = lua.execute_script<LuaFunction>("return function(a, b) return a + b end");
+console.log(fn(5, 3)); // 8
 ```
 
 ## API Reference
@@ -266,17 +363,46 @@ Sets a global variable or function in the Lua environment.
 - `name`: Name of the global variable
 - `value`: Value to set (function, number, string, boolean, or object)
 
+### `LuaContext.create_coroutine(script)`
+
+Creates a coroutine from a Lua script that returns a function.
+
+**Parameters:**
+
+- `script`: String containing Lua code that returns a function to be used as the
+  coroutine body
+
+**Returns:** `LuaCoroutine` object with `status` property (`'suspended'`,
+`'running'`, or `'dead'`)
+
+### `LuaContext.resume(coroutine, ...args)`
+
+Resumes a suspended coroutine with optional arguments.
+
+**Parameters:**
+
+- `coroutine`: The `LuaCoroutine` object to resume
+- `...args`: Arguments to pass to the coroutine (received by `yield` on resume,
+  or as function arguments on first resume)
+
+**Returns:** `CoroutineResult` object containing:
+
+- `status`: `'suspended'` | `'running'` | `'dead'`
+- `values`: Array of values yielded or returned by the coroutine
+- `error`: Error message if the coroutine failed (optional)
+
 ## Data Type Conversion
 
-| Lua Type              | JavaScript Type | Notes                                      |
-| --------------------- | --------------- | ------------------------------------------ |
-| `nil`                 | `null`          |                                            |
-| `boolean`             | `boolean`       |                                            |
-| `number`              | `number`        |                                            |
-| `string`              | `string`        |                                            |
-| `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 |
-| `table` (object-like) | `Object`        | String or mixed keys                       |
-| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS           |
+| Lua Type              | JavaScript Type  | Notes                                      |
+| --------------------- | ---------------- | ------------------------------------------ |
+| `nil`                 | `null`           |                                            |
+| `boolean`             | `boolean`        |                                            |
+| `number`              | `number`         |                                            |
+| `string`              | `string`         |                                            |
+| `table` (array-like)  | `Array`          | Sequential numeric indices starting from 1 |
+| `table` (object-like) | `Object`         | String or mixed keys                       |
+| `function`            | `Function`       | Bidirectional: JS→Lua and Lua→JS           |
+| `thread`              | `LuaCoroutine`   | Created via `create_coroutine()`           |
 
 ## Limitations
 
