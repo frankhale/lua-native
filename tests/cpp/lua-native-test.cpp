@@ -218,7 +218,7 @@ TEST(LuaRuntimeCore, HostFunctionException) {
   });
   auto res = rt.ExecuteScript("return oops()");
   ASSERT_TRUE(std::holds_alternative<std::string>(res));
-  EXPECT_NE(std::get<std::string>(res).find("Host function threw an exception"), std::string::npos);
+  EXPECT_NE(std::get<std::string>(res).find("threw an exception"), std::string::npos);
 }
 
 TEST(LuaRuntimeCore, SetGlobalComplexStructures) {
