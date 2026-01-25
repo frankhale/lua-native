@@ -10,10 +10,9 @@ struct StackGuard {
   ~StackGuard() { lua_settop(L, top); }
 };
 
- bool isSequentialArray(lua_State* L, int index) {
+bool isSequentialArray(lua_State* L, int index) {
   const int abs_index = lua_absindex(L, index);
   lua_Integer expected = 1;
-  constexpr bool isArray = true;
   lua_pushnil(L);
   while (lua_next(L, abs_index) != 0) {
     if (!lua_isinteger(L, -2) || lua_tointeger(L, -2) != expected) {
@@ -23,7 +22,7 @@ struct StackGuard {
     expected++;
     lua_pop(L, 1);
   }
-  return isArray;
+  return true;
 }
 } // namespace
 
@@ -100,17 +99,19 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
 }
 
 ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
+  const int stackBefore = lua_gettop(L_);
+
   if (luaL_loadstring(L_, script.c_str()) || lua_pcall(L_, 0, LUA_MULTRET, 0)) {
     std::string error = lua_tostring(L_, -1);
     lua_pop(L_, 1);
     return error;
   }
 
-  const int nresults = lua_gettop(L_);
+  const int nresults = lua_gettop(L_) - stackBefore;
   std::vector<LuaPtr> results;
   results.reserve(nresults);
-  for (int i = 1; i <= nresults; ++i) {
-    results.push_back(ToLuaValue(L_, i));
+  for (int i = 0; i < nresults; ++i) {
+    results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
   }
   lua_pop(L_, nresults);
   return results;
@@ -137,6 +138,8 @@ std::optional<LuaPtr> LuaRuntime::GetGlobal(const std::string& name) const {
 
 ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
                                       const std::vector<LuaPtr>& args) const {
+  const int stackBefore = lua_gettop(L_);
+
   lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
 
   for (const auto& arg : args) {
@@ -149,34 +152,33 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
     return error;
   }
 
-  const int nresults = lua_gettop(L_);
+  const int nresults = lua_gettop(L_) - stackBefore;
   std::vector<LuaPtr> results;
   results.reserve(nresults);
-  for (int i = 1; i <= nresults; ++i) {
-    results.push_back(ToLuaValue(L_, i));
+  for (int i = 0; i < nresults; ++i) {
+    results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
   }
   lua_pop(L_, nresults);
   return results;
 }
 
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
-  using Variant = LuaValue::Variant;
-  if (depth > kMaxDepth) return std::make_shared<LuaValue>(Variant{std::monostate{}});
+  if (depth > kMaxDepth) return std::make_shared<LuaValue>(LuaValue::nil());
   switch (const int abs_index = lua_absindex(L, index); lua_type(L, abs_index)) {
     case LUA_TNIL:
-      return std::make_shared<LuaValue>(Variant{std::monostate{}});
+      return std::make_shared<LuaValue>(LuaValue::nil());
     case LUA_TNUMBER:
       if (lua_isinteger(L, abs_index)) {
-        return std::make_shared<LuaValue>(Variant{static_cast<int64_t>(lua_tointeger(L, abs_index))});
+        return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(lua_tointeger(L, abs_index))));
       } else {
-        return std::make_shared<LuaValue>(Variant{static_cast<double>(lua_tonumber(L, abs_index))});
+        return std::make_shared<LuaValue>(LuaValue::from(static_cast<double>(lua_tonumber(L, abs_index))));
       }
     case LUA_TBOOLEAN:
-      return std::make_shared<LuaValue>(Variant{static_cast<bool>(lua_toboolean(L, abs_index))});
+      return std::make_shared<LuaValue>(LuaValue::from(static_cast<bool>(lua_toboolean(L, abs_index))));
     case LUA_TSTRING: {
       size_t len;
       const char* str = lua_tolstring(L, abs_index, &len);
-      return std::make_shared<LuaValue>(Variant{std::string(str, len)});
+      return std::make_shared<LuaValue>(LuaValue::from(std::string(str, len)));
     }
     case LUA_TTABLE: {
       StackGuard guard(L);
@@ -189,7 +191,7 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
           arr.push_back(ToLuaValue(L, -1, depth + 1));
           lua_pop(L, 1);
         }
-        return std::make_shared<LuaValue>(Variant{std::move(arr)});
+        return std::make_shared<LuaValue>(LuaValue::from(std::move(arr)));
       }
 
       LuaTable map;
@@ -211,21 +213,21 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
         map.emplace(std::move(key), ToLuaValue(L, -1, depth + 1));
         lua_pop(L, 1);
       }
-      return std::make_shared<LuaValue>(Variant{std::move(map)});
+      return std::make_shared<LuaValue>(LuaValue::from(std::move(map)));
     }
     case LUA_TFUNCTION: {
       lua_pushvalue(L, abs_index);
       const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-      return std::make_shared<LuaValue>(Variant{LuaFunctionRef(ref, L)});
+      return std::make_shared<LuaValue>(LuaValue::from(LuaFunctionRef(ref, L)));
     }
     case LUA_TTHREAD: {
       lua_State* thread = lua_tothread(L, abs_index);
       lua_pushvalue(L, abs_index);
       const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-      return std::make_shared<LuaValue>(Variant{LuaThreadRef(ref, L, thread)});
+      return std::make_shared<LuaValue>(LuaValue::from(LuaThreadRef(ref, L, thread)));
     }
     default:
-      return std::make_shared<LuaValue>(Variant{std::monostate{}});
+      return std::make_shared<LuaValue>(LuaValue::nil());
   }
 }
 

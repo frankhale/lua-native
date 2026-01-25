@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-// ReSharper disable once CppUnusedIncludeDirective
 #include <cmath>
 #include <limits>
 

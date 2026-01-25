@@ -18,11 +18,35 @@ using LuaPtr = std::shared_ptr<LuaValue>;
 using LuaArray = std::vector<LuaPtr>;
 using LuaTable = std::unordered_map<std::string, LuaPtr>;
 
+// Holds a reference to a Lua function in the registry.
+// Note: Copies share the same registry ref - only one should call release().
+// Prefer moving when transferring ownership.
 struct LuaFunctionRef {
   int ref;
   lua_State* L;
 
   LuaFunctionRef(int r, lua_State* state) : ref(r), L(state) {}
+
+  // Default copy (shares the same ref - be careful with release())
+  LuaFunctionRef(const LuaFunctionRef&) = default;
+  LuaFunctionRef& operator=(const LuaFunctionRef&) = default;
+
+  // Move transfers ownership (source becomes invalid)
+  LuaFunctionRef(LuaFunctionRef&& other) noexcept
+      : ref(other.ref), L(other.L) {
+    other.ref = LUA_NOREF;
+    other.L = nullptr;
+  }
+  LuaFunctionRef& operator=(LuaFunctionRef&& other) noexcept {
+    if (this != &other) {
+      release();
+      ref = other.ref;
+      L = other.L;
+      other.ref = LUA_NOREF;
+      other.L = nullptr;
+    }
+    return *this;
+  }
 
   void release() {
     if (L && ref != LUA_NOREF) {
@@ -32,6 +56,9 @@ struct LuaFunctionRef {
   }
 };
 
+// Holds a reference to a Lua coroutine thread in the registry.
+// Note: Copies share the same registry ref - only one should call release().
+// Prefer moving when transferring ownership.
 struct LuaThreadRef {
   int ref;
   lua_State* L;        // Main state
@@ -39,6 +66,30 @@ struct LuaThreadRef {
 
   LuaThreadRef(int r, lua_State* mainState, lua_State* threadState)
     : ref(r), L(mainState), thread(threadState) {}
+
+  // Default copy (shares the same ref - be careful with release())
+  LuaThreadRef(const LuaThreadRef&) = default;
+  LuaThreadRef& operator=(const LuaThreadRef&) = default;
+
+  // Move transfers ownership (source becomes invalid)
+  LuaThreadRef(LuaThreadRef&& other) noexcept
+      : ref(other.ref), L(other.L), thread(other.thread) {
+    other.ref = LUA_NOREF;
+    other.L = nullptr;
+    other.thread = nullptr;
+  }
+  LuaThreadRef& operator=(LuaThreadRef&& other) noexcept {
+    if (this != &other) {
+      release();
+      ref = other.ref;
+      L = other.L;
+      thread = other.thread;
+      other.ref = LUA_NOREF;
+      other.L = nullptr;
+      other.thread = nullptr;
+    }
+    return *this;
+  }
 
   void release() {
     if (L && ref != LUA_NOREF) {
@@ -61,22 +112,34 @@ struct CoroutineResult {
   std::optional<std::string> error;
 };
 
-  struct LuaValue {
-    using Variant = std::variant<
-        std::monostate,  // nil
-        bool,
-        int64_t,
-        double,
-        std::string,
-        LuaArray,
-        LuaTable,
-        LuaFunctionRef,
-        LuaThreadRef>;
-    Variant value;
+struct LuaValue {
+  using Variant = std::variant<
+      std::monostate,  // nil
+      bool,
+      int64_t,
+      double,
+      std::string,
+      LuaArray,
+      LuaTable,
+      LuaFunctionRef,
+      LuaThreadRef>;
+  Variant value;
 
-    LuaValue() = default;
-    explicit LuaValue(Variant v) : value(std::move(v)) {}
-  };
+  LuaValue() = default;
+  explicit LuaValue(Variant v) : value(std::move(v)) {}
+
+  // Convenience factory functions
+  static LuaValue nil() { return LuaValue{Variant{std::monostate{}}}; }
+  static LuaValue from(bool b) { return LuaValue{Variant{b}}; }
+  static LuaValue from(int64_t i) { return LuaValue{Variant{i}}; }
+  static LuaValue from(double d) { return LuaValue{Variant{d}}; }
+  static LuaValue from(const std::string& s) { return LuaValue{Variant{s}}; }
+  static LuaValue from(std::string&& s) { return LuaValue{Variant{std::move(s)}}; }
+  static LuaValue from(LuaArray arr) { return LuaValue{Variant{std::move(arr)}}; }
+  static LuaValue from(LuaTable tbl) { return LuaValue{Variant{std::move(tbl)}}; }
+  static LuaValue from(LuaFunctionRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
+  static LuaValue from(LuaThreadRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
+};
 
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
 

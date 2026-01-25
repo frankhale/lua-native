@@ -52,6 +52,8 @@ private:
     std::vector<std::unique_ptr<LuaThreadData>> lua_thread_data_;      // Prevent coroutine leaks
 
     void RegisterCallbacks(const Napi::Object& callbacks);
+    // Helper to create a callback wrapper for JS functions
+    lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);
     // Adapter conversion (private)
     Napi::Value CoreToNapi(const lua_core::LuaValue& value);
 
