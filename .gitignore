@@ -5,6 +5,10 @@ build-test/
 CMakeFiles
 CMakeCache.txt
 
+cmake-build-debug-visual-studio/
+cmake-build-release-visual-studio/
+
+
 # Logs
 logs
 *.log
