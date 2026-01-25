@@ -12,7 +12,11 @@
       "Bash(npm run build:*)",
       "Bash(npm run:*)",
       "Bash(ls:*)",
-      "Bash(npm test:*)"
+      "Bash(npm test:*)",
+      "Bash(npm ls:*)",
+      "Bash(git submodule:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git rev-parse:*)"
     ]
   }
 }

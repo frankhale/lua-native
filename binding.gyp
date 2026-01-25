@@ -140,7 +140,7 @@
     ["skip_test!=1", {
       "targets": [
           {
-            "target_name": "test",
+            "target_name": "lua-native-test",
             "type": "executable",
             "sources": [
               "src/core/lua-runtime.cpp",
