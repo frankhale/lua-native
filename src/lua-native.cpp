@@ -1,5 +1,7 @@
 #include "lua-native.h"
 
+// ReSharper disable once CppUnusedIncludeDirective
+#include <cmath>
 #include <limits>
 
 static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value,

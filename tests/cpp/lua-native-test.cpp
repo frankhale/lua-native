@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+// ReSharper disable once CppUnusedIncludeDirective
+#include <cmath>
+#include <limits>
+
 #include "core/lua-runtime.h"
 
 using namespace lua_core;

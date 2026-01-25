@@ -25,6 +25,7 @@
     "build-release": "node-gyp rebuild --release -- -Dskip_test=1",
     "start": "vitest",
     "test": "vitest",
+    "test-cpp": "node run-tests.js",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib"
   },

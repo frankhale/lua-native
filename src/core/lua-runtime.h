@@ -61,19 +61,22 @@ struct CoroutineResult {
   std::optional<std::string> error;
 };
 
-struct LuaValue {
-  using Variant = std::variant<
-      std::monostate,  // nil
-      bool,
-      int64_t,
-      double,
-      std::string,
-      LuaArray,
-      LuaTable,
-      LuaFunctionRef,
-      LuaThreadRef>;
-  Variant value;
-};
+  struct LuaValue {
+    using Variant = std::variant<
+        std::monostate,  // nil
+        bool,
+        int64_t,
+        double,
+        std::string,
+        LuaArray,
+        LuaTable,
+        LuaFunctionRef,
+        LuaThreadRef>;
+    Variant value;
+
+    LuaValue() = default;
+    explicit LuaValue(Variant v) : value(std::move(v)) {}
+  };
 
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
 

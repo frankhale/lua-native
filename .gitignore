@@ -1,6 +1,9 @@
 .DS_Store
 
 prebuilds/
+build-test/
+CMakeFiles
+CMakeCache.txt
 
 # Logs
 logs
