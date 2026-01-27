@@ -34,6 +34,9 @@ npm install lua-native
 NOTE: Prebuilt binaries are available for Windows (x64) and macOS (Apple Silicon/arm64).
 Linux prebuilt binaries are coming soon. Intel Mac users will need to build from source.
 
+NOTE: The prebuilt binaries include Lua 5.5. If you need a different Lua version, you
+will need to build from source.
+
 ## Building from Source
 
 ### Prerequisites
@@ -437,8 +440,8 @@ MIT
 
 ## Author
 
-Frank Hale
+Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-18 January 2026
+26 January 2026
