@@ -327,6 +327,31 @@ describe('lua-native Node adapter', () => {
         expect(level4.value).toBe("deep");
       });
 
+      it('throws error when nesting depth exceeds limit', () => {
+        const lua = new lua_native.init({});
+        expect(() => {
+          lua.execute_script(`
+            local function nest(n)
+              if n == 0 then return {} end
+              return { child = nest(n-1) }
+            end
+            return nest(105)
+          `);
+        }).toThrow(/nesting depth/);
+      });
+
+      it('throws error when JS value nesting depth exceeds limit on set_global', () => {
+        const lua = new lua_native.init({});
+        // Build a deeply nested JS object
+        let obj: any = { value: 'deep' };
+        for (let i = 0; i < 105; i++) {
+          obj = { child: obj };
+        }
+        expect(() => {
+          lua.set_global('deep', obj);
+        }).toThrow(/nesting depth/);
+      });
+
       it('handles table with numeric string keys', () => {
         const lua = new lua_native.init({});
         const result = lua.execute_script('return {["1"] = "a", ["2"] = "b"}');

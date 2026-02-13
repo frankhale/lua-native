@@ -180,14 +180,14 @@ public:
     stored_function_data_.emplace_back(data, destructor);
   }
 
+  static constexpr int kMaxDepth = 100;
+
 private:
   lua_State* L_ { nullptr };
   std::unordered_map<std::string, Function> host_functions_;
   std::vector<std::pair<void*, void (*)(void*)>> stored_function_data_;
 
   static int LuaCallHostFunction(lua_State* L);
-
-  static constexpr int kMaxDepth = 100;
 };
 
 } // namespace lua_core

@@ -138,6 +138,6 @@ Option B (explicit methods) as a stepping stone, with Option A (full proxy suppo
 
 ## Notes
 
-- Coroutine support was implemented in January 2025
+- Coroutine support was implemented in January 2026
 - Lua function returns to JS were implemented previously
 - Both userdata and full metatable support share architectural requirements around keeping Lua references instead of immediate conversion

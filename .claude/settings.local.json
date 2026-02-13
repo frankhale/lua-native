@@ -16,7 +16,8 @@
       "Bash(npm ls:*)",
       "Bash(git submodule:*)",
       "Bash(git ls-tree:*)",
-      "Bash(git rev-parse:*)"
+      "Bash(git rev-parse:*)",
+      "Bash(node:*)"
     ]
   }
 }

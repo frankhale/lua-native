@@ -18,8 +18,13 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   // Convert JS arguments to Lua values
   std::vector<lua_core::LuaPtr> args;
   args.reserve(info.Length());
-  for (size_t i = 0; i < info.Length(); ++i) {
-    args.push_back(std::make_shared<lua_core::LuaValue>(LuaContext::NapiToCore(info[i])));
+  try {
+    for (size_t i = 0; i < info.Length(); ++i) {
+      args.push_back(std::make_shared<lua_core::LuaValue>(LuaContext::NapiToCore(info[i])));
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
   // Call the Lua function
@@ -126,8 +131,13 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
       js_callbacks[key_str] = Napi::Persistent(val.As<Napi::Function>());
       runtime->RegisterFunction(key_str, CreateJsCallbackWrapper(key_str));
     } else {
-    runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
-  }
+      try {
+        runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
+      } catch (const std::exception& e) {
+        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+        return;
+      }
+    }
   }
 }
 
@@ -143,7 +153,12 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
     js_callbacks[name] = Napi::Persistent(value.As<Napi::Function>());
     runtime->RegisterFunction(name, CreateJsCallbackWrapper(name));
   } else {
-    runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
+    try {
+      runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
   }
 
   return env.Undefined();
@@ -204,8 +219,9 @@ Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
 NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)
 
 lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int depth) {
-  if (depth > 100) {
-    return lua_core::LuaValue::nil();
+  if (depth > lua_core::LuaRuntime::kMaxDepth) {
+    throw std::runtime_error("Value nesting depth exceeds the maximum of "
+      + std::to_string(lua_core::LuaRuntime::kMaxDepth) + " levels");
   }
 
   if (value.IsFunction()) {
@@ -263,8 +279,9 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
 }
 
 lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
-  if (depth > 100) {
-    return lua_core::LuaValue::nil();
+  if (depth > lua_core::LuaRuntime::kMaxDepth) {
+    throw std::runtime_error("Value nesting depth exceeds the maximum of "
+      + std::to_string(lua_core::LuaRuntime::kMaxDepth) + " levels");
   }
 
   const napi_valuetype type = value.Type();
@@ -432,8 +449,13 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
 
   // Collect arguments (skip the first one which is the coroutine object)
   std::vector<lua_core::LuaPtr> args;
-  for (size_t i = 1; i < info.Length(); ++i) {
-    args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
+  try {
+    for (size_t i = 1; i < info.Length(); ++i) {
+      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
   // Resume the coroutine

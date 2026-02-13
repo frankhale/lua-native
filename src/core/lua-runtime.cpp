@@ -75,8 +75,15 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   const int argc = lua_gettop(L);
   std::vector<LuaPtr> args;
   args.reserve(argc);
-  for (int i = 1; i <= argc; ++i) {
-    args.push_back(ToLuaValue(L, i));
+  try {
+    for (int i = 1; i <= argc; ++i) {
+      args.push_back(ToLuaValue(L, i));
+    }
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "Error converting arguments for '%s': %s",
+                    func_name ? func_name : "<unknown>", e.what());
+    lua_error(L);
+    return 0;
   }
 
   LuaPtr resultHolder;
@@ -94,7 +101,14 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
     return 0;
   }
 
-  PushLuaValue(L, resultHolder);
+  try {
+    PushLuaValue(L, resultHolder);
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "Error converting return value from '%s': %s",
+                    func_name ? func_name : "<unknown>", e.what());
+    lua_error(L);
+    return 0;
+  }
   return 1;
 }
 
@@ -110,8 +124,13 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   const int nresults = lua_gettop(L_) - stackBefore;
   std::vector<LuaPtr> results;
   results.reserve(nresults);
-  for (int i = 0; i < nresults; ++i) {
-    results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+  try {
+    for (int i = 0; i < nresults; ++i) {
+      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+    }
+  } catch (const std::exception& e) {
+    lua_pop(L_, nresults);
+    return std::string(e.what());
   }
   lua_pop(L_, nresults);
   return results;
@@ -155,15 +174,22 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
   const int nresults = lua_gettop(L_) - stackBefore;
   std::vector<LuaPtr> results;
   results.reserve(nresults);
-  for (int i = 0; i < nresults; ++i) {
-    results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+  try {
+    for (int i = 0; i < nresults; ++i) {
+      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+    }
+  } catch (const std::exception& e) {
+    lua_pop(L_, nresults);
+    return std::string(e.what());
   }
   lua_pop(L_, nresults);
   return results;
 }
 
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
-  if (depth > kMaxDepth) return std::make_shared<LuaValue>(LuaValue::nil());
+  if (depth > kMaxDepth) {
+    throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
+  }
   switch (const int abs_index = lua_absindex(L, index); lua_type(L, abs_index)) {
     case LUA_TNIL:
       return std::make_shared<LuaValue>(LuaValue::nil());
@@ -232,7 +258,9 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
 }
 
 void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth) {
-  if (depth > kMaxDepth) { lua_pushnil(L); return; }
+  if (depth > kMaxDepth) {
+    throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
+  }
   std::visit(
       [&](const auto& v) {
         using T = std::decay_t<decltype(v)>;
@@ -312,8 +340,14 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
   }
 
   // Push arguments onto the coroutine's stack
-  for (const auto& arg : args) {
-    PushLuaValue(threadRef.thread, arg);
+  try {
+    for (const auto& arg : args) {
+      PushLuaValue(threadRef.thread, arg);
+    }
+  } catch (const std::exception& e) {
+    result.status = CoroutineStatus::Dead;
+    result.error = std::string("Error converting coroutine arguments: ") + e.what();
+    return result;
   }
 
   // Resume the coroutine
@@ -323,15 +357,30 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
   if (resumeStatus == LUA_YIELD) {
     result.status = CoroutineStatus::Suspended;
     // Collect yielded values
-    for (int i = 1; i <= nresults; ++i) {
-      result.values.push_back(ToLuaValue(threadRef.thread, i));
+    try {
+      for (int i = 1; i <= nresults; ++i) {
+        result.values.push_back(ToLuaValue(threadRef.thread, i));
+      }
+    } catch (const std::exception& e) {
+      result.values.clear();
+      lua_pop(threadRef.thread, nresults);
+      result.status = CoroutineStatus::Dead;
+      result.error = e.what();
+      return result;
     }
     lua_pop(threadRef.thread, nresults);
   } else if (resumeStatus == LUA_OK) {
     result.status = CoroutineStatus::Dead;
     // Collect return values
-    for (int i = 1; i <= nresults; ++i) {
-      result.values.push_back(ToLuaValue(threadRef.thread, i));
+    try {
+      for (int i = 1; i <= nresults; ++i) {
+        result.values.push_back(ToLuaValue(threadRef.thread, i));
+      }
+    } catch (const std::exception& e) {
+      result.values.clear();
+      lua_pop(threadRef.thread, nresults);
+      result.error = e.what();
+      return result;
     }
     lua_pop(threadRef.thread, nresults);
   } else {
