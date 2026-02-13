@@ -89,6 +89,20 @@ static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value
           return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
         }
         return env.Undefined();
+      } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
+        if (runtime) {
+          auto data = std::make_unique<LuaThreadData>(runtime, v);
+          auto* dataPtr = data.release();
+          runtime->StoreFunctionData(dataPtr, [](void* ptr) { delete static_cast<LuaThreadData*>(ptr); });
+          Napi::Object coro = Napi::Object::New(env);
+          coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr));
+          lua_core::CoroutineStatus status = runtime->GetCoroutineStatus(v);
+          coro.Set("status", Napi::String::New(env,
+            status == lua_core::CoroutineStatus::Suspended ? "suspended" :
+            status == lua_core::CoroutineStatus::Running ? "running" : "dead"));
+          return coro;
+        }
+        return env.Undefined();
       }
       return env.Undefined();
     },

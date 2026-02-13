@@ -160,7 +160,7 @@ public:
   void SetGlobal(const std::string& name, const LuaPtr& value) const;
   void RegisterFunction(const std::string& name, Function fn);
 
-  [[nodiscard]] std::optional<LuaPtr> GetGlobal(const std::string& name) const;
+  [[nodiscard]] LuaPtr GetGlobal(const std::string& name) const;
 
   [[nodiscard]] ScriptResult CallFunction(const LuaFunctionRef& funcRef,
                                           const std::vector<LuaPtr>& args) const;

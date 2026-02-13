@@ -59,6 +59,23 @@ All recommended changes have been implemented and verified. The native module bu
 #### `tests/ts/lua-native.spec.ts`
 - **Added depth limit error tests** for both Lua-to-JS conversion (`execute_script`) and JS-to-Lua conversion (`set_global`)
 
+#### `src/lua-native.h` (Issues #10)
+- **Added `std::move`** to both `LuaFunctionData` and `LuaThreadData` constructors for their ref parameters
+
+#### `src/core/lua-runtime.cpp` (Issues #12, #14, #15)
+- **Added null guard** to `PushLuaValue()` — pushes `nil` and returns early when `LuaPtr` is null
+- **Changed `GetGlobal()` return type** from `std::optional<LuaPtr>` to `LuaPtr` and added `StackGuard`
+- **Added `StackGuard`** to `CreateCoroutine()` for automatic stack balancing on error paths
+
+#### `src/core/lua-runtime.h` (Issue #14)
+- **Changed `GetGlobal()` declaration** from `std::optional<LuaPtr>` to `LuaPtr`
+
+#### `src/lua-native.cpp` (Issue #13)
+- **Added `LuaThreadRef` handling** to static `LuaValueToNapi()` — creates coroutine object with status, matching `CoreToNapi` behavior
+
+#### `tests/cpp/lua-native-test.cpp` (Issue #14)
+- **Updated `SetGlobalAndGetGlobal` test** to use `LuaPtr` directly instead of `std::optional<LuaPtr>`
+
 ### Not Implemented
 
 None - all issues have been resolved.
@@ -218,7 +235,7 @@ The `<cmath>` include is actually used for `std::modf` and `std::isfinite`. The 
 
 ## New Recommendations
 
-### 10. Missing `std::move` in Data Constructors (Low Priority)
+### 10. Missing `std::move` in Data Constructors (Low Priority) - RESOLVED
 
 **Location:** `src/lua-native.h` — `LuaFunctionData` and `LuaThreadData` constructors
 
@@ -228,12 +245,9 @@ LuaFunctionData(std::shared_ptr<lua_core::LuaRuntime> rt, lua_core::LuaFunctionR
     : runtime(std::move(rt)), funcRef(ref) {}  // funcRef is copied, not moved
 ```
 
-Since move semantics were specifically added to these reference types (Issue #3) to prevent shared-ref problems, the constructors should `std::move` the parameter into the member:
-```cpp
-    : runtime(std::move(rt)), funcRef(std::move(ref)) {}
-```
+Since move semantics were specifically added to these reference types (Issue #3) to prevent shared-ref problems, the constructors should `std::move` the parameter into the member.
 
-Same applies to `LuaThreadData`.
+**Resolution:** Both `LuaFunctionData` and `LuaThreadData` constructors now use `std::move(ref)` in their initializer lists.
 
 ---
 
@@ -252,54 +266,53 @@ The core runtime defines this as a constant (`kMaxDepth = 100` in `src/core/lua-
 
 ---
 
-### 12. Null `LuaPtr` Could Crash `PushLuaValue` (Medium Priority)
+### 12. Null `LuaPtr` Could Crash `PushLuaValue` (Medium Priority) - RESOLVED
 
 **Location:** `src/core/lua-runtime.cpp` — `PushLuaValue()`
 
-**Problem:** `PushLuaValue` dereferences `value->value` without checking for a null `shared_ptr`. If a host callback returns `nullptr` from `LuaCallHostFunction`, this would cause a segfault. A simple null guard pushing `nil` would prevent this:
-```cpp
-if (!value) { lua_pushnil(L); return; }
-```
+**Problem:** `PushLuaValue` dereferences `value->value` without checking for a null `shared_ptr`. If a host callback returns `nullptr` from `LuaCallHostFunction`, this would cause a segfault.
+
+**Resolution:** Added a null guard at the top of `PushLuaValue` that pushes `nil` and returns early when the `LuaPtr` is null.
 
 ---
 
-### 13. `LuaValueToNapi` Does Not Handle `LuaThreadRef` (Low Priority)
+### 13. `LuaValueToNapi` Does Not Handle `LuaThreadRef` (Low Priority) - RESOLVED
 
 **Location:** `src/lua-native.cpp` — `LuaValueToNapi()` (standalone static function)
 
 **Problem:** The standalone `LuaValueToNapi` function handles `LuaFunctionRef` but silently falls through to `env.Undefined()` for `LuaThreadRef`. The instance method `CoreToNapi` does handle it correctly. If a Lua function called from JS returns a coroutine thread through the static callback path, it would silently become `undefined`.
 
+**Resolution:** Added a `LuaThreadRef` handler to the static `LuaValueToNapi` function that mirrors the `CoreToNapi` behavior — creates a coroutine object with `_coroutine` external data and `status` property. Thread data is stored via `runtime->StoreFunctionData` for cleanup.
+
 ---
 
-### 14. `GetGlobal` Return Type Is Misleading (Low Priority)
+### 14. `GetGlobal` Return Type Is Misleading (Low Priority) - RESOLVED
 
 **Location:** `src/core/lua-runtime.cpp` — `GetGlobal()`
 
-**Problem:** `GetGlobal` returns `std::optional<LuaPtr>` but never returns `std::nullopt`. Non-existent globals come back as `LuaValue::nil()` wrapped in the optional. The `optional` wrapper suggests the function might not return a value, which is misleading. Either return `std::nullopt` for nil/missing globals, or change the return type to plain `LuaPtr`.
+**Problem:** `GetGlobal` returns `std::optional<LuaPtr>` but never returns `std::nullopt`. Non-existent globals come back as `LuaValue::nil()` wrapped in the optional. The `optional` wrapper suggests the function might not return a value, which is misleading.
+
+**Resolution:** Changed `GetGlobal` return type from `std::optional<LuaPtr>` to `LuaPtr` in both the header declaration and implementation. Updated the C++ test to use `ASSERT_NE(gv, nullptr)` and `gv->value` instead of `gv.has_value()` and `(*gv)->value`.
 
 ---
 
-### 15. `StackGuard` Underutilization (Low Priority)
+### 15. `StackGuard` Underutilization (Low Priority) - RESOLVED
 
 **Location:** `src/core/lua-runtime.cpp`
 
-**Problem:** The `StackGuard` RAII helper is only used in `ToLuaValue` for the table case. Functions like `GetGlobal`, `LuaCallHostFunction`, and `CreateCoroutine` perform manual stack management that could benefit from `StackGuard` to ensure the Lua stack is always balanced, especially on error paths.
+**Problem:** The `StackGuard` RAII helper is only used in `ToLuaValue` for the table case. Functions like `GetGlobal` and `CreateCoroutine` perform manual stack management that could benefit from `StackGuard` to ensure the Lua stack is always balanced, especially on error paths.
+
+**Resolution:** Added `StackGuard` to `GetGlobal` and `CreateCoroutine`. `LuaCallHostFunction` was excluded because as a `lua_CFunction` it must leave return values on the stack for Lua, making `StackGuard` incompatible with its calling convention.
 
 ---
 
-### 16. Indentation Inconsistency in `RegisterCallbacks` (Trivial)
+### 16. Indentation Inconsistency in `RegisterCallbacks` (Trivial) - RESOLVED
 
 **Location:** `src/lua-native.cpp` — `RegisterCallbacks()`
 
-**Problem:** The `else` body is under-indented compared to the `if` body:
-```cpp
-    if (val.IsFunction()) {
-      js_callbacks[key_str] = Napi::Persistent(val.As<Napi::Function>());
-      runtime->RegisterFunction(key_str, CreateJsCallbackWrapper(key_str));
-    } else {
-    runtime->SetGlobal(key_str, ...);  // under-indented
-  }
-```
+**Problem:** The `else` body was under-indented compared to the `if` body.
+
+**Resolution:** Fixed as a side effect of adding try-catch blocks in Issue #7. The `else` body now has proper indentation.
 
 ---
 
@@ -307,13 +320,13 @@ if (!value) { lua_pushnil(L); return; }
 
 | Issue | Priority | Status | Files Affected |
 |-------|----------|--------|----------------|
-| Missing `std::move` in data constructors | Low | Open | `lua-native.h` |
+| Missing `std::move` in data constructors | Low | Resolved | `lua-native.h` |
 | Hardcoded depth limit magic number | Low | Resolved | `lua-native.cpp`, `lua-runtime.h` |
-| Null `LuaPtr` crash in `PushLuaValue` | Medium | Open | `lua-runtime.cpp` |
-| `LuaValueToNapi` missing `LuaThreadRef` | Low | Open | `lua-native.cpp` |
-| `GetGlobal` misleading return type | Low | Open | `lua-runtime.cpp`, `lua-runtime.h` |
-| `StackGuard` underutilization | Low | Open | `lua-runtime.cpp` |
-| Indentation in `RegisterCallbacks` | Trivial | Open | `lua-native.cpp` |
+| Null `LuaPtr` crash in `PushLuaValue` | Medium | Resolved | `lua-runtime.cpp` |
+| `LuaValueToNapi` missing `LuaThreadRef` | Low | Resolved | `lua-native.cpp` |
+| `GetGlobal` misleading return type | Low | Resolved | `lua-runtime.cpp`, `lua-runtime.h`, `lua-native-test.cpp` |
+| `StackGuard` underutilization | Low | Resolved | `lua-runtime.cpp` |
+| Indentation in `RegisterCallbacks` | Trivial | Resolved | `lua-native.cpp` |
 
 ---
 

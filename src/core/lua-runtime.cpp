@@ -148,11 +148,10 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
   lua_setglobal(L_, name.c_str());
 }
 
-std::optional<LuaPtr> LuaRuntime::GetGlobal(const std::string& name) const {
+LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
+  StackGuard guard(L_);
   lua_getglobal(L_, name.c_str());
-  LuaPtr v = ToLuaValue(L_, -1);
-  lua_pop(L_, 1);
-  return v;
+  return ToLuaValue(L_, -1);
 }
 
 ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
@@ -258,6 +257,10 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
 }
 
 void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth) {
+  if (!value) {
+    lua_pushnil(L);
+    return;
+  }
   if (depth > kMaxDepth) {
     throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
   }
@@ -298,13 +301,15 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
 }
 
 std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFunctionRef& funcRef) const {
+  StackGuard guard(L_);
+
   // Create a new Lua thread (coroutine)
   lua_State* thread = lua_newthread(L_);
   if (!thread) {
     return std::string("Failed to create coroutine thread");
   }
 
-  // Store the thread in the registry to prevent GC
+  // Store the thread in the registry to prevent GC (pops thread from stack)
   const int threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);
 
   // Push the function onto the new thread's stack

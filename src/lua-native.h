@@ -13,7 +13,7 @@ struct LuaFunctionData {
   lua_core::LuaFunctionRef funcRef;
 
   LuaFunctionData(std::shared_ptr<lua_core::LuaRuntime> rt, lua_core::LuaFunctionRef ref)
-    : runtime(std::move(rt)), funcRef(ref) {}
+    : runtime(std::move(rt)), funcRef(std::move(ref)) {}
 
   ~LuaFunctionData() {
     // Release the Lua registry reference when this data is destroyed
@@ -26,7 +26,7 @@ struct LuaThreadData {
   lua_core::LuaThreadRef threadRef;
 
   LuaThreadData(std::shared_ptr<lua_core::LuaRuntime> rt, lua_core::LuaThreadRef ref)
-    : runtime(std::move(rt)), threadRef(ref) {}
+    : runtime(std::move(rt)), threadRef(std::move(ref)) {}
 
   ~LuaThreadData() {
     threadRef.release();

@@ -65,8 +65,8 @@ TEST(LuaRuntimeCore, SetGlobalAndGetGlobal) {
   const LuaRuntime rt;
   rt.SetGlobal("x", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42))));
   const auto gv = rt.GetGlobal("x");
-  ASSERT_TRUE(gv.has_value());
-  EXPECT_EQ(std::get<int64_t>((*gv)->value), 42);
+  ASSERT_NE(gv, nullptr);
+  EXPECT_EQ(std::get<int64_t>(gv->value), 42);
 
   const auto res = rt.ExecuteScript("return x");
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
