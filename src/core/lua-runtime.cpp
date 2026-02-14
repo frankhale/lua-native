@@ -416,5 +416,3 @@ CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) co
 }
 
 } // namespace lua_core
-
-

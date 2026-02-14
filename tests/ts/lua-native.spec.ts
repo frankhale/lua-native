@@ -544,9 +544,8 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles function with no return value', () => {
-      const lua = new lua_native.init({});
       let sideEffect = 0;
-      const lua2 = new lua_native.init({
+      const lua = new lua_native.init({
         setSideEffect: (...args) => {
           if (typeof args[0] === 'number') {
             sideEffect = args[0];
@@ -555,7 +554,7 @@ describe('lua-native Node adapter', () => {
           }
         }
       });
-      const noReturn = lua2.execute_script(`
+      const noReturn = lua.execute_script(`
         return function(val)
           setSideEffect(val)
         end
@@ -1137,5 +1136,3 @@ describe('lua-native Node adapter', () => {
     });
   });
 });
-
-

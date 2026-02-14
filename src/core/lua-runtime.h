@@ -191,5 +191,3 @@ private:
 };
 
 } // namespace lua_core
-
-

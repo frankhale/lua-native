@@ -178,7 +178,7 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
-LuaContext::~LuaContext() { js_callbacks.clear(); }
+LuaContext::~LuaContext() = default;
 
 lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::string& name) {
   return [this, name](const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
@@ -217,10 +217,6 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
   const Napi::Array array = Napi::Array::New(env, values.size());
   for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
   return array;
-}
-
-Napi::Value LuaContext::LuaFunctionCallback(const Napi::CallbackInfo& info) {
-  return LuaFunctionCallbackStatic(info);
 }
 
 Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
@@ -394,13 +390,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
 }
 
 Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
-  if (info.Length() < 1) {
-    Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-
-  // Accept a script string that returns a function
-  if (!info[0].IsString()) {
+  if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
     return env.Undefined();
   }

@@ -31,8 +31,9 @@ the usage is identical across all three runtimes.
 npm install lua-native
 ```
 
-NOTE: Prebuilt binaries are available for Windows (x64) and macOS (Apple Silicon/arm64).
-Linux prebuilt binaries are coming soon. Intel Mac users will need to build from source.
+NOTE: Prebuilt binaries are currently available for macOS (Apple Silicon/arm64).
+Windows (x64) and Linux prebuilt binaries are coming soon. Intel Mac users will
+need to build from source.
 
 NOTE: The prebuilt binaries include Lua 5.5. If you need a different Lua version, you
 will need to build from source.
@@ -70,7 +71,7 @@ import lua_native from "lua-native";
 
 // Create a new Lua context
 const lua = new lua_native.init({
-  print: (msg: string) => {
+  print: (msg) => {
     console.log(msg);
   },
 });
@@ -329,7 +330,9 @@ console.log(res.status); // 'suspended' | 'dead'
 console.log(res.values); // LuaValue[]
 
 // Type-safe Lua function return
-const fn = lua.execute_script<LuaFunction>("return function(a, b) return a + b end");
+const fn = lua.execute_script<LuaFunction>(
+  "return function(a, b) return a + b end",
+);
 console.log(fn(5, 3)); // 8
 ```
 
@@ -396,19 +399,20 @@ Resumes a suspended coroutine with optional arguments.
 
 ## Data Type Conversion
 
-| Lua Type              | JavaScript Type  | Notes                                      |
-| --------------------- | ---------------- | ------------------------------------------ |
-| `nil`                 | `null`           |                                            |
-| `boolean`             | `boolean`        |                                            |
-| `number`              | `number`         |                                            |
-| `string`              | `string`         |                                            |
-| `table` (array-like)  | `Array`          | Sequential numeric indices starting from 1 |
-| `table` (object-like) | `Object`         | String or mixed keys                       |
-| `function`            | `Function`       | Bidirectional: JS→Lua and Lua→JS           |
-| `thread`              | `LuaCoroutine`   | Created via `create_coroutine()`           |
+| Lua Type              | JavaScript Type | Notes                                      |
+| --------------------- | --------------- | ------------------------------------------ |
+| `nil`                 | `null`          |                                            |
+| `boolean`             | `boolean`       |                                            |
+| `number`              | `number`        |                                            |
+| `string`              | `string`        |                                            |
+| `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 |
+| `table` (object-like) | `Object`        | String or mixed keys                       |
+| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS           |
+| `thread`              | `LuaCoroutine`  | Created via `create_coroutine()`           |
 
 ## Limitations
 
+- **Nesting depth limit** - Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
 - **No metatable support** - Lua metatables are not accessible or configurable from JavaScript.
 - **No userdata support** - Lua userdata types are not supported.
 
@@ -417,17 +421,25 @@ Resumes a suspended coroutine with optional arguments.
 ### Running Tests
 
 ```bash
+# JavaScript/TypeScript integration tests (vitest)
 npm test
+
+# C++ unit tests (Google Test)
+npm run test-cpp
 ```
 
 ### Project Structure
 
 - `src/` - C++ source code
-  - `lua-native.cpp` - Main module implementation
+  - `lua-native.cpp` - N-API binding layer
+  - `lua-native.h` - N-API binding header
   - `core/lua-runtime.cpp` - Lua runtime wrapper
+  - `core/lua-runtime.h` - Lua runtime header
 - `tests/` - Test files
-  - `ts/lua-native.spec.ts` - TypeScript/JavaScript tests
+  - `ts/lua-native.spec.ts` - TypeScript/JavaScript integration tests
   - `cpp/lua-native-test.cpp` - C++ unit tests
+- `index.js` - Module loader (finds and loads the native binary)
+- `index.d.ts` - TypeScript entry point (re-exports from `types.d.ts`)
 - `types.d.ts` - TypeScript type definitions
 
 ## Repository
@@ -444,4 +456,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-26 January 2026
+13 February 2026

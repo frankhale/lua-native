@@ -57,13 +57,10 @@ private:
     // Adapter conversion (private)
     Napi::Value CoreToNapi(const lua_core::LuaValue& value);
 
-public:
     lua_core::LuaValue NapiToCoreInstance(const Napi::Value& value, int depth = 0);
+
+public:
     static lua_core::LuaValue NapiToCore(const Napi::Value& value, int depth = 0);
-
-private:
-
-    static Napi::Value LuaFunctionCallback(const Napi::CallbackInfo& info);
 };
 
 #endif //LUA_NATIVE_H
