@@ -79,12 +79,17 @@ public:
 
     Napi::Value ExecuteScript(const Napi::CallbackInfo& info);
     Napi::Value ExecuteFile(const Napi::CallbackInfo& info);
+    Napi::Value ExecuteScriptAsync(const Napi::CallbackInfo& info);
+    Napi::Value ExecuteFileAsync(const Napi::CallbackInfo& info);
+    Napi::Value IsBusyMethod(const Napi::CallbackInfo& info);
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
     Napi::Value GetGlobal(const Napi::CallbackInfo& info);
     Napi::Value SetUserdata(const Napi::CallbackInfo& info);
     Napi::Value SetMetatable(const Napi::CallbackInfo& info);
     Napi::Value CreateCoroutine(const Napi::CallbackInfo& info);
     Napi::Value ResumeCoroutine(const Napi::CallbackInfo& info);
+
+    void ClearBusy();
 
     // Public so LuaFunctionCallbackStatic can use it
     Napi::Value CoreToNapi(const lua_core::LuaValue& value);
@@ -98,6 +103,8 @@ private:
     std::vector<std::unique_ptr<LuaThreadData>> lua_thread_data_;
     std::vector<std::unique_ptr<LuaUserdataData>> lua_userdata_data_;
     std::vector<std::unique_ptr<LuaTableRefData>> lua_table_ref_data_;
+
+    bool is_busy_ = false;
 
     // Userdata reference tracking
     std::unordered_map<int, UserdataEntry> js_userdata_;

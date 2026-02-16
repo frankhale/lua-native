@@ -2154,4 +2154,101 @@ describe('lua-native Node adapter', () => {
       expect(lua.execute_script('return type(utf8)')).toBe('table');
     });
   });
+
+  // ============================================
+  // ASYNC EXECUTION
+  // ============================================
+  describe('async execution', () => {
+    it('resolves with correct value', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async('return 6 * 7');
+      expect(result).toBe(42);
+    });
+
+    it('resolves with multiple return values', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async("return 1, 'two', true");
+      expect(result).toEqual([1, 'two', true]);
+    });
+
+    it('resolves with undefined for no return', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async('local x = 1');
+      expect(result).toBeUndefined();
+    });
+
+    it('rejects on Lua errors', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async("error('boom')")).rejects.toThrow('boom');
+    });
+
+    it('rejects on syntax errors', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async('return %%%')).rejects.toThrow();
+    });
+
+    it('rejects when calling JS callbacks', async () => {
+      const lua = new lua_native.init({
+        greet: () => 'hello',
+      }, ALL_LIBS);
+      await expect(lua.execute_script_async('return greet()')).rejects.toThrow('async mode');
+    });
+
+    it('works with stdlib functions', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async("return string.upper('hello')");
+      expect(result).toBe('HELLO');
+    });
+
+    it('returns tables correctly', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async("return {a = 1, b = 'two'}");
+      expect(result).toEqual({ a: 1, b: 'two' });
+    });
+
+    it('is_busy returns false after completion', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await lua.execute_script_async('return 1');
+      expect(lua.is_busy()).toBe(false);
+    });
+
+    it('allows sync calls after async completes', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await lua.execute_script_async('return 1');
+      const result = lua.execute_script('return 2 + 3');
+      expect(result).toBe(5);
+    });
+
+    it('execute_file_async works', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const os = await import('os');
+      const tmpFile = path.join(os.tmpdir(), `lua-async-test-${Date.now()}.lua`);
+      fs.writeFileSync(tmpFile, 'return 6 * 7');
+      try {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const result = await lua.execute_file_async(tmpFile);
+        expect(result).toBe(42);
+      } finally {
+        fs.unlinkSync(tmpFile);
+      }
+    });
+
+    it('execute_file_async rejects on file not found', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_file_async('/nonexistent/file.lua')).rejects.toThrow();
+    });
+
+    it('concurrent execution across contexts', async () => {
+      const contexts = Array.from({ length: 4 }, () =>
+        new lua_native.init({}, ALL_LIBS)
+      );
+      const results = await Promise.all(
+        contexts.map((lua, i) =>
+          lua.execute_script_async(`return ${i + 1} * 10`)
+        )
+      );
+      expect(results).toEqual([10, 20, 30, 40]);
+    });
+  });
 });

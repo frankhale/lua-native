@@ -197,6 +197,30 @@ export interface LuaContext {
    * // result.values: yielded or returned values
    */
   resume(coroutine: LuaCoroutine, ...args: LuaValue[]): CoroutineResult;
+
+  /**
+   * Executes a Lua script string asynchronously on a worker thread.
+   * Returns a Promise that resolves with the result.
+   * JS callbacks are not available during async execution.
+   * @param script The Lua script to execute
+   * @returns Promise resolving with the result of the script execution
+   */
+  execute_script_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
+
+  /**
+   * Executes a Lua file asynchronously on a worker thread.
+   * Returns a Promise that resolves with the result.
+   * JS callbacks are not available during async execution.
+   * @param filepath The path to the Lua file to execute
+   * @returns Promise resolving with the result of the file execution
+   */
+  execute_file_async<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): Promise<T>;
+
+  /**
+   * Returns whether the context is currently busy with an async operation.
+   * While busy, sync methods will throw and new async calls will be rejected.
+   */
+  is_busy(): boolean;
 }
 
 /**

@@ -1,4 +1,5 @@
 #include "lua-native.h"
+#include "lua-async-worker.h"
 
 #include <cmath>
 #include <limits>
@@ -175,7 +176,10 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("set_userdata", &LuaContext::SetUserdata),
     InstanceMethod("set_metatable", &LuaContext::SetMetatable),
     InstanceMethod("create_coroutine", &LuaContext::CreateCoroutine),
-    InstanceMethod("resume", &LuaContext::ResumeCoroutine)
+    InstanceMethod("resume", &LuaContext::ResumeCoroutine),
+    InstanceMethod("execute_script_async", &LuaContext::ExecuteScriptAsync),
+    InstanceMethod("execute_file_async", &LuaContext::ExecuteFileAsync),
+    InstanceMethod("is_busy", &LuaContext::IsBusyMethod)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -294,6 +298,10 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
 }
 
 Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 2 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string name as first argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -317,6 +325,10 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string name as first argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -328,6 +340,10 @@ Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object[, options])").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -366,6 +382,10 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -439,6 +459,10 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
 }
 
 Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -462,6 +486,10 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -482,6 +510,110 @@ Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
   const Napi::Array array = Napi::Array::New(env, values.size());
   for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
   return array;
+}
+
+void LuaContext::ClearBusy() {
+  is_busy_ = false;
+}
+
+Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& info) {
+  return Napi::Boolean::New(env, is_busy_);
+}
+
+Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string script = info[0].As<Napi::String>().Utf8Value();
+  is_busy_ = true;
+
+  auto deferred = Napi::Promise::Deferred::New(env);
+  auto* worker = new LuaScriptAsyncWorker(runtime, script, this, deferred);
+  worker->Queue();
+  return deferred.Promise();
+}
+
+Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string filepath = info[0].As<Napi::String>().Utf8Value();
+  is_busy_ = true;
+
+  auto deferred = Napi::Promise::Deferred::New(env);
+  auto* worker = new LuaFileAsyncWorker(runtime, filepath, this, deferred);
+  worker->Queue();
+  return deferred.Promise();
+}
+
+// --- AsyncWorker OnOK/OnError implementations ---
+
+void LuaScriptAsyncWorker::OnOK() {
+  Napi::Env env = Env();
+  context_->ClearBusy();
+
+  if (std::holds_alternative<std::string>(result_)) {
+    deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
+    return;
+  }
+
+  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(result_);
+  if (values.empty()) {
+    deferred_.Resolve(env.Undefined());
+  } else if (values.size() == 1) {
+    deferred_.Resolve(context_->CoreToNapi(*values[0]));
+  } else {
+    Napi::Array array = Napi::Array::New(env, values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+      array.Set(i, context_->CoreToNapi(*values[i]));
+    }
+    deferred_.Resolve(array);
+  }
+}
+
+void LuaScriptAsyncWorker::OnError(const Napi::Error& error) {
+  context_->ClearBusy();
+  deferred_.Reject(error.Value());
+}
+
+void LuaFileAsyncWorker::OnOK() {
+  Napi::Env env = Env();
+  context_->ClearBusy();
+
+  if (std::holds_alternative<std::string>(result_)) {
+    deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
+    return;
+  }
+
+  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(result_);
+  if (values.empty()) {
+    deferred_.Resolve(env.Undefined());
+  } else if (values.size() == 1) {
+    deferred_.Resolve(context_->CoreToNapi(*values[0]));
+  } else {
+    Napi::Array array = Napi::Array::New(env, values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+      array.Set(i, context_->CoreToNapi(*values[i]));
+    }
+    deferred_.Resolve(array);
+  }
+}
+
+void LuaFileAsyncWorker::OnError(const Napi::Error& error) {
+  context_->ClearBusy();
+  deferred_.Reject(error.Value());
 }
 
 Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
@@ -728,6 +860,10 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
 }
 
 Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -766,6 +902,10 @@ Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (info.Length() < 1 || !info[0].IsObject()) {
     Napi::TypeError::New(env, "Expected a coroutine object as first argument").ThrowAsJavaScriptException();
     return env.Undefined();

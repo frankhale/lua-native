@@ -275,6 +275,9 @@ public:
   // Userdata support
   void SetUserdataGCCallback(UserdataGCCallback cb);
   void SetPropertyHandlers(PropertyGetter getter, PropertySetter setter);
+
+  void SetAsyncMode(bool enabled);
+  bool IsAsyncMode() const;
   // Metatable support
   void StoreHostFunction(const std::string& name, Function fn);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
@@ -314,6 +317,7 @@ private:
   std::unordered_map<int, int> userdata_ref_counts_;
   PropertyGetter property_getter_;
   PropertySetter property_setter_;
+  bool async_mode_ = false;
 
   void InitState();
   static int LibraryMask(const std::vector<std::string>& libraries);

@@ -197,6 +197,9 @@ void LuaRuntime::SetPropertyHandlers(PropertyGetter getter, PropertySetter sette
   property_setter_ = std::move(setter);
 }
 
+void LuaRuntime::SetAsyncMode(bool enabled) { async_mode_ = enabled; }
+bool LuaRuntime::IsAsyncMode() const { return async_mode_; }
+
 void LuaRuntime::CreateUserdataGlobal(const std::string& name, int ref_id) {
   auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
   *block = ref_id;
@@ -284,6 +287,12 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
     lua_pushfstring(L, "Host function '%s' not found", func_name ? func_name : "");
     lua_error(L);
     return 0;
+  }
+
+  if (runtime->async_mode_) {
+    return luaL_error(L,
+      "JS callbacks are not available in async mode (called '%s')",
+      func_name ? func_name : "<unknown>");
   }
 
   const int argc = lua_gettop(L);

@@ -21,6 +21,7 @@ data structures.
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
+- Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
 - Cross-platform support (Windows, macOS)
@@ -338,6 +339,63 @@ Available library names: `base`, `package`, `coroutine`, `table`, `io`, `os`,
 
 Available presets: `'all'` (all 10 libraries), `'safe'` (all except `io`, `os`,
 `debug`).
+
+### Async Execution
+
+By default, all Lua execution blocks the Node.js event loop. The async methods
+run Lua on a worker thread and return Promises, keeping the event loop free for
+other work.
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Non-blocking execution
+const result = await lua.execute_script_async("return 6 * 7");
+console.log(result); // 42
+
+// File execution
+const fileResult = await lua.execute_file_async("./scripts/heavy.lua");
+```
+
+Run multiple independent contexts concurrently with `Promise.all()`:
+
+```javascript
+const contexts = [1, 2, 3, 4].map(() => new lua_native.init({}, { libraries: "all" }));
+
+const results = await Promise.all(
+  contexts.map((lua, i) => lua.execute_script_async(`return ${i + 1} * 10`))
+);
+console.log(results); // [10, 20, 30, 40]
+```
+
+Error handling works with standard try/catch:
+
+```javascript
+try {
+  await lua.execute_script_async("error('something failed')");
+} catch (error) {
+  console.error(error.message); // includes "something failed"
+}
+```
+
+**Important:** JS callbacks registered on the context are not available during
+async execution. Calling a registered JS function from async Lua code will
+reject the promise with a clear error:
+
+```javascript
+const lua = new lua_native.init({
+  greet: () => "hello",
+}, { libraries: "all" });
+
+// This will reject — JS callbacks can't run on the worker thread
+await lua.execute_script_async("return greet()"); // Error: "JS callbacks are not available in async mode"
+
+// Workaround: set up data before async, compute in Lua
+lua.set_global("name", "World");
+const result = await lua.execute_script_async("return 'Hello, ' .. name .. '!'");
+```
 
 ### Coroutines
 
@@ -834,6 +892,39 @@ has no return statement.
 
 **Throws:** Error if the file is not found, contains syntax errors, or encounters
 a runtime error.
+
+### `LuaContext.execute_script_async(script)`
+
+Executes a Lua script asynchronously on a worker thread.
+
+**Parameters:**
+
+- `script`: String containing Lua code to execute
+
+**Returns:** `Promise` that resolves with the script result or rejects on error.
+JS callbacks are not available during async execution.
+
+**Throws:** Error if the context is busy with another async operation.
+
+### `LuaContext.execute_file_async(filepath)`
+
+Executes a Lua file asynchronously on a worker thread.
+
+**Parameters:**
+
+- `filepath`: Path to the Lua file to execute
+
+**Returns:** `Promise` that resolves with the file result or rejects on error.
+JS callbacks are not available during async execution.
+
+**Throws:** Error if the context is busy with another async operation.
+
+### `LuaContext.is_busy()`
+
+Returns whether the context is currently busy with an async operation.
+
+**Returns:** `boolean` — `true` while an async operation is in progress, `false`
+otherwise.
 
 ### `LuaContext.set_global(name, value)`
 

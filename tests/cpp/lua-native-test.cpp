@@ -1918,6 +1918,57 @@ TEST(LuaRuntimeLibraries, HostFunctionsWorkWithSelectiveLibs) {
   EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 42);
 }
 
+// ============================================
+// ASYNC MODE
+// ============================================
+
+TEST(LuaRuntimeAsync, AsyncModeFlagDefaultsOff) {
+  const LuaRuntime rt;
+  EXPECT_FALSE(rt.IsAsyncMode());
+}
+
+TEST(LuaRuntimeAsync, AsyncModeBlocksHostFunctions) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.RegisterFunction("greet", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("hello")));
+  });
+
+  // Works normally
+  auto res = rt.ExecuteScript("return greet()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "hello");
+
+  // Blocked in async mode
+  rt.SetAsyncMode(true);
+  auto res2 = rt.ExecuteScript("return greet()");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res2));
+  EXPECT_NE(std::get<std::string>(res2).find("async mode"), std::string::npos);
+
+  // Works again after clearing
+  rt.SetAsyncMode(false);
+  auto res3 = rt.ExecuteScript("return greet()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res3));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res3)[0]->value), "hello");
+}
+
+TEST(LuaRuntimeAsync, PureLuaWorksInAsyncMode) {
+  LuaRuntime rt;
+  rt.SetAsyncMode(true);
+  auto res = rt.ExecuteScript("return 6 * 7");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 42);
+  rt.SetAsyncMode(false);
+}
+
+TEST(LuaRuntimeAsync, StdlibWorksInAsyncMode) {
+  LuaRuntime rt(std::vector<std::string>{"base", "string"});
+  rt.SetAsyncMode(true);
+  auto res = rt.ExecuteScript("return string.upper('hello')");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "HELLO");
+  rt.SetAsyncMode(false);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

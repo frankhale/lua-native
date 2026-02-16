@@ -423,6 +423,36 @@ Non-string elements in the array produce a `TypeError`. Unknown preset strings p
 
 ---
 
+## Async Execution (February 2026)
+
+### Overview
+
+`execute_script_async()` and `execute_file_async()` run Lua scripts on the libuv thread pool via `Napi::AsyncWorker`, returning Promises. This keeps the Node.js event loop free during CPU-heavy Lua computation. JS callbacks are disallowed in async mode — scripts that call registered JS functions get a clear error.
+
+### Architecture
+
+**AsyncWorker pattern:** Two classes (`LuaScriptAsyncWorker`, `LuaFileAsyncWorker`) extend `Napi::AsyncWorker`. The libuv worker thread calls `Execute()`, which is pure C++ (no N-API). The main thread calls `OnOK()`, where N-API conversions happen.
+
+- `Execute()`: Sets `async_mode_` on the runtime, calls `ExecuteScript`/`ExecuteFile`, clears `async_mode_`. The result is stored in a `ScriptResult` member.
+- `OnOK()`: Clears the busy flag, converts the `ScriptResult` to N-API values via `CoreToNapi`, resolves or rejects the deferred Promise.
+- `OnError()`: Clears the busy flag, rejects the deferred Promise.
+
+**Busy flag:** `LuaContext` has an `is_busy_` flag that is set to `true` when an async operation starts and cleared in `OnOK()`/`OnError()`. All 8 sync methods (`execute_script`, `execute_file`, `set_global`, `get_global`, `set_userdata`, `set_metatable`, `create_coroutine`, `resume`) check this flag and throw if set. The async methods also check it, preventing concurrent async operations on the same context.
+
+**Callback guard:** `LuaRuntime::async_mode_` is checked in `LuaCallHostFunction` right after the host function lookup. If set, the function returns a Lua error (`luaL_error`) with a message including "async mode" and the function name. This is caught by `lua_pcall` and propagated through the `ScriptResult` error path.
+
+### Design Decisions
+
+**Why a busy flag instead of a mutex:** A mutex would allow queuing sync operations behind an async one, which would still block the event loop (defeating the purpose). The busy flag provides a clear, immediate error: "you started an async operation, wait for it to complete before touching this context." This is simpler and more predictable.
+
+**Why disallow JS callbacks in async mode:** N-API calls (`Napi::Function::Call`, `Napi::Value` construction) are only safe on the main thread. The `Execute()` method runs on a worker thread. Rather than adding complex marshalling to bounce callbacks back to the main thread (which would negate the async benefit for callback-heavy scripts), Phase 1 takes the simple approach: callbacks are blocked with a clear error. Users can set up globals before the async call and read results after.
+
+**Why one operation per context:** Lua states are not thread-safe — a single `lua_State*` must not be accessed from multiple threads simultaneously. The busy flag enforces this invariant. For true concurrency, users should create multiple `LuaContext` instances (each with its own `lua_State`).
+
+**Result conversion on the main thread:** `OnOK()` runs on the main thread, where N-API calls are safe. The `ScriptResult` (a `variant<vector<LuaPtr>, string>`) is a pure C++ type that was populated on the worker thread. The conversion to `Napi::Value` via `CoreToNapi` mirrors the existing sync path exactly.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -437,3 +467,4 @@ Non-string elements in the array produce a `TypeError`. Unknown preset strings p
 | Reference-based tables with Proxy | High | February 2026 |
 | File execution | Low | February 2026 |
 | Opt-in standard library loading with presets | Low | February 2026 |
+| Async execution (Phase 1) | Moderate | February 2026 |
