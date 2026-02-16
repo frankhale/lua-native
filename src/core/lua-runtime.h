@@ -243,8 +243,12 @@ public:
   using PropertyGetter = std::function<LuaPtr(int, const std::string&)>;
   using PropertySetter = std::function<void(int, const std::string&, const LuaPtr&)>;
 
-  explicit LuaRuntime(bool openStdLibs = true);
+  LuaRuntime();
+  explicit LuaRuntime(const std::vector<std::string>& libraries);
   ~LuaRuntime();
+
+  static std::vector<std::string> AllLibraries();
+  static std::vector<std::string> SafeLibraries();
 
   LuaRuntime(const LuaRuntime&) = delete;
   LuaRuntime& operator=(const LuaRuntime&) = delete;
@@ -310,6 +314,9 @@ private:
   std::unordered_map<int, int> userdata_ref_counts_;
   PropertyGetter property_getter_;
   PropertySetter property_setter_;
+
+  void InitState();
+  static int LibraryMask(const std::vector<std::string>& libraries);
 
   void RegisterUserdataMetatable();
   void RegisterProxyUserdataMetatable();

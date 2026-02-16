@@ -188,7 +188,53 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
 
 LuaContext::LuaContext(const Napi::CallbackInfo& info)
   : ObjectWrap(info), env(info.Env()) {
-  runtime = std::make_shared<lua_core::LuaRuntime>(true);
+
+  // Check for options (second argument)
+  if (info.Length() > 1 && info[1].IsObject()) {
+    auto options = info[1].As<Napi::Object>();
+    if (options.Has("libraries")) {
+      auto libsVal = options.Get("libraries");
+      if (libsVal.IsArray()) {
+        // Array of specific library names
+        auto arr = libsVal.As<Napi::Array>();
+        std::vector<std::string> libraries;
+        libraries.reserve(arr.Length());
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+          if (!arr.Get(i).IsString()) {
+            Napi::TypeError::New(env, "libraries array must contain only strings").ThrowAsJavaScriptException();
+            return;
+          }
+          libraries.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
+        }
+        try {
+          runtime = std::make_shared<lua_core::LuaRuntime>(libraries);
+        } catch (const std::runtime_error& e) {
+          Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+          return;
+        }
+      } else if (libsVal.IsString()) {
+        // Preset string: 'all' or 'safe'
+        std::string preset = libsVal.As<Napi::String>().Utf8Value();
+        if (preset == "all") {
+          runtime = std::make_shared<lua_core::LuaRuntime>(lua_core::LuaRuntime::AllLibraries());
+        } else if (preset == "safe") {
+          runtime = std::make_shared<lua_core::LuaRuntime>(lua_core::LuaRuntime::SafeLibraries());
+        } else {
+          Napi::TypeError::New(env, "libraries must be 'all', 'safe', or an array of library names").ThrowAsJavaScriptException();
+          return;
+        }
+      } else {
+        Napi::TypeError::New(env, "libraries must be 'all', 'safe', or an array of library names").ThrowAsJavaScriptException();
+        return;
+      }
+    } else {
+      // options present but no libraries field -> bare state
+      runtime = std::make_shared<lua_core::LuaRuntime>();
+    }
+  } else {
+    // No options at all -> bare state
+    runtime = std::make_shared<lua_core::LuaRuntime>();
+  }
 
   // Set up userdata GC callback
   runtime->SetUserdataGCCallback([this](int ref_id) {

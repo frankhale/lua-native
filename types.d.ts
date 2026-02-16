@@ -200,12 +200,60 @@ export interface LuaContext {
 }
 
 /**
+ * Available Lua standard library names for selective loading
+ */
+export type LuaLibrary =
+  | 'base'
+  | 'package'
+  | 'coroutine'
+  | 'debug'
+  | 'io'
+  | 'math'
+  | 'os'
+  | 'string'
+  | 'table'
+  | 'utf8';
+
+/**
+ * Preset names for loading groups of standard libraries
+ * - 'all': Load all 10 standard libraries
+ * - 'safe': Load all except io, os, and debug (for sandboxing)
+ */
+export type LuaLibraryPreset = 'all' | 'safe';
+
+/**
+ * Options for configuring a new Lua context
+ */
+export interface LuaInitOptions {
+  /**
+   * Which Lua standard libraries to load. If omitted, NO libraries are loaded (bare state).
+   *
+   * - `'all'` — load all 10 standard libraries
+   * - `'safe'` — load all except io, os, and debug (for sandboxing)
+   * - `LuaLibrary[]` — load specific libraries by name
+   * - `[]` — bare state with no standard libraries
+   *
+   * @example
+   * // Load all libraries
+   * { libraries: 'all' }
+   *
+   * // Safe sandboxed environment
+   * { libraries: 'safe' }
+   *
+   * // Only load string and math
+   * { libraries: ['base', 'string', 'math'] }
+   */
+  libraries?: LuaLibrary[] | LuaLibraryPreset;
+}
+
+/**
  * The main Lua module interface
  */
 export interface LuaNative {
   /**
    * Creates a new Lua context with the provided callbacks and values
    * @param callbacks Object containing functions and values to be available in Lua
+   * @param options Optional configuration for the Lua context
    */
-  init: new (callbacks?: LuaCallbacks) => LuaContext;
+  init: new (callbacks?: LuaCallbacks, options?: LuaInitOptions) => LuaContext;
 }

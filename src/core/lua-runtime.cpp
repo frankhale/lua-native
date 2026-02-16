@@ -26,14 +26,33 @@ bool isSequentialArray(lua_State* L, int index) {
 }
 } // namespace
 
-LuaRuntime::LuaRuntime(const bool openStdLibs) {
-  L_ = luaL_newstate();
-  if (!L_) {
-    throw std::runtime_error("Failed to create Lua state");
+// Map from user-facing library name to the Lua 5.5 bitmask constant
+static const std::unordered_map<std::string, int> kLibFlags = {
+  {"base",      LUA_GLIBK},
+  {"package",   LUA_LOADLIBK},
+  {"coroutine", LUA_COLIBK},
+  {"debug",     LUA_DBLIBK},
+  {"io",        LUA_IOLIBK},
+  {"math",      LUA_MATHLIBK},
+  {"os",        LUA_OSLIBK},
+  {"string",    LUA_STRLIBK},
+  {"table",     LUA_TABLIBK},
+  {"utf8",      LUA_UTF8LIBK},
+};
+
+int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
+  int mask = 0;
+  for (const auto& lib : libraries) {
+    const auto it = kLibFlags.find(lib);
+    if (it == kLibFlags.end()) {
+      throw std::runtime_error("Unknown Lua library: '" + lib + "'");
+    }
+    mask |= it->second;
   }
-  if (openStdLibs) {
-    luaL_openlibs(L_);
-  }
+  return mask;
+}
+
+void LuaRuntime::InitState() {
   // Store the runtime in registry for callbacks
   lua_pushlightuserdata(L_, this);
   lua_setfield(L_, LUA_REGISTRYINDEX, "_lua_core_runtime");
@@ -41,6 +60,33 @@ LuaRuntime::LuaRuntime(const bool openStdLibs) {
   // Register userdata metatables
   RegisterUserdataMetatable();
   RegisterProxyUserdataMetatable();
+}
+
+std::vector<std::string> LuaRuntime::AllLibraries() {
+  return {"base", "package", "coroutine", "table", "io", "os", "string", "math", "utf8", "debug"};
+}
+
+std::vector<std::string> LuaRuntime::SafeLibraries() {
+  return {"base", "package", "coroutine", "table", "string", "math", "utf8"};
+}
+
+LuaRuntime::LuaRuntime() {
+  L_ = luaL_newstate();
+  if (!L_) {
+    throw std::runtime_error("Failed to create Lua state");
+  }
+  InitState();
+}
+
+LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries) {
+  L_ = luaL_newstate();
+  if (!L_) {
+    throw std::runtime_error("Failed to create Lua state");
+  }
+  if (!libraries.empty()) {
+    luaL_openselectedlibs(L_, LibraryMask(libraries), 0);
+  }
+  InitState();
 }
 
 LuaRuntime::~LuaRuntime() {

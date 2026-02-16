@@ -377,6 +377,52 @@ The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no bi
 
 ---
 
+## Opt-In Standard Library Loading (February 2026)
+
+### Overview
+
+Standard library loading is now opt-in. The default `LuaRuntime()` constructor creates a bare Lua state with no standard libraries loaded. Users choose what to load via preset strings (`'all'`, `'safe'`) or an explicit array of library names. This is the primary mechanism for sandboxing untrusted scripts.
+
+### Architecture
+
+**Core layer:** The `LuaRuntime()` default constructor creates a bare state (no libraries). The `LuaRuntime(bool openStdLibs)` constructor was removed. Two static helpers provide named library lists:
+
+- `LuaRuntime::AllLibraries()` — returns a `vector<string>` of all 10 standard library names
+- `LuaRuntime::SafeLibraries()` — returns a `vector<string>` of all libraries except `io`, `os`, and `debug`
+
+The `LuaRuntime(const std::vector<std::string>& libraries)` constructor loads the specified libraries. All constructors share common initialization via a private `InitState()` method that stores the runtime in the registry and registers userdata metatables.
+
+A static map (`kLibFlags`) maps user-facing library names to Lua 5.5's bitmask constants (`LUA_GLIBK`, `LUA_LOADLIBK`, etc.). The static `LibraryMask()` method OR's the requested library flags into a single integer. The constructor calls `luaL_openselectedlibs(L_, mask, 0)` — a Lua 5.5 API that loads exactly the specified libraries in a single call.
+
+Unknown library names throw `std::runtime_error` with a descriptive message including the bad name.
+
+**N-API layer:** The `LuaContext` constructor checks for a second argument (options object). The `options.libraries` field accepts:
+
+- A preset string `'all'` — resolved to `LuaRuntime::AllLibraries()`
+- A preset string `'safe'` — resolved to `LuaRuntime::SafeLibraries()`
+- An array of library name strings — passed directly to the `vector<string>` constructor
+- Omitted or empty array — creates a bare state via the default `LuaRuntime()` constructor
+
+Non-string elements in the array produce a `TypeError`. Unknown preset strings produce a `TypeError`.
+
+**TypeScript types:** `LuaLibraryPreset = 'all' | 'safe'` is a new type alias. `LuaInitOptions.libraries` accepts `LuaLibrary[] | LuaLibraryPreset`.
+
+**Available libraries:** `base`, `package`, `coroutine`, `table`, `io`, `os`, `string`, `math`, `utf8`, `debug`.
+
+### Design Decisions
+
+**`luaL_openselectedlibs` over `luaL_requiref`:** Lua 5.5 provides `luaL_openselectedlibs(L, load, preload)` which handles all library name registration internally. This is cleaner than calling `luaL_requiref` in a loop and avoids the special-case handling of the base library (which registers under `"_G"` rather than `"base"`).
+
+**Bare by default:** The default constructor creates a bare state to encourage explicit library selection. This is safer for sandboxing — users must opt in to potentially dangerous libraries like `io`, `os`, and `debug` rather than remembering to opt out. The `'all'` preset provides a convenient one-word escape hatch for scripts that need everything.
+
+**Static helpers over enum:** `AllLibraries()` and `SafeLibraries()` return plain vectors rather than using an enum or bitfield. This keeps the API consistent — both presets and manual lists use the same `vector<string>` constructor path.
+
+**Preset strings in the N-API layer:** Preset resolution (`'all'` and `'safe'`) happens in the N-API layer, not the core layer. The core layer only knows about `vector<string>`. This keeps the core layer simple and testable — presets are a convenience feature for the JS API.
+
+**Validation at construction:** Unknown library names throw immediately during `LuaRuntime` construction rather than silently ignoring them. This catches typos early.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -390,3 +436,4 @@ The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no bi
 | Explicit metatables | Moderate | February 2026 |
 | Reference-based tables with Proxy | High | February 2026 |
 | File execution | Low | February 2026 |
+| Opt-in standard library loading with presets | Low | February 2026 |

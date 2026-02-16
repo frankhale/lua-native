@@ -6,8 +6,12 @@ export type {
   LuaContext,
   LuaCoroutine,
   LuaFunction,
+  LuaInitOptions,
+  LuaLibrary,
+  LuaLibraryPreset,
   LuaNative,
   LuaTable,
+  LuaTableRef,
   LuaValue,
 } from './types';
 

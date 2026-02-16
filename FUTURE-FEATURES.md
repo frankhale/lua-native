@@ -12,54 +12,9 @@ Implemented. See `execute_file()` in the API documentation.
 
 ---
 
-### Selective Standard Library Loading
+### ~~Selective Standard Library Loading~~ (Completed)
 
-The core layer already has an `openStdLibs` boolean, but it's all-or-nothing and not exposed to JS. Allow users to choose which standard libraries are available:
-
-```typescript
-const lua = new lua_native.init({}, {
-  libraries: ['string', 'table', 'math']  // no io, os, debug
-});
-```
-
-Important for sandboxing untrusted scripts. Lua provides individual loader functions (`luaopen_string`, `luaopen_math`, etc.) that can be called selectively instead of `luaL_openlibs`.
-
-#### Implementation Plan
-
-**Core layer** (`lua-runtime.h/.cpp`):
-- Add a new constructor overload or change the existing one: `LuaRuntime(const std::vector<std::string>& libraries)`. The empty vector means no libs; a special sentinel (or the existing `bool` overload) means all libs.
-- Build a static map from library name to loader function:
-  ```cpp
-  static const std::unordered_map<std::string, lua_CFunction> kLibLoaders = {
-    {"base",      luaopen_base},
-    {"coroutine", luaopen_coroutine},
-    {"table",     luaopen_table},
-    {"io",        luaopen_io},
-    {"os",        luaopen_os},
-    {"string",    luaopen_string},
-    {"math",      luaopen_math},
-    {"utf8",      luaopen_utf8},
-    {"debug",     luaopen_debug},
-    {"package",   luaopen_package},
-  };
-  ```
-- For each requested library, call `luaL_requiref(L_, name, loader, 1); lua_pop(L_, 1);` — this is the standard pattern for selective loading.
-- Throw if an unknown library name is provided.
-
-**N-API layer** (`lua-native.h/.cpp`):
-- Modify the `LuaContext` constructor (line 188) to accept an optional second argument (options object).
-- If `options.libraries` is present and is an array of strings, extract the list and pass to the new `LuaRuntime` constructor.
-- If `options.libraries` is absent, default to `luaL_openlibs` (current behavior).
-
-**Types** (`types.d.ts`):
-- Add `LuaInitOptions` interface with `libraries?: string[]`.
-- Update `init` constructor: `new (callbacks?: LuaCallbacks, options?: LuaInitOptions) => LuaContext`.
-
-**Tests**:
-- Verify `math.floor` works when `'math'` is included, errors when omitted.
-- Verify `io.open` errors when `'io'` is omitted.
-- Verify empty libraries array creates a bare Lua state.
-- Verify unknown library name throws.
+Implemented. See the `libraries` option in `LuaInitOptions` and the API documentation.
 
 ---
 

@@ -20,6 +20,7 @@ data structures.
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
+- Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
 - Cross-platform support (Windows, macOS)
@@ -239,7 +240,7 @@ Lua errors are automatically converted to JavaScript exceptions:
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 try {
   lua.execute_script("error('Something went wrong')");
@@ -256,7 +257,7 @@ const lua = new lua_native.init({
   riskyOperation: () => {
     throw new Error("Database connection failed");
   },
-});
+}, { libraries: "all" });
 
 try {
   lua.execute_script("riskyOperation()");
@@ -266,6 +267,78 @@ try {
 }
 ```
 
+### Standard Library Loading (Opt-In)
+
+By default, `new lua_native.init()` creates a **bare Lua state** with no
+standard libraries loaded. You opt in to the libraries you need via the
+`libraries` option.
+
+#### Load all libraries
+
+The `'all'` preset loads all 10 standard libraries — equivalent to the previous
+default behavior:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+lua.execute_script('print(string.upper("hello"))'); // "HELLO"
+lua.execute_script("print(math.floor(3.7))"); // 3
+lua.execute_script("print(os.clock())"); // works
+```
+
+#### Safe preset (sandboxing)
+
+The `'safe'` preset loads everything except `io`, `os`, and `debug` — ideal for
+running untrusted scripts:
+
+```javascript
+const sandbox = new lua_native.init({}, { libraries: "safe" });
+
+sandbox.execute_script('print(string.upper("hello"))'); // "HELLO"
+sandbox.execute_script("print(math.floor(3.7))"); // 3
+sandbox.execute_script("print(type(io))"); // "nil" — io is not loaded
+sandbox.execute_script("print(type(os))"); // "nil" — os is not loaded
+sandbox.execute_script("print(type(debug))"); // "nil" — debug is not loaded
+```
+
+#### Selective loading (array)
+
+You can also pass an explicit array of library names:
+
+```javascript
+// Only load base, string, and math
+const lua = new lua_native.init({}, {
+  libraries: ["base", "string", "math"],
+});
+
+lua.execute_script('print(string.upper("hello"))'); // "HELLO"
+lua.execute_script("print(math.floor(3.7))"); // 3
+lua.execute_script("print(type(io))"); // "nil" — io is not loaded
+```
+
+#### Bare state (default)
+
+Omitting `libraries` or passing an empty array creates a bare Lua state with no
+standard libraries at all:
+
+```javascript
+const bare = new lua_native.init({});
+
+// Basic Lua still works (arithmetic, strings, return)
+bare.execute_script("return 1 + 2"); // 3
+
+// But no standard functions are available
+// bare.execute_script('print("hi")') -- ERROR: 'print' is nil
+```
+
+Available library names: `base`, `package`, `coroutine`, `table`, `io`, `os`,
+`string`, `math`, `utf8`, `debug`.
+
+Available presets: `'all'` (all 10 libraries), `'safe'` (all except `io`, `os`,
+`debug`).
+
 ### Coroutines
 
 Lua coroutines are supported, allowing you to create pausable/resumable functions:
@@ -273,7 +346,7 @@ Lua coroutines are supported, allowing you to create pausable/resumable function
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 // Create a coroutine from a function
 const coro = lua.create_coroutine(`
@@ -354,7 +427,7 @@ modify its properties:
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 const connection = { host: "localhost", port: 5432, connected: true };
 lua.set_userdata("db", connection);
@@ -409,7 +482,7 @@ const lua = new lua_native.init({
     // fileHandle is opaque to JS, but can be returned to Lua
     return fileHandle;
   },
-});
+}, { libraries: "all" });
 
 lua.execute_script(`
   local f = io.tmpfile()
@@ -431,7 +504,7 @@ overloading, custom `tostring`, callable tables, custom indexing, and more.
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 // Create two vector tables in Lua
 lua.execute_script("v1 = {x = 1, y = 2}; v2 = {x = 10, y = 20}");
@@ -538,7 +611,7 @@ deep-copied as before.
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 const obj = lua.execute_script(`
   local t = {}
@@ -638,6 +711,8 @@ import type {
   LuaCallbacks,
   LuaContext,
   LuaCoroutine,
+  LuaInitOptions,
+  LuaLibraryPreset,
   CoroutineResult,
   LuaFunction,
   LuaTableRef,
@@ -651,7 +726,7 @@ const callbacks: LuaCallbacks = {
   greet: (name: string): string => `Hello, ${name}!`,
 };
 
-const lua: LuaContext = new lua_native.init(callbacks);
+const lua: LuaContext = new lua_native.init(callbacks, { libraries: "all" });
 const result: number = lua.execute_script("return add(10, 20)");
 
 // Type-safe global access
@@ -696,11 +771,21 @@ const proxy = lua.execute_script<LuaTableRef>(`
 `);
 console.log(proxy.x); // 1
 console.log(proxy.hello); // "hello" — __index fires
+
+// Type-safe library loading with presets
+const preset: LuaLibraryPreset = "safe";
+const sandboxed: LuaContext = new lua_native.init({}, { libraries: preset });
+sandboxed.execute_script('print(string.upper("safe"))'); // "SAFE"
+
+// Or with an explicit array
+const options: LuaInitOptions = { libraries: ["base", "string", "math"] };
+const custom: LuaContext = new lua_native.init({}, options);
+custom.execute_script('print(string.upper("custom"))'); // "CUSTOM"
 ```
 
 ## API Reference
 
-### `lua_native.init(callbacks?)`
+### `lua_native.init(callbacks?, options?)`
 
 Creates a new Lua execution context.
 
@@ -708,8 +793,20 @@ Creates a new Lua execution context.
 
 - `callbacks` (optional): Object containing JavaScript functions and values to
   make available in Lua
+- `options` (optional): Configuration object
+  - `libraries` (optional): Which standard libraries to load. If omitted, **no
+    libraries are loaded** (bare state). Accepts:
+    - `'all'` — loads all 10 standard libraries
+    - `'safe'` — loads all except `io`, `os`, and `debug`
+    - `LuaLibrary[]` — array of specific library names
+    - `[]` — bare state (no libraries)
+
+    Valid library names: `'base'`, `'package'`, `'coroutine'`, `'table'`, `'io'`,
+    `'os'`, `'string'`, `'math'`, `'utf8'`, `'debug'`
 
 **Returns:** `LuaContext` instance
+
+**Throws:** Error if an unknown library name is provided
 
 ### `LuaContext.execute_script(script)`
 
