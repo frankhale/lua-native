@@ -18,7 +18,8 @@
       "Bash(git ls-tree:*)",
       "Bash(git rev-parse:*)",
       "Bash(node:*)",
-      "Bash(/Users/frankhale/DEV/lua-native/build/Debug/lua-native-test:*)"
+      "Bash(/Users/frankhale/DEV/lua-native/build/Debug/lua-native-test:*)",
+      "Bash(gh pr create:*)"
     ]
   }
 }
