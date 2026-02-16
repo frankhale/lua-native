@@ -3,6 +3,121 @@
 #include <cmath>
 #include <limits>
 
+// --- Proxy trap functions for LuaTableRef ---
+
+static Napi::Value TableRefGetTrap(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+
+  auto target = info[0].As<Napi::Object>();
+  auto prop = info[1];
+
+  // Skip symbols
+  if (!prop.IsString()) return env.Undefined();
+
+  std::string key = prop.As<Napi::String>().Utf8Value();
+
+  // Round-trip marker
+  if (key == "_tableRef") {
+    return target.Get("_tableRef");
+  }
+
+  // "then" suppression - prevents Proxy from being treated as a thenable
+  if (key == "then") return env.Undefined();
+
+  try {
+    auto result = data->runtime->GetTableField(data->tableRef.ref, key);
+    return data->context->CoreToNapi(*result);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+}
+
+static Napi::Value TableRefSetTrap(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+
+  auto prop = info[1];
+  auto value = info[2];
+
+  if (!prop.IsString()) return Napi::Boolean::New(env, true);
+
+  std::string key = prop.As<Napi::String>().Utf8Value();
+
+  try {
+    auto coreValue = std::make_shared<lua_core::LuaValue>(
+      data->context->NapiToCoreInstance(value));
+    data->runtime->SetTableField(data->tableRef.ref, key, coreValue);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+  }
+  return Napi::Boolean::New(env, true);
+}
+
+static Napi::Value TableRefHasTrap(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+
+  auto prop = info[1];
+
+  if (!prop.IsString()) return Napi::Boolean::New(env, false);
+
+  std::string key = prop.As<Napi::String>().Utf8Value();
+
+  if (key == "_tableRef") return Napi::Boolean::New(env, true);
+
+  try {
+    bool has = data->runtime->HasTableField(data->tableRef.ref, key);
+    return Napi::Boolean::New(env, has);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+}
+
+static Napi::Value TableRefOwnKeysTrap(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+
+  try {
+    auto keys = data->runtime->GetTableKeys(data->tableRef.ref);
+    Napi::Array arr = Napi::Array::New(env, keys.size());
+    for (size_t i = 0; i < keys.size(); i++) {
+      arr.Set(static_cast<uint32_t>(i), Napi::String::New(env, keys[i]));
+    }
+    return arr;
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return Napi::Array::New(env, 0);
+  }
+}
+
+static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+
+  auto prop = info[1];
+
+  if (!prop.IsString()) return env.Undefined();
+
+  std::string key = prop.As<Napi::String>().Utf8Value();
+
+  try {
+    if (data->runtime->HasTableField(data->tableRef.ref, key)) {
+      auto value = data->runtime->GetTableField(data->tableRef.ref, key);
+      Napi::Object desc = Napi::Object::New(env);
+      desc.Set("configurable", Napi::Boolean::New(env, true));
+      desc.Set("enumerable", Napi::Boolean::New(env, true));
+      desc.Set("value", data->context->CoreToNapi(*value));
+      return desc;
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+  }
+  return env.Undefined();
+}
+
 static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
@@ -345,9 +460,19 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   }
 
   if (type == napi_object) {
-    // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
     if (value.IsObject()) {
       auto obj = value.As<Napi::Object>();
+
+      // Check if it's a LuaTableRef Proxy (metatabled table round-tripping through JS)
+      if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
+        auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
+        if (data) {
+          return lua_core::LuaValue::from(
+            lua_core::LuaTableRef(data->tableRef.ref, data->tableRef.L));
+        }
+      }
+
+      // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
       if (obj.Has("_userdata") && obj.Get("_userdata").IsExternal()) {
         auto* data = obj.Get("_userdata").As<Napi::External<LuaUserdataData>>().Data();
         if (data) {
@@ -494,6 +619,38 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
             handle.Set("_userdata", Napi::External<LuaUserdataData>::New(env, dataPtr));
             return handle;
           }
+        } else if constexpr (std::is_same_v<T, lua_core::LuaTableRef>) {
+          // Create a JS Proxy that preserves Lua metamethods
+          Napi::Object target = Napi::Object::New(env);
+
+          // Store data for traps
+          auto data = std::make_unique<LuaTableRefData>(runtime, v, this);
+          auto* dataPtr = data.get();
+          lua_table_ref_data_.push_back(std::move(data));
+
+          // Store _tableRef as non-enumerable on target for round-trip detection
+          auto external = Napi::External<LuaTableRefData>::New(env, dataPtr);
+          auto Object = env.Global().Get("Object").As<Napi::Object>();
+          auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
+          Napi::Object descriptor = Napi::Object::New(env);
+          descriptor.Set("value", external);
+          descriptor.Set("enumerable", Napi::Boolean::New(env, false));
+          descriptor.Set("configurable", Napi::Boolean::New(env, true));
+          defineProperty.Call({target, Napi::String::New(env, "_tableRef"), descriptor});
+
+          // Create handler with traps
+          Napi::Object handler = Napi::Object::New(env);
+          handler.Set("get", Napi::Function::New(env, TableRefGetTrap, "get", dataPtr));
+          handler.Set("set", Napi::Function::New(env, TableRefSetTrap, "set", dataPtr));
+          handler.Set("has", Napi::Function::New(env, TableRefHasTrap, "has", dataPtr));
+          handler.Set("ownKeys", Napi::Function::New(env, TableRefOwnKeysTrap, "ownKeys", dataPtr));
+          handler.Set("getOwnPropertyDescriptor",
+            Napi::Function::New(env, TableRefGetOwnPropertyDescriptorTrap,
+                                "getOwnPropertyDescriptor", dataPtr));
+
+          // Create Proxy
+          auto ProxyCtor = env.Global().Get("Proxy").As<Napi::Function>();
+          return ProxyCtor.New({target, handler});
         }
         return env.Undefined();
       },

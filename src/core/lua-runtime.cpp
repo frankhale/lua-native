@@ -377,6 +377,14 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
     }
     case LUA_TTABLE: {
       StackGuard guard(L);
+      // Metatabled tables are kept as registry references to preserve metamethods
+      if (lua_getmetatable(L, abs_index)) {
+        lua_pop(L, 1);  // pop metatable
+        lua_pushvalue(L, abs_index);
+        int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        return std::make_shared<LuaValue>(LuaValue::from(LuaTableRef(ref, L)));
+      }
+      // Plain tables (no metatable) are deep-copied as before
       if (isSequentialArray(L, abs_index)) {
         LuaArray arr;
         const int len = static_cast<int>(lua_rawlen(L, abs_index));
@@ -503,9 +511,84 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             lua_pop(L, 1);
             if (runtime) runtime->IncrementUserdataRefCount(v.ref_id);
           }
+        } else if constexpr (std::is_same_v<T, LuaTableRef>) {
+          lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
         }
       },
       value->value);
+}
+
+// --- Table reference operations ---
+
+LuaPtr LuaRuntime::GetTableField(int registry_ref, const std::string& key) const {
+  StackGuard guard(L_);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+
+  // Try integer key
+  char* end = nullptr;
+  long long int_key = strtoll(key.c_str(), &end, 10);
+  if (end != key.c_str() && *end == '\0') {
+    lua_geti(L_, -1, static_cast<lua_Integer>(int_key));
+  } else {
+    lua_getfield(L_, -1, key.c_str());
+  }
+
+  return ToLuaValue(L_, -1);
+}
+
+void LuaRuntime::SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const {
+  StackGuard guard(L_);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  PushLuaValue(L_, value);
+
+  char* end = nullptr;
+  long long int_key = strtoll(key.c_str(), &end, 10);
+  if (end != key.c_str() && *end == '\0') {
+    lua_seti(L_, -2, static_cast<lua_Integer>(int_key));
+  } else {
+    lua_setfield(L_, -2, key.c_str());
+  }
+}
+
+bool LuaRuntime::HasTableField(int registry_ref, const std::string& key) const {
+  StackGuard guard(L_);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+
+  char* end = nullptr;
+  long long int_key = strtoll(key.c_str(), &end, 10);
+  if (end != key.c_str() && *end == '\0') {
+    lua_geti(L_, -1, static_cast<lua_Integer>(int_key));
+  } else {
+    lua_getfield(L_, -1, key.c_str());
+  }
+
+  bool has = !lua_isnil(L_, -1);
+  return has;
+}
+
+std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
+  StackGuard guard(L_);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+
+  std::vector<std::string> keys;
+  lua_pushnil(L_);
+  while (lua_next(L_, -2) != 0) {
+    if (lua_type(L_, -2) == LUA_TSTRING) {
+      keys.emplace_back(lua_tostring(L_, -2));
+    } else if (lua_type(L_, -2) == LUA_TNUMBER) {
+      lua_pushvalue(L_, -2);
+      keys.emplace_back(lua_tostring(L_, -1));
+      lua_pop(L_, 1);
+    }
+    lua_pop(L_, 1);  // pop value, keep key
+  }
+  return keys;
+}
+
+int LuaRuntime::GetTableLength(int registry_ref) const {
+  StackGuard guard(L_);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  return static_cast<int>(luaL_len(L_, -1));
 }
 
 // --- Coroutine support ---

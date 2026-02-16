@@ -147,6 +147,41 @@ struct LuaUserdataRef {
   }
 };
 
+// Holds a reference to a Lua table in the registry.
+// Used for metatabled tables to preserve metamethods across the JS boundary.
+struct LuaTableRef {
+  int ref;
+  lua_State* L;
+
+  LuaTableRef(int r, lua_State* state) : ref(r), L(state) {}
+
+  LuaTableRef(const LuaTableRef&) = default;
+  LuaTableRef& operator=(const LuaTableRef&) = default;
+
+  LuaTableRef(LuaTableRef&& other) noexcept
+      : ref(other.ref), L(other.L) {
+    other.ref = LUA_NOREF;
+    other.L = nullptr;
+  }
+  LuaTableRef& operator=(LuaTableRef&& other) noexcept {
+    if (this != &other) {
+      release();
+      ref = other.ref;
+      L = other.L;
+      other.ref = LUA_NOREF;
+      other.L = nullptr;
+    }
+    return *this;
+  }
+
+  void release() {
+    if (L && ref != LUA_NOREF) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ref);
+      ref = LUA_NOREF;
+    }
+  }
+};
+
 struct MetatableEntry {
   std::string key;
   bool is_function;
@@ -177,7 +212,8 @@ struct LuaValue {
       LuaTable,
       LuaFunctionRef,
       LuaThreadRef,
-      LuaUserdataRef>;
+      LuaUserdataRef,
+      LuaTableRef>;
   Variant value;
 
   LuaValue() = default;
@@ -195,6 +231,7 @@ struct LuaValue {
   static LuaValue from(LuaFunctionRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
   static LuaValue from(LuaThreadRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
   static LuaValue from(LuaUserdataRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
+  static LuaValue from(LuaTableRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
 };
 
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
@@ -241,6 +278,13 @@ public:
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
   void IncrementUserdataRefCount(int ref_id);
   void DecrementUserdataRefCount(int ref_id);
+
+  // Table reference operations (for metatabled tables preserved as refs)
+  [[nodiscard]] LuaPtr GetTableField(int registry_ref, const std::string& key) const;
+  void SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const;
+  [[nodiscard]] bool HasTableField(int registry_ref, const std::string& key) const;
+  [[nodiscard]] std::vector<std::string> GetTableKeys(int registry_ref) const;
+  [[nodiscard]] int GetTableLength(int registry_ref) const;
 
   [[nodiscard]] lua_State* RawState() const { return L_; }
 

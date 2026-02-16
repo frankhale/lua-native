@@ -51,6 +51,21 @@ struct LuaUserdataData {
   }
 };
 
+struct LuaTableRefData {
+  std::shared_ptr<lua_core::LuaRuntime> runtime;
+  lua_core::LuaTableRef tableRef;
+  LuaContext* context;
+
+  LuaTableRefData(std::shared_ptr<lua_core::LuaRuntime> rt,
+                  lua_core::LuaTableRef ref,
+                  LuaContext* ctx)
+    : runtime(std::move(rt)), tableRef(std::move(ref)), context(ctx) {}
+
+  ~LuaTableRefData() {
+    tableRef.release();
+  }
+};
+
 struct UserdataEntry {
   Napi::ObjectReference object;
   bool readable;
@@ -82,6 +97,7 @@ private:
     std::vector<std::unique_ptr<LuaFunctionData>> lua_function_data_;
     std::vector<std::unique_ptr<LuaThreadData>> lua_thread_data_;
     std::vector<std::unique_ptr<LuaUserdataData>> lua_userdata_data_;
+    std::vector<std::unique_ptr<LuaTableRefData>> lua_table_ref_data_;
 
     // Userdata reference tracking
     std::unordered_map<int, UserdataEntry> js_userdata_;

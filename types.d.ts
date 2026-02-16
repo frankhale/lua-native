@@ -1,8 +1,20 @@
 // Type definitions for the Lua module
 
 /**
+ * Represents a Lua table that has a metatable, returned as a JS Proxy object.
+ * Property access flows through Lua metamethods (__index, __newindex, etc.).
+ * When passed back to Lua, the original metatabled table is restored.
+ */
+export interface LuaTableRef {
+  [key: string]: LuaValue;
+}
+
+/**
  * Represents a value that can be passed to or returned from Lua.
  * This includes all primitive types, arrays, objects, and functions.
+ *
+ * Note: Tables with metatables are returned as Proxy objects (LuaTableRef)
+ * that preserve metamethods. Plain tables (no metatable) are deep-copied.
  */
 export type LuaValue =
   | null
@@ -11,6 +23,7 @@ export type LuaValue =
   | string
   | LuaValue[]
   | LuaTable
+  | LuaTableRef
   | LuaFunction;
 
 /**

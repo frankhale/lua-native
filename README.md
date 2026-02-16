@@ -11,9 +11,6 @@ data structures.
 - Bun
 - Deno
 
-All runtimes use the same API. Bun and Deno support native Node.js modules, so
-the usage is identical across all three runtimes.
-
 ## Features
 
 - Execute Lua scripts from Node.js
@@ -22,9 +19,10 @@ the usage is identical across all three runtimes.
 - Global variable management (get and set)
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
+- Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
-- Cross-platform support (Windows, macOS, Linux)
+- Cross-platform support (Windows, macOS)
 - TypeScript support with full type definitions
 
 ## Installation
@@ -34,11 +32,11 @@ npm install lua-native
 ```
 
 NOTE: Prebuilt binaries are currently available for macOS (Apple Silicon/arm64).
-Windows (x64) and Linux prebuilt binaries are coming soon. Intel Mac users will
-need to build from source.
+Intel Mac and Windows users will need to build from source. Linux has not been
+tested.
 
-NOTE: The prebuilt binaries include Lua 5.5. If you need a different Lua version, you
-will need to build from source.
+NOTE: The prebuilt binaries include Lua 5.5 (pre-release). If you need a
+different Lua version, you will need to build from source.
 
 ## Building from Source
 
@@ -52,7 +50,7 @@ will need to build from source.
 
 NOTE: There are two ways to build this module. You can use traditional
 `bindings.gyp` along with `node-gyp` or you can use `cmake` on
-Windows and macOS. I have not configured the build for Linux yet.
+Windows and macOS. Linux has not been tested.
 
 ```bash
 # Debug build
@@ -344,7 +342,11 @@ lua.execute_script(`
 `);
 
 // Read-write access
-lua.set_userdata("state", { lives: 3, level: 1 }, { readable: true, writable: true });
+lua.set_userdata(
+  "state",
+  { lives: 3, level: 1 },
+  { readable: true, writable: true },
+);
 
 lua.execute_script(`
   state.level = state.level + 1
@@ -395,13 +397,10 @@ lua.execute_script("v1 = {x = 1, y = 2}; v2 = {x = 10, y = 20}");
 // Attach a metatable with __tostring and __add
 lua.set_metatable("v1", {
   __tostring: (t) => `(${t.x}, ${t.y})`,
-  __add: (a, b) => {
-    lua.set_global("_result", { x: a.x + b.x, y: a.y + b.y });
-    return lua.get_global("_result");
-  },
+  __add: (a, b) => ({ x: a.x + b.x, y: a.y + b.y }),
 });
 
-lua.execute_script('print(tostring(v1))'); // (1, 2)
+lua.execute_script("print(tostring(v1))"); // (1, 2)
 const sum = lua.execute_script("return v1 + v2");
 console.log(sum); // { x: 11, y: 22 }
 ```
@@ -466,23 +465,126 @@ console.log(lua.execute_script("return protected.y")); // null (write was interc
 
 #### All Supported Metamethods
 
-| Metamethod   | Lua Trigger         | Description                  |
-| ------------ | ------------------- | ---------------------------- |
-| `__tostring` | `tostring(t)`       | Custom string representation |
-| `__add`      | `a + b`             | Addition                     |
-| `__sub`      | `a - b`             | Subtraction                  |
-| `__mul`      | `a * b`             | Multiplication               |
-| `__div`      | `a / b`             | Division                     |
-| `__mod`      | `a % b`             | Modulo                       |
-| `__unm`      | `-a`                | Unary minus                  |
-| `__concat`   | `a .. b`            | String concatenation         |
-| `__len`      | `#a`                | Length operator               |
-| `__eq`       | `a == b`            | Equality (both need metatable) |
-| `__lt`       | `a < b`             | Less than (both need metatable) |
+| Metamethod   | Lua Trigger         | Description                         |
+| ------------ | ------------------- | ----------------------------------- |
+| `__tostring` | `tostring(t)`       | Custom string representation        |
+| `__add`      | `a + b`             | Addition                            |
+| `__sub`      | `a - b`             | Subtraction                         |
+| `__mul`      | `a * b`             | Multiplication                      |
+| `__div`      | `a / b`             | Division                            |
+| `__mod`      | `a % b`             | Modulo                              |
+| `__unm`      | `-a`                | Unary minus                         |
+| `__concat`   | `a .. b`            | String concatenation                |
+| `__len`      | `#a`                | Length operator                     |
+| `__eq`       | `a == b`            | Equality (both need metatable)      |
+| `__lt`       | `a < b`             | Less than (both need metatable)     |
 | `__le`       | `a <= b`            | Less or equal (both need metatable) |
-| `__call`     | `t(args)`           | Calling table as function    |
-| `__index`    | `t.key` (missing)   | Custom read (function or table) |
-| `__newindex` | `t.key = val` (new) | Custom write interception    |
+| `__call`     | `t(args)`           | Calling table as function           |
+| `__index`    | `t.key` (missing)   | Custom read (function or table)     |
+| `__newindex` | `t.key = val` (new) | Custom write interception           |
+
+### Reference-Based Tables
+
+When a Lua table has a metatable, it is returned to JavaScript as a Proxy object
+instead of being deep-copied. This preserves all metamethods — `__index`,
+`__newindex`, `__tostring`, `__add`, `__call`, etc. — so they fire naturally when
+you access the object from JavaScript. Plain tables (no metatable) are still
+deep-copied as before.
+
+#### Live Property Access via `__index`
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({});
+
+const obj = lua.execute_script(`
+  local t = {}
+  setmetatable(t, {
+    __index = function(_, key) return key:upper() end
+  })
+  return t
+`);
+
+console.log(obj.hello); // "HELLO" — __index fires through the Proxy
+console.log(obj.world); // "WORLD"
+```
+
+#### Direct Property Read/Write
+
+```javascript
+const vec = lua.execute_script(`
+  local v = {x = 10, y = 20}
+  setmetatable(v, {})
+  return v
+`);
+
+console.log(vec.x); // 10
+vec.x = 99; // sets via Lua (triggers __newindex if defined)
+console.log(vec.x); // 99
+```
+
+#### Object.keys() and `in` Operator
+
+```javascript
+console.log(Object.keys(vec)); // ['x', 'y']
+console.log("x" in vec); // true
+console.log("z" in vec); // false
+```
+
+#### Round-Trip Through JavaScript
+
+Proxy objects passed back to Lua restore the original metatabled table, so
+metamethods continue to work:
+
+```javascript
+lua.set_global("inspect", (tbl) => {
+  console.log(tbl.x); // access via Proxy
+  return tbl; // return to Lua — original table restored
+});
+
+lua.execute_script(`
+  local t = {x = 42}
+  setmetatable(t, {
+    __tostring = function(self) return "x=" .. self.x end
+  })
+  local t2 = inspect(t)
+  print(tostring(t2))  -- "x=42" — metamethods preserved after round-trip
+`);
+```
+
+#### Arithmetic and Other Metamethods
+
+All metamethods work when the Proxy is passed back to Lua:
+
+```javascript
+lua.execute_script(`
+  v1 = {x = 1, y = 2}
+  v2 = {x = 10, y = 20}
+`);
+
+lua.set_metatable("v1", {
+  __add: (a, b) => {
+    // Return a new metatabled table
+    return lua.execute_script(
+      `local r = {x = ${a.x + b.x}, y = ${a.y + b.y}}; setmetatable(r, getmetatable(v1)); return r`,
+    );
+  },
+  __tostring: (t) => `(${t.x}, ${t.y})`,
+});
+
+// v1 + v2 triggers __add, tostring() triggers __tostring
+lua.execute_script("print(tostring(v1 + v2))"); // (11, 22)
+```
+
+#### Plain Tables Are Unaffected
+
+Tables without metatables continue to deep-copy as before — no behavior change:
+
+```javascript
+const plain = lua.execute_script("return {a = 1, b = 2}");
+// plain is a regular JS object: { a: 1, b: 2 }
+```
 
 ## TypeScript Support
 
@@ -496,6 +598,7 @@ import type {
   LuaCoroutine,
   CoroutineResult,
   LuaFunction,
+  LuaTableRef,
   MetatableDefinition,
   UserdataOptions,
 } from "lua-native";
@@ -536,12 +639,21 @@ const opts: UserdataOptions = { readable: true, writable: true };
 lua.set_userdata("player", { name: "Alice", score: 0 }, opts);
 
 // Type-safe metatable
-lua.execute_script('vec = {x = 1, y = 2}');
+lua.execute_script("vec = {x = 1, y = 2}");
 const mt: MetatableDefinition = {
   __tostring: (t) => `(${t.x}, ${t.y})`,
   __unm: (t) => ({ x: -t.x, y: -t.y }),
 };
 lua.set_metatable("vec", mt);
+
+// Type-safe reference-based tables
+const proxy = lua.execute_script<LuaTableRef>(`
+  local t = {x = 1}
+  setmetatable(t, { __index = function(_, k) return k end })
+  return t
+`);
+console.log(proxy.x); // 1
+console.log(proxy.hello); // "hello" — __index fires
 ```
 
 ## API Reference
@@ -566,7 +678,8 @@ Executes a Lua script and returns the result.
 - `script`: String containing Lua code to execute
 
 **Returns:** The result of the script execution (converted to the appropriate
-JavaScript type)
+JavaScript type). Tables with metatables are returned as Proxy objects that
+preserve metamethods; plain tables are deep-copied into objects or arrays.
 
 ### `LuaContext.set_global(name, value)`
 
@@ -643,23 +756,24 @@ Resumes a suspended coroutine with optional arguments.
 
 ## Data Type Conversion
 
-| Lua Type              | JavaScript Type | Notes                                      |
-| --------------------- | --------------- | ------------------------------------------ |
-| `nil`                 | `null`          |                                            |
-| `boolean`             | `boolean`       |                                            |
-| `number`              | `number`        |                                            |
-| `string`              | `string`        |                                            |
-| `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 |
-| `table` (object-like) | `Object`        | String or mixed keys                       |
-| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS           |
-| `thread`              | `LuaCoroutine`  | Created via `create_coroutine()`           |
+| Lua Type              | JavaScript Type | Notes                                                                                                         |
+| --------------------- | --------------- | ------------------------------------------------------------------------------------------------------------- |
+| `nil`                 | `null`          |                                                                                                               |
+| `boolean`             | `boolean`       |                                                                                                               |
+| `number`              | `number`        |                                                                                                               |
+| `string`              | `string`        |                                                                                                               |
+| `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 (no metatable)                                                     |
+| `table` (object-like) | `Object`        | String or mixed keys (no metatable)                                                                           |
+| `table` (metatabled)  | `Proxy`         | Wrapped as JS Proxy — metamethods preserved                                                                   |
+| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS                                                                              |
+| `thread`              | `LuaCoroutine`  | Created via `create_coroutine()`                                                                              |
 | `userdata`            | `Object`        | JS-created via `set_userdata()`, returned by reference. Lua-created userdata passes through as opaque handles |
 
 ## Limitations
 
 - **Nesting depth limit** — Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
-- **Metatables only for globals** — `set_metatable()` works on global tables only. Metatables on tables returned from Lua to JavaScript are not preserved (tables are deep-copied on return).
-- **Tables are copied, not referenced** — When Lua tables are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Use `set_userdata()` for reference semantics.
+- **`set_metatable()` only for globals** — `set_metatable()` works on global tables only. To set metatables on non-global tables, use `setmetatable()` in Lua code.
+- **Plain tables are copied, not referenced** — When Lua tables _without metatables_ are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Tables _with metatables_ are returned as live Proxy objects that maintain a reference to the original Lua table.
 
 ## Development
 
