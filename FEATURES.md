@@ -1,0 +1,371 @@
+# Feature Implementation Details
+
+This document describes every feature in lua-native with architecture details and design decisions. The codebase is organized into two layers: a pure C++ Lua runtime wrapper (`src/core/lua-runtime.h/cpp`) and an N-API binding layer (`src/lua-native.h/cpp`) that bridges the runtime to Node.js.
+
+---
+
+## Architecture Overview
+
+### Two-Layer Design
+
+The codebase is split into two distinct layers with a clear boundary between them:
+
+**Core layer (`lua_core` namespace):** A standalone C++ wrapper around the Lua C API. It has no knowledge of Node.js, N-API, or JavaScript types. All values flow through `LuaValue`, a tagged union (`std::variant`) supporting nil, bool, int64, double, string, array, table, function ref, thread ref, userdata ref, and table ref. The core layer owns the `lua_State*` and provides methods for script execution, global management, function calling, coroutine control, userdata lifecycle, metatable attachment, and table operations.
+
+**N-API layer:** Bridges the core layer to Node.js via `Napi::ObjectWrap<LuaContext>`. Converts between `Napi::Value` and `lua_core::LuaValue`, manages JavaScript object lifetimes (`Napi::Reference`, `Napi::Persistent`), and exposes the API as `LuaContext` instance methods. Each `new lua_native.init()` call creates one `LuaContext` which owns one `shared_ptr<LuaRuntime>`.
+
+**Why two layers:** The core layer is testable independently (the C++ test suite uses it directly without Node.js). It also means the Lua interop logic is not coupled to any particular JS runtime — the N-API layer could theoretically be replaced with a different binding (e.g., for embedding in a game engine). The core layer never `#include`s `<napi.h>`.
+
+### The `LuaValue` Type System
+
+All data crossing the Lua/JS boundary passes through `LuaValue`, a struct wrapping a `std::variant`:
+
+```cpp
+using Variant = std::variant<
+    std::monostate,      // nil
+    bool,
+    int64_t,
+    double,
+    std::string,
+    LuaArray,            // vector<shared_ptr<LuaValue>>
+    LuaTable,            // unordered_map<string, shared_ptr<LuaValue>>
+    LuaFunctionRef,      // Lua registry ref to a function
+    LuaThreadRef,        // Lua registry ref to a coroutine thread
+    LuaUserdataRef,      // JS object handle or Lua-created userdata ref
+    LuaTableRef>;        // Lua registry ref to a metatabled table
+```
+
+Factory functions (`LuaValue::from(...)`) construct values. `LuaPtr` (`shared_ptr<LuaValue>`) is used throughout for shared ownership.
+
+**Why `shared_ptr`:** Lua values frequently appear in multiple places simultaneously — as function arguments, return values, table entries, and callback parameters. Shared ownership avoids premature destruction and complex lifetime tracking. The overhead is acceptable since value conversions are not on a hot path (they happen at the JS/Lua boundary, not inside tight Lua loops).
+
+### Registry Reference Pattern
+
+Lua functions, coroutine threads, userdata, and metatabled tables all use the same pattern for cross-boundary lifetime management:
+
+1. Push the Lua object onto the stack
+2. Call `luaL_ref(L, LUA_REGISTRYINDEX)` to get a stable integer reference
+3. Store the ref in a typed struct (`LuaFunctionRef`, `LuaThreadRef`, `LuaUserdataRef`, `LuaTableRef`)
+4. When done, call `luaL_unref(L, LUA_REGISTRYINDEX, ref)` via the struct's `release()` method
+
+Each ref struct supports default copy (shares the ref — only one copy should call `release()`), move (transfers ownership, invalidates the source), and explicit `release()`. The N-API layer wraps these in `*Data` structs (`LuaFunctionData`, `LuaThreadData`, `LuaUserdataData`, `LuaTableRefData`) that call `release()` in their destructors, stored in vectors on `LuaContext` for automatic cleanup.
+
+### Stack Safety
+
+All core layer methods that touch the Lua stack use `StackGuard` — a RAII helper that records `lua_gettop()` on construction and calls `lua_settop()` on destruction, ensuring the stack is always balanced even if an exception is thrown. This prevents stack leaks which are a common source of subtle bugs in Lua C API code.
+
+### Conversion Functions
+
+Four conversion functions handle the boundary:
+
+| Function | Direction | Layer | Purpose |
+|----------|-----------|-------|---------|
+| `ToLuaValue` | Lua stack → `LuaValue` | Core | Reads a Lua stack slot, produces a `LuaPtr` |
+| `PushLuaValue` | `LuaValue` → Lua stack | Core | Pushes a `LuaPtr` onto the Lua stack |
+| `CoreToNapi` | `LuaValue` → `Napi::Value` | N-API | Converts core values to JS values |
+| `NapiToCoreInstance` | `Napi::Value` → `LuaValue` | N-API | Converts JS values to core values |
+
+There is also a static `NapiToCore` which does the same as `NapiToCoreInstance` but without access to the `LuaContext` instance (cannot handle round-trip detection for userdata/table refs). `NapiToCoreInstance` is the preferred path for all conversions that might involve reference types.
+
+Both `ToLuaValue` and `NapiToCoreInstance` enforce a maximum nesting depth of 100 levels to prevent stack overflow from deeply nested or circular structures.
+
+---
+
+## Script Execution
+
+### Overview
+
+`execute_script()` accepts a Lua source string and returns the result(s). Lua scripts can return zero, one, or multiple values via `return`.
+
+### Architecture
+
+**Core layer:** `ExecuteScript` uses `luaL_loadstring` to compile the script, then `lua_pcall` with `LUA_MULTRET` to execute it. The stack delta (top after vs. before) determines how many values were returned. Each is converted via `ToLuaValue` and collected into a `vector<LuaPtr>`. Errors from compilation or execution are returned as a `string` variant of `ScriptResult`.
+
+**N-API layer:** Single return values are converted directly via `CoreToNapi`. Multiple return values are wrapped in a `Napi::Array`. Zero return values produce `undefined`. Errors become JS exceptions via `Napi::Error::New(...).ThrowAsJavaScriptException()`.
+
+**Why `LUA_MULTRET`:** Lua natively supports multiple return values. Using `LUA_MULTRET` preserves this behavior rather than forcing single-value semantics. On the JS side, multiple returns are destructured with `const [a, b] = lua.execute_script("return 1, 2")`.
+
+---
+
+## Host Function Bridge (JS Callbacks in Lua)
+
+### Overview
+
+JavaScript functions registered via the constructor callbacks object, `set_global()`, or internally via `set_metatable()` become callable from Lua. This is the primary mechanism for JS-to-Lua interop.
+
+### Architecture
+
+**Registration:** Each JS callback is stored in two places:
+1. `js_callbacks` map on `LuaContext` (a `Napi::FunctionReference` keyed by name)
+2. `host_functions_` map on `LuaRuntime` (a `std::function<LuaPtr(vector<LuaPtr>)>` keyed by name)
+
+`RegisterFunction` pushes the function name as a string upvalue and creates a `lua_pushcclosure` with `LuaCallHostFunction` as the C function, then sets it as a Lua global.
+
+**Dispatch (`LuaCallHostFunction`):** This single static C function handles all host function calls from Lua:
+1. Reads the function name from `lua_upvalueindex(1)`
+2. Retrieves the `LuaRuntime*` from the Lua registry (`_lua_core_runtime` key)
+3. Looks up the matching `std::function` in `host_functions_`
+4. Converts all Lua arguments to `LuaPtr` via `ToLuaValue`
+5. Calls the function
+6. Converts the return value back via `PushLuaValue`
+
+**The JS callback wrapper (`CreateJsCallbackWrapper`):** The `std::function` stored in `host_functions_` is a lambda that:
+1. Converts `LuaPtr` args to `napi_value` via `CoreToNapi`
+2. Calls the stored `Napi::FunctionReference`
+3. Converts the JS return value back via `NapiToCoreInstance`
+
+**Why upvalue-based dispatch:** Each Lua closure carries the function name as an upvalue. This avoids needing a separate C function per callback. A single `LuaCallHostFunction` handles all registered callbacks — the upvalue tells it which one to invoke. This is the standard Lua pattern for C function factories.
+
+**Why two maps:** The core layer stores `std::function` (no N-API types). The N-API layer stores `Napi::FunctionReference` (prevents GC of the JS function). The wrapper lambda bridges them. This maintains the layer separation.
+
+---
+
+## Global Variable Management
+
+### Overview
+
+`set_global(name, value)` sets a Lua global from JS. `get_global(name)` reads one back.
+
+### Architecture
+
+**`set_global`:** Functions go through the callback registration path (stored in both maps, registered as closures). Non-function values are converted via `NapiToCoreInstance` and pushed with `PushLuaValue` + `lua_setglobal`.
+
+**`get_global`:** Calls `lua_getglobal` + `ToLuaValue` in the core layer, then `CoreToNapi` in the N-API layer. Uses `StackGuard` so the global read is stack-safe.
+
+**Constructor callbacks:** The callbacks object passed to `new lua_native.init({...})` is iterated in `RegisterCallbacks`. Functions and non-function values are handled identically to `set_global` — the constructor is just syntactic sugar for bulk registration.
+
+---
+
+## Lua Function Returns
+
+### Overview
+
+Lua functions returned from `execute_script()` or passed to JS callbacks become callable JavaScript functions. Closures, upvalues, and Lua state are preserved.
+
+### Architecture
+
+**Core layer:** When `ToLuaValue` encounters `LUA_TFUNCTION`, it pushes a copy of the function and calls `luaL_ref` to anchor it in the registry, returning a `LuaFunctionRef`. When `CallFunction` is called later, it pushes the function from the registry via `lua_rawgeti`, pushes arguments, and calls `lua_pcall`.
+
+**N-API layer:** `CoreToNapi` wraps `LuaFunctionRef` in a `LuaFunctionData` struct (holding the runtime, func ref, and context pointer) and creates a `Napi::Function` with `LuaFunctionCallbackStatic` as the C callback and `LuaFunctionData*` as the function data.
+
+**`LuaFunctionCallbackStatic`:** When the JS function is called:
+1. Extracts the `LuaFunctionData*` from `info.Data()`
+2. Converts JS arguments to `LuaPtr` via `NapiToCoreInstance`
+3. Calls `CallFunction` on the runtime
+4. Converts results back via `CoreToNapi`
+5. Single return → direct value; multiple returns → `Napi::Array`
+
+**Why `NapiToCoreInstance` (not `NapiToCore`):** `LuaFunctionCallbackStatic` uses the instance method so that round-trip detection works. If a Lua function receives a metatabled table Proxy or a userdata handle as an argument, `NapiToCoreInstance` detects the `_tableRef` or `_userdata` markers and reconstructs the original `LuaTableRef` or `LuaUserdataRef` instead of deep-copying the object.
+
+---
+
+## Coroutines
+
+### Overview
+
+`create_coroutine(script)` creates a pausable Lua coroutine. `resume(coro, ...args)` resumes it, returning yielded or final values along with the coroutine status.
+
+### Architecture
+
+**Core layer:**
+- `CreateCoroutine`: Creates a new Lua thread via `lua_newthread`, anchors it in the registry, moves the function onto the thread's stack via `lua_xmove`.
+- `ResumeCoroutine`: Pushes arguments onto the thread's stack, calls `lua_resume`. Collects yielded/returned values from the thread's stack. Returns a `CoroutineResult` with status, values, and optional error.
+- `GetCoroutineStatus`: Checks `lua_status` — `LUA_YIELD` means suspended, `LUA_OK` with an empty stack means dead, otherwise suspended.
+
+**N-API layer:**
+- `CreateCoroutine`: Executes the script to get a function, creates a coroutine from it, wraps the `LuaThreadRef` in a `LuaThreadData`, returns a JS object with `{ _coroutine: External, status: "suspended" }`.
+- `ResumeCoroutine`: Extracts the `LuaThreadData` from the coroutine object's `_coroutine` external, converts JS arguments, resumes, builds a result object with `{ status, values, error? }`, and updates the coroutine object's status.
+
+**Why a separate thread:** Lua coroutines run on their own `lua_State` (thread). This is how Lua implements cooperative multitasking — each coroutine has its own stack but shares the global state with the main thread. The registry reference prevents GC of the thread while JS holds a handle to it.
+
+---
+
+## Error Handling
+
+### Overview
+
+Errors from Lua scripts, host function callbacks, and value conversion are all propagated as JavaScript exceptions with descriptive messages.
+
+### Architecture
+
+**Lua script errors:** `luaL_loadstring` (compile) and `lua_pcall` (execute) both return error codes. On failure, the error message is on top of the Lua stack. The core layer returns it as a `string` variant of `ScriptResult`. The N-API layer converts it to a `Napi::Error`.
+
+**Host function errors:** `LuaCallHostFunction` wraps the call in try/catch. `std::exception` and unknown exceptions are caught and converted to Lua errors via `lua_pushfstring` + `lua_error`. The error message includes the function name for debugging (e.g., `"Host function 'riskyOperation' threw an exception: ..."`).
+
+**Argument conversion errors:** If `ToLuaValue` fails while converting arguments for a host function call, the error is caught and reported with context (e.g., `"Error converting arguments for 'funcName': ..."`). Same for return value conversion.
+
+**Nesting depth:** Both `ToLuaValue` and `NapiToCoreInstance` check a depth counter against `kMaxDepth` (100). Exceeding it throws a `std::runtime_error` which propagates up as a JS exception. This prevents stack overflow from circular or deeply nested structures.
+
+**Why `lua_pcall` (not `lua_call`):** `lua_pcall` runs in protected mode — Lua errors are caught and returned as error codes instead of longjumping past C++ destructors. This is critical for correct RAII behavior (destructors must run) and for clean error propagation to JavaScript.
+
+---
+
+## Bidirectional Data Conversion
+
+### Overview
+
+Values are automatically converted between JavaScript and Lua types when crossing the boundary. The conversion is symmetric — a value that round-trips (JS → Lua → JS) should arrive as the same JS type.
+
+### Type Mapping
+
+| Lua Type | Core Type | JS Type | Notes |
+|----------|-----------|---------|-------|
+| `nil` | `monostate` | `null` | `undefined` also maps to nil |
+| `boolean` | `bool` | `boolean` | |
+| `number` (integer) | `int64_t` | `number` | Lua integers are preserved as int64 internally |
+| `number` (float) | `double` | `number` | |
+| `string` | `std::string` | `string` | Binary-safe via `lua_tolstring`/`lua_pushlstring` |
+| `table` (array) | `LuaArray` | `Array` | Sequential integer keys starting from 1, no metatable |
+| `table` (map) | `LuaTable` | `Object` | String or mixed keys, no metatable |
+| `table` (metatabled) | `LuaTableRef` | `Proxy` | Registry reference, metamethods preserved |
+| `function` | `LuaFunctionRef` | `Function` | Registry reference, callable from JS |
+| `thread` | `LuaThreadRef` | `Object` | `{ _coroutine, status }` |
+| `userdata` (JS-created) | `LuaUserdataRef` | `Object` | Original JS object returned by reference |
+| `userdata` (Lua-created) | `LuaUserdataRef` | `Object` | Opaque `{ _userdata: External }` for round-trip |
+
+### Design Decisions
+
+**Array detection (`isSequentialArray`):** Before converting a plain Lua table, the code iterates with `lua_next` to check if all keys are consecutive integers starting from 1. If so, it becomes a JS `Array`; otherwise a JS `Object`. This matches user expectations — Lua uses tables for both arrays and maps, but JS distinguishes them.
+
+**Integer preservation:** JS has only `number` (IEEE 754 double). When converting JS → Lua, whole numbers within int64 range become Lua integers (via `lua_pushinteger`). When converting Lua → JS, integers become `Number` (which can represent integers exactly up to 2^53). The core layer preserves the distinction (`int64_t` vs `double`) for accurate round-tripping within the C++ layer.
+
+**Binary-safe strings:** `lua_tolstring` with explicit length and `lua_pushlstring` are used instead of `lua_tostring`/`lua_pushstring`. This preserves strings containing embedded null bytes, which are valid in Lua.
+
+---
+
+## Userdata (February 2026)
+
+### Overview
+
+JavaScript objects can be passed into Lua as userdata — Lua holds a reference to the original object, not a copy. Three modes are supported: opaque handles, property-access-enabled handles, and Lua-created userdata passthrough.
+
+### Architecture
+
+**Core layer:**
+- `LuaUserdataRef` struct with `ref_id` (JS object map key), `registry_ref` (for Lua-created passthrough), `opaque` flag, and `proxy` flag
+- Two metatables registered at runtime construction:
+  - `lua_native_userdata` — `__gc` only (opaque handles)
+  - `lua_native_proxy_userdata` — `__gc`, `__index`, `__newindex` (property access)
+- Reference counting via `IncrementUserdataRefCount` / `DecrementUserdataRefCount` with a GC callback to notify the N-API layer when Lua releases a reference
+- `UserdataGC`, `UserdataIndex`, `UserdataNewIndex` static C functions as metamethod handlers
+- `PropertyGetter` / `PropertySetter` callback types set by the N-API layer
+
+**N-API layer:**
+- `UserdataEntry` struct with `Napi::ObjectReference`, `readable`, `writable` flags
+- `js_userdata_` map (`int` ref_id → `UserdataEntry`) for JS object storage
+- GC callback clears entries from `js_userdata_` when Lua releases a reference
+- Property handlers bridge Lua `__index`/`__newindex` to `obj.Get(key)` / `obj.Set(key, value)` on the original JS object
+
+**Lua-created userdata passthrough:** Userdata from Lua libraries (e.g., `io.open()` file handles) are detected by metatable check — if the userdata doesn't match either of our metatables, it's foreign. It's stored in the registry and wrapped as `{ _userdata: External }` on the JS side. `NapiToCoreInstance` detects this marker for round-trip back to Lua.
+
+### Design Decisions
+
+**Two metatables instead of one:** Opaque userdata uses `lua_native_userdata` (only `__gc`), while property-access-enabled userdata uses `lua_native_proxy_userdata` (`__gc` + `__index` + `__newindex`). This prevents accidental property dispatch on opaque handles and makes the metatable check in `ToLuaValue` unambiguous about the proxy flag.
+
+**Reference counting for `__gc`:** When `PushLuaValue` creates a new userdata block (e.g., during round-trip through a host function), it increments the ref count for that ref_id. Each `__gc` decrements it. The JS object is only released from `js_userdata_` when the count reaches zero. This handles the case where multiple Lua userdata blocks share the same ref_id.
+
+**Property handlers as callbacks:** The core layer doesn't know about N-API types. Property access is bridged via `PropertyGetter` / `PropertySetter` callbacks (`std::function`) set by the N-API layer during `LuaContext` construction. The `__index` C function extracts the ref_id from the userdata, retrieves the runtime from the registry, and calls the registered handler.
+
+**Safe destructor ordering:** `~LuaContext` explicitly nulls out the GC callback and property handlers before member destruction begins. This prevents the `__gc` metamethods (which fire during `lua_close()` in `~LuaRuntime`) from accessing `js_userdata_` or calling property handlers on a partially destroyed `LuaContext`.
+
+---
+
+## Explicit Metatable Support (February 2026)
+
+### Overview
+
+`set_metatable()` attaches Lua metatables to global tables from JavaScript, enabling operator overloading, custom indexing, `__tostring`, `__call`, and other metamethods.
+
+### Architecture
+
+**Core layer:**
+- `MetatableEntry` struct: `key` (string), `is_function` (bool), `func_name` (string), `value` (LuaPtr)
+- `StoreHostFunction(name, fn)`: stores in `host_functions_` without creating a Lua global
+- `SetGlobalMetatable(name, entries)`: validates the global exists and is a table, creates a new metatable via `lua_newtable`, pushes each entry as either a C closure or a value, then attaches with `lua_setmetatable`
+
+**N-API layer:**
+- `SetMetatable` iterates JS metatable properties, generates unique function names (`__mt_<id>_<key>`) for function entries, stores JS callbacks via `StoreHostFunction` + `CreateJsCallbackWrapper`, converts non-function values via `NapiToCoreInstance`, builds `vector<MetatableEntry>`, and delegates to `SetGlobalMetatable`
+- `next_metatable_id_` counter ensures unique function names across multiple `set_metatable` calls
+
+All standard Lua metamethods work: `__tostring`, `__add`, `__sub`, `__mul`, `__div`, `__mod`, `__unm`, `__concat`, `__len`, `__eq`, `__lt`, `__le`, `__call`, `__index` (as function or table), `__newindex`.
+
+### Design Decisions
+
+**Closures, not global functions:** JS metamethod functions are stored as host functions with unique generated names (`__mt_1___add`, etc.) rather than registered as globals. This avoids polluting the Lua global namespace with internal metamethod closures. The existing `LuaCallHostFunction` bridge is reused — the same upvalue-based dispatch mechanism that powers `RegisterFunction` works identically for metamethod closures.
+
+**`set_metatable()` only works for global tables.** To set metatables on non-global tables, use `setmetatable()` in Lua code directly. This is a deliberate simplification — the API takes a global name string, which is unambiguous. Supporting arbitrary table references would require the Proxy-based table ref system (which was built later).
+
+---
+
+## Reference-Based Tables with Proxy (February 2026)
+
+### Overview
+
+Metatabled Lua tables are kept as Lua registry references and wrapped in JS Proxy objects, preserving metamethods (`__index`, `__newindex`, `__tostring`, `__add`, etc.) across the Lua/JS boundary. Plain tables (no metatable) continue to deep-copy as before — fully backward compatible.
+
+### Architecture
+
+**Core layer:**
+- `LuaTableRef` struct: `int ref` (Lua registry reference), `lua_State* L`. Same pattern as `LuaFunctionRef`.
+- `ToLuaValue` LUA_TTABLE case: checks `lua_getmetatable()` before deep-copy. If metatable exists, creates `LuaTableRef` via `luaL_ref`. Otherwise falls through to existing deep-copy logic.
+- `PushLuaValue` handles `LuaTableRef`: `lua_rawgeti(L, LUA_REGISTRYINDEX, ref)` to push the original table.
+- Five table operation methods on `LuaRuntime`:
+  - `GetTableField(registry_ref, key)` — uses `lua_getfield` (triggers `__index`), with integer key detection via `strtoll` for `lua_geti`
+  - `SetTableField(registry_ref, key, value)` — uses `lua_setfield` (triggers `__newindex`), with integer key detection for `lua_seti`
+  - `HasTableField(registry_ref, key)` — `lua_getfield` + nil check
+  - `GetTableKeys(registry_ref)` — iterates with `lua_next`
+  - `GetTableLength(registry_ref)` — uses `luaL_len` (triggers `__len`)
+
+**N-API layer:**
+- `LuaTableRefData` struct: holds `shared_ptr<LuaRuntime>`, `LuaTableRef`, and `LuaContext*` pointer
+- `CoreToNapi` handler for `LuaTableRef`: creates a JS Proxy with a target object, a non-enumerable `_tableRef` external for round-trip detection, and a handler with five traps
+- Five static trap functions (`TableRefGetTrap`, `TableRefSetTrap`, `TableRefHasTrap`, `TableRefOwnKeysTrap`, `TableRefGetOwnPropertyDescriptorTrap`) each receive `LuaTableRefData*` via N-API function data
+- `NapiToCoreInstance` round-trip: detects `_tableRef` external on incoming objects (before the existing `_userdata` check) and reconstructs the `LuaTableRef`
+
+### Design Decisions
+
+**Only metatabled tables become refs:** The `lua_getmetatable()` check in `ToLuaValue` is the sole decision point. No opt-in flag needed — metatabled tables get Proxy wrappers, plain tables deep-copy. Fully backward compatible.
+
+**Proxy traps go through the Lua C API:** `lua_getfield`/`lua_setfield` are used (not `lua_rawget`/`lua_rawset`) so that `__index` and `__newindex` metamethods fire naturally on property access.
+
+**"then" suppression:** The `get` trap returns `undefined` for `prop === "then"` to prevent JS from treating the Proxy as a thenable/Promise (which would break `await` and other async patterns).
+
+**`_tableRef` non-enumerable:** Hidden from `Object.keys()` / `for...in` but detectable for round-trip reconstruction. Same pattern as the `_userdata` external used for userdata passthrough.
+
+**Integer key detection:** `GetTableField` and `SetTableField` attempt to parse string keys as integers via `strtoll`. If the key is a pure integer string (e.g., `"1"`, `"42"`), `lua_geti`/`lua_seti` are used instead of `lua_getfield`/`lua_setfield` for correct Lua sequence access.
+
+---
+
+## Module Loading
+
+### Overview
+
+`index.js` handles locating and loading the native `.node` binary across different build configurations and platforms.
+
+### Architecture
+
+The loader tries multiple paths in priority order:
+
+1. **Prebuilds** (`prebuilds/<platform>-<arch>/lua-native`) — for distributed packages
+2. **CMake output** (`build/Debug/<platform>/`, `build/Release/<platform>/`) — for development
+3. **node-gyp output** (`build/Debug/`, `build/Release/`) — for standard builds
+4. **`node-gyp-build` fallback** — scans the build directory using the standard prebuild detection library
+
+The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no binary is found, it throws a descriptive error pointing the user to `npm run build-debug`.
+
+**Why this complexity:** The native binary can end up in different locations depending on the build system (node-gyp vs CMake), build type (Debug vs Release), and platform. Rather than requiring users to copy binaries to a fixed location, the loader searches all reasonable paths. The prebuild path is checked first for installed packages; development paths are fallbacks.
+
+---
+
+## Implementation Timeline
+
+| Feature | Complexity | Date |
+|---------|------------|------|
+| Script execution, data conversion, host functions | Foundation | January 2026 |
+| Lua function returns to JS | Moderate | January 2026 |
+| Coroutine support | Moderate | January 2026 |
+| Expose `get_global` | Low | February 2026 |
+| Opaque userdata + passthrough | Moderate | February 2026 |
+| Full userdata with properties | High | February 2026 |
+| Explicit metatables | Moderate | February 2026 |
+| Reference-based tables with Proxy | High | February 2026 |

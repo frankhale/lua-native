@@ -1135,4 +1135,854 @@ describe('lua-native Node adapter', () => {
       }).toThrow(/function/);
     });
   });
+
+  // ============================================
+  // GET GLOBAL
+  // ============================================
+  describe('get_global', () => {
+    it('gets a number global', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('x', 42);
+      expect(lua.get_global('x')).toBe(42);
+    });
+
+    it('gets a string global', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('name', 'hello');
+      expect(lua.get_global('name')).toBe('hello');
+    });
+
+    it('gets a boolean global', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('flag', true);
+      expect(lua.get_global('flag')).toBe(true);
+    });
+
+    it('gets a table global', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('config', { a: 1, b: 'two' });
+      const result = lua.get_global('config');
+      expect(result).toEqual({ a: 1, b: 'two' });
+    });
+
+    it('gets a global set from Lua script', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('myVar = 999');
+      expect(lua.get_global('myVar')).toBe(999);
+    });
+
+    it('returns null for non-existent global', () => {
+      const lua = new lua_native.init({});
+      expect(lua.get_global('doesNotExist')).toBeNull();
+    });
+
+    it('reflects updated global value', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('x', 10);
+      expect(lua.get_global('x')).toBe(10);
+      lua.set_global('x', 20);
+      expect(lua.get_global('x')).toBe(20);
+    });
+
+    it('gets a global modified by Lua script', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('counter', 0);
+      lua.execute_script('counter = counter + 1');
+      expect(lua.get_global('counter')).toBe(1);
+    });
+  });
+
+  // ============================================
+  // USERDATA - OPAQUE HANDLES (Phase 1)
+  // ============================================
+  describe('userdata - opaque handles', () => {
+    it('stores a JS object as userdata and receives it back in a callback', () => {
+      let received: any = null;
+      const original = { data: [1, 2, 3], name: 'test' };
+      const lua = new lua_native.init({
+        capture: (...args: any[]) => { received = args[0]; }
+      });
+      lua.set_userdata('handle', original);
+      lua.execute_script('capture(handle)');
+      expect(received).toBe(original); // Same reference, not a copy
+    });
+
+    it('userdata preserves object identity', () => {
+      const obj = { id: 42 };
+      let received: any = null;
+      const lua = new lua_native.init({
+        check: (...args: any[]) => { received = args[0]; }
+      });
+      lua.set_userdata('obj', obj);
+      lua.execute_script('check(obj)');
+      expect(received === obj).toBe(true);
+    });
+
+    it('userdata can be passed between Lua variables', () => {
+      const original = { value: 'hello' };
+      let received: any = null;
+      const lua = new lua_native.init({
+        capture: (...args: any[]) => { received = args[0]; }
+      });
+      lua.set_userdata('handle', original);
+      lua.execute_script(`
+        local copy = handle
+        local another = copy
+        capture(another)
+      `);
+      expect(received).toBe(original);
+    });
+
+    it('userdata returned from execute_script maps back to original object', () => {
+      const original = { x: 10, y: 20 };
+      const lua = new lua_native.init({});
+      lua.set_userdata('point', original);
+      const result = lua.execute_script('return point');
+      expect(result).toBe(original);
+    });
+
+    it('multiple userdata handles are independent', () => {
+      const obj1 = { id: 1 };
+      const obj2 = { id: 2 };
+      let r1: any = null, r2: any = null;
+      const lua = new lua_native.init({
+        capture1: (...args: any[]) => { r1 = args[0]; },
+        capture2: (...args: any[]) => { r2 = args[0]; }
+      });
+      lua.set_userdata('a', obj1);
+      lua.set_userdata('b', obj2);
+      lua.execute_script('capture1(a); capture2(b)');
+      expect(r1).toBe(obj1);
+      expect(r2).toBe(obj2);
+    });
+
+    it('userdata works with class instances', () => {
+      class MyClass {
+        value: number;
+        constructor(v: number) { this.value = v; }
+        double() { return this.value * 2; }
+      }
+      const instance = new MyClass(21);
+      let received: any = null;
+      const lua = new lua_native.init({
+        process: (...args: any[]) => {
+          received = args[0];
+          return args[0].double();
+        }
+      });
+      lua.set_userdata('obj', instance);
+      const result = lua.execute_script('return process(obj)');
+      expect(received).toBe(instance);
+      expect(result).toBe(42);
+    });
+
+    it('userdata survives multiple callback round-trips', () => {
+      const original = { count: 0 };
+      const lua = new lua_native.init({
+        increment: (...args: any[]) => {
+          args[0].count++;
+        }
+      });
+      lua.set_userdata('counter', original);
+      lua.execute_script(`
+        increment(counter)
+        increment(counter)
+        increment(counter)
+      `);
+      expect(original.count).toBe(3);
+    });
+
+    it('userdata cleanup on GC', () => {
+      const obj = { data: 'test' };
+      const lua = new lua_native.init({});
+      lua.set_userdata('handle', obj);
+      // Set to nil and force GC
+      lua.execute_script('handle = nil; collectgarbage()');
+      // The global is now nil
+      const result = lua.execute_script('return handle == nil');
+      expect(result).toBe(true);
+    });
+  });
+
+  // ============================================
+  // METATABLE SUPPORT
+  // ============================================
+  describe('metatable support', () => {
+    it('__tostring metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('vec = {x = 1, y = 2}');
+      lua.set_metatable('vec', {
+        __tostring: () => 'custom_tostring'
+      });
+      const result = lua.execute_script('return tostring(vec)');
+      expect(result).toBe('custom_tostring');
+    });
+
+    it('__tostring receives the table as argument', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('vec = {x = 10, y = 20}');
+      lua.set_metatable('vec', {
+        __tostring: (...args: any[]) => {
+          const t = args[0];
+          return `(${t.x}, ${t.y})`;
+        }
+      });
+      const result = lua.execute_script('return tostring(vec)');
+      expect(result).toBe('(10, 20)');
+    });
+
+    it('__add metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 10}; b = {value = 20}');
+      lua.set_metatable('a', {
+        __add: (...args: any[]) => {
+          return (args[0] as any).value + (args[1] as any).value;
+        }
+      });
+      const result = lua.execute_script('return a + b');
+      expect(result).toBe(30);
+    });
+
+    it('__sub metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 30}; b = {value = 10}');
+      lua.set_metatable('a', {
+        __sub: (...args: any[]) => (args[0] as any).value - (args[1] as any).value
+      });
+      const result = lua.execute_script('return a - b');
+      expect(result).toBe(20);
+    });
+
+    it('__mul metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 5}; b = {value = 6}');
+      lua.set_metatable('a', {
+        __mul: (...args: any[]) => (args[0] as any).value * (args[1] as any).value
+      });
+      const result = lua.execute_script('return a * b');
+      expect(result).toBe(30);
+    });
+
+    it('__div metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 20}; b = {value = 4}');
+      lua.set_metatable('a', {
+        __div: (...args: any[]) => (args[0] as any).value / (args[1] as any).value
+      });
+      const result = lua.execute_script('return a / b');
+      expect(result).toBe(5);
+    });
+
+    it('__unm metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 42}');
+      lua.set_metatable('a', {
+        __unm: (...args: any[]) => -(args[0] as any).value
+      });
+      const result = lua.execute_script('return -a');
+      expect(result).toBe(-42);
+    });
+
+    it('__mod metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 17}; b = {value = 5}');
+      lua.set_metatable('a', {
+        __mod: (...args: any[]) => (args[0] as any).value % (args[1] as any).value
+      });
+      const result = lua.execute_script('return a % b');
+      expect(result).toBe(2);
+    });
+
+    it('__concat metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {text = "hello"}; b = {text = " world"}');
+      lua.set_metatable('a', {
+        __concat: (...args: any[]) => (args[0] as any).text + (args[1] as any).text
+      });
+      const result = lua.execute_script('return a .. b');
+      expect(result).toBe('hello world');
+    });
+
+    it('__len metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {items = 5}');
+      lua.set_metatable('a', {
+        __len: (...args: any[]) => (args[0] as any).items
+      });
+      const result = lua.execute_script('return #a');
+      expect(result).toBe(5);
+    });
+
+    it('__eq metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {id = 1}; b = {id = 1}');
+      // Both tables need the same metatable for __eq to fire
+      const mt = {
+        __eq: (...args: any[]) => (args[0] as any).id === (args[1] as any).id
+      };
+      lua.set_metatable('a', mt);
+      lua.set_metatable('b', mt);
+      const result = lua.execute_script('return a == b');
+      expect(result).toBe(true);
+    });
+
+    it('__lt metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 1}; b = {value = 2}');
+      const mt = {
+        __lt: (...args: any[]) => (args[0] as any).value < (args[1] as any).value
+      };
+      lua.set_metatable('a', mt);
+      lua.set_metatable('b', mt);
+      const result = lua.execute_script('return a < b');
+      expect(result).toBe(true);
+    });
+
+    it('__le metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 3}; b = {value = 3}');
+      const mt = {
+        __le: (...args: any[]) => (args[0] as any).value <= (args[1] as any).value
+      };
+      lua.set_metatable('a', mt);
+      lua.set_metatable('b', mt);
+      const result = lua.execute_script('return a <= b');
+      expect(result).toBe(true);
+    });
+
+    it('__call metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {factor = 10}');
+      lua.set_metatable('obj', {
+        __call: (...args: any[]) => {
+          const self = args[0] as any;
+          const x = args[1] as number;
+          return self.factor * x;
+        }
+      });
+      const result = lua.execute_script('return obj(5)');
+      expect(result).toBe(50);
+    });
+
+    it('__index as function', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {}');
+      lua.set_metatable('obj', {
+        __index: (...args: any[]) => {
+          const key = args[1] as string;
+          return 'default_' + key;
+        }
+      });
+      const result = lua.execute_script('return obj.foo');
+      expect(result).toBe('default_foo');
+    });
+
+    it('__index as table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {}');
+      lua.set_metatable('obj', {
+        __index: { fallback_key: 99 }
+      });
+      const result = lua.execute_script('return obj.fallback_key');
+      expect(result).toBe(99);
+    });
+
+    it('__newindex as function', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {}; intercepted = {}');
+      lua.set_metatable('obj', {
+        __newindex: (...args: any[]) => {
+          // Store in a different table via rawset
+          // args: table, key, value - we return the key/value for testing
+          return null;
+        }
+      });
+      // __newindex fires for new keys; the function intercepts assignment
+      // Verify it doesn't throw and the metamethod is called
+      lua.execute_script('obj.newkey = 42');
+      // Since __newindex intercepts, rawget should show nil
+      const result = lua.execute_script('return rawget(obj, "newkey")');
+      expect(result).toBeNull();
+    });
+
+    it('multiple metamethods on one table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 10}; b = {value = 3}');
+      lua.set_metatable('a', {
+        __add: (...args: any[]) => (args[0] as any).value + (args[1] as any).value,
+        __tostring: (...args: any[]) => 'val:' + (args[0] as any).value,
+        __unm: (...args: any[]) => -(args[0] as any).value,
+      });
+      expect(lua.execute_script('return a + b')).toBe(13);
+      expect(lua.execute_script('return tostring(a)')).toBe('val:10');
+      expect(lua.execute_script('return -a')).toBe(-10);
+    });
+
+    it('error: non-existent global', () => {
+      const lua = new lua_native.init({});
+      expect(() => {
+        lua.set_metatable('nonexistent', { __tostring: () => 'x' });
+      }).toThrow(/does not exist/);
+    });
+
+    it('error: non-table global', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('num', 42);
+      expect(() => {
+        lua.set_metatable('num', { __tostring: () => 'x' });
+      }).toThrow(/not a table/);
+    });
+
+    it('metatable on Lua-created global table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('myTable = {x = 5, y = 10}');
+      lua.set_metatable('myTable', {
+        __tostring: (...args: any[]) => {
+          const t = args[0] as any;
+          return `(${t.x}, ${t.y})`;
+        }
+      });
+      const result = lua.execute_script('return tostring(myTable)');
+      expect(result).toBe('(5, 10)');
+    });
+  });
+
+  // ============================================
+  // REFERENCE-BASED TABLES (Metatabled tables as Proxy)
+  // ============================================
+  describe('reference-based tables', () => {
+    it('metatabled table returns as Proxy, not plain object', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {x = 1, y = 2}');
+      lua.set_metatable('t', {
+        __tostring: () => 'custom'
+      });
+      const result = lua.execute_script('return t') as any;
+      expect(typeof result).toBe('object');
+      expect(result).not.toBeNull();
+      // Proxy allows live access to table fields
+      expect(result.x).toBe(1);
+      expect(result.y).toBe(2);
+    });
+
+    it('__index metamethod flows through Proxy get', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {}');
+      lua.set_metatable('t', {
+        __index: (...args: any[]) => {
+          return 'default_' + args[1];
+        }
+      });
+      const result = lua.execute_script('return t') as any;
+      expect(result.missingKey).toBe('default_missingKey');
+    });
+
+    it('__newindex metamethod flows through Proxy set', () => {
+      let interceptedKey = '';
+      let interceptedValue: any = null;
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {}');
+      lua.set_metatable('t', {
+        __newindex: (...args: any[]) => {
+          interceptedKey = args[1];
+          interceptedValue = args[2];
+        }
+      });
+      const result = lua.execute_script('return t') as any;
+      result.newProp = 42;
+      expect(interceptedKey).toBe('newProp');
+      expect(interceptedValue).toBe(42);
+    });
+
+    it('direct property read and write on metatabled table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {x = 10}');
+      lua.set_metatable('t', { __tostring: () => 'T' });
+      const result = lua.execute_script('return t') as any;
+      expect(result.x).toBe(10);
+      result.x = 20;
+      // Verify change is visible in Lua
+      expect(lua.execute_script('return t.x')).toBe(20);
+    });
+
+    it('plain table still deep-copies (backward compat)', () => {
+      const lua = new lua_native.init({});
+      const result = lua.execute_script('return {a = 1, b = 2}') as any;
+      expect(result.a).toBe(1);
+      expect(result.b).toBe(2);
+      // Modifying JS copy should NOT affect Lua
+      result.a = 999;
+      // Lua doesn't have this anonymous table anymore, but behavior is unchanged
+    });
+
+    it('round-trip through JS callback preserves metatabled table', () => {
+      let received: any = null;
+      const lua = new lua_native.init({
+        capture: (...args: any[]) => {
+          received = args[0];
+          return args[0]; // Pass it back
+        }
+      });
+      lua.execute_script('t = {x = 5, y = 10}');
+      lua.set_metatable('t', {
+        __tostring: (...args: any[]) => {
+          return `(${args[0].x}, ${args[0].y})`;
+        }
+      });
+      // Pass table through JS and back to Lua
+      const result = lua.execute_script('return capture(t)');
+      expect(received).not.toBeNull();
+      expect((received as any).x).toBe(5);
+      // The returned value should still work with metamethods in Lua
+      const str = lua.execute_script('return tostring(t)');
+      expect(str).toBe('(5, 10)');
+    });
+
+    it('integer keys work through Proxy', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {10, 20, 30}');
+      lua.set_metatable('t', { __tostring: () => 'array-like' });
+      const result = lua.execute_script('return t') as any;
+      expect(result['1']).toBe(10);
+      expect(result['2']).toBe(20);
+      expect(result['3']).toBe(30);
+    });
+
+    it('Object.keys() works via ownKeys trap', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {a = 1, b = 2, c = 3}');
+      lua.set_metatable('t', { __tostring: () => 'T' });
+      const result = lua.execute_script('return t') as any;
+      const keys = Object.keys(result);
+      expect(keys.sort()).toEqual(['a', 'b', 'c'].sort());
+    });
+
+    it('"key" in obj works via has trap', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {x = 1}');
+      lua.set_metatable('t', { __tostring: () => 'T' });
+      const result = lua.execute_script('return t') as any;
+      expect('x' in result).toBe(true);
+      expect('nonexistent' in result).toBe(false);
+    });
+
+    it('__len via Lua works on round-tripped table', () => {
+      const lua = new lua_native.init({
+        getLen: (...args: any[]) => {
+          return args[0]; // pass back to Lua
+        }
+      });
+      lua.execute_script('t = {items = 5}');
+      lua.set_metatable('t', {
+        __len: (...args: any[]) => (args[0] as any).items
+      });
+      const result = lua.execute_script('local ref = getLen(t); return #ref');
+      expect(result).toBe(5);
+    });
+
+    it('__tostring via Lua works on round-tripped table', () => {
+      const lua = new lua_native.init({
+        passThrough: (...args: any[]) => args[0]
+      });
+      lua.execute_script('t = {name = "hello"}');
+      lua.set_metatable('t', {
+        __tostring: (...args: any[]) => 'name:' + (args[0] as any).name
+      });
+      const result = lua.execute_script('return tostring(passThrough(t))');
+      expect(result).toBe('name:hello');
+    });
+
+    it('__add via Lua works on round-tripped table', () => {
+      const lua = new lua_native.init({
+        passThrough: (...args: any[]) => args[0]
+      });
+      lua.execute_script('a = {value = 10}; b = {value = 20}');
+      lua.set_metatable('a', {
+        __add: (...args: any[]) => (args[0] as any).value + (args[1] as any).value
+      });
+      const result = lua.execute_script('return passThrough(a) + b');
+      expect(result).toBe(30);
+    });
+
+    it('__call via Lua works on round-tripped table', () => {
+      const lua = new lua_native.init({
+        passThrough: (...args: any[]) => args[0]
+      });
+      lua.execute_script('obj = {factor = 10}');
+      lua.set_metatable('obj', {
+        __call: (...args: any[]) => {
+          return (args[0] as any).factor * (args[1] as number);
+        }
+      });
+      const result = lua.execute_script('return passThrough(obj)(5)');
+      expect(result).toBe(50);
+    });
+
+    it('nested metatabled table is also a Proxy', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script(`
+        inner = {val = 42}
+        outer = {child = inner}
+      `);
+      lua.set_metatable('inner', { __tostring: () => 'inner' });
+      lua.set_metatable('outer', { __tostring: () => 'outer' });
+      const result = lua.execute_script('return outer') as any;
+      // outer is a Proxy
+      expect(typeof result).toBe('object');
+      // outer.child should return inner, which is also metatabled
+      const child = result.child;
+      // child is the inner table - since inner has a metatable, it should be a Proxy
+      expect(typeof child).toBe('object');
+      expect(child.val).toBe(42);
+    });
+
+    it('multiple independent Proxies', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {x = 1}; b = {x = 2}');
+      lua.set_metatable('a', { __tostring: () => 'a' });
+      lua.set_metatable('b', { __tostring: () => 'b' });
+      const ra = lua.execute_script('return a') as any;
+      const rb = lua.execute_script('return b') as any;
+      expect(ra.x).toBe(1);
+      expect(rb.x).toBe(2);
+      // Modifying one doesn't affect the other
+      ra.x = 100;
+      expect(ra.x).toBe(100);
+      expect(rb.x).toBe(2);
+    });
+
+    it('not treated as thenable', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('t = {x = 1}');
+      lua.set_metatable('t', { __tostring: () => 'T' });
+      const result = lua.execute_script('return t') as any;
+      // "then" should return undefined, preventing Promise-like behavior
+      expect(result.then).toBeUndefined();
+    });
+  });
+
+  // ============================================
+  // USERDATA - LUA-CREATED PASSTHROUGH (Phase 2)
+  // ============================================
+  describe('userdata - Lua-created passthrough', () => {
+    it('Lua-created userdata can pass through JS callbacks', () => {
+      let received: any = null;
+      const lua = new lua_native.init({
+        passThrough: (...args: any[]) => {
+          received = args[0];
+          return args[0]; // Pass it back
+        }
+      });
+      // io.open returns userdata (a file handle)
+      const result = lua.execute_script(`
+        local f = io.tmpfile()
+        if f then
+          local returned = passThrough(f)
+          f:close()
+          return true
+        end
+        return false
+      `);
+      expect(result).toBe(true);
+      expect(received).toBeDefined();
+      expect(received).not.toBeNull();
+    });
+
+    it('opaque userdata round-trips correctly', () => {
+      const lua = new lua_native.init({
+        identity: (...args: any[]) => args[0]
+      });
+      const result = lua.execute_script(`
+        local f = io.tmpfile()
+        if f then
+          local returned = identity(f)
+          -- returned should be the same file handle
+          returned:write("hello")
+          returned:seek("set")
+          local content = returned:read("*a")
+          returned:close()
+          return content
+        end
+        return "no file"
+      `);
+      expect(result).toBe("hello");
+    });
+  });
+
+  // ============================================
+  // USERDATA - PROPERTY ACCESS (Phase 3)
+  // ============================================
+  describe('userdata - property access', () => {
+    describe('readable', () => {
+      it('reads properties from Lua', () => {
+        const obj = { x: 10, y: 20, name: 'point' };
+        const lua = new lua_native.init({});
+        lua.set_userdata('point', obj, { readable: true });
+        expect(lua.execute_script('return point.x')).toBe(10);
+        expect(lua.execute_script('return point.y')).toBe(20);
+        expect(lua.execute_script('return point.name')).toBe('point');
+      });
+
+      it('non-existent property returns nil', () => {
+        const obj = { x: 10 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true });
+        const result = lua.execute_script('return obj.nonexistent == nil');
+        expect(result).toBe(true);
+      });
+
+      it('reads boolean properties correctly', () => {
+        const obj = { active: true, deleted: false };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true });
+        expect(lua.execute_script('return obj.active')).toBe(true);
+        expect(lua.execute_script('return obj.deleted')).toBe(false);
+      });
+
+      it('reads nested object properties as tables', () => {
+        const obj = { nested: { a: 1, b: 2 } };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true });
+        // nested is returned as a Lua table (one level deep)
+        const result = lua.execute_script('return obj.nested');
+        expect(result).toEqual({ a: 1, b: 2 });
+      });
+
+      it('reads array properties', () => {
+        const obj = { items: [10, 20, 30] };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true });
+        const result = lua.execute_script('return obj.items');
+        expect(result).toEqual([10, 20, 30]);
+      });
+
+      it('reads null properties as nil', () => {
+        const obj = { value: null };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true });
+        const result = lua.execute_script('return obj.value == nil');
+        expect(result).toBe(true);
+      });
+    });
+
+    describe('writable', () => {
+      it('writes properties from Lua', () => {
+        const obj: any = { x: 10, y: 20 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('point', obj, { readable: true, writable: true });
+        lua.execute_script('point.x = 100; point.y = 200');
+        expect(obj.x).toBe(100);
+        expect(obj.y).toBe(200);
+      });
+
+      it('creates new properties from Lua', () => {
+        const obj: any = {};
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true, writable: true });
+        lua.execute_script('obj.newProp = 42');
+        expect(obj.newProp).toBe(42);
+      });
+
+      it('writes different types', () => {
+        const obj: any = {};
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true, writable: true });
+        lua.execute_script(`
+          obj.num = 42
+          obj.str = "hello"
+          obj.bool = true
+        `);
+        expect(obj.num).toBe(42);
+        expect(obj.str).toBe('hello');
+        expect(obj.bool).toBe(true);
+      });
+
+      it('write then read reflects the change', () => {
+        const obj: any = { value: 0 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true, writable: true });
+        lua.execute_script('obj.value = 99');
+        const result = lua.execute_script('return obj.value');
+        expect(result).toBe(99);
+        expect(obj.value).toBe(99);
+      });
+    });
+
+    describe('access control', () => {
+      it('read-only: writes throw a Lua error', () => {
+        const obj = { x: 10 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: true, writable: false });
+        expect(() => {
+          lua.execute_script('obj.x = 20');
+        }).toThrow(/not writable/);
+        expect(obj.x).toBe(10); // Unchanged
+      });
+
+      it('write-only: reads throw a Lua error', () => {
+        const obj: any = { x: 10 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: false, writable: true });
+        expect(() => {
+          lua.execute_script('return obj.x');
+        }).toThrow(/not readable/);
+      });
+
+      it('write-only: writes succeed', () => {
+        const obj: any = { x: 10 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj, { readable: false, writable: true });
+        lua.execute_script('obj.x = 99');
+        expect(obj.x).toBe(99);
+      });
+
+      it('opaque userdata (no options) cannot be indexed', () => {
+        const obj = { x: 10 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('obj', obj);
+        // Accessing properties on opaque userdata should error
+        expect(() => {
+          lua.execute_script('return obj.x');
+        }).toThrow();
+      });
+    });
+
+    describe('property access with callbacks', () => {
+      it('callback receives userdata with properties still accessible', () => {
+        const player = { name: 'Alice', health: 100 };
+        let receivedName: any = null;
+        const lua = new lua_native.init({
+          getName: (...args: any[]) => {
+            receivedName = args[0].name;
+          }
+        });
+        lua.set_userdata('player', player, { readable: true });
+        lua.execute_script('getName(player)');
+        expect(receivedName).toBe('Alice');
+      });
+
+      it('mutations through userdata are visible in JS', () => {
+        const state: any = { score: 0 };
+        const lua = new lua_native.init({});
+        lua.set_userdata('state', state, { readable: true, writable: true });
+        lua.execute_script(`
+          for i = 1, 10 do
+            state.score = state.score + 1
+          end
+        `);
+        expect(state.score).toBe(10);
+      });
+
+      it('multiple proxy userdata objects are independent', () => {
+        const obj1: any = { value: 'a' };
+        const obj2: any = { value: 'b' };
+        const lua = new lua_native.init({});
+        lua.set_userdata('o1', obj1, { readable: true, writable: true });
+        lua.set_userdata('o2', obj2, { readable: true, writable: true });
+        lua.execute_script('o1.value = "x"; o2.value = "y"');
+        expect(obj1.value).toBe('x');
+        expect(obj2.value).toBe('y');
+      });
+    });
+  });
 });
