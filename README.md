@@ -19,7 +19,8 @@ the usage is identical across all three runtimes.
 - Execute Lua scripts from Node.js
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
-- Global variable management
+- Global variable management (get and set)
+- Userdata support — pass JavaScript objects to Lua by reference with optional property access
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
 - Cross-platform support (Windows, macOS, Linux)
@@ -122,6 +123,10 @@ lua.set_global("times2", (n) => n * 2);
 // Use globals in Lua script
 const [a, b] = lua.execute_script("return x, times2(x)");
 console.log(a, b); // 7, 14
+
+// Read globals back from Lua
+lua.execute_script("y = x * 3");
+console.log(lua.get_global("y")); // 21
 ```
 
 ### Complex Data Structures
@@ -294,6 +299,83 @@ while (result.status === "suspended") {
 console.log(values); // [1, 4, 9, 16, 25]
 ```
 
+### Userdata
+
+JavaScript objects can be passed into Lua as userdata — Lua holds a reference to
+the original object, not a copy. When the userdata flows back to JavaScript
+(through callbacks or return values), the original object is returned.
+
+#### Opaque Handles
+
+By default, userdata is opaque — Lua can pass it around but cannot read or
+modify its properties:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({});
+
+const connection = { host: "localhost", port: 5432, connected: true };
+lua.set_userdata("db", connection);
+
+// Lua can pass the handle to JavaScript callbacks
+lua.set_global("useConnection", (conn) => {
+  console.log(conn === connection); // true — same object
+  console.log(conn.host); // 'localhost'
+});
+
+lua.execute_script("useConnection(db)");
+```
+
+#### Property Access
+
+You can grant Lua read and/or write access to the object's properties:
+
+```javascript
+const player = { name: "Alice", health: 100, score: 0 };
+
+// Read-only access
+lua.set_userdata("player", player, { readable: true });
+
+lua.execute_script(`
+  print(player.name)    -- "Alice"
+  print(player.health)  -- 100
+`);
+
+// Read-write access
+lua.set_userdata("state", { lives: 3, level: 1 }, { readable: true, writable: true });
+
+lua.execute_script(`
+  state.level = state.level + 1
+  state.lives = state.lives - 1
+`);
+
+console.log(lua.get_global("state")); // Changes are visible in JS
+```
+
+#### Lua-Created Userdata Passthrough
+
+Userdata created by Lua libraries (e.g., `io.open()` file handles) can pass
+through JavaScript callbacks and back to Lua without losing their identity:
+
+```javascript
+const lua = new lua_native.init({
+  processFile: (fileHandle) => {
+    // fileHandle is opaque to JS, but can be returned to Lua
+    return fileHandle;
+  },
+});
+
+lua.execute_script(`
+  local f = io.tmpfile()
+  local f2 = processFile(f)
+  f2:write("hello")
+  f2:seek("set")
+  print(f2:read("*a"))  -- "hello"
+  f2:close()
+`);
+```
+
 ## TypeScript Support
 
 The module includes comprehensive TypeScript definitions:
@@ -306,6 +388,7 @@ import type {
   LuaCoroutine,
   CoroutineResult,
   LuaFunction,
+  UserdataOptions,
 } from "lua-native";
 
 // Type-safe callback definition
@@ -316,6 +399,10 @@ const callbacks: LuaCallbacks = {
 
 const lua: LuaContext = new lua_native.init(callbacks);
 const result: number = lua.execute_script("return add(10, 20)");
+
+// Type-safe global access
+lua.set_global("x", 42);
+const x = lua.get_global("x"); // LuaValue
 
 // Type-safe coroutine usage
 const coro: LuaCoroutine = lua.create_coroutine(`
@@ -334,6 +421,10 @@ const fn = lua.execute_script<LuaFunction>(
   "return function(a, b) return a + b end",
 );
 console.log(fn(5, 3)); // 8
+
+// Type-safe userdata
+const opts: UserdataOptions = { readable: true, writable: true };
+lua.set_userdata("player", { name: "Alice", score: 0 }, opts);
 ```
 
 ## API Reference
@@ -368,6 +459,29 @@ Sets a global variable or function in the Lua environment.
 
 - `name`: Name of the global variable
 - `value`: Value to set (function, number, string, boolean, or object)
+
+### `LuaContext.get_global(name)`
+
+Gets a global variable from the Lua environment.
+
+**Parameters:**
+
+- `name`: Name of the global variable
+
+**Returns:** The value of the global (converted to JavaScript), or `null` if not set
+
+### `LuaContext.set_userdata(name, value, options?)`
+
+Sets a JavaScript object as userdata in the Lua environment. The object is
+passed by reference — Lua holds a handle to the original object, not a copy.
+
+**Parameters:**
+
+- `name`: The global variable name in Lua
+- `value`: The JavaScript object to store as userdata
+- `options` (optional): Access control for property access from Lua
+  - `readable`: Allow Lua to read properties via `__index` (default: `false`)
+  - `writable`: Allow Lua to write properties via `__newindex` (default: `false`)
 
 ### `LuaContext.create_coroutine(script)`
 
@@ -409,12 +523,13 @@ Resumes a suspended coroutine with optional arguments.
 | `table` (object-like) | `Object`        | String or mixed keys                       |
 | `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS           |
 | `thread`              | `LuaCoroutine`  | Created via `create_coroutine()`           |
+| `userdata`            | `Object`        | JS-created via `set_userdata()`, returned by reference. Lua-created userdata passes through as opaque handles |
 
 ## Limitations
 
-- **Nesting depth limit** - Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
-- **No metatable support** - Lua metatables are not accessible or configurable from JavaScript.
-- **No userdata support** - Lua userdata types are not supported.
+- **Nesting depth limit** — Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
+- **No metatable support for tables** — Lua metatables on tables are not accessible or configurable from JavaScript. Userdata metatables (`__gc`, `__index`, `__newindex`) are handled internally.
+- **Tables are copied, not referenced** — When Lua tables are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Use `set_userdata()` for reference semantics.
 
 ## Development
 
@@ -456,4 +571,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-13 February 2026
+15 February 2026

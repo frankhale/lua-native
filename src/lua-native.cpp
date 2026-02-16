@@ -3,14 +3,11 @@
 #include <cmath>
 #include <limits>
 
-static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value,
-                                   std::shared_ptr<lua_core::LuaRuntime> runtime);
-
 static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
   auto* data = static_cast<LuaFunctionData*>(info.Data());
-  if (!data || !data->runtime) {
+  if (!data || !data->runtime || !data->context) {
     Napi::Error::New(env, "Invalid Lua function reference").ThrowAsJavaScriptException();
     return env.Undefined();
   }
@@ -20,7 +17,8 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   args.reserve(info.Length());
   try {
     for (size_t i = 0; i < info.Length(); ++i) {
-      args.push_back(std::make_shared<lua_core::LuaValue>(LuaContext::NapiToCore(info[i])));
+      args.push_back(std::make_shared<lua_core::LuaValue>(
+        data->context->NapiToCoreInstance(info[i])));
     }
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -42,77 +40,23 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
 
   // For single return value, return it directly
   if (values.size() == 1) {
-    return LuaValueToNapi(env, *values[0], data->runtime);
+    return data->context->CoreToNapi(*values[0]);
   }
 
   // For multiple return values, return as array
   Napi::Array arr = Napi::Array::New(env, values.size());
   for (size_t i = 0; i < values.size(); ++i) {
-    arr.Set(i, LuaValueToNapi(env, *values[i], data->runtime));
+    arr.Set(i, data->context->CoreToNapi(*values[i]));
   }
   return arr;
-}
-
-static Napi::Value LuaValueToNapi(Napi::Env env, const lua_core::LuaValue& value,
-                                   std::shared_ptr<lua_core::LuaRuntime> runtime = nullptr) {
-  return std::visit(
-    [&](const auto& v) -> Napi::Value {
-      using T = std::decay_t<decltype(v)>;
-      if constexpr (std::is_same_v<T, std::monostate>) {
-        return env.Null();
-      } else if constexpr (std::is_same_v<T, bool>) {
-        return Napi::Boolean::New(env, v);
-      } else if constexpr (std::is_same_v<T, int64_t>) {
-        return Napi::Number::New(env, static_cast<double>(v));
-      } else if constexpr (std::is_same_v<T, double>) {
-        return Napi::Number::New(env, v);
-      } else if constexpr (std::is_same_v<T, std::string>) {
-        return Napi::String::New(env, v);
-      } else if constexpr (std::is_same_v<T, lua_core::LuaArray>) {
-        Napi::Array arr = Napi::Array::New(env, v.size());
-        for (size_t i = 0; i < v.size(); ++i) {
-          arr.Set(i, LuaValueToNapi(env, *v[i], runtime));
-        }
-        return arr;
-      } else if constexpr (std::is_same_v<T, lua_core::LuaTable>) {
-        Napi::Object obj = Napi::Object::New(env);
-        for (const auto& [k, val] : v) {
-          obj.Set(k, LuaValueToNapi(env, *val, runtime));
-        }
-        return obj;
-      } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
-        if (runtime) {
-          // Create wrapper data and store it in the runtime for cleanup
-          auto data = std::make_unique<LuaFunctionData>(runtime, v);
-          auto* dataPtr = data.release();
-          runtime->StoreFunctionData(dataPtr, [](void* ptr) { delete static_cast<LuaFunctionData*>(ptr); });
-          return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
-        }
-        return env.Undefined();
-      } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
-        if (runtime) {
-          auto data = std::make_unique<LuaThreadData>(runtime, v);
-          auto* dataPtr = data.release();
-          runtime->StoreFunctionData(dataPtr, [](void* ptr) { delete static_cast<LuaThreadData*>(ptr); });
-          Napi::Object coro = Napi::Object::New(env);
-          coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr));
-          lua_core::CoroutineStatus status = runtime->GetCoroutineStatus(v);
-          coro.Set("status", Napi::String::New(env,
-            status == lua_core::CoroutineStatus::Suspended ? "suspended" :
-            status == lua_core::CoroutineStatus::Running ? "running" : "dead"));
-          return coro;
-        }
-        return env.Undefined();
-      }
-      return env.Undefined();
-    },
-    value.value);
 }
 
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   const Napi::Function func = DefineClass(env, "LuaContext", {
     InstanceMethod("execute_script", &LuaContext::ExecuteScript),
     InstanceMethod("set_global", &LuaContext::SetGlobal),
+    InstanceMethod("get_global", &LuaContext::GetGlobal),
+    InstanceMethod("set_userdata", &LuaContext::SetUserdata),
     InstanceMethod("create_coroutine", &LuaContext::CreateCoroutine),
     InstanceMethod("resume", &LuaContext::ResumeCoroutine)
   });
@@ -128,6 +72,37 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
 LuaContext::LuaContext(const Napi::CallbackInfo& info)
   : ObjectWrap(info), env(info.Env()) {
   runtime = std::make_shared<lua_core::LuaRuntime>(true);
+
+  // Set up userdata GC callback
+  runtime->SetUserdataGCCallback([this](int ref_id) {
+    js_userdata_.erase(ref_id);
+  });
+
+  // Set up property handlers for proxy userdata
+  runtime->SetPropertyHandlers(
+    // Getter (__index)
+    [this](int ref_id, const std::string& key) -> lua_core::LuaPtr {
+      auto it = js_userdata_.find(ref_id);
+      if (it == js_userdata_.end()) {
+        return std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::nil());
+      }
+      if (!it->second.readable) {
+        throw std::runtime_error("userdata is not readable");
+      }
+      Napi::Value val = it->second.object.Value().Get(key);
+      return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+    },
+    // Setter (__newindex)
+    [this](int ref_id, const std::string& key, const lua_core::LuaPtr& value) {
+      auto it = js_userdata_.find(ref_id);
+      if (it == js_userdata_.end()) return;
+      if (!it->second.writable) {
+        throw std::runtime_error("userdata is not writable");
+      }
+      it->second.object.Value().Set(key, CoreToNapi(*value));
+    }
+  );
+
   if (info.Length() > 0 && info[0].IsObject()) {
     RegisterCallbacks(info[0].As<Napi::Object>());
   }
@@ -178,7 +153,62 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
-LuaContext::~LuaContext() = default;
+Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string name as first argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string name = info[0].As<Napi::String>().Utf8Value();
+  auto result = runtime->GetGlobal(name);
+  return CoreToNapi(*result);
+}
+
+Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
+  if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
+    Napi::TypeError::New(env, "Expected (string, object[, options])").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string name = info[0].As<Napi::String>().Utf8Value();
+
+  bool readable = false;
+  bool writable = false;
+
+  if (info.Length() >= 3 && info[2].IsObject()) {
+    auto options = info[2].As<Napi::Object>();
+    if (options.Has("readable") && options.Get("readable").IsBoolean()) {
+      readable = options.Get("readable").As<Napi::Boolean>().Value();
+    }
+    if (options.Has("writable") && options.Get("writable").IsBoolean()) {
+      writable = options.Get("writable").As<Napi::Boolean>().Value();
+    }
+  }
+
+  int ref_id = next_userdata_id_++;
+
+  UserdataEntry entry;
+  entry.object = Napi::Persistent(info[1].As<Napi::Object>());
+  entry.readable = readable;
+  entry.writable = writable;
+  js_userdata_[ref_id] = std::move(entry);
+
+  if (readable || writable) {
+    runtime->CreateProxyUserdataGlobal(name, ref_id);
+  } else {
+    runtime->CreateUserdataGlobal(name, ref_id);
+  }
+
+  return env.Undefined();
+}
+
+LuaContext::~LuaContext() {
+  // Clear callbacks to prevent accessing member state during lua_close()
+  if (runtime) {
+    runtime->SetUserdataGCCallback(nullptr);
+    runtime->SetPropertyHandlers(nullptr, nullptr);
+  }
+}
 
 lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::string& name) {
   return [this, name](const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
@@ -265,6 +295,20 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   }
 
   if (type == napi_object) {
+    // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
+    if (value.IsObject()) {
+      auto obj = value.As<Napi::Object>();
+      if (obj.Has("_userdata") && obj.Get("_userdata").IsExternal()) {
+        auto* data = obj.Get("_userdata").As<Napi::External<LuaUserdataData>>().Data();
+        if (data) {
+          return lua_core::LuaValue::from(lua_core::LuaUserdataRef(
+            data->userdataRef.ref_id, data->userdataRef.L,
+            data->userdataRef.opaque, data->userdataRef.registry_ref,
+            data->userdataRef.proxy));
+        }
+      }
+    }
+
     if (value.IsArray()) {
       const auto arr = value.As<Napi::Array>();
       lua_core::LuaArray coreArr;
@@ -367,7 +411,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           }
           return obj;
         } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
-          auto data = std::make_unique<LuaFunctionData>(runtime, v);
+          auto data = std::make_unique<LuaFunctionData>(runtime, v, this);
           auto* dataPtr = data.get();
           lua_function_data_.push_back(std::move(data));
           return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
@@ -383,6 +427,23 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
             status == lua_core::CoroutineStatus::Suspended ? "suspended" :
             status == lua_core::CoroutineStatus::Running ? "running" : "dead"));
           return coro;
+        } else if constexpr (std::is_same_v<T, lua_core::LuaUserdataRef>) {
+          if (!v.opaque) {
+            // JS-created userdata - return the original JS object
+            auto it = js_userdata_.find(v.ref_id);
+            if (it != js_userdata_.end()) {
+              return it->second.object.Value();
+            }
+            return env.Null();
+          } else {
+            // Lua-created userdata - wrap as opaque handle for round-trip
+            auto data = std::make_unique<LuaUserdataData>(runtime, v);
+            auto* dataPtr = data.get();
+            lua_userdata_data_.push_back(std::move(data));
+            Napi::Object handle = Napi::Object::New(env);
+            handle.Set("_userdata", Napi::External<LuaUserdataData>::New(env, dataPtr));
+            return handle;
+          }
         }
         return env.Undefined();
       },

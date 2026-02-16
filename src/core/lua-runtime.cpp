@@ -37,6 +37,10 @@ LuaRuntime::LuaRuntime(const bool openStdLibs) {
   // Store the runtime in registry for callbacks
   lua_pushlightuserdata(L_, this);
   lua_setfield(L_, LUA_REGISTRYINDEX, "_lua_core_runtime");
+
+  // Register userdata metatables
+  RegisterUserdataMetatable();
+  RegisterProxyUserdataMetatable();
 }
 
 LuaRuntime::~LuaRuntime() {
@@ -51,6 +55,135 @@ LuaRuntime::~LuaRuntime() {
     L_ = nullptr;
   }
 }
+
+// --- Userdata metatable registration ---
+
+void LuaRuntime::RegisterUserdataMetatable() {
+  luaL_newmetatable(L_, kUserdataMetaName);
+  lua_pushcfunction(L_, UserdataGC);
+  lua_setfield(L_, -2, "__gc");
+  lua_pop(L_, 1);
+}
+
+void LuaRuntime::RegisterProxyUserdataMetatable() {
+  luaL_newmetatable(L_, kProxyUserdataMetaName);
+  lua_pushcfunction(L_, UserdataGC);
+  lua_setfield(L_, -2, "__gc");
+  lua_pushcfunction(L_, UserdataIndex);
+  lua_setfield(L_, -2, "__index");
+  lua_pushcfunction(L_, UserdataNewIndex);
+  lua_setfield(L_, -2, "__newindex");
+  lua_pop(L_, 1);
+}
+
+// --- Userdata metamethods ---
+
+int LuaRuntime::UserdataGC(lua_State* L) {
+  auto* block = static_cast<int*>(lua_touserdata(L, 1));
+  if (!block) return 0;
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  if (runtime) {
+    runtime->DecrementUserdataRefCount(*block);
+  }
+  return 0;
+}
+
+int LuaRuntime::UserdataIndex(lua_State* L) {
+  auto* block = static_cast<int*>(lua_touserdata(L, 1));
+  if (!block) return 0;
+
+  const char* key = lua_tostring(L, 2);
+  if (!key) return 0;
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  if (runtime && runtime->property_getter_) {
+    try {
+      auto result = runtime->property_getter_(*block, key);
+      PushLuaValue(L, result);
+      return 1;
+    } catch (const std::exception& e) {
+      lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
+      lua_error(L);
+    }
+  }
+  lua_pushnil(L);
+  return 1;
+}
+
+int LuaRuntime::UserdataNewIndex(lua_State* L) {
+  auto* block = static_cast<int*>(lua_touserdata(L, 1));
+  if (!block) return 0;
+
+  const char* key = lua_tostring(L, 2);
+  if (!key) return 0;
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  if (runtime && runtime->property_setter_) {
+    try {
+      auto value = ToLuaValue(L, 3);
+      runtime->property_setter_(*block, key, value);
+    } catch (const std::exception& e) {
+      lua_pushfstring(L, "Error writing property '%s': %s", key, e.what());
+      lua_error(L);
+    }
+  }
+  return 0;
+}
+
+// --- Userdata support methods ---
+
+void LuaRuntime::SetUserdataGCCallback(UserdataGCCallback cb) {
+  userdata_gc_callback_ = std::move(cb);
+}
+
+void LuaRuntime::SetPropertyHandlers(PropertyGetter getter, PropertySetter setter) {
+  property_getter_ = std::move(getter);
+  property_setter_ = std::move(setter);
+}
+
+void LuaRuntime::CreateUserdataGlobal(const std::string& name, int ref_id) {
+  auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
+  *block = ref_id;
+  luaL_setmetatable(L_, kUserdataMetaName);
+  lua_setglobal(L_, name.c_str());
+  IncrementUserdataRefCount(ref_id);
+}
+
+void LuaRuntime::CreateProxyUserdataGlobal(const std::string& name, int ref_id) {
+  auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
+  *block = ref_id;
+  luaL_setmetatable(L_, kProxyUserdataMetaName);
+  lua_setglobal(L_, name.c_str());
+  IncrementUserdataRefCount(ref_id);
+}
+
+void LuaRuntime::IncrementUserdataRefCount(int ref_id) {
+  userdata_ref_counts_[ref_id]++;
+}
+
+void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
+  auto it = userdata_ref_counts_.find(ref_id);
+  if (it != userdata_ref_counts_.end()) {
+    if (--it->second <= 0) {
+      userdata_ref_counts_.erase(it);
+      if (userdata_gc_callback_) {
+        userdata_gc_callback_(ref_id);
+      }
+    }
+  }
+}
+
+// --- Host function bridge ---
 
 int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   const char* func_name = lua_tostring(L, lua_upvalueindex(1));
@@ -185,6 +318,8 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
   return results;
 }
 
+// --- Value conversion ---
+
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
   if (depth > kMaxDepth) {
     throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
@@ -251,6 +386,29 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
       const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
       return std::make_shared<LuaValue>(LuaValue::from(LuaThreadRef(ref, L, thread)));
     }
+    case LUA_TUSERDATA: {
+      // Check if it's our proxy userdata (property-access-enabled)
+      if (luaL_testudata(L, abs_index, kProxyUserdataMetaName)) {
+        auto* block = static_cast<int*>(lua_touserdata(L, abs_index));
+        if (block) {
+          return std::make_shared<LuaValue>(LuaValue::from(
+            LuaUserdataRef(*block, L, false, LUA_NOREF, true)));
+        }
+      }
+      // Check if it's our opaque userdata
+      if (luaL_testudata(L, abs_index, kUserdataMetaName)) {
+        auto* block = static_cast<int*>(lua_touserdata(L, abs_index));
+        if (block) {
+          return std::make_shared<LuaValue>(LuaValue::from(
+            LuaUserdataRef(*block, L)));
+        }
+      }
+      // Lua-created userdata (from libraries like io) - store as opaque registry ref
+      lua_pushvalue(L, abs_index);
+      const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+      return std::make_shared<LuaValue>(LuaValue::from(
+        LuaUserdataRef(-1, L, true, ref)));
+    }
     default:
       return std::make_shared<LuaValue>(LuaValue::nil());
   }
@@ -295,10 +453,27 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
           lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
         } else if constexpr (std::is_same_v<T, LuaThreadRef>) {
           lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
+        } else if constexpr (std::is_same_v<T, LuaUserdataRef>) {
+          if (v.opaque) {
+            // Lua-created userdata - push from registry
+            lua_rawgeti(L, LUA_REGISTRYINDEX, v.registry_ref);
+          } else {
+            // JS-created userdata - create a new userdata block with same ref_id
+            auto* block = static_cast<int*>(lua_newuserdata(L, sizeof(int)));
+            *block = v.ref_id;
+            luaL_setmetatable(L, v.proxy ? kProxyUserdataMetaName : kUserdataMetaName);
+            // Increment ref count so __gc balances correctly
+            lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+            auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+            lua_pop(L, 1);
+            if (runtime) runtime->IncrementUserdataRefCount(v.ref_id);
+          }
         }
       },
       value->value);
 }
+
+// --- Coroutine support ---
 
 std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFunctionRef& funcRef) const {
   StackGuard guard(L_);

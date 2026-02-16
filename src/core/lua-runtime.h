@@ -100,6 +100,53 @@ struct LuaThreadRef {
   }
 };
 
+// Holds a reference to userdata.
+// For JS-created userdata: ref_id maps to a JS object, registry_ref is LUA_NOREF.
+// For Lua-created userdata (opaque passthrough): ref_id is -1, registry_ref holds the Lua registry reference.
+struct LuaUserdataRef {
+  int ref_id;           // JS object map key (-1 if opaque/Lua-created)
+  int registry_ref;     // Lua registry ref (for opaque/Lua-created passthrough)
+  lua_State* L;
+  bool opaque;          // true = Lua-created userdata (can't inspect internals)
+  bool proxy;           // true = property access enabled (__index/__newindex)
+
+  LuaUserdataRef(int id, lua_State* state, bool is_opaque = false,
+                 int reg_ref = LUA_NOREF, bool is_proxy = false)
+    : ref_id(id), registry_ref(reg_ref), L(state),
+      opaque(is_opaque), proxy(is_proxy) {}
+
+  LuaUserdataRef(const LuaUserdataRef&) = default;
+  LuaUserdataRef& operator=(const LuaUserdataRef&) = default;
+
+  LuaUserdataRef(LuaUserdataRef&& other) noexcept
+    : ref_id(other.ref_id), registry_ref(other.registry_ref),
+      L(other.L), opaque(other.opaque), proxy(other.proxy) {
+    other.registry_ref = LUA_NOREF;
+    other.L = nullptr;
+  }
+
+  LuaUserdataRef& operator=(LuaUserdataRef&& other) noexcept {
+    if (this != &other) {
+      release();
+      ref_id = other.ref_id;
+      registry_ref = other.registry_ref;
+      L = other.L;
+      opaque = other.opaque;
+      proxy = other.proxy;
+      other.registry_ref = LUA_NOREF;
+      other.L = nullptr;
+    }
+    return *this;
+  }
+
+  void release() {
+    if (opaque && L && registry_ref != LUA_NOREF) {
+      luaL_unref(L, LUA_REGISTRYINDEX, registry_ref);
+      registry_ref = LUA_NOREF;
+    }
+  }
+};
+
 enum class CoroutineStatus {
   Suspended,
   Running,
@@ -122,7 +169,8 @@ struct LuaValue {
       LuaArray,
       LuaTable,
       LuaFunctionRef,
-      LuaThreadRef>;
+      LuaThreadRef,
+      LuaUserdataRef>;
   Variant value;
 
   LuaValue() = default;
@@ -139,6 +187,7 @@ struct LuaValue {
   static LuaValue from(LuaTable tbl) { return LuaValue{Variant{std::move(tbl)}}; }
   static LuaValue from(LuaFunctionRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
   static LuaValue from(LuaThreadRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
+  static LuaValue from(LuaUserdataRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
 };
 
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
@@ -146,6 +195,9 @@ using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
 class LuaRuntime {
 public:
   using Function = std::function<LuaPtr(const std::vector<LuaPtr>&)>;
+  using UserdataGCCallback = std::function<void(int)>;
+  using PropertyGetter = std::function<LuaPtr(int, const std::string&)>;
+  using PropertySetter = std::function<void(int, const std::string&, const LuaPtr&)>;
 
   explicit LuaRuntime(bool openStdLibs = true);
   ~LuaRuntime();
@@ -171,6 +223,14 @@ public:
                                                  const std::vector<LuaPtr>& args) const;
   [[nodiscard]] CoroutineStatus GetCoroutineStatus(const LuaThreadRef& threadRef) const;
 
+  // Userdata support
+  void SetUserdataGCCallback(UserdataGCCallback cb);
+  void SetPropertyHandlers(PropertyGetter getter, PropertySetter setter);
+  void CreateUserdataGlobal(const std::string& name, int ref_id);
+  void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
+  void IncrementUserdataRefCount(int ref_id);
+  void DecrementUserdataRefCount(int ref_id);
+
   [[nodiscard]] lua_State* RawState() const { return L_; }
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
@@ -181,13 +241,27 @@ public:
   }
 
   static constexpr int kMaxDepth = 100;
+  static constexpr const char* kUserdataMetaName = "lua_native_userdata";
+  static constexpr const char* kProxyUserdataMetaName = "lua_native_proxy_userdata";
 
 private:
   lua_State* L_ { nullptr };
   std::unordered_map<std::string, Function> host_functions_;
   std::vector<std::pair<void*, void (*)(void*)>> stored_function_data_;
 
+  // Userdata support
+  UserdataGCCallback userdata_gc_callback_;
+  std::unordered_map<int, int> userdata_ref_counts_;
+  PropertyGetter property_getter_;
+  PropertySetter property_setter_;
+
+  void RegisterUserdataMetatable();
+  void RegisterProxyUserdataMetatable();
+
   static int LuaCallHostFunction(lua_State* L);
+  static int UserdataGC(lua_State* L);
+  static int UserdataIndex(lua_State* L);
+  static int UserdataNewIndex(lua_State* L);
 };
 
 } // namespace lua_core
