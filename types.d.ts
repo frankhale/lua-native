@@ -111,6 +111,16 @@ export interface LuaContext {
   execute_script<T extends LuaValue | LuaValue[] = LuaValue>(script: string): T;
 
   /**
+   * Executes a Lua file and returns the result.
+   * Use the generic parameter to specify the expected return type.
+   * @param filepath The path to the Lua file to execute
+   * @returns The result of the file execution
+   * @example
+   * const result = lua.execute_file<number>('./scripts/init.lua');
+   */
+  execute_file<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): T;
+
+  /**
    * Sets a global variable or function in the Lua environment
    * @param name The name of the global variable or function
    * @param value The value to set (function, number, boolean, string, or object)

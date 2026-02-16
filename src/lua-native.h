@@ -21,7 +21,6 @@ struct LuaFunctionData {
     : runtime(std::move(rt)), funcRef(std::move(ref)), context(ctx) {}
 
   ~LuaFunctionData() {
-    // Release the Lua registry reference when this data is destroyed
     funcRef.release();
   }
 };
@@ -79,6 +78,7 @@ public:
     ~LuaContext() override;
 
     Napi::Value ExecuteScript(const Napi::CallbackInfo& info);
+    Napi::Value ExecuteFile(const Napi::CallbackInfo& info);
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
     Napi::Value GetGlobal(const Napi::CallbackInfo& info);
     Napi::Value SetUserdata(const Napi::CallbackInfo& info);

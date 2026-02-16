@@ -304,6 +304,34 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   return results;
 }
 
+ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
+  if (filepath.empty()) {
+    return std::string("File path cannot be empty");
+  }
+
+  const int stackBefore = lua_gettop(L_);
+
+  if (luaL_loadfile(L_, filepath.c_str()) || lua_pcall(L_, 0, LUA_MULTRET, 0)) {
+    std::string error = lua_tostring(L_, -1);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  const int nresults = lua_gettop(L_) - stackBefore;
+  std::vector<LuaPtr> results;
+  results.reserve(nresults);
+  try {
+    for (int i = 0; i < nresults; ++i) {
+      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+    }
+  } catch (const std::exception& e) {
+    lua_pop(L_, nresults);
+    return std::string(e.what());
+  }
+  lua_pop(L_, nresults);
+  return results;
+}
+
 void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
   PushLuaValue(L_, value);
   lua_setglobal(L_, name.c_str());

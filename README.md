@@ -13,7 +13,7 @@ data structures.
 
 ## Features
 
-- Execute Lua scripts from Node.js
+- Execute Lua scripts and files from Node.js
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Global variable management (get and set)
@@ -91,6 +91,48 @@ const lua = new lua_native.init({});
 // Execute a simple script
 const result = lua.execute_script("return 42");
 console.log(result); // 42
+```
+
+### File Execution
+
+Execute Lua files directly instead of passing script strings:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({
+  greet: (name) => `Hello, ${name}!`,
+});
+
+// Execute a Lua file
+const result = lua.execute_file("./scripts/init.lua");
+console.log(result);
+```
+
+Return values, globals, and callbacks all work exactly as with `execute_script`:
+
+```javascript
+// scripts/math.lua:
+//   return 6 * 7
+
+const answer = lua.execute_file("./scripts/math.lua");
+console.log(answer); // 42
+
+// scripts/setup.lua:
+//   config = { debug = true, level = 3 }
+
+lua.execute_file("./scripts/setup.lua");
+console.log(lua.get_global("config")); // { debug: true, level: 3 }
+```
+
+Errors (file not found, syntax errors, runtime errors) throw JavaScript exceptions:
+
+```javascript
+try {
+  lua.execute_file("./nonexistent.lua");
+} catch (error) {
+  console.error(error.message); // "cannot open ./nonexistent.lua: No such file or directory"
+}
 ```
 
 ### Passing JavaScript Functions to Lua
@@ -680,6 +722,21 @@ Executes a Lua script and returns the result.
 **Returns:** The result of the script execution (converted to the appropriate
 JavaScript type). Tables with metatables are returned as Proxy objects that
 preserve metamethods; plain tables are deep-copied into objects or arrays.
+
+### `LuaContext.execute_file(filepath)`
+
+Executes a Lua file and returns the result.
+
+**Parameters:**
+
+- `filepath`: Path to the Lua file to execute
+
+**Returns:** The result of the file execution (converted to the appropriate
+JavaScript type), identical to `execute_script`. Returns `undefined` if the file
+has no return statement.
+
+**Throws:** Error if the file is not found, contains syntax errors, or encounters
+a runtime error.
 
 ### `LuaContext.set_global(name, value)`
 

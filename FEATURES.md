@@ -357,6 +357,26 @@ The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no bi
 
 ---
 
+## File Execution (February 2026)
+
+### Overview
+
+`execute_file()` executes a Lua file directly from a filesystem path, mirroring `execute_script()` but using `luaL_loadfile` instead of `luaL_loadstring`. Return values, globals, callbacks, and error handling all work identically.
+
+### Architecture
+
+**Core layer:** `ExecuteFile` validates the filepath is non-empty (returning an early error string), then follows the exact same pattern as `ExecuteScript`: `luaL_loadfile` to compile, `lua_pcall` with `LUA_MULTRET` to execute, stack delta to count results, `ToLuaValue` to convert each result. Lua handles file-not-found errors naturally — `luaL_loadfile` returns a descriptive error string.
+
+**N-API layer:** `ExecuteFile` accepts a single string argument, delegates to `runtime->ExecuteFile(path)`, and converts results identically to `ExecuteScript` — single value returned directly, multiple values as `Napi::Array`, zero values as `undefined`, errors as JS exceptions.
+
+### Design Decisions
+
+**Empty path guard:** The core layer rejects empty paths before calling `luaL_loadfile`. This provides a clear error message rather than Lua's generic "cannot open" message for an empty string.
+
+**No path normalization:** File paths are passed directly to `luaL_loadfile` without normalization or resolution. This keeps the implementation simple and lets the caller control path handling. Relative paths resolve against the process working directory, matching standard filesystem behavior.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -369,3 +389,4 @@ The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no bi
 | Full userdata with properties | High | February 2026 |
 | Explicit metatables | Moderate | February 2026 |
 | Reference-based tables with Proxy | High | February 2026 |
+| File execution | Low | February 2026 |

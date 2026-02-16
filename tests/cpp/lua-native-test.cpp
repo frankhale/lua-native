@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <limits>
 
 #include "core/lua-runtime.h"
@@ -1709,6 +1711,104 @@ TEST(LuaRuntimeTableRef, IntegerKeyHandling) {
   rt.SetTableField(tableRef.ref, "2", newVal);
   auto updated = rt.GetTableField(tableRef.ref, "2");
   EXPECT_EQ(std::get<int64_t>(updated->value), 99);
+}
+
+// --- File Execution ---
+
+// Helper to write a temporary Lua file for testing
+class LuaFileTest : public ::testing::Test {
+protected:
+  std::string tmp_path_;
+
+  void WriteFile(const std::string& content) {
+    tmp_path_ = std::tmpnam(nullptr) + std::string(".lua");
+    std::ofstream ofs(tmp_path_);
+    ofs << content;
+    ofs.close();
+  }
+
+  void TearDown() override {
+    if (!tmp_path_.empty()) {
+      std::remove(tmp_path_.c_str());
+    }
+  }
+};
+
+TEST_F(LuaFileTest, ExecuteFileReturnsValues) {
+  WriteFile("return 42, 'hello'");
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 42);
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "hello");
+}
+
+TEST_F(LuaFileTest, ExecuteFileReturnsTable) {
+  WriteFile("return { x = 10, y = 20 }");
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  const auto& tbl = std::get<LuaTable>(vals[0]->value);
+  EXPECT_EQ(std::get<int64_t>(tbl.at("x")->value), 10);
+  EXPECT_EQ(std::get<int64_t>(tbl.at("y")->value), 20);
+}
+
+TEST_F(LuaFileTest, ExecuteFileSetsGlobals) {
+  WriteFile("my_global = 'from file'");
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  auto val = rt.GetGlobal("my_global");
+  EXPECT_EQ(std::get<std::string>(val->value), "from file");
+}
+
+TEST_F(LuaFileTest, ExecuteFileWithCallbacks) {
+  WriteFile("return add(3, 4)");
+  LuaRuntime rt;
+  rt.RegisterFunction("add", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    auto a = std::get<int64_t>(args[0]->value);
+    auto b = std::get<int64_t>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(a + b));
+  });
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 7);
+}
+
+TEST_F(LuaFileTest, ExecuteFileNotFound) {
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile("/nonexistent/path/to/file.lua");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  const auto& err = std::get<std::string>(res);
+  EXPECT_NE(err.find("cannot open"), std::string::npos);
+}
+
+TEST_F(LuaFileTest, ExecuteFileSyntaxError) {
+  WriteFile("this is not valid lua");
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+}
+
+TEST_F(LuaFileTest, ExecuteFileEmptyPath) {
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile("");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_EQ(std::get<std::string>(res), "File path cannot be empty");
+}
+
+TEST_F(LuaFileTest, ExecuteFileNoReturnValue) {
+  WriteFile("local x = 42");
+  LuaRuntime rt;
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_TRUE(std::get<std::vector<LuaPtr>>(res).empty());
 }
 
 int main(int argc, char **argv) {

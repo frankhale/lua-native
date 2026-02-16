@@ -169,6 +169,7 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   const Napi::Function func = DefineClass(env, "LuaContext", {
     InstanceMethod("execute_script", &LuaContext::ExecuteScript),
+    InstanceMethod("execute_file", &LuaContext::ExecuteFile),
     InstanceMethod("set_global", &LuaContext::SetGlobal),
     InstanceMethod("get_global", &LuaContext::GetGlobal),
     InstanceMethod("set_userdata", &LuaContext::SetUserdata),
@@ -400,6 +401,29 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
   const std::string script = info[0].As<Napi::String>().Utf8Value();
 
   const auto res = runtime->ExecuteScript(script);
+  if (std::holds_alternative<std::string>(res)) {
+    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
+  if (values.empty()) return env.Undefined();
+  if (values.size() == 1) return CoreToNapi(*values[0]);
+
+  const Napi::Array array = Napi::Array::New(env, values.size());
+  for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
+  return array;
+}
+
+Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string filepath = info[0].As<Napi::String>().Utf8Value();
+
+  const auto res = runtime->ExecuteFile(filepath);
   if (std::holds_alternative<std::string>(res)) {
     Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
     return env.Undefined();

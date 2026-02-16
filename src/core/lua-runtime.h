@@ -252,6 +252,7 @@ public:
   LuaRuntime& operator=(LuaRuntime&&) = delete;
 
   [[nodiscard]] ScriptResult ExecuteScript(const std::string& script) const;
+  [[nodiscard]] ScriptResult ExecuteFile(const std::string& filepath) const;
 
   void SetGlobal(const std::string& name, const LuaPtr& value) const;
   void RegisterFunction(const std::string& name, Function fn);
