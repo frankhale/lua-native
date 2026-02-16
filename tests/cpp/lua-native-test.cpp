@@ -756,6 +756,724 @@ TEST(LuaRuntimeUserdata, DecrementUnknownRefIdIsNoOp) {
   EXPECT_FALSE(callback_fired);
 }
 
+// ========== Metatable Tests ==========
+
+TEST(LuaRuntimeMetatable, StoreHostFunctionDoesNotCreateGlobal) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__hidden_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42)));
+  });
+
+  // The function should NOT be accessible as a global
+  const auto res = rt.ExecuteScript("return type(__hidden_fn)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "nil");
+}
+
+TEST(LuaRuntimeMetatable, StoreHostFunctionIsCallableViaClosure) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("stored")));
+  });
+
+  // Verify the function is stored in host_functions_ by using it in a metatable
+  (void)rt.ExecuteScript("t = {}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__tostring";
+  e.is_function = true;
+  e.func_name = "__mt_fn";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("t", entries);
+
+  const auto res = rt.ExecuteScript("return tostring(t)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "stored");
+}
+
+TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonExistentGlobal) {
+  LuaRuntime rt;
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({
+    rt.SetGlobalMetatable("nonexistent", entries);
+  }, std::runtime_error);
+
+  try {
+    rt.SetGlobalMetatable("nonexistent", entries);
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("does not exist"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonTable) {
+  LuaRuntime rt;
+  rt.SetGlobal("num", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42))));
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({
+    rt.SetGlobalMetatable("num", entries);
+  }, std::runtime_error);
+
+  try {
+    rt.SetGlobalMetatable("num", entries);
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("not a table"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForStringGlobal) {
+  LuaRuntime rt;
+  rt.SetGlobal("s", std::make_shared<LuaValue>(LuaValue::from(std::string("hello"))));
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({
+    rt.SetGlobalMetatable("s", entries);
+  }, std::runtime_error);
+}
+
+TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForBoolGlobal) {
+  LuaRuntime rt;
+  rt.SetGlobal("b", std::make_shared<LuaValue>(LuaValue::from(true)));
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({
+    rt.SetGlobalMetatable("b", entries);
+  }, std::runtime_error);
+}
+
+TEST(LuaRuntimeMetatable, ToStringMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_tostring", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("custom_repr")));
+  });
+
+  (void)rt.ExecuteScript("obj = {x = 10}");
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__tostring";
+  e.is_function = true;
+  e.func_name = "__mt_tostring";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("obj", entries);
+
+  const auto res = rt.ExecuteScript("return tostring(obj)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "custom_repr");
+}
+
+TEST(LuaRuntimeMetatable, ToStringReceivesTableArg) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_ts", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    EXPECT_EQ(args.size(), 1u);
+    const auto& tbl = std::get<LuaTable>(args[0]->value);
+    auto x = std::get<int64_t>(tbl.at("x")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("x=" + std::to_string(x))));
+  });
+
+  (void)rt.ExecuteScript("obj = {x = 7}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__tostring";
+  e.is_function = true;
+  e.func_name = "__mt_ts";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("obj", entries);
+
+  const auto res = rt.ExecuteScript("return tostring(obj)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "x=7");
+}
+
+TEST(LuaRuntimeMetatable, AddMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_add", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("value")->value);
+    int64_t vb = std::get<int64_t>(b.at("value")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va + vb));
+  });
+
+  (void)rt.ExecuteScript("a = {value = 10}; b = {value = 20}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__add";
+  e.is_function = true;
+  e.func_name = "__mt_add";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a + b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 30);
+}
+
+TEST(LuaRuntimeMetatable, SubMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_sub", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("v")->value);
+    int64_t vb = std::get<int64_t>(b.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va - vb));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 30}; b = {v = 8}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__sub";
+  e.is_function = true;
+  e.func_name = "__mt_sub";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a - b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 22);
+}
+
+TEST(LuaRuntimeMetatable, MulMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_mul", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("v")->value);
+    int64_t vb = std::get<int64_t>(b.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va * vb));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 5}; b = {v = 7}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__mul";
+  e.is_function = true;
+  e.func_name = "__mt_mul";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a * b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 35);
+}
+
+TEST(LuaRuntimeMetatable, DivMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_div", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    double va = static_cast<double>(std::get<int64_t>(a.at("v")->value));
+    double vb = static_cast<double>(std::get<int64_t>(b.at("v")->value));
+    return std::make_shared<LuaValue>(LuaValue::from(va / vb));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 20}; b = {v = 4}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__div";
+  e.is_function = true;
+  e.func_name = "__mt_div";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a / b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_DOUBLE_EQ(std::get<double>(std::get<std::vector<LuaPtr>>(res)[0]->value), 5.0);
+}
+
+TEST(LuaRuntimeMetatable, UnmMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_unm", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    int64_t v = std::get<int64_t>(a.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(-v));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 42}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__unm";
+  e.is_function = true;
+  e.func_name = "__mt_unm";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return -a");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), -42);
+}
+
+TEST(LuaRuntimeMetatable, ModMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_mod", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("v")->value);
+    int64_t vb = std::get<int64_t>(b.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va % vb));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 17}; b = {v = 5}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__mod";
+  e.is_function = true;
+  e.func_name = "__mt_mod";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a % b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+}
+
+TEST(LuaRuntimeMetatable, ConcatMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_concat", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    std::string sa = std::get<std::string>(a.at("t")->value);
+    std::string sb = std::get<std::string>(b.at("t")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(sa + sb));
+  });
+
+  (void)rt.ExecuteScript("a = {t = 'hello'}; b = {t = ' world'}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__concat";
+  e.is_function = true;
+  e.func_name = "__mt_concat";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a .. b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "hello world");
+}
+
+TEST(LuaRuntimeMetatable, LenMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_len", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    int64_t n = std::get<int64_t>(a.at("count")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(n));
+  });
+
+  (void)rt.ExecuteScript("a = {count = 5}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__len";
+  e.is_function = true;
+  e.func_name = "__mt_len";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return #a");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 5);
+}
+
+TEST(LuaRuntimeMetatable, EqMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_eq", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("id")->value);
+    int64_t vb = std::get<int64_t>(b.at("id")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va == vb));
+  });
+
+  (void)rt.ExecuteScript("a = {id = 1}; b = {id = 1}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__eq";
+  e.is_function = true;
+  e.func_name = "__mt_eq";
+  entries.push_back(std::move(e));
+  // Both tables need the same metamethod for __eq to fire
+  rt.SetGlobalMetatable("a", entries);
+  rt.SetGlobalMetatable("b", entries);
+
+  const auto res = rt.ExecuteScript("return a == b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<bool>(std::get<std::vector<LuaPtr>>(res)[0]->value), true);
+}
+
+TEST(LuaRuntimeMetatable, LtMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_lt", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("v")->value);
+    int64_t vb = std::get<int64_t>(b.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va < vb));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 1}; b = {v = 2}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__lt";
+  e.is_function = true;
+  e.func_name = "__mt_lt";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+  rt.SetGlobalMetatable("b", entries);
+
+  {
+    const auto res = rt.ExecuteScript("return a < b");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<bool>(std::get<std::vector<LuaPtr>>(res)[0]->value), true);
+  }
+  {
+    const auto res = rt.ExecuteScript("return b < a");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<bool>(std::get<std::vector<LuaPtr>>(res)[0]->value), false);
+  }
+}
+
+TEST(LuaRuntimeMetatable, LeMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_le", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    int64_t va = std::get<int64_t>(a.at("v")->value);
+    int64_t vb = std::get<int64_t>(b.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(va <= vb));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 3}; b = {v = 3}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__le";
+  e.is_function = true;
+  e.func_name = "__mt_le";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+  rt.SetGlobalMetatable("b", entries);
+
+  const auto res = rt.ExecuteScript("return a <= b");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<bool>(std::get<std::vector<LuaPtr>>(res)[0]->value), true);
+}
+
+TEST(LuaRuntimeMetatable, CallMetamethod) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_call", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    // args[0] is the table itself, args[1] is the argument passed in the call
+    const auto& self = std::get<LuaTable>(args[0]->value);
+    int64_t factor = std::get<int64_t>(self.at("factor")->value);
+    int64_t x = std::get<int64_t>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(factor * x));
+  });
+
+  (void)rt.ExecuteScript("obj = {factor = 10}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__call";
+  e.is_function = true;
+  e.func_name = "__mt_call";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("obj", entries);
+
+  const auto res = rt.ExecuteScript("return obj(5)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 50);
+}
+
+TEST(LuaRuntimeMetatable, IndexAsFunction) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_index", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    // args[0] = table, args[1] = key
+    std::string key = std::get<std::string>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("default_" + key)));
+  });
+
+  (void)rt.ExecuteScript("obj = {}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__index";
+  e.is_function = true;
+  e.func_name = "__mt_index";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("obj", entries);
+
+  const auto res = rt.ExecuteScript("return obj.foo");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "default_foo");
+}
+
+TEST(LuaRuntimeMetatable, IndexAsTable) {
+  LuaRuntime rt;
+
+  (void)rt.ExecuteScript("obj = {}");
+  LuaTable fallback;
+  fallback.emplace("fallback_key", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(99))));
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__index";
+  e.is_function = false;
+  e.value = std::make_shared<LuaValue>(LuaValue::from(std::move(fallback)));
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("obj", entries);
+
+  const auto res = rt.ExecuteScript("return obj.fallback_key");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 99);
+}
+
+TEST(LuaRuntimeMetatable, NewIndexAsFunction) {
+  LuaRuntime rt;
+  std::string captured_key;
+  int64_t captured_value = 0;
+
+  rt.StoreHostFunction("__mt_newindex", [&](const std::vector<LuaPtr>& args) -> LuaPtr {
+    captured_key = std::get<std::string>(args[1]->value);
+    captured_value = std::get<int64_t>(args[2]->value);
+    return nullptr;
+  });
+
+  (void)rt.ExecuteScript("obj = {}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__newindex";
+  e.is_function = true;
+  e.func_name = "__mt_newindex";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("obj", entries);
+
+  (void)rt.ExecuteScript("obj.x = 42");
+  EXPECT_EQ(captured_key, "x");
+  EXPECT_EQ(captured_value, 42);
+
+  // rawget should return nil since __newindex intercepted it
+  const auto res = rt.ExecuteScript("return rawget(obj, 'x')");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(std::get<std::vector<LuaPtr>>(res)[0]->value));
+}
+
+TEST(LuaRuntimeMetatable, MultipleMetamethods) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_ts", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& tbl = std::get<LuaTable>(args[0]->value);
+    int64_t v = std::get<int64_t>(tbl.at("v")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("val:" + std::to_string(v))));
+  });
+  rt.StoreHostFunction("__mt_add", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    const auto& b = std::get<LuaTable>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(
+      std::get<int64_t>(a.at("v")->value) + std::get<int64_t>(b.at("v")->value)));
+  });
+  rt.StoreHostFunction("__mt_unm", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& a = std::get<LuaTable>(args[0]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(-std::get<int64_t>(a.at("v")->value)));
+  });
+
+  (void)rt.ExecuteScript("a = {v = 10}; b = {v = 3}");
+
+  std::vector<MetatableEntry> entries;
+  {
+    MetatableEntry e;
+    e.key = "__tostring";
+    e.is_function = true;
+    e.func_name = "__mt_ts";
+    entries.push_back(std::move(e));
+  }
+  {
+    MetatableEntry e;
+    e.key = "__add";
+    e.is_function = true;
+    e.func_name = "__mt_add";
+    entries.push_back(std::move(e));
+  }
+  {
+    MetatableEntry e;
+    e.key = "__unm";
+    e.is_function = true;
+    e.func_name = "__mt_unm";
+    entries.push_back(std::move(e));
+  }
+  rt.SetGlobalMetatable("a", entries);
+
+  {
+    const auto res = rt.ExecuteScript("return a + b");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 13);
+  }
+  {
+    const auto res = rt.ExecuteScript("return tostring(a)");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "val:10");
+  }
+  {
+    const auto res = rt.ExecuteScript("return -a");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), -10);
+  }
+}
+
+TEST(LuaRuntimeMetatable, MetatableOnLuaCreatedTable) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_ts", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    const auto& tbl = std::get<LuaTable>(args[0]->value);
+    int64_t x = std::get<int64_t>(tbl.at("x")->value);
+    int64_t y = std::get<int64_t>(tbl.at("y")->value);
+    return std::make_shared<LuaValue>(LuaValue::from(
+      std::string("(" + std::to_string(x) + "," + std::to_string(y) + ")")));
+  });
+
+  (void)rt.ExecuteScript("point = {x = 5, y = 10}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__tostring";
+  e.is_function = true;
+  e.func_name = "__mt_ts";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("point", entries);
+
+  const auto res = rt.ExecuteScript("return tostring(point)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "(5,10)");
+}
+
+TEST(LuaRuntimeMetatable, EmptyMetatableEntriesDoesNotCrash) {
+  LuaRuntime rt;
+  (void)rt.ExecuteScript("t = {x = 1}");
+  std::vector<MetatableEntry> entries; // empty
+  rt.SetGlobalMetatable("t", entries);
+
+  // Table should still work normally
+  const auto res = rt.ExecuteScript("return t.x");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 1);
+}
+
+TEST(LuaRuntimeMetatable, MetatableExceptionInHostFunction) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_bad", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    throw std::runtime_error("metamethod error");
+  });
+
+  (void)rt.ExecuteScript("a = {v = 1}; b = {v = 2}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__add";
+  e.is_function = true;
+  e.func_name = "__mt_bad";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("a", entries);
+
+  const auto res = rt.ExecuteScript("return a + b");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("metamethod error"), std::string::npos);
+}
+
+TEST(LuaRuntimeMetatable, StackBalanceAfterSetGlobalMetatable) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_ts", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("ok")));
+  });
+
+  (void)rt.ExecuteScript("t = {}");
+  int top_before = lua_gettop(rt.RawState());
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__tostring";
+  e.is_function = true;
+  e.func_name = "__mt_ts";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("t", entries);
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeMetatable, StackBalanceAfterFailedSetGlobalMetatable) {
+  LuaRuntime rt;
+  int top_before = lua_gettop(rt.RawState());
+
+  std::vector<MetatableEntry> entries;
+  try {
+    rt.SetGlobalMetatable("nonexistent", entries);
+  } catch (...) {
+    // expected
+  }
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeMetatable, MetatableWithStaticValue) {
+  LuaRuntime rt;
+  (void)rt.ExecuteScript("t = {}");
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__metatable";
+  e.is_function = false;
+  e.value = std::make_shared<LuaValue>(LuaValue::from(std::string("protected")));
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("t", entries);
+
+  // getmetatable returns __metatable value when set
+  const auto res = rt.ExecuteScript("return getmetatable(t)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "protected");
+}
+
+TEST(LuaRuntimeMetatable, ReplacingMetatable) {
+  LuaRuntime rt;
+  rt.StoreHostFunction("__mt_ts1", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("first")));
+  });
+  rt.StoreHostFunction("__mt_ts2", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("second")));
+  });
+
+  (void)rt.ExecuteScript("t = {}");
+
+  // Set first metatable
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "__tostring";
+    e.is_function = true;
+    e.func_name = "__mt_ts1";
+    entries.push_back(std::move(e));
+    rt.SetGlobalMetatable("t", entries);
+  }
+
+  {
+    const auto res = rt.ExecuteScript("return tostring(t)");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "first");
+  }
+
+  // Replace with second metatable
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "__tostring";
+    e.is_function = true;
+    e.func_name = "__mt_ts2";
+    entries.push_back(std::move(e));
+    rt.SetGlobalMetatable("t", entries);
+  }
+
+  {
+    const auto res = rt.ExecuteScript("return tostring(t)");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+    EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "second");
+  }
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

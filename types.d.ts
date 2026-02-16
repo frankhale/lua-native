@@ -65,6 +65,14 @@ export interface LuaCallbacks {
 }
 
 /**
+ * Defines a Lua metatable with metamethods and/or static values.
+ * Functions become Lua C closures; other values are set directly.
+ */
+export interface MetatableDefinition {
+  [key: string]: LuaCallback | LuaValue;
+}
+
+/**
  * Options for set_userdata controlling property access from Lua
  */
 export interface UserdataOptions {
@@ -123,6 +131,22 @@ export interface LuaContext {
    * lua.set_userdata('config', configObj, { readable: true });
    */
   set_userdata(name: string, value: object, options?: UserdataOptions): void;
+
+  /**
+   * Sets a metatable on an existing global Lua table, enabling operator
+   * overloading, custom indexing, __tostring, __call, and other metamethods.
+   *
+   * @param name The name of an existing global table
+   * @param metatable An object whose keys are metamethod names (e.g. __add, __tostring)
+   *   and values are either callback functions or static Lua values
+   * @example
+   * lua.execute_script('vec = {x = 1, y = 2}');
+   * lua.set_metatable('vec', {
+   *   __tostring: (t) => `(${t.x}, ${t.y})`,
+   *   __add: (a, b) => { ... }
+   * });
+   */
+  set_metatable(name: string, metatable: MetatableDefinition): void;
 
   /**
    * Creates a coroutine from a Lua script that returns a function.

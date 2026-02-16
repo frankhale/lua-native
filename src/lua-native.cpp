@@ -57,6 +57,7 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("set_global", &LuaContext::SetGlobal),
     InstanceMethod("get_global", &LuaContext::GetGlobal),
     InstanceMethod("set_userdata", &LuaContext::SetUserdata),
+    InstanceMethod("set_metatable", &LuaContext::SetMetatable),
     InstanceMethod("create_coroutine", &LuaContext::CreateCoroutine),
     InstanceMethod("resume", &LuaContext::ResumeCoroutine)
   });
@@ -197,6 +198,55 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
     runtime->CreateProxyUserdataGlobal(name, ref_id);
   } else {
     runtime->CreateUserdataGlobal(name, ref_id);
+  }
+
+  return env.Undefined();
+}
+
+Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
+  if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
+    Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string name = info[0].As<Napi::String>().Utf8Value();
+  const auto mt = info[1].As<Napi::Object>();
+  const Napi::Array keys = mt.GetPropertyNames();
+
+  int mt_id = next_metatable_id_++;
+  std::vector<lua_core::MetatableEntry> entries;
+
+  for (uint32_t i = 0; i < keys.Length(); i++) {
+    const std::string key = keys[i].As<Napi::String>().Utf8Value();
+    const Napi::Value val = mt.Get(key);
+
+    lua_core::MetatableEntry entry;
+    entry.key = key;
+
+    if (val.IsFunction()) {
+      const std::string func_name = "__mt_" + std::to_string(mt_id) + "_" + key;
+      js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+      runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+      entry.is_function = true;
+      entry.func_name = func_name;
+    } else {
+      entry.is_function = false;
+      try {
+        entry.value = std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+      } catch (const std::exception& e) {
+        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+    }
+
+    entries.push_back(std::move(entry));
+  }
+
+  try {
+    runtime->SetGlobalMetatable(name, entries);
+  } catch (const std::runtime_error& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
   return env.Undefined();

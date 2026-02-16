@@ -183,6 +183,41 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
   }
 }
 
+// --- Metatable support ---
+
+void LuaRuntime::StoreHostFunction(const std::string& name, Function fn) {
+  host_functions_[name] = std::move(fn);
+}
+
+void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries) {
+  StackGuard guard(L_);
+
+  lua_getglobal(L_, name.c_str());
+  if (lua_isnil(L_, -1)) {
+    throw std::runtime_error("Global '" + name + "' does not exist");
+  }
+  if (!lua_istable(L_, -1)) {
+    throw std::runtime_error("Global '" + name + "' is not a table");
+  }
+
+  // Create the metatable
+  lua_newtable(L_);
+
+  for (const auto& entry : entries) {
+    if (entry.is_function) {
+      // Push function name as upvalue, then create closure
+      lua_pushstring(L_, entry.func_name.c_str());
+      lua_pushcclosure(L_, LuaCallHostFunction, 1);
+    } else {
+      PushLuaValue(L_, entry.value);
+    }
+    lua_setfield(L_, -2, entry.key.c_str());
+  }
+
+  // Set the metatable on the target table (pops metatable)
+  lua_setmetatable(L_, -2);
+}
+
 // --- Host function bridge ---
 
 int LuaRuntime::LuaCallHostFunction(lua_State* L) {

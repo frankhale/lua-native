@@ -95,13 +95,52 @@ Production code grew by ~235 lines (~20% increase). Test code grew by ~391 lines
 
 ---
 
-## Remaining: Metatable Support
+## Implemented: Explicit Metatable Support (February 2026)
 
-Metatables enable operator overloading, custom indexing, and OOP patterns in Lua. With userdata and property access now implemented, the remaining metatable work is about tables specifically.
+The `set_metatable()` API allows JS to attach Lua metatables to global tables, enabling operator overloading, custom indexing, `__tostring`, `__call`, and other metamethods. All 147 tests passing (21 new metatable tests).
 
-### Option A: Reference-Based Tables (Significant Architectural Change)
+### What Was Implemented
 
-Keep tables as references like functions, use JS Proxy for transparent access:
+JS functions in the metatable object become Lua C closures (not string references). A new `StoreHostFunction` method stores JS callbacks in `host_functions_` without creating a Lua global, allowing metamethod closures to be built directly in the metatable.
+
+### API
+
+```typescript
+lua.execute_script('vec = {x = 1, y = 2}');
+lua.set_metatable('vec', {
+  __tostring: (t) => `(${t.x}, ${t.y})`,
+  __add: (a, b) => ({ x: a.x + b.x, y: a.y + b.y }),
+  __call: (self, n) => self.x * n,
+  __index: { default_key: 42 },  // non-function values are supported too
+});
+```
+
+### Supported Metamethods
+
+All standard Lua metamethods work: `__tostring`, `__add`, `__sub`, `__mul`, `__div`, `__mod`, `__unm`, `__concat`, `__len`, `__eq`, `__lt`, `__le`, `__call`, `__index` (as function or table), `__newindex`.
+
+### Architecture
+
+**Core layer (`lua-runtime.h/cpp`):**
+- `MetatableEntry` struct: `key` (string), `is_function` (bool), `func_name` (string), `value` (LuaPtr)
+- `StoreHostFunction(name, fn)`: stores in `host_functions_` without creating a Lua global
+- `SetGlobalMetatable(name, entries)`: validates the global exists and is a table, creates a new metatable, pushes each entry as either a `lua_pushcclosure(LuaCallHostFunction, 1)` (for functions) or `PushLuaValue` (for values), then attaches with `lua_setmetatable`. Uses `StackGuard` for stack safety.
+
+**N-API layer (`lua-native.h/cpp`):**
+- `SetMetatable` method: validates arguments, iterates JS metatable properties, generates unique function names (`__mt_<id>_<key>`) for function entries, stores JS callbacks via `StoreHostFunction` + `CreateJsCallbackWrapper`, converts non-function values via `NapiToCoreInstance`, builds `vector<MetatableEntry>`, and delegates to `SetGlobalMetatable`
+- `next_metatable_id_` counter ensures unique function names across multiple `set_metatable` calls
+
+**Key design decision:** JS functions are stored as host functions with unique generated names rather than registered as globals. This avoids polluting the Lua global namespace with internal metamethod closures. The existing `LuaCallHostFunction` bridge is reused — the same upvalue-based dispatch mechanism that powers `RegisterFunction` works identically for metamethod closures.
+
+### Limitation
+
+Only works for global tables. Could be extended to work on table references if/when reference-based tables are implemented.
+
+---
+
+## Remaining: Reference-Based Tables
+
+Keep tables as Lua references instead of immediately converting to JS objects/arrays. Use JS Proxy for transparent property access:
 
 ```typescript
 const lua = new lua_native.init({});
@@ -119,23 +158,7 @@ obj.hello  // "HELLO" - goes through metatable
 - Significant change to the conversion layer
 - Would need a way to opt in/out to avoid breaking the existing immediate-conversion behavior (e.g., a `{ refTables: true }` option, or only returning refs for tables that have metatables)
 
-### Option B: Explicit Metatable Methods (Simpler)
-
-Add methods to set/get metatables on globals:
-
-```typescript
-const lua = new lua_native.init({});
-lua.set_global('myTable', { value: 42 });
-lua.set_metatable('myTable', {
-  __tostring: () => 'MyTable object'
-});
-```
-
-**Limitation:** Only works for globals, not arbitrary tables. Could be extended to work on table references if/when reference-based tables are implemented.
-
-### Recommendation
-
-Option B (explicit methods) as a stepping stone, with Option A (full proxy support) as a future enhancement if there's demand. For Option A, consider only returning table references when a metatable is present, preserving the current immediate-conversion behavior for plain tables.
+With explicit metatable support now implemented, this becomes the natural next step for full metatable interop — allowing metatabled tables returned from Lua to preserve their metamethods when accessed from JS.
 
 ---
 
@@ -146,7 +169,7 @@ Option B (explicit methods) as a stepping stone, with Option A (full proxy suppo
 | Expose `get_global` | Low | High | **Done** |
 | Opaque userdata + passthrough | Moderate | Medium-High | **Done** |
 | Full userdata with properties | High | High | **Done** |
-| Explicit metatables | Moderate | Medium | Planned |
+| Explicit metatables | Moderate | Medium | **Done** |
 | Reference-based tables with Proxy | High | High | Planned |
 
 ---
@@ -157,4 +180,5 @@ Option B (explicit methods) as a stepping stone, with Option A (full proxy suppo
 - Lua function returns to JS were implemented previously
 - Full userdata support (opaque handles, passthrough, property access) was implemented in February 2026
 - `get_global` was exposed in February 2026
+- Explicit metatable support (`set_metatable`) was implemented in February 2026
 - Reference-based table support (with Proxy) remains the main outstanding architectural change, sharing requirements with the now-implemented userdata reference pattern

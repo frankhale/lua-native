@@ -67,6 +67,7 @@ public:
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
     Napi::Value GetGlobal(const Napi::CallbackInfo& info);
     Napi::Value SetUserdata(const Napi::CallbackInfo& info);
+    Napi::Value SetMetatable(const Napi::CallbackInfo& info);
     Napi::Value CreateCoroutine(const Napi::CallbackInfo& info);
     Napi::Value ResumeCoroutine(const Napi::CallbackInfo& info);
 
@@ -85,6 +86,7 @@ private:
     // Userdata reference tracking
     std::unordered_map<int, UserdataEntry> js_userdata_;
     int next_userdata_id_ = 1;
+    int next_metatable_id_ = 1;
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);

@@ -147,6 +147,13 @@ struct LuaUserdataRef {
   }
 };
 
+struct MetatableEntry {
+  std::string key;
+  bool is_function;
+  std::string func_name;  // Used when is_function == true
+  LuaPtr value;           // Used when is_function == false
+};
+
 enum class CoroutineStatus {
   Suspended,
   Running,
@@ -226,6 +233,10 @@ public:
   // Userdata support
   void SetUserdataGCCallback(UserdataGCCallback cb);
   void SetPropertyHandlers(PropertyGetter getter, PropertySetter setter);
+  // Metatable support
+  void StoreHostFunction(const std::string& name, Function fn);
+  void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
+
   void CreateUserdataGlobal(const std::string& name, int ref_id);
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
   void IncrementUserdataRefCount(int ref_id);

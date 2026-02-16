@@ -1305,6 +1305,249 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // METATABLE SUPPORT
+  // ============================================
+  describe('metatable support', () => {
+    it('__tostring metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('vec = {x = 1, y = 2}');
+      lua.set_metatable('vec', {
+        __tostring: () => 'custom_tostring'
+      });
+      const result = lua.execute_script('return tostring(vec)');
+      expect(result).toBe('custom_tostring');
+    });
+
+    it('__tostring receives the table as argument', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('vec = {x = 10, y = 20}');
+      lua.set_metatable('vec', {
+        __tostring: (...args: any[]) => {
+          const t = args[0];
+          return `(${t.x}, ${t.y})`;
+        }
+      });
+      const result = lua.execute_script('return tostring(vec)');
+      expect(result).toBe('(10, 20)');
+    });
+
+    it('__add metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 10}; b = {value = 20}');
+      lua.set_metatable('a', {
+        __add: (...args: any[]) => {
+          return (args[0] as any).value + (args[1] as any).value;
+        }
+      });
+      const result = lua.execute_script('return a + b');
+      expect(result).toBe(30);
+    });
+
+    it('__sub metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 30}; b = {value = 10}');
+      lua.set_metatable('a', {
+        __sub: (...args: any[]) => (args[0] as any).value - (args[1] as any).value
+      });
+      const result = lua.execute_script('return a - b');
+      expect(result).toBe(20);
+    });
+
+    it('__mul metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 5}; b = {value = 6}');
+      lua.set_metatable('a', {
+        __mul: (...args: any[]) => (args[0] as any).value * (args[1] as any).value
+      });
+      const result = lua.execute_script('return a * b');
+      expect(result).toBe(30);
+    });
+
+    it('__div metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 20}; b = {value = 4}');
+      lua.set_metatable('a', {
+        __div: (...args: any[]) => (args[0] as any).value / (args[1] as any).value
+      });
+      const result = lua.execute_script('return a / b');
+      expect(result).toBe(5);
+    });
+
+    it('__unm metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 42}');
+      lua.set_metatable('a', {
+        __unm: (...args: any[]) => -(args[0] as any).value
+      });
+      const result = lua.execute_script('return -a');
+      expect(result).toBe(-42);
+    });
+
+    it('__mod metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 17}; b = {value = 5}');
+      lua.set_metatable('a', {
+        __mod: (...args: any[]) => (args[0] as any).value % (args[1] as any).value
+      });
+      const result = lua.execute_script('return a % b');
+      expect(result).toBe(2);
+    });
+
+    it('__concat metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {text = "hello"}; b = {text = " world"}');
+      lua.set_metatable('a', {
+        __concat: (...args: any[]) => (args[0] as any).text + (args[1] as any).text
+      });
+      const result = lua.execute_script('return a .. b');
+      expect(result).toBe('hello world');
+    });
+
+    it('__len metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {items = 5}');
+      lua.set_metatable('a', {
+        __len: (...args: any[]) => (args[0] as any).items
+      });
+      const result = lua.execute_script('return #a');
+      expect(result).toBe(5);
+    });
+
+    it('__eq metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {id = 1}; b = {id = 1}');
+      // Both tables need the same metatable for __eq to fire
+      const mt = {
+        __eq: (...args: any[]) => (args[0] as any).id === (args[1] as any).id
+      };
+      lua.set_metatable('a', mt);
+      lua.set_metatable('b', mt);
+      const result = lua.execute_script('return a == b');
+      expect(result).toBe(true);
+    });
+
+    it('__lt metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 1}; b = {value = 2}');
+      const mt = {
+        __lt: (...args: any[]) => (args[0] as any).value < (args[1] as any).value
+      };
+      lua.set_metatable('a', mt);
+      lua.set_metatable('b', mt);
+      const result = lua.execute_script('return a < b');
+      expect(result).toBe(true);
+    });
+
+    it('__le metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 3}; b = {value = 3}');
+      const mt = {
+        __le: (...args: any[]) => (args[0] as any).value <= (args[1] as any).value
+      };
+      lua.set_metatable('a', mt);
+      lua.set_metatable('b', mt);
+      const result = lua.execute_script('return a <= b');
+      expect(result).toBe(true);
+    });
+
+    it('__call metamethod', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {factor = 10}');
+      lua.set_metatable('obj', {
+        __call: (...args: any[]) => {
+          const self = args[0] as any;
+          const x = args[1] as number;
+          return self.factor * x;
+        }
+      });
+      const result = lua.execute_script('return obj(5)');
+      expect(result).toBe(50);
+    });
+
+    it('__index as function', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {}');
+      lua.set_metatable('obj', {
+        __index: (...args: any[]) => {
+          const key = args[1] as string;
+          return 'default_' + key;
+        }
+      });
+      const result = lua.execute_script('return obj.foo');
+      expect(result).toBe('default_foo');
+    });
+
+    it('__index as table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {}');
+      lua.set_metatable('obj', {
+        __index: { fallback_key: 99 }
+      });
+      const result = lua.execute_script('return obj.fallback_key');
+      expect(result).toBe(99);
+    });
+
+    it('__newindex as function', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('obj = {}; intercepted = {}');
+      lua.set_metatable('obj', {
+        __newindex: (...args: any[]) => {
+          // Store in a different table via rawset
+          // args: table, key, value - we return the key/value for testing
+          return null;
+        }
+      });
+      // __newindex fires for new keys; the function intercepts assignment
+      // Verify it doesn't throw and the metamethod is called
+      lua.execute_script('obj.newkey = 42');
+      // Since __newindex intercepts, rawget should show nil
+      const result = lua.execute_script('return rawget(obj, "newkey")');
+      expect(result).toBeNull();
+    });
+
+    it('multiple metamethods on one table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('a = {value = 10}; b = {value = 3}');
+      lua.set_metatable('a', {
+        __add: (...args: any[]) => (args[0] as any).value + (args[1] as any).value,
+        __tostring: (...args: any[]) => 'val:' + (args[0] as any).value,
+        __unm: (...args: any[]) => -(args[0] as any).value,
+      });
+      expect(lua.execute_script('return a + b')).toBe(13);
+      expect(lua.execute_script('return tostring(a)')).toBe('val:10');
+      expect(lua.execute_script('return -a')).toBe(-10);
+    });
+
+    it('error: non-existent global', () => {
+      const lua = new lua_native.init({});
+      expect(() => {
+        lua.set_metatable('nonexistent', { __tostring: () => 'x' });
+      }).toThrow(/does not exist/);
+    });
+
+    it('error: non-table global', () => {
+      const lua = new lua_native.init({});
+      lua.set_global('num', 42);
+      expect(() => {
+        lua.set_metatable('num', { __tostring: () => 'x' });
+      }).toThrow(/not a table/);
+    });
+
+    it('metatable on Lua-created global table', () => {
+      const lua = new lua_native.init({});
+      lua.execute_script('myTable = {x = 5, y = 10}');
+      lua.set_metatable('myTable', {
+        __tostring: (...args: any[]) => {
+          const t = args[0] as any;
+          return `(${t.x}, ${t.y})`;
+        }
+      });
+      const result = lua.execute_script('return tostring(myTable)');
+      expect(result).toBe('(5, 10)');
+    });
+  });
+
+  // ============================================
   // USERDATA - LUA-CREATED PASSTHROUGH (Phase 2)
   // ============================================
   describe('userdata - Lua-created passthrough', () => {
