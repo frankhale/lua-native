@@ -9,6 +9,18 @@ describe('lua-native Node adapter', () => {
   // BASIC FUNCTIONALITY
   // ============================================
   describe('basic functionality', () => {
+    it('creates a Lua context with no arguments (bare state)', () => {
+      const lua = new lua_native.init();
+      const result = lua.execute_script('return 1 + 2');
+      expect(result).toBe(3);
+    });
+
+    it('creates a Lua context with options only (no callbacks)', () => {
+      const lua = new lua_native.init(undefined, ALL_LIBS);
+      const result = lua.execute_script('return math.floor(3.7)');
+      expect(result).toBe(3);
+    });
+
     it('creates a Lua context and returns a number', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script('return 42');

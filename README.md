@@ -88,8 +88,8 @@ Return a value:
 ```javascript
 import lua_native from "lua-native";
 
-// Create a new Lua context
-const lua = new lua_native.init({});
+// Create a new Lua context (no callbacks or options needed)
+const lua = new lua_native.init();
 
 // Execute a simple script
 const result = lua.execute_script("return 42");
@@ -158,7 +158,7 @@ console.log(result); // 5
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 // Set global variables
 lua.set_global("x", 7);
@@ -208,7 +208,7 @@ Lua functions can be returned to JavaScript and called directly:
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 // Return a Lua function
 const add = lua.execute_script(`
@@ -322,11 +322,11 @@ lua.execute_script("print(type(io))"); // "nil" — io is not loaded
 
 #### Bare state (default)
 
-Omitting `libraries` or passing an empty array creates a bare Lua state with no
-standard libraries at all:
+Omitting `libraries` (or omitting all arguments entirely) creates a bare Lua state
+with no standard libraries at all:
 
 ```javascript
-const bare = new lua_native.init({});
+const bare = new lua_native.init();
 
 // Basic Lua still works (arithmetic, strings, return)
 bare.execute_script("return 1 + 2"); // 3
@@ -649,7 +649,7 @@ console.log(sum); // { x: 11, y: 22 }
 #### Callable Tables — `__call`
 
 ```javascript
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 lua.execute_script("multiplier = {factor = 10}");
 
@@ -666,7 +666,7 @@ console.log(result); // 50
 `__index` can be a function (for computed lookups) or a table (for fallback values):
 
 ```javascript
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 // __index as a function — compute missing keys dynamically
 lua.execute_script("obj = {}");
@@ -688,7 +688,7 @@ console.log(lua.execute_script("return config.timeout")); // 30
 #### Intercepting Writes — `__newindex`
 
 ```javascript
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 const log = [];
 lua.execute_script("protected = {x = 1}");
@@ -922,7 +922,8 @@ custom.execute_script('print(string.upper("custom"))'); // "CUSTOM"
 
 ### `lua_native.init(callbacks?, options?)`
 
-Creates a new Lua execution context.
+Creates a new Lua execution context. Both arguments are optional — `new lua_native.init()`
+creates a bare Lua state with no callbacks and no standard libraries.
 
 **Parameters:**
 
