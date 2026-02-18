@@ -20,6 +20,7 @@ data structures.
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
+- Module / require integration — register JS modules and add search paths for Lua's `require()`
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Coroutine support with yield/resume semantics
@@ -339,6 +340,73 @@ Available library names: `base`, `package`, `coroutine`, `table`, `io`, `os`,
 
 Available presets: `'all'` (all 10 libraries), `'safe'` (all except `io`, `os`,
 `debug`).
+
+### Module / Require Integration
+
+Register JavaScript objects as Lua modules available via `require()`, or add
+filesystem search paths for Lua module loading. Requires the `package` library.
+
+#### Registering JS Modules
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Register a JS object as a Lua module
+lua.register_module("utils", {
+  clamp: (x, min, max) => Math.min(Math.max(x, min), max),
+  lerp: (a, b, t) => a + (b - a) * t,
+  version: "1.0.0",
+});
+
+// Use it from Lua with require()
+const result = lua.execute_script(`
+  local utils = require('utils')
+  return utils.clamp(15, 0, 10), utils.version
+`);
+console.log(result); // [10, '1.0.0']
+```
+
+Modules are pre-loaded into `package.loaded` — no filesystem search occurs.
+Functions in the module become callable from Lua, and plain values (strings,
+numbers, booleans) are set directly.
+
+#### Adding Search Paths
+
+```javascript
+// Add filesystem search paths for Lua's require()
+lua.add_search_path("./lua_modules/?.lua");
+lua.add_search_path("./libs/?/init.lua");
+
+// Lua can now require modules from those directories
+lua.execute_script(`
+  local mymod = require('mymod')  -- searches ./lua_modules/mymod.lua
+  print(mymod.name)
+`);
+```
+
+The path must contain a `?` placeholder that gets replaced by the module name.
+
+#### Combined Usage
+
+```javascript
+// Mix filesystem modules with JS-registered modules
+lua.add_search_path("./scripts/?.lua");
+
+lua.register_module("config", {
+  debug: true,
+  maxRetries: 3,
+});
+
+lua.execute_script(`
+  local config = require('config')   -- from JS
+  local helpers = require('helpers')  -- from ./scripts/helpers.lua
+  if config.debug then
+    print(helpers.format_debug())
+  end
+`);
+```
 
 ### Async Execution
 
@@ -830,6 +898,15 @@ const proxy = lua.execute_script<LuaTableRef>(`
 console.log(proxy.x); // 1
 console.log(proxy.hello); // "hello" — __index fires
 
+// Type-safe module registration
+lua.register_module("math_utils", {
+  clamp: (x: number, min: number, max: number): number =>
+    Math.min(Math.max(x, min), max),
+  PI: Math.PI,
+});
+lua.add_search_path("./lua_modules/?.lua");
+const mod = lua.execute_script("return require('math_utils').clamp(15, 0, 10)");
+
 // Type-safe library loading with presets
 const preset: LuaLibraryPreset = "safe";
 const sandboxed: LuaContext = new lua_native.init({}, { libraries: preset });
@@ -925,6 +1002,31 @@ Returns whether the context is currently busy with an async operation.
 
 **Returns:** `boolean` — `true` while an async operation is in progress, `false`
 otherwise.
+
+### `LuaContext.add_search_path(path)`
+
+Appends a search path to Lua's `package.path` for module resolution.
+
+**Parameters:**
+
+- `path`: Search path template containing a `?` placeholder (e.g., `'./modules/?.lua'`)
+
+**Throws:** Error if the `package` library is not loaded, or if the path does not
+contain a `?` placeholder.
+
+### `LuaContext.register_module(name, module)`
+
+Registers a JavaScript object as a Lua module, making it available via
+`require(name)`. The module is pre-loaded into `package.loaded` — no filesystem
+search occurs.
+
+**Parameters:**
+
+- `name`: The module name used in `require(name)`
+- `module`: An object whose properties become the module's fields. Functions
+  become callable from Lua; other values are set directly.
+
+**Throws:** Error if the `package` library is not loaded.
 
 ### `LuaContext.set_global(name, value)`
 
@@ -1060,4 +1162,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-16 February 2026
+18 February 2026

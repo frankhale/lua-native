@@ -179,7 +179,9 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("resume", &LuaContext::ResumeCoroutine),
     InstanceMethod("execute_script_async", &LuaContext::ExecuteScriptAsync),
     InstanceMethod("execute_file_async", &LuaContext::ExecuteFileAsync),
-    InstanceMethod("is_busy", &LuaContext::IsBusyMethod)
+    InstanceMethod("is_busy", &LuaContext::IsBusyMethod),
+    InstanceMethod("add_search_path", &LuaContext::AddSearchPath),
+    InstanceMethod("register_module", &LuaContext::RegisterModule)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -426,6 +428,87 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
 
   try {
     runtime->SetGlobalMetatable(name, entries);
+  } catch (const std::runtime_error& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  return env.Undefined();
+}
+
+Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string path = info[0].As<Napi::String>().Utf8Value();
+
+  if (path.find('?') == std::string::npos) {
+    Napi::Error::New(env,
+      "Search path must contain a '?' placeholder (e.g., './modules/?.lua')").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    runtime->AddSearchPath(path);
+  } catch (const std::runtime_error& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  return env.Undefined();
+}
+
+Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
+    Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string name = info[0].As<Napi::String>().Utf8Value();
+  const auto moduleObj = info[1].As<Napi::Object>();
+  const Napi::Array keys = moduleObj.GetPropertyNames();
+
+  int mod_id = next_module_id_++;
+  std::vector<lua_core::MetatableEntry> entries;
+
+  for (uint32_t i = 0; i < keys.Length(); i++) {
+    const std::string key = keys[i].As<Napi::String>().Utf8Value();
+    const Napi::Value val = moduleObj.Get(key);
+
+    lua_core::MetatableEntry entry;
+    entry.key = key;
+
+    if (val.IsFunction()) {
+      const std::string func_name = "__module_" + std::to_string(mod_id) + "_" + key;
+      js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+      runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+      entry.is_function = true;
+      entry.func_name = func_name;
+    } else {
+      entry.is_function = false;
+      try {
+        entry.value = std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+      } catch (const std::exception& e) {
+        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+    }
+
+    entries.push_back(std::move(entry));
+  }
+
+  try {
+    runtime->RegisterModuleTable(name, entries);
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();

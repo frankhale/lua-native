@@ -282,6 +282,10 @@ public:
   void StoreHostFunction(const std::string& name, Function fn);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
 
+  // Module / require support
+  void AddSearchPath(const std::string& path) const;
+  void RegisterModuleTable(const std::string& name, const std::vector<MetatableEntry>& entries) const;
+
   void CreateUserdataGlobal(const std::string& name, int ref_id);
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
   void IncrementUserdataRefCount(int ref_id);
@@ -321,6 +325,7 @@ private:
 
   void InitState();
   static int LibraryMask(const std::vector<std::string>& libraries);
+  bool HasPackageLibrary() const;
 
   void RegisterUserdataMetatable();
   void RegisterProxyUserdataMetatable();

@@ -172,6 +172,36 @@ export interface LuaContext {
   set_metatable(name: string, metatable: MetatableDefinition): void;
 
   /**
+   * Appends a search path to Lua's `package.path` for module resolution.
+   * The path must contain a `?` placeholder that gets replaced by the module name.
+   * Requires the `package` library to be loaded.
+   *
+   * @param path Search path template (e.g., './modules/?.lua')
+   * @example
+   * lua.add_search_path('./lua_modules/?.lua');
+   * lua.add_search_path('./libs/?/init.lua');
+   * // Lua: local mod = require('mymod')  -- searches ./lua_modules/mymod.lua
+   */
+  add_search_path(path: string): void;
+
+  /**
+   * Registers a JavaScript object as a Lua module, making it available via `require(name)`.
+   * The module is pre-loaded into `package.loaded` — no filesystem search occurs.
+   * Functions in the module object become callable from Lua.
+   * Requires the `package` library to be loaded.
+   *
+   * @param name The module name used in `require(name)`
+   * @param module An object whose properties become the module's fields
+   * @example
+   * lua.register_module('utils', {
+   *   clamp: (x, min, max) => Math.min(Math.max(x, min), max),
+   *   version: '1.0.0',
+   * });
+   * // Lua: local utils = require('utils'); utils.clamp(5, 0, 10)
+   */
+  register_module(name: string, module: LuaTable | LuaCallbacks): void;
+
+  /**
    * Creates a coroutine from a Lua script that returns a function.
    * @param script A Lua script that returns a function to be used as the coroutine body
    * @returns A coroutine object that can be resumed

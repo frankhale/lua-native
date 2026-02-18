@@ -453,6 +453,40 @@ Non-string elements in the array produce a `TypeError`. Unknown preset strings p
 
 ---
 
+## Module / Require Integration (February 2026)
+
+### Overview
+
+`add_search_path()` appends filesystem search paths to Lua's `package.path`, enabling `require()` to find `.lua` module files. `register_module()` pre-loads a JavaScript object into `package.loaded`, making it available via `require(name)` without any filesystem search. Functions within the module object become callable from Lua.
+
+### Architecture
+
+**Core layer:**
+- `HasPackageLibrary()` (private helper): Checks that the `package` global is a table. Used by both methods to validate the prerequisite.
+- `AddSearchPath(path)`: Uses `StackGuard`. Gets `package.path`, appends the new path with `;` separator, sets it back.
+- `RegisterModuleTable(name, entries)`: Uses `StackGuard`. Gets `package.loaded`, creates a new Lua table, iterates the entries vector — for function entries, pushes a `lua_pushcclosure` with `LuaCallHostFunction` (function name as upvalue); for value entries, pushes via `PushLuaValue`. Sets the table in `package.loaded[name]`.
+
+**N-API layer:**
+- `AddSearchPath`: Busy check, string validation, `?` placeholder validation, delegates to core.
+- `RegisterModule`: Busy check, argument validation (string + object), iterates JS object properties. Functions are stored via `StoreHostFunction` + `CreateJsCallbackWrapper` with generated names (`__module_<id>_<key>`). Non-function values are converted via `NapiToCoreInstance`. Builds a `vector<MetatableEntry>` and delegates to `RegisterModuleTable`.
+- `next_module_id_` counter ensures unique function names across multiple `register_module` calls.
+
+Both methods require the `package` library to be loaded. The `'safe'` and `'all'` presets include `package` by default.
+
+### Design Decisions
+
+**Approach C — Build the module table directly in Lua:** Three approaches were considered (see `docs/REQUIRE.md` for the full comparison). The chosen approach builds the Lua table directly on the Lua stack inside `RegisterModuleTable`, pushing closures for functions inline. This avoids creating temporary Lua globals (Approach A's global-then-nil pattern) and cleanly separates concerns between the N-API and core layers.
+
+**Reuses `MetatableEntry`:** The `MetatableEntry` struct has exactly the right shape for module entries (key + is_function flag + func_name or value). Rather than creating a duplicate struct, it's reused directly. The name is semantically off but the structure is identical.
+
+**`StoreHostFunction` over `RegisterFunction`:** Module functions are stored via `StoreHostFunction` (same as `set_metatable`), which places them in `host_functions_` without creating Lua globals. The closures are pushed directly into the module table. This prevents namespace pollution — internal function names like `__module_1_clamp` never appear as Lua globals.
+
+**`?` placeholder validation in N-API layer:** The core layer doesn't validate path format — it just manipulates `package.path`. The `?` check is a user-facing concern handled at the N-API boundary.
+
+**JS modules win over filesystem modules:** If a JS-registered module and a filesystem module share the same name, the JS module wins because `package.loaded` is checked before any searcher runs. This is standard Lua behavior for pre-loaded modules.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -468,3 +502,4 @@ Non-string elements in the array produce a `TypeError`. Unknown preset strings p
 | File execution | Low | February 2026 |
 | Opt-in standard library loading with presets | Low | February 2026 |
 | Async execution (Phase 1) | Moderate | February 2026 |
+| Module / require integration | Moderate | February 2026 |

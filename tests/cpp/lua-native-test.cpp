@@ -1969,6 +1969,327 @@ TEST(LuaRuntimeAsync, StdlibWorksInAsyncMode) {
   rt.SetAsyncMode(false);
 }
 
+// ========== Module / Require Tests ==========
+
+TEST(LuaRuntimeModule, AddSearchPathAppendsToPackagePath) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.AddSearchPath("./modules/?.lua");
+
+  const auto res = rt.ExecuteScript("return package.path");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  const auto& path = std::get<std::string>(vals[0]->value);
+  EXPECT_NE(path.find("./modules/?.lua"), std::string::npos);
+}
+
+TEST(LuaRuntimeModule, AddSearchPathMultiplePaths) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.AddSearchPath("./a/?.lua");
+  rt.AddSearchPath("./b/?.lua");
+
+  const auto res = rt.ExecuteScript("return package.path");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& path = std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value);
+  EXPECT_NE(path.find("./a/?.lua"), std::string::npos);
+  EXPECT_NE(path.find("./b/?.lua"), std::string::npos);
+}
+
+TEST(LuaRuntimeModule, AddSearchPathThrowsWithoutPackageLib) {
+  const LuaRuntime rt(std::vector<std::string>{"base"});
+  EXPECT_THROW({
+    rt.AddSearchPath("./modules/?.lua");
+  }, std::runtime_error);
+
+  try {
+    rt.AddSearchPath("./modules/?.lua");
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("package"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeModule, AddSearchPathStackBalance) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int top_before = lua_gettop(rt.RawState());
+  rt.AddSearchPath("./test/?.lua");
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableWithFunctions) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_add", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    int64_t a = std::get<int64_t>(args[0]->value);
+    int64_t b = std::get<int64_t>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(a + b));
+  });
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "add";
+  e.is_function = true;
+  e.func_name = "__mod_add";
+  entries.push_back(std::move(e));
+  rt.RegisterModuleTable("mymod", entries);
+
+  const auto res = rt.ExecuteScript("local m = require('mymod'); return m.add(3, 4)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 7);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableWithValues) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  std::vector<MetatableEntry> entries;
+  {
+    MetatableEntry e;
+    e.key = "name";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(std::string("testmod")));
+    entries.push_back(std::move(e));
+  }
+  {
+    MetatableEntry e;
+    e.key = "version";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(2)));
+    entries.push_back(std::move(e));
+  }
+  rt.RegisterModuleTable("info", entries);
+
+  const auto res = rt.ExecuteScript("local m = require('info'); return m.name, m.version");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "testmod");
+  EXPECT_EQ(std::get<int64_t>(vals[1]->value), 2);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableMixed) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_greet", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    std::string name = std::get<std::string>(args[0]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("hello " + name)));
+  });
+
+  std::vector<MetatableEntry> entries;
+  {
+    MetatableEntry e;
+    e.key = "greet";
+    e.is_function = true;
+    e.func_name = "__mod_greet";
+    entries.push_back(std::move(e));
+  }
+  {
+    MetatableEntry e;
+    e.key = "version";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(std::string("1.0")));
+    entries.push_back(std::move(e));
+  }
+  rt.RegisterModuleTable("mixed", entries);
+
+  const auto res = rt.ExecuteScript(R"(
+    local m = require('mixed')
+    return m.greet('world'), m.version
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "hello world");
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "1.0");
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableThrowsWithoutPackageLib) {
+  const LuaRuntime rt(std::vector<std::string>{"base"});
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({
+    rt.RegisterModuleTable("mymod", entries);
+  }, std::runtime_error);
+
+  try {
+    rt.RegisterModuleTable("mymod", entries);
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("package"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableStackBalance) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+  });
+
+  int top_before = lua_gettop(rt.RawState());
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "fn";
+  e.is_function = true;
+  e.func_name = "__mod_fn";
+  entries.push_back(std::move(e));
+  rt.RegisterModuleTable("stacktest", entries);
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableCaching) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "val";
+  e.is_function = false;
+  e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42)));
+  entries.push_back(std::move(e));
+  rt.RegisterModuleTable("cached", entries);
+
+  // Require twice — should return the same cached module
+  const auto res = rt.ExecuteScript(R"(
+    local m1 = require('cached')
+    local m2 = require('cached')
+    return m1 == m2, m1.val
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<bool>(vals[0]->value), true);
+  EXPECT_EQ(std::get<int64_t>(vals[1]->value), 42);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableEmptyModule) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  std::vector<MetatableEntry> entries; // empty
+  rt.RegisterModuleTable("empty", entries);
+
+  const auto res = rt.ExecuteScript("local m = require('empty'); return type(m)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "table");
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableReRegistration) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  // Register first version
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "ver";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("versioned", entries);
+  }
+
+  // Re-register with new version
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "ver";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(2)));
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("versioned", entries);
+  }
+
+  // Re-registration overwrites package.loaded, so require returns new version
+  const auto res = rt.ExecuteScript("local m = require('versioned'); return m.ver");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+}
+
+TEST(LuaRuntimeModule, AddSearchPathAndRequireFile) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  // Get the path to the test fixtures directory
+  // This test assumes the test binary is run from the project root
+  rt.AddSearchPath("./tests/fixtures/modules/?.lua");
+
+  const auto res = rt.ExecuteScript(R"(
+    local m = require('testmod')
+    return m.add(10, 20), m.name
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 30);
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "testmod");
+}
+
+TEST(LuaRuntimeModule, ModuleNamespaceIsolation) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_a_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("from_a")));
+  });
+  rt.StoreHostFunction("__mod_b_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("from_b")));
+  });
+
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "fn";
+    e.is_function = true;
+    e.func_name = "__mod_a_fn";
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("mod_a", entries);
+  }
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "fn";
+    e.is_function = true;
+    e.func_name = "__mod_b_fn";
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("mod_b", entries);
+  }
+
+  const auto res = rt.ExecuteScript(R"(
+    local a = require('mod_a')
+    local b = require('mod_b')
+    return a.fn(), b.fn()
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "from_a");
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "from_b");
+}
+
+TEST(LuaRuntimeModule, AddSearchPathStackBalanceOnFailure) {
+  LuaRuntime rt(std::vector<std::string>{"base"});
+  int top_before = lua_gettop(rt.RawState());
+
+  try {
+    rt.AddSearchPath("./modules/?.lua");
+  } catch (...) {
+    // expected
+  }
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableStackBalanceOnFailure) {
+  LuaRuntime rt(std::vector<std::string>{"base"});
+  int top_before = lua_gettop(rt.RawState());
+
+  std::vector<MetatableEntry> entries;
+  try {
+    rt.RegisterModuleTable("mymod", entries);
+  } catch (...) {
+    // expected
+  }
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

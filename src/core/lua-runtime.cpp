@@ -267,6 +267,78 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
   lua_setmetatable(L_, -2);
 }
 
+// --- Module / require support ---
+
+bool LuaRuntime::HasPackageLibrary() const {
+  StackGuard guard(L_);
+  lua_getglobal(L_, "package");
+  bool has = !lua_isnil(L_, -1) && lua_istable(L_, -1);
+  return has;
+}
+
+void LuaRuntime::AddSearchPath(const std::string& path) const {
+  StackGuard guard(L_);
+
+  if (!HasPackageLibrary()) {
+    throw std::runtime_error(
+      "Cannot add search path: the 'package' library is not loaded. "
+      "Include 'package' in the libraries option.");
+  }
+
+  lua_getglobal(L_, "package");
+
+  // Get current package.path
+  lua_getfield(L_, -1, "path");
+  const char* current_raw = lua_tostring(L_, -1);
+  std::string current = current_raw ? current_raw : "";
+  lua_pop(L_, 1);  // pop path string
+
+  // Append the new path
+  if (!current.empty()) {
+    current += ";";
+  }
+  current += path;
+
+  // Set the updated package.path
+  lua_pushstring(L_, current.c_str());
+  lua_setfield(L_, -2, "path");
+}
+
+void LuaRuntime::RegisterModuleTable(const std::string& name,
+                                      const std::vector<MetatableEntry>& entries) const {
+  StackGuard guard(L_);
+
+  if (!HasPackageLibrary()) {
+    throw std::runtime_error(
+      "Cannot register module: the 'package' library is not loaded. "
+      "Include 'package' in the libraries option.");
+  }
+
+  lua_getglobal(L_, "package");
+  lua_getfield(L_, -1, "loaded");
+  if (lua_isnil(L_, -1)) {
+    throw std::runtime_error(
+      "Cannot register module: package.loaded is not available.");
+  }
+
+  // Create the module table
+  lua_newtable(L_);
+
+  for (const auto& entry : entries) {
+    if (entry.is_function) {
+      // Push function name as upvalue, then create closure
+      lua_pushstring(L_, entry.func_name.c_str());
+      lua_pushcclosure(L_, LuaCallHostFunction, 1);
+    } else {
+      PushLuaValue(L_, entry.value);
+    }
+    lua_setfield(L_, -2, entry.key.c_str());
+  }
+
+  // package.loaded[name] = module_table
+  lua_setfield(L_, -2, name.c_str());
+}
+
 // --- Host function bridge ---
 
 int LuaRuntime::LuaCallHostFunction(lua_State* L) {

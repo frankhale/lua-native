@@ -110,60 +110,9 @@ Prevents infinite loops from hanging the process. The hook function checks the i
 
 ## Medium Value
 
-### Module / Require Integration
+### ~~Module / Require Integration~~ (Completed)
 
-Register custom `package.searchers` so Lua's `require()` can resolve modules from JS-provided paths or load JS-defined modules:
-
-```typescript
-lua.addSearchPath('./lua_modules/?.lua');
-
-// Or register a JS object as a Lua module
-lua.registerModule('utils', {
-  clamp: (x, min, max) => Math.min(Math.max(x, min), max),
-});
-// Lua: local utils = require('utils'); utils.clamp(5, 0, 10)
-```
-
-Important for larger Lua projects with multiple files and dependencies.
-
-#### Implementation Plan
-
-**Core layer** (`lua-runtime.h/.cpp`):
-- `AddSearchPath(const std::string& path)`: Append to `package.path` via:
-  ```cpp
-  lua_getglobal(L_, "package");
-  lua_getfield(L_, -1, "path");
-  std::string current = lua_tostring(L_, -1);
-  current += ";" + path;
-  lua_pop(L_, 1);
-  lua_pushstring(L_, current.c_str());
-  lua_setfield(L_, -2, "path");
-  lua_pop(L_, 1);
-  ```
-- `RegisterModule(const std::string& name, const LuaPtr& value)`: Pre-load a module into `package.loaded` so `require(name)` returns it without searching:
-  ```cpp
-  lua_getglobal(L_, "package");
-  lua_getfield(L_, -1, "loaded");
-  PushLuaValue(L_, value);
-  lua_setfield(L_, -2, name.c_str());
-  lua_pop(L_, 2);
-  ```
-- Both methods require the `package` library to be loaded. Throw if it's not available.
-
-**N-API layer** (`lua-native.h/.cpp`):
-- Add `Napi::Value AddSearchPath(const Napi::CallbackInfo& info)` — accepts a string.
-- Add `Napi::Value RegisterModule(const Napi::CallbackInfo& info)` — accepts a name (string) and value (object/table). Convert the JS object to a `LuaValue` via `NapiToCoreInstance` and pass to the core layer. For function values in the module table, register them as host functions (similar to `RegisterCallbacks`).
-- Register both as instance methods in `Init`.
-
-**Types** (`types.d.ts`):
-- Add `add_search_path(path: string): void` and `register_module(name: string, module: LuaTable | LuaCallbacks): void` to `LuaContext`.
-
-**Tests**:
-- Create a temp `.lua` module file, add its directory as a search path, verify `require('modname')` loads it.
-- Register a JS module with functions, verify `require('modname').fn()` works from Lua.
-- Verify requiring an unknown module still errors.
-
-**Depends on**: Selective Standard Library Loading (the `package` library must be loaded).
+Implemented. See `add_search_path()` and `register_module()` in the API documentation.
 
 ---
 

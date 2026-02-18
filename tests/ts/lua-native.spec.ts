@@ -2251,4 +2251,248 @@ describe('lua-native Node adapter', () => {
       expect(results).toEqual([10, 20, 30, 40]);
     });
   });
+
+  // ============================================
+  // MODULE / REQUIRE INTEGRATION
+  // ============================================
+  describe('module / require integration', () => {
+    describe('add_search_path', () => {
+      it('loads a Lua module from a search path', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-modules-'));
+        const modPath = path.join(tmpDir, 'mymod.lua');
+        fs.writeFileSync(modPath, `
+          local M = {}
+          function M.greet(name)
+            return "Hello, " .. name
+          end
+          M.version = 42
+          return M
+        `);
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(tmpDir, '?.lua'));
+          const result = lua.execute_script(`
+            local mymod = require('mymod')
+            return mymod.greet('World'), mymod.version
+          `);
+          expect(result).toEqual(['Hello, World', 42]);
+        } finally {
+          fs.unlinkSync(modPath);
+          fs.rmdirSync(tmpDir);
+        }
+      });
+
+      it('loads a module from a fixture directory', () => {
+        const path = require('path');
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fixtureDir = path.resolve(__dirname, '../fixtures/modules');
+        lua.add_search_path(path.join(fixtureDir, '?.lua'));
+        const result = lua.execute_script(`
+          local testmod = require('testmod')
+          return testmod.add(3, 4), testmod.name
+        `);
+        expect(result).toEqual([7, 'testmod']);
+      });
+
+      it('supports multiple search paths', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mods1-'));
+        const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mods2-'));
+        fs.writeFileSync(path.join(dir1, 'mod_a.lua'), 'return { x = 1 }');
+        fs.writeFileSync(path.join(dir2, 'mod_b.lua'), 'return { y = 2 }');
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(dir1, '?.lua'));
+          lua.add_search_path(path.join(dir2, '?.lua'));
+
+          expect(lua.execute_script("return require('mod_a').x")).toBe(1);
+          expect(lua.execute_script("return require('mod_b').y")).toBe(2);
+        } finally {
+          fs.unlinkSync(path.join(dir1, 'mod_a.lua'));
+          fs.unlinkSync(path.join(dir2, 'mod_b.lua'));
+          fs.rmdirSync(dir1);
+          fs.rmdirSync(dir2);
+        }
+      });
+
+      it('throws when package library is not loaded', () => {
+        const lua = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.add_search_path('./?.lua')).toThrow(/package/);
+      });
+
+      it('throws when path has no ? placeholder', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.add_search_path('./modules/foo.lua')).toThrow(/\?/);
+      });
+
+      it('throws on non-string argument', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).add_search_path(42)).toThrow();
+      });
+
+      it('require caches the module (loaded once)', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-cache-'));
+        fs.writeFileSync(path.join(tmpDir, 'counter.lua'), `
+          local M = { count = 0 }
+          M.count = M.count + 1
+          return M
+        `);
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(tmpDir, '?.lua'));
+          lua.execute_script(`
+            local c1 = require('counter')
+            local c2 = require('counter')
+            assert(c1 == c2, "require should cache modules")
+          `);
+        } finally {
+          fs.unlinkSync(path.join(tmpDir, 'counter.lua'));
+          fs.rmdirSync(tmpDir);
+        }
+      });
+    });
+
+    describe('register_module', () => {
+      it('registers a module with plain values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('config', {
+          debug: true,
+          version: '1.0.0',
+          maxRetries: 3,
+        });
+        expect(lua.execute_script("return require('config').debug")).toBe(true);
+        expect(lua.execute_script("return require('config').version")).toBe('1.0.0');
+        expect(lua.execute_script("return require('config').maxRetries")).toBe(3);
+      });
+
+      it('registers a module with functions', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('math_utils', {
+          clamp: (...args: any[]) => {
+            const [x, min, max] = args as number[];
+            return Math.min(Math.max(x, min), max);
+          },
+          lerp: (...args: any[]) => {
+            const [a, b, t] = args as number[];
+            return a + (b - a) * t;
+          },
+        });
+        expect(lua.execute_script("return require('math_utils').clamp(15, 0, 10)")).toBe(10);
+        expect(lua.execute_script("return require('math_utils').clamp(-5, 0, 10)")).toBe(0);
+        expect(lua.execute_script("return require('math_utils').lerp(0, 100, 0.5)")).toBe(50);
+      });
+
+      it('registers a module with mixed functions and values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('utils', {
+          version: '2.0',
+          double: (...args: any[]) => (args[0] as number) * 2,
+        });
+        expect(lua.execute_script("return require('utils').version")).toBe('2.0');
+        expect(lua.execute_script("return require('utils').double(21)")).toBe(42);
+      });
+
+      it('module is cached by require', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('singleton', { id: 1 });
+        lua.execute_script(`
+          local a = require('singleton')
+          local b = require('singleton')
+          assert(a == b, "require should return the same table")
+        `);
+      });
+
+      it('overwrites existing module on re-register', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('mymod', { value: 1 });
+        expect(lua.execute_script("return require('mymod').value")).toBe(1);
+
+        // Re-register overwrites package.loaded directly
+        lua.register_module('mymod', { value: 2 });
+        expect(lua.execute_script("return require('mymod').value")).toBe(2);
+      });
+
+      it('throws when package library is not loaded', () => {
+        const lua = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.register_module('mod', { x: 1 })).toThrow(/package/);
+      });
+
+      it('throws on invalid arguments', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).register_module(42, {})).toThrow();
+        expect(() => (lua as any).register_module('mod')).toThrow();
+      });
+
+      it('module functions receive correct arguments from Lua', () => {
+        let receivedArgs: any[] = [];
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('capture', {
+          capture: (...args: any[]) => {
+            receivedArgs = [...args];
+            return null;
+          },
+        });
+        lua.execute_script("require('capture').capture(1, 'hello', true)");
+        expect(receivedArgs).toEqual([1, 'hello', true]);
+      });
+
+      it('requiring an unknown module still errors', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.execute_script("require('nonexistent')")).toThrow();
+      });
+
+      it('registered module does not pollute global namespace', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('secret', { value: 42 });
+        expect(lua.execute_script("return type(secret)")).toBe('nil');
+        expect(lua.execute_script("return require('secret').value")).toBe(42);
+      });
+
+      it('works alongside add_search_path', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mixed-'));
+        fs.writeFileSync(path.join(tmpDir, 'filemod.lua'),
+          "return { source = 'file' }");
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(tmpDir, '?.lua'));
+          lua.register_module('jsmod', { source: 'js' });
+
+          expect(lua.execute_script("return require('filemod').source")).toBe('file');
+          expect(lua.execute_script("return require('jsmod').source")).toBe('js');
+        } finally {
+          fs.unlinkSync(path.join(tmpDir, 'filemod.lua'));
+          fs.rmdirSync(tmpDir);
+        }
+      });
+    });
+
+    describe('busy state', () => {
+      it('add_search_path works after async completes', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        await lua.execute_script_async("return 1");
+        lua.add_search_path('./?.lua');
+      });
+
+      it('register_module works after async completes', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        await lua.execute_script_async("return 1");
+        lua.register_module('mod', { x: 1 });
+      });
+    });
+  });
 });

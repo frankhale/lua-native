@@ -88,6 +88,8 @@ public:
     Napi::Value SetMetatable(const Napi::CallbackInfo& info);
     Napi::Value CreateCoroutine(const Napi::CallbackInfo& info);
     Napi::Value ResumeCoroutine(const Napi::CallbackInfo& info);
+    Napi::Value AddSearchPath(const Napi::CallbackInfo& info);
+    Napi::Value RegisterModule(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 
@@ -110,6 +112,7 @@ private:
     std::unordered_map<int, UserdataEntry> js_userdata_;
     int next_userdata_id_ = 1;
     int next_metatable_id_ = 1;
+    int next_module_id_ = 1;
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);
