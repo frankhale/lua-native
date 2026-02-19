@@ -22,6 +22,7 @@ data structures.
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Module / require integration — register JS modules and add search paths for Lua's `require()`
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
+- Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_bytecode()` for faster startup
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
@@ -465,6 +466,72 @@ lua.set_global("name", "World");
 const result = await lua.execute_script_async("return 'Hello, ' .. name .. '!'");
 ```
 
+### Bytecode Precompilation
+
+Compile Lua source to bytecode and load it later for faster startup. Bytecode
+skips the parsing and compilation phases on subsequent loads.
+
+```javascript
+import lua_native from "lua-native";
+import fs from "fs";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Compile source to bytecode (returns a Buffer)
+const bytecode = lua.compile('return function(x) return x * 2 end');
+
+// Save to disk for later
+fs.writeFileSync("my-script.luac", bytecode);
+
+// Load and execute bytecode (identical result to execute_script)
+const fn = lua.load_bytecode(bytecode);
+fn(21); // 42
+```
+
+Compile files directly:
+
+```javascript
+const bytecode = lua.compile_file("./scripts/init.lua");
+lua.load_bytecode(bytecode);
+```
+
+Strip debug information for smaller production bytecode:
+
+```javascript
+const devBuild = lua.compile(source);
+const prodBuild = lua.compile(source, { stripDebug: true });
+console.log(`Dev: ${devBuild.length} bytes, Prod: ${prodBuild.length} bytes`);
+```
+
+Bytecode is portable across Lua contexts (same Lua version and architecture):
+
+```javascript
+// Compile once, run in multiple independent contexts
+const compiler = new lua_native.init();
+const bytecode = compiler.compile("return function(x) return x * x end");
+
+const ctx1 = new lua_native.init();
+const ctx2 = new lua_native.init();
+const square1 = ctx1.load_bytecode(bytecode);
+const square2 = ctx2.load_bytecode(bytecode);
+square1(5); // 25
+square2(7); // 49
+```
+
+#### Security Considerations
+
+- **Binary-only loading** — `load_bytecode()` uses Lua's binary-only mode
+  (`"b"`), rejecting raw source text. Use `execute_script()` for source strings.
+- **Version-specific** — Lua bytecode encodes the Lua version, endianness, and
+  pointer size. Bytecode from a different Lua version or architecture will fail
+  with a clear error.
+- **No integrity checks** — Lua bytecode has no built-in tamper protection.
+  Malformed bytecode can crash the Lua VM. If bytecode comes from an untrusted
+  source, verify its integrity (e.g., via checksum or signature) before loading.
+- **Strip debug info for production** — Use `{ stripDebug: true }` to remove
+  local variable names and line numbers, producing smaller bytecode that doesn't
+  leak source structure.
+
 ### Coroutines
 
 Lua coroutines are supported, allowing you to create pausable/resumable functions:
@@ -836,6 +903,7 @@ import lua_native from "lua-native";
 import type {
   LuaCallbacks,
   LuaContext,
+  CompileOptions,
   LuaCoroutine,
   LuaInitOptions,
   LuaLibraryPreset,
@@ -906,6 +974,14 @@ lua.register_module("math_utils", {
 });
 lua.add_search_path("./lua_modules/?.lua");
 const mod = lua.execute_script("return require('math_utils').clamp(15, 0, 10)");
+
+// Type-safe bytecode precompilation
+const opts: CompileOptions = { stripDebug: true, chunkName: "@my-script" };
+const bytecode: Buffer = lua.compile("return 6 * 7", opts);
+const answer: number = lua.load_bytecode<number>(bytecode);
+
+const fileBytecode: Buffer = lua.compile_file("./scripts/init.lua");
+lua.load_bytecode(fileBytecode);
 
 // Type-safe library loading with presets
 const preset: LuaLibraryPreset = "safe";
@@ -1101,6 +1177,52 @@ Resumes a suspended coroutine with optional arguments.
 - `status`: `'suspended'` | `'running'` | `'dead'`
 - `values`: Array of values yielded or returned by the coroutine
 - `error`: Error message if the coroutine failed (optional)
+
+### `LuaContext.compile(script, options?)`
+
+Compiles Lua source code to bytecode without executing it.
+
+**Parameters:**
+
+- `script`: Lua source code string
+- `options` (optional): Compilation settings
+  - `stripDebug`: Strip debug information for smaller bytecode (default: `false`)
+  - `chunkName`: Name used in error messages (default: derived from source)
+
+**Returns:** `Buffer` containing the compiled bytecode
+
+**Throws:** Error if the source has syntax errors
+
+### `LuaContext.compile_file(filepath, options?)`
+
+Compiles a Lua file to bytecode without executing it.
+
+**Parameters:**
+
+- `filepath`: Path to the Lua source file
+- `options` (optional): Same as `compile()`
+
+**Returns:** `Buffer` containing the compiled bytecode
+
+**Throws:** Error if the file cannot be read or has syntax errors
+
+### `LuaContext.load_bytecode(bytecode, chunkName?)`
+
+Loads and executes precompiled Lua bytecode. Only accepts binary bytecode — raw
+source text is rejected (use `execute_script()` for source).
+
+**Parameters:**
+
+- `bytecode`: `Buffer` containing Lua bytecode (from `compile()`, `compile_file()`,
+  or the `luac` compiler)
+- `chunkName` (optional): Name for error messages (default: `"bytecode"`). Note:
+  for binary bytecode, the name embedded at compile time takes precedence.
+
+**Returns:** The result of executing the bytecode (converted to the appropriate
+JavaScript type), identical to `execute_script`.
+
+**Throws:** Error if the bytecode is invalid, corrupted, or from an incompatible
+Lua version.
 
 ## Data Type Conversion
 

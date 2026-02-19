@@ -90,6 +90,9 @@ public:
     Napi::Value ResumeCoroutine(const Napi::CallbackInfo& info);
     Napi::Value AddSearchPath(const Napi::CallbackInfo& info);
     Napi::Value RegisterModule(const Napi::CallbackInfo& info);
+    Napi::Value Compile(const Napi::CallbackInfo& info);
+    Napi::Value CompileFile(const Napi::CallbackInfo& info);
+    Napi::Value LoadBytecode(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 
