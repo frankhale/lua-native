@@ -2507,4 +2507,169 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // BYTECODE PRECOMPILATION
+  // ============================================
+  describe('bytecode precompilation', () => {
+    describe('compile()', () => {
+      it('compiles a script to a bytecode buffer', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('return 42');
+        expect(bytecode).toBeInstanceOf(Buffer);
+        expect(bytecode.length).toBeGreaterThan(0);
+      });
+
+      it('throws on syntax error', () => {
+        const lua = new lua_native.init();
+        expect(() => lua.compile('return +')).toThrow();
+      });
+
+      it('supports stripDebug option', () => {
+        const lua = new lua_native.init();
+        const full = lua.compile('local x = 1; return x');
+        const stripped = lua.compile('local x = 1; return x', { stripDebug: true });
+        expect(stripped.length).toBeLessThanOrEqual(full.length);
+      });
+
+      it('supports chunkName option (visible in error messages)', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('error("test")', { chunkName: '@my-script' });
+        expect(() => lua.load_bytecode(bytecode)).toThrow(/my-script/);
+      });
+
+      it('compiles without executing', () => {
+        const lua = new lua_native.init();
+        // If compile executed the code, the global would be set
+        lua.compile('x = 999');
+        expect(lua.get_global('x')).toBeNull();
+      });
+    });
+
+    describe('load_bytecode()', () => {
+      it('loads and executes bytecode with correct result', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('return 42');
+        const result = lua.load_bytecode(bytecode);
+        expect(result).toBe(42);
+      });
+
+      it('produces identical results to execute_script', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const source = `
+          local t = {}
+          for i = 1, 5 do t[i] = i * 10 end
+          return t
+        `;
+        const direct = lua.execute_script(source);
+        const bytecode = lua.compile(source);
+        const loaded = lua.load_bytecode(bytecode);
+        expect(loaded).toEqual(direct);
+      });
+
+      it('returns functions from bytecode', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('return function(x) return x * 2 end');
+        const fn = lua.load_bytecode(bytecode) as Function;
+        expect(fn(21)).toBe(42);
+      });
+
+      it('returns multiple values from bytecode', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('return 1, "two", true');
+        const result = lua.load_bytecode(bytecode);
+        expect(result).toEqual([1, 'two', true]);
+      });
+
+      it('throws on invalid bytecode', () => {
+        const lua = new lua_native.init();
+        const garbage = Buffer.from([0x00, 0x01, 0x02, 0x03]);
+        expect(() => lua.load_bytecode(garbage)).toThrow();
+      });
+
+      it('throws on empty bytecode', () => {
+        const lua = new lua_native.init();
+        expect(() => lua.load_bytecode(Buffer.alloc(0))).toThrow();
+      });
+
+      it('rejects raw source text (binary-only mode)', () => {
+        const lua = new lua_native.init();
+        const source = Buffer.from('return 42');
+        expect(() => lua.load_bytecode(source)).toThrow();
+      });
+
+      it('loads the same bytecode multiple times', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('return 99');
+        expect(lua.load_bytecode(bytecode)).toBe(99);
+        expect(lua.load_bytecode(bytecode)).toBe(99);
+        expect(lua.load_bytecode(bytecode)).toBe(99);
+      });
+
+      it('supports custom chunk name via compile option', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        // Chunk name is embedded at compile time; load_bytecode uses the embedded name
+        const bytecode = lua.compile('error("boom")', { chunkName: 'my-chunk' });
+        expect(() => lua.load_bytecode(bytecode)).toThrow(/my-chunk/);
+      });
+
+      it('works with callbacks registered on the context', () => {
+        const lua = new lua_native.init({
+          double: (...args: any[]) => (args[0] as number) * 2
+        });
+        const bytecode = lua.compile('return double(21)');
+        expect(lua.load_bytecode(bytecode)).toBe(42);
+      });
+
+      it('interacts with globals set before loading', () => {
+        const lua = new lua_native.init();
+        lua.set_global('multiplier', 10);
+        const bytecode = lua.compile('return multiplier * 5');
+        expect(lua.load_bytecode(bytecode)).toBe(50);
+      });
+
+      it('allows bytecode compiled on one context to run on another', () => {
+        const lua1 = new lua_native.init();
+        const lua2 = new lua_native.init();
+        const bytecode = lua1.compile('return 123');
+        expect(lua2.load_bytecode(bytecode)).toBe(123);
+      });
+
+      it('returns undefined when bytecode has no return value', () => {
+        const lua = new lua_native.init();
+        const bytecode = lua.compile('local x = 1');
+        expect(lua.load_bytecode(bytecode)).toBeUndefined();
+      });
+    });
+
+    describe('compile_file()', () => {
+      it('compiles a file to bytecode', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const bytecode = lua.compile_file('./tests/fixtures/return-values.lua');
+        expect(bytecode).toBeInstanceOf(Buffer);
+        expect(bytecode.length).toBeGreaterThan(0);
+      });
+
+      it('produces identical results to execute_file when loaded', () => {
+        const lua1 = new lua_native.init({}, ALL_LIBS);
+        const lua2 = new lua_native.init({}, ALL_LIBS);
+        const fromFile = lua1.execute_file('./tests/fixtures/return-values.lua');
+        const bytecode = lua2.compile_file('./tests/fixtures/return-values.lua');
+        const fromBytecode = lua2.load_bytecode(bytecode);
+        expect(fromBytecode).toEqual(fromFile);
+      });
+
+      it('throws on nonexistent file', () => {
+        const lua = new lua_native.init();
+        expect(() => lua.compile_file('./nonexistent.lua')).toThrow();
+      });
+
+      it('supports stripDebug option', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const full = lua.compile_file('./tests/fixtures/return-values.lua');
+        const stripped = lua.compile_file('./tests/fixtures/return-values.lua', { stripDebug: true });
+        expect(stripped.length).toBeLessThanOrEqual(full.length);
+      });
+    });
+  });
 });

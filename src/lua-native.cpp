@@ -181,7 +181,10 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("execute_file_async", &LuaContext::ExecuteFileAsync),
     InstanceMethod("is_busy", &LuaContext::IsBusyMethod),
     InstanceMethod("add_search_path", &LuaContext::AddSearchPath),
-    InstanceMethod("register_module", &LuaContext::RegisterModule)
+    InstanceMethod("register_module", &LuaContext::RegisterModule),
+    InstanceMethod("compile", &LuaContext::Compile),
+    InstanceMethod("compile_file", &LuaContext::CompileFile),
+    InstanceMethod("load_bytecode", &LuaContext::LoadBytecode)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -515,6 +518,106 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   }
 
   return env.Undefined();
+}
+
+Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string script = info[0].As<Napi::String>().Utf8Value();
+
+  bool strip_debug = false;
+  std::string chunk_name;
+  if (info.Length() >= 2 && info[1].IsObject()) {
+    auto options = info[1].As<Napi::Object>();
+    if (options.Has("stripDebug") && options.Get("stripDebug").IsBoolean()) {
+      strip_debug = options.Get("stripDebug").As<Napi::Boolean>().Value();
+    }
+    if (options.Has("chunkName") && options.Get("chunkName").IsString()) {
+      chunk_name = options.Get("chunkName").As<Napi::String>().Utf8Value();
+    }
+  }
+
+  const auto result = runtime->CompileScript(script, strip_debug, chunk_name);
+
+  if (std::holds_alternative<std::string>(result)) {
+    Napi::Error::New(env, std::get<std::string>(result)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& bytecode = std::get<std::vector<uint8_t>>(result);
+  return Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size());
+}
+
+Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string filepath = info[0].As<Napi::String>().Utf8Value();
+
+  bool strip_debug = false;
+  if (info.Length() >= 2 && info[1].IsObject()) {
+    auto options = info[1].As<Napi::Object>();
+    if (options.Has("stripDebug") && options.Get("stripDebug").IsBoolean()) {
+      strip_debug = options.Get("stripDebug").As<Napi::Boolean>().Value();
+    }
+  }
+
+  const auto result = runtime->CompileFile(filepath, strip_debug);
+
+  if (std::holds_alternative<std::string>(result)) {
+    Napi::Error::New(env, std::get<std::string>(result)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& bytecode = std::get<std::vector<uint8_t>>(result);
+  return Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size());
+}
+
+Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsBuffer()) {
+    Napi::TypeError::New(env, "Expected Buffer argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto buffer = info[0].As<Napi::Buffer<uint8_t>>();
+  std::vector<uint8_t> bytecode(buffer.Data(), buffer.Data() + buffer.Length());
+
+  std::string chunk_name = "bytecode";
+  if (info.Length() >= 2 && info[1].IsString()) {
+    chunk_name = info[1].As<Napi::String>().Utf8Value();
+  }
+
+  const auto res = runtime->LoadBytecode(bytecode, chunk_name);
+
+  if (std::holds_alternative<std::string>(res)) {
+    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
+  if (values.empty()) return env.Undefined();
+  if (values.size() == 1) return CoreToNapi(*values[0]);
+
+  const Napi::Array array = Napi::Array::New(env, values.size());
+  for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
+  return array;
 }
 
 LuaContext::~LuaContext() {

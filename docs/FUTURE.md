@@ -217,7 +217,9 @@ Useful for performance tuning — e.g., pausing GC during a batch of operations,
 
 ---
 
-### Bytecode Precompilation
+### ~~Bytecode Precompilation~~ (Completed)
+
+Implemented. See `compile()`, `compile_file()`, and `load_bytecode()` in the API documentation.
 
 Compile Lua scripts to bytecode with `luaL_dump` and load them with `lua_load`:
 

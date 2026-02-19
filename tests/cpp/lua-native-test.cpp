@@ -2290,6 +2290,228 @@ TEST(LuaRuntimeModule, RegisterModuleTableStackBalanceOnFailure) {
   EXPECT_EQ(top_before, top_after);
 }
 
+// ============================================
+// BYTECODE PRECOMPILATION
+// ============================================
+
+TEST(LuaRuntimeBytecode, CompileScriptReturnsBytes) {
+  LuaRuntime runtime;
+  auto result = runtime.CompileScript("return 42");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(result));
+  auto& bytecode = std::get<std::vector<uint8_t>>(result);
+  EXPECT_GT(bytecode.size(), 0u);
+}
+
+TEST(LuaRuntimeBytecode, CompileScriptSyntaxError) {
+  LuaRuntime runtime;
+  auto result = runtime.CompileScript("return +");
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+}
+
+TEST(LuaRuntimeBytecode, CompileScriptWithStripDebug) {
+  LuaRuntime runtime;
+  auto full = runtime.CompileScript("local x = 1\nlocal y = 2\nreturn x + y");
+  auto stripped = runtime.CompileScript("local x = 1\nlocal y = 2\nreturn x + y", true);
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(full));
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(stripped));
+  EXPECT_LE(std::get<std::vector<uint8_t>>(stripped).size(),
+            std::get<std::vector<uint8_t>>(full).size());
+}
+
+TEST(LuaRuntimeBytecode, CompileScriptWithChunkName) {
+  LuaRuntime runtime;
+  auto result = runtime.CompileScript("error('test')", false, "@my-script");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(result));
+  auto& bytecode = std::get<std::vector<uint8_t>>(result);
+  auto exec = runtime.LoadBytecode(bytecode, "@my-script");
+  ASSERT_TRUE(std::holds_alternative<std::string>(exec));
+  EXPECT_NE(std::get<std::string>(exec).find("my-script"), std::string::npos);
+}
+
+TEST(LuaRuntimeBytecode, CompileDoesNotExecute) {
+  LuaRuntime runtime;
+  (void)runtime.CompileScript("x = 999");
+  auto global = runtime.GetGlobal("x");
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(global->value));
+}
+
+TEST(LuaRuntimeBytecode, CompileFileReturnsBytes) {
+  LuaRuntime runtime(LuaRuntime::AllLibraries());
+  auto result = runtime.CompileFile("tests/fixtures/return-values.lua");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(result));
+  EXPECT_GT(std::get<std::vector<uint8_t>>(result).size(), 0u);
+}
+
+TEST(LuaRuntimeBytecode, CompileFileNonexistent) {
+  LuaRuntime runtime;
+  auto result = runtime.CompileFile("nonexistent.lua");
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+}
+
+TEST(LuaRuntimeBytecode, CompileFileEmptyPath) {
+  LuaRuntime runtime;
+  auto result = runtime.CompileFile("");
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeExecutesCorrectly) {
+  LuaRuntime runtime;
+  auto compiled = runtime.CompileScript("return 42");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  auto result = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(result));
+  auto& values = std::get<std::vector<LuaPtr>>(result);
+  ASSERT_EQ(values.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<int64_t>(values[0]->value));
+  EXPECT_EQ(std::get<int64_t>(values[0]->value), 42);
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeMatchesExecuteScript) {
+  LuaRuntime runtime(LuaRuntime::AllLibraries());
+
+  std::string source = "return 'hello', 42, true";
+
+  auto direct = runtime.ExecuteScript(source);
+  auto compiled = runtime.CompileScript(source);
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  auto loaded = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(direct));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(loaded));
+
+  auto& dv = std::get<std::vector<LuaPtr>>(direct);
+  auto& lv = std::get<std::vector<LuaPtr>>(loaded);
+  ASSERT_EQ(dv.size(), lv.size());
+  ASSERT_EQ(dv.size(), 3u);
+
+  EXPECT_EQ(std::get<std::string>(dv[0]->value), std::get<std::string>(lv[0]->value));
+  EXPECT_EQ(std::get<int64_t>(dv[1]->value), std::get<int64_t>(lv[1]->value));
+  EXPECT_EQ(std::get<bool>(dv[2]->value), std::get<bool>(lv[2]->value));
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeInvalidData) {
+  LuaRuntime runtime;
+  std::vector<uint8_t> garbage = {0x00, 0x01, 0x02, 0x03};
+  auto result = runtime.LoadBytecode(garbage);
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeEmpty) {
+  LuaRuntime runtime;
+  std::vector<uint8_t> empty;
+  auto result = runtime.LoadBytecode(empty);
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeRejectSourceText) {
+  LuaRuntime runtime;
+  std::string source = "return 42";
+  std::vector<uint8_t> text(source.begin(), source.end());
+  auto result = runtime.LoadBytecode(text);
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeSameBufferMultipleTimes) {
+  LuaRuntime runtime;
+  auto compiled = runtime.CompileScript("return 99");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  auto& bc = std::get<std::vector<uint8_t>>(compiled);
+
+  for (int i = 0; i < 3; ++i) {
+    auto result = runtime.LoadBytecode(bc);
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(result));
+    auto& values = std::get<std::vector<LuaPtr>>(result);
+    ASSERT_EQ(values.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(values[0]->value), 99);
+  }
+}
+
+TEST(LuaRuntimeBytecode, BytecodePortableBetweenStates) {
+  LuaRuntime runtime1;
+  LuaRuntime runtime2;
+
+  auto compiled = runtime1.CompileScript("return 'hello'");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+
+  auto result = runtime2.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(result));
+  auto& values = std::get<std::vector<LuaPtr>>(result);
+  ASSERT_EQ(values.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(values[0]->value), "hello");
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeWithHostFunctions) {
+  LuaRuntime runtime;
+  runtime.RegisterFunction("triple", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    if (!args.empty() && std::holds_alternative<int64_t>(args[0]->value)) {
+      return std::make_shared<LuaValue>(
+        LuaValue::from(std::get<int64_t>(args[0]->value) * 3));
+    }
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+
+  auto compiled = runtime.CompileScript("return triple(10)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  auto result = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(result));
+  auto& values = std::get<std::vector<LuaPtr>>(result);
+  ASSERT_EQ(values.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(values[0]->value), 30);
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeWithGlobals) {
+  LuaRuntime runtime;
+  runtime.SetGlobal("factor", std::make_shared<LuaValue>(LuaValue::from(int64_t(7))));
+
+  auto compiled = runtime.CompileScript("return factor * 6");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  auto result = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(result));
+  auto& values = std::get<std::vector<LuaPtr>>(result);
+  ASSERT_EQ(values.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(values[0]->value), 42);
+}
+
+TEST(LuaRuntimeBytecode, LoadBytecodeReturnsFunction) {
+  LuaRuntime runtime;
+  auto compiled = runtime.CompileScript("return function(a, b) return a + b end");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  auto result = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(result));
+  auto& values = std::get<std::vector<LuaPtr>>(result);
+  ASSERT_EQ(values.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(values[0]->value));
+
+  // Call the returned function
+  auto& funcRef = std::get<LuaFunctionRef>(values[0]->value);
+  std::vector<LuaPtr> args = {
+    std::make_shared<LuaValue>(LuaValue::from(int64_t(10))),
+    std::make_shared<LuaValue>(LuaValue::from(int64_t(32)))
+  };
+  auto callResult = runtime.CallFunction(funcRef, args);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(callResult));
+  auto& callValues = std::get<std::vector<LuaPtr>>(callResult);
+  ASSERT_EQ(callValues.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(callValues[0]->value), 42);
+}
+
+TEST(LuaRuntimeBytecode, CompileFileAndLoadBytecodeMatch) {
+  LuaRuntime runtime(LuaRuntime::AllLibraries());
+
+  auto compiled = runtime.CompileFile("tests/fixtures/return-values.lua");
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+
+  auto fromBytecode = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  auto fromFile = runtime.ExecuteFile("tests/fixtures/return-values.lua");
+
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fromBytecode));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fromFile));
+
+  auto& bcVals = std::get<std::vector<LuaPtr>>(fromBytecode);
+  auto& fileVals = std::get<std::vector<LuaPtr>>(fromFile);
+  ASSERT_EQ(bcVals.size(), fileVals.size());
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

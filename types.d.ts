@@ -86,6 +86,16 @@ export interface MetatableDefinition {
 }
 
 /**
+ * Options for bytecode compilation
+ */
+export interface CompileOptions {
+  /** Strip debug info (line numbers, local variable names) for smaller bytecode. Default: false */
+  stripDebug?: boolean;
+  /** Chunk name used in error messages. Default: source prefix or "@filepath" */
+  chunkName?: string;
+}
+
+/**
  * Options for set_userdata controlling property access from Lua
  */
 export interface UserdataOptions {
@@ -251,6 +261,50 @@ export interface LuaContext {
    * While busy, sync methods will throw and new async calls will be rejected.
    */
   is_busy(): boolean;
+
+  /**
+   * Compiles Lua source code to bytecode without executing it.
+   * The returned Buffer can be saved to disk or passed to `load_bytecode()`.
+   *
+   * @param script The Lua source code to compile
+   * @param options Optional compilation settings
+   * @returns Buffer containing the compiled bytecode
+   * @throws Error if the source has syntax errors
+   * @example
+   * const bytecode = lua.compile('return function(x) return x * 2 end');
+   * fs.writeFileSync('my-script.luac', bytecode);
+   */
+  compile(script: string, options?: CompileOptions): Buffer;
+
+  /**
+   * Compiles a Lua file to bytecode without executing it.
+   * The chunk name defaults to "@filepath" matching Lua convention.
+   *
+   * @param filepath Path to the Lua source file
+   * @param options Optional compilation settings
+   * @returns Buffer containing the compiled bytecode
+   * @throws Error if the file cannot be read or has syntax errors
+   * @example
+   * const bytecode = lua.compile_file('./scripts/init.lua');
+   */
+  compile_file(filepath: string, options?: CompileOptions): Buffer;
+
+  /**
+   * Loads and executes precompiled Lua bytecode.
+   * Only accepts binary bytecode (not source text). Use `execute_script()` for source.
+   *
+   * @param bytecode Buffer containing Lua bytecode (from `compile()`, `compile_file()`, or `luac`)
+   * @param chunkName Optional name for error messages. Default: "bytecode"
+   * @returns The result of executing the bytecode
+   * @throws Error if the bytecode is invalid, corrupted, or from an incompatible Lua version
+   * @example
+   * const bytecode = lua.compile('return 42');
+   * const result = lua.load_bytecode<number>(bytecode); // 42
+   */
+  load_bytecode<T extends LuaValue | LuaValue[] = LuaValue>(
+    bytecode: Buffer,
+    chunkName?: string
+  ): T;
 }
 
 /**

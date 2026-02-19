@@ -407,6 +407,113 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   return 1;
 }
 
+CompileResult LuaRuntime::CompileScript(const std::string& script,
+                                         bool strip_debug,
+                                         const std::string& chunk_name) const {
+  StackGuard guard(L_);
+
+  int status;
+  if (!chunk_name.empty()) {
+    status = luaL_loadbuffer(L_, script.c_str(), script.size(), chunk_name.c_str());
+  } else {
+    status = luaL_loadstring(L_, script.c_str());
+  }
+
+  if (status != LUA_OK) {
+    std::string err = lua_tostring(L_, -1);
+    return err;
+  }
+
+  std::vector<uint8_t> bytecode;
+  lua_dump(L_, [](lua_State*, const void* p, size_t sz, void* ud) -> int {
+    auto* bc = static_cast<std::vector<uint8_t>*>(ud);
+    auto* bytes = static_cast<const uint8_t*>(p);
+    bc->insert(bc->end(), bytes, bytes + sz);
+    return 0;
+  }, &bytecode, strip_debug ? 1 : 0);
+
+  return bytecode;
+}
+
+CompileResult LuaRuntime::CompileFile(const std::string& filepath,
+                                       bool strip_debug) const {
+  if (filepath.empty()) {
+    return std::string("File path cannot be empty");
+  }
+
+  StackGuard guard(L_);
+
+  if (luaL_loadfile(L_, filepath.c_str()) != LUA_OK) {
+    std::string err = lua_tostring(L_, -1);
+    return err;
+  }
+
+  std::vector<uint8_t> bytecode;
+  lua_dump(L_, [](lua_State*, const void* p, size_t sz, void* ud) -> int {
+    auto* bc = static_cast<std::vector<uint8_t>*>(ud);
+    auto* bytes = static_cast<const uint8_t*>(p);
+    bc->insert(bc->end(), bytes, bytes + sz);
+    return 0;
+  }, &bytecode, strip_debug ? 1 : 0);
+
+  return bytecode;
+}
+
+ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
+                                       const std::string& chunk_name) const {
+  if (bytecode.empty()) {
+    return std::string("Bytecode cannot be empty");
+  }
+
+  const int stackBefore = lua_gettop(L_);
+
+  struct ReaderData {
+    const uint8_t* data;
+    size_t size;
+    bool consumed;
+  };
+  ReaderData reader{bytecode.data(), bytecode.size(), false};
+
+  int status = lua_load(L_,
+    [](lua_State*, void* ud, size_t* sz) -> const char* {
+      auto* r = static_cast<ReaderData*>(ud);
+      if (r->consumed) {
+        *sz = 0;
+        return nullptr;
+      }
+      *sz = r->size;
+      r->consumed = true;
+      return reinterpret_cast<const char*>(r->data);
+    },
+    &reader, chunk_name.c_str(), "b");
+
+  if (status != LUA_OK) {
+    std::string error = lua_tostring(L_, -1);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  if (lua_pcall(L_, 0, LUA_MULTRET, 0) != LUA_OK) {
+    std::string error = lua_tostring(L_, -1);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  const int nresults = lua_gettop(L_) - stackBefore;
+  std::vector<LuaPtr> results;
+  results.reserve(nresults);
+  try {
+    for (int i = 0; i < nresults; ++i) {
+      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+    }
+  } catch (const std::exception& e) {
+    lua_pop(L_, nresults);
+    return std::string(e.what());
+  }
+  lua_pop(L_, nresults);
+  return results;
+}
+
 ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   const int stackBefore = lua_gettop(L_);
 

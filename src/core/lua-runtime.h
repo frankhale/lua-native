@@ -235,6 +235,7 @@ struct LuaValue {
 };
 
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
+using CompileResult = std::variant<std::vector<uint8_t>, std::string>;
 
 class LuaRuntime {
 public:
@@ -257,6 +258,14 @@ public:
 
   [[nodiscard]] ScriptResult ExecuteScript(const std::string& script) const;
   [[nodiscard]] ScriptResult ExecuteFile(const std::string& filepath) const;
+
+  [[nodiscard]] CompileResult CompileScript(const std::string& script,
+                                             bool strip_debug = false,
+                                             const std::string& chunk_name = "") const;
+  [[nodiscard]] CompileResult CompileFile(const std::string& filepath,
+                                           bool strip_debug = false) const;
+  [[nodiscard]] ScriptResult LoadBytecode(const std::vector<uint8_t>& bytecode,
+                                           const std::string& chunk_name = "bytecode") const;
 
   void SetGlobal(const std::string& name, const LuaPtr& value) const;
   void RegisterFunction(const std::string& name, Function fn);
