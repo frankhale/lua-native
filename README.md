@@ -13,13 +13,16 @@ data structures.
 
 ## Features
 
-- Execute Lua scripts from Node.js
+- Execute Lua scripts and files from Node.js
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Global variable management (get and set)
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
+- Module / require integration — register JS modules and add search paths for Lua's `require()`
+- Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
+- Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
 - Cross-platform support (Windows, macOS)
@@ -85,12 +88,54 @@ Return a value:
 ```javascript
 import lua_native from "lua-native";
 
-// Create a new Lua context
-const lua = new lua_native.init({});
+// Create a new Lua context (no callbacks or options needed)
+const lua = new lua_native.init();
 
 // Execute a simple script
 const result = lua.execute_script("return 42");
 console.log(result); // 42
+```
+
+### File Execution
+
+Execute Lua files directly instead of passing script strings:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({
+  greet: (name) => `Hello, ${name}!`,
+});
+
+// Execute a Lua file
+const result = lua.execute_file("./scripts/init.lua");
+console.log(result);
+```
+
+Return values, globals, and callbacks all work exactly as with `execute_script`:
+
+```javascript
+// scripts/math.lua:
+//   return 6 * 7
+
+const answer = lua.execute_file("./scripts/math.lua");
+console.log(answer); // 42
+
+// scripts/setup.lua:
+//   config = { debug = true, level = 3 }
+
+lua.execute_file("./scripts/setup.lua");
+console.log(lua.get_global("config")); // { debug: true, level: 3 }
+```
+
+Errors (file not found, syntax errors, runtime errors) throw JavaScript exceptions:
+
+```javascript
+try {
+  lua.execute_file("./nonexistent.lua");
+} catch (error) {
+  console.error(error.message); // "cannot open ./nonexistent.lua: No such file or directory"
+}
 ```
 
 ### Passing JavaScript Functions to Lua
@@ -113,7 +158,7 @@ console.log(result); // 5
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 // Set global variables
 lua.set_global("x", 7);
@@ -163,7 +208,7 @@ Lua functions can be returned to JavaScript and called directly:
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 // Return a Lua function
 const add = lua.execute_script(`
@@ -197,7 +242,7 @@ Lua errors are automatically converted to JavaScript exceptions:
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 try {
   lua.execute_script("error('Something went wrong')");
@@ -214,7 +259,7 @@ const lua = new lua_native.init({
   riskyOperation: () => {
     throw new Error("Database connection failed");
   },
-});
+}, { libraries: "all" });
 
 try {
   lua.execute_script("riskyOperation()");
@@ -224,6 +269,202 @@ try {
 }
 ```
 
+### Standard Library Loading (Opt-In)
+
+By default, `new lua_native.init()` creates a **bare Lua state** with no
+standard libraries loaded. You opt in to the libraries you need via the
+`libraries` option.
+
+#### Load all libraries
+
+The `'all'` preset loads all 10 standard libraries — equivalent to the previous
+default behavior:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+lua.execute_script('print(string.upper("hello"))'); // "HELLO"
+lua.execute_script("print(math.floor(3.7))"); // 3
+lua.execute_script("print(os.clock())"); // works
+```
+
+#### Safe preset (sandboxing)
+
+The `'safe'` preset loads everything except `io`, `os`, and `debug` — ideal for
+running untrusted scripts:
+
+```javascript
+const sandbox = new lua_native.init({}, { libraries: "safe" });
+
+sandbox.execute_script('print(string.upper("hello"))'); // "HELLO"
+sandbox.execute_script("print(math.floor(3.7))"); // 3
+sandbox.execute_script("print(type(io))"); // "nil" — io is not loaded
+sandbox.execute_script("print(type(os))"); // "nil" — os is not loaded
+sandbox.execute_script("print(type(debug))"); // "nil" — debug is not loaded
+```
+
+#### Selective loading (array)
+
+You can also pass an explicit array of library names:
+
+```javascript
+// Only load base, string, and math
+const lua = new lua_native.init({}, {
+  libraries: ["base", "string", "math"],
+});
+
+lua.execute_script('print(string.upper("hello"))'); // "HELLO"
+lua.execute_script("print(math.floor(3.7))"); // 3
+lua.execute_script("print(type(io))"); // "nil" — io is not loaded
+```
+
+#### Bare state (default)
+
+Omitting `libraries` (or omitting all arguments entirely) creates a bare Lua state
+with no standard libraries at all:
+
+```javascript
+const bare = new lua_native.init();
+
+// Basic Lua still works (arithmetic, strings, return)
+bare.execute_script("return 1 + 2"); // 3
+
+// But no standard functions are available
+// bare.execute_script('print("hi")') -- ERROR: 'print' is nil
+```
+
+Available library names: `base`, `package`, `coroutine`, `table`, `io`, `os`,
+`string`, `math`, `utf8`, `debug`.
+
+Available presets: `'all'` (all 10 libraries), `'safe'` (all except `io`, `os`,
+`debug`).
+
+### Module / Require Integration
+
+Register JavaScript objects as Lua modules available via `require()`, or add
+filesystem search paths for Lua module loading. Requires the `package` library.
+
+#### Registering JS Modules
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Register a JS object as a Lua module
+lua.register_module("utils", {
+  clamp: (x, min, max) => Math.min(Math.max(x, min), max),
+  lerp: (a, b, t) => a + (b - a) * t,
+  version: "1.0.0",
+});
+
+// Use it from Lua with require()
+const result = lua.execute_script(`
+  local utils = require('utils')
+  return utils.clamp(15, 0, 10), utils.version
+`);
+console.log(result); // [10, '1.0.0']
+```
+
+Modules are pre-loaded into `package.loaded` — no filesystem search occurs.
+Functions in the module become callable from Lua, and plain values (strings,
+numbers, booleans) are set directly.
+
+#### Adding Search Paths
+
+```javascript
+// Add filesystem search paths for Lua's require()
+lua.add_search_path("./lua_modules/?.lua");
+lua.add_search_path("./libs/?/init.lua");
+
+// Lua can now require modules from those directories
+lua.execute_script(`
+  local mymod = require('mymod')  -- searches ./lua_modules/mymod.lua
+  print(mymod.name)
+`);
+```
+
+The path must contain a `?` placeholder that gets replaced by the module name.
+
+#### Combined Usage
+
+```javascript
+// Mix filesystem modules with JS-registered modules
+lua.add_search_path("./scripts/?.lua");
+
+lua.register_module("config", {
+  debug: true,
+  maxRetries: 3,
+});
+
+lua.execute_script(`
+  local config = require('config')   -- from JS
+  local helpers = require('helpers')  -- from ./scripts/helpers.lua
+  if config.debug then
+    print(helpers.format_debug())
+  end
+`);
+```
+
+### Async Execution
+
+By default, all Lua execution blocks the Node.js event loop. The async methods
+run Lua on a worker thread and return Promises, keeping the event loop free for
+other work.
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Non-blocking execution
+const result = await lua.execute_script_async("return 6 * 7");
+console.log(result); // 42
+
+// File execution
+const fileResult = await lua.execute_file_async("./scripts/heavy.lua");
+```
+
+Run multiple independent contexts concurrently with `Promise.all()`:
+
+```javascript
+const contexts = [1, 2, 3, 4].map(() => new lua_native.init({}, { libraries: "all" }));
+
+const results = await Promise.all(
+  contexts.map((lua, i) => lua.execute_script_async(`return ${i + 1} * 10`))
+);
+console.log(results); // [10, 20, 30, 40]
+```
+
+Error handling works with standard try/catch:
+
+```javascript
+try {
+  await lua.execute_script_async("error('something failed')");
+} catch (error) {
+  console.error(error.message); // includes "something failed"
+}
+```
+
+**Important:** JS callbacks registered on the context are not available during
+async execution. Calling a registered JS function from async Lua code will
+reject the promise with a clear error:
+
+```javascript
+const lua = new lua_native.init({
+  greet: () => "hello",
+}, { libraries: "all" });
+
+// This will reject — JS callbacks can't run on the worker thread
+await lua.execute_script_async("return greet()"); // Error: "JS callbacks are not available in async mode"
+
+// Workaround: set up data before async, compute in Lua
+lua.set_global("name", "World");
+const result = await lua.execute_script_async("return 'Hello, ' .. name .. '!'");
+```
+
 ### Coroutines
 
 Lua coroutines are supported, allowing you to create pausable/resumable functions:
@@ -231,7 +472,7 @@ Lua coroutines are supported, allowing you to create pausable/resumable function
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 // Create a coroutine from a function
 const coro = lua.create_coroutine(`
@@ -312,7 +553,7 @@ modify its properties:
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 const connection = { host: "localhost", port: 5432, connected: true };
 lua.set_userdata("db", connection);
@@ -367,7 +608,7 @@ const lua = new lua_native.init({
     // fileHandle is opaque to JS, but can be returned to Lua
     return fileHandle;
   },
-});
+}, { libraries: "all" });
 
 lua.execute_script(`
   local f = io.tmpfile()
@@ -389,7 +630,7 @@ overloading, custom `tostring`, callable tables, custom indexing, and more.
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 // Create two vector tables in Lua
 lua.execute_script("v1 = {x = 1, y = 2}; v2 = {x = 10, y = 20}");
@@ -408,7 +649,7 @@ console.log(sum); // { x: 11, y: 22 }
 #### Callable Tables — `__call`
 
 ```javascript
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 lua.execute_script("multiplier = {factor = 10}");
 
@@ -425,7 +666,7 @@ console.log(result); // 50
 `__index` can be a function (for computed lookups) or a table (for fallback values):
 
 ```javascript
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 // __index as a function — compute missing keys dynamically
 lua.execute_script("obj = {}");
@@ -447,7 +688,7 @@ console.log(lua.execute_script("return config.timeout")); // 30
 #### Intercepting Writes — `__newindex`
 
 ```javascript
-const lua = new lua_native.init({});
+const lua = new lua_native.init();
 
 const log = [];
 lua.execute_script("protected = {x = 1}");
@@ -496,7 +737,7 @@ deep-copied as before.
 ```javascript
 import lua_native from "lua-native";
 
-const lua = new lua_native.init({});
+const lua = new lua_native.init({}, { libraries: "all" });
 
 const obj = lua.execute_script(`
   local t = {}
@@ -596,6 +837,8 @@ import type {
   LuaCallbacks,
   LuaContext,
   LuaCoroutine,
+  LuaInitOptions,
+  LuaLibraryPreset,
   CoroutineResult,
   LuaFunction,
   LuaTableRef,
@@ -609,7 +852,7 @@ const callbacks: LuaCallbacks = {
   greet: (name: string): string => `Hello, ${name}!`,
 };
 
-const lua: LuaContext = new lua_native.init(callbacks);
+const lua: LuaContext = new lua_native.init(callbacks, { libraries: "all" });
 const result: number = lua.execute_script("return add(10, 20)");
 
 // Type-safe global access
@@ -654,20 +897,52 @@ const proxy = lua.execute_script<LuaTableRef>(`
 `);
 console.log(proxy.x); // 1
 console.log(proxy.hello); // "hello" — __index fires
+
+// Type-safe module registration
+lua.register_module("math_utils", {
+  clamp: (x: number, min: number, max: number): number =>
+    Math.min(Math.max(x, min), max),
+  PI: Math.PI,
+});
+lua.add_search_path("./lua_modules/?.lua");
+const mod = lua.execute_script("return require('math_utils').clamp(15, 0, 10)");
+
+// Type-safe library loading with presets
+const preset: LuaLibraryPreset = "safe";
+const sandboxed: LuaContext = new lua_native.init({}, { libraries: preset });
+sandboxed.execute_script('print(string.upper("safe"))'); // "SAFE"
+
+// Or with an explicit array
+const options: LuaInitOptions = { libraries: ["base", "string", "math"] };
+const custom: LuaContext = new lua_native.init({}, options);
+custom.execute_script('print(string.upper("custom"))'); // "CUSTOM"
 ```
 
 ## API Reference
 
-### `lua_native.init(callbacks?)`
+### `lua_native.init(callbacks?, options?)`
 
-Creates a new Lua execution context.
+Creates a new Lua execution context. Both arguments are optional — `new lua_native.init()`
+creates a bare Lua state with no callbacks and no standard libraries.
 
 **Parameters:**
 
 - `callbacks` (optional): Object containing JavaScript functions and values to
   make available in Lua
+- `options` (optional): Configuration object
+  - `libraries` (optional): Which standard libraries to load. If omitted, **no
+    libraries are loaded** (bare state). Accepts:
+    - `'all'` — loads all 10 standard libraries
+    - `'safe'` — loads all except `io`, `os`, and `debug`
+    - `LuaLibrary[]` — array of specific library names
+    - `[]` — bare state (no libraries)
+
+    Valid library names: `'base'`, `'package'`, `'coroutine'`, `'table'`, `'io'`,
+    `'os'`, `'string'`, `'math'`, `'utf8'`, `'debug'`
 
 **Returns:** `LuaContext` instance
+
+**Throws:** Error if an unknown library name is provided
 
 ### `LuaContext.execute_script(script)`
 
@@ -680,6 +955,79 @@ Executes a Lua script and returns the result.
 **Returns:** The result of the script execution (converted to the appropriate
 JavaScript type). Tables with metatables are returned as Proxy objects that
 preserve metamethods; plain tables are deep-copied into objects or arrays.
+
+### `LuaContext.execute_file(filepath)`
+
+Executes a Lua file and returns the result.
+
+**Parameters:**
+
+- `filepath`: Path to the Lua file to execute
+
+**Returns:** The result of the file execution (converted to the appropriate
+JavaScript type), identical to `execute_script`. Returns `undefined` if the file
+has no return statement.
+
+**Throws:** Error if the file is not found, contains syntax errors, or encounters
+a runtime error.
+
+### `LuaContext.execute_script_async(script)`
+
+Executes a Lua script asynchronously on a worker thread.
+
+**Parameters:**
+
+- `script`: String containing Lua code to execute
+
+**Returns:** `Promise` that resolves with the script result or rejects on error.
+JS callbacks are not available during async execution.
+
+**Throws:** Error if the context is busy with another async operation.
+
+### `LuaContext.execute_file_async(filepath)`
+
+Executes a Lua file asynchronously on a worker thread.
+
+**Parameters:**
+
+- `filepath`: Path to the Lua file to execute
+
+**Returns:** `Promise` that resolves with the file result or rejects on error.
+JS callbacks are not available during async execution.
+
+**Throws:** Error if the context is busy with another async operation.
+
+### `LuaContext.is_busy()`
+
+Returns whether the context is currently busy with an async operation.
+
+**Returns:** `boolean` — `true` while an async operation is in progress, `false`
+otherwise.
+
+### `LuaContext.add_search_path(path)`
+
+Appends a search path to Lua's `package.path` for module resolution.
+
+**Parameters:**
+
+- `path`: Search path template containing a `?` placeholder (e.g., `'./modules/?.lua'`)
+
+**Throws:** Error if the `package` library is not loaded, or if the path does not
+contain a `?` placeholder.
+
+### `LuaContext.register_module(name, module)`
+
+Registers a JavaScript object as a Lua module, making it available via
+`require(name)`. The module is pre-loaded into `package.loaded` — no filesystem
+search occurs.
+
+**Parameters:**
+
+- `name`: The module name used in `require(name)`
+- `module`: An object whose properties become the module's fields. Functions
+  become callable from Lua; other values are set directly.
+
+**Throws:** Error if the `package` library is not loaded.
 
 ### `LuaContext.set_global(name, value)`
 
@@ -815,4 +1163,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-16 February 2026
+18 February 2026

@@ -243,8 +243,12 @@ public:
   using PropertyGetter = std::function<LuaPtr(int, const std::string&)>;
   using PropertySetter = std::function<void(int, const std::string&, const LuaPtr&)>;
 
-  explicit LuaRuntime(bool openStdLibs = true);
+  LuaRuntime();
+  explicit LuaRuntime(const std::vector<std::string>& libraries);
   ~LuaRuntime();
+
+  static std::vector<std::string> AllLibraries();
+  static std::vector<std::string> SafeLibraries();
 
   LuaRuntime(const LuaRuntime&) = delete;
   LuaRuntime& operator=(const LuaRuntime&) = delete;
@@ -252,6 +256,7 @@ public:
   LuaRuntime& operator=(LuaRuntime&&) = delete;
 
   [[nodiscard]] ScriptResult ExecuteScript(const std::string& script) const;
+  [[nodiscard]] ScriptResult ExecuteFile(const std::string& filepath) const;
 
   void SetGlobal(const std::string& name, const LuaPtr& value) const;
   void RegisterFunction(const std::string& name, Function fn);
@@ -270,9 +275,16 @@ public:
   // Userdata support
   void SetUserdataGCCallback(UserdataGCCallback cb);
   void SetPropertyHandlers(PropertyGetter getter, PropertySetter setter);
+
+  void SetAsyncMode(bool enabled);
+  bool IsAsyncMode() const;
   // Metatable support
   void StoreHostFunction(const std::string& name, Function fn);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
+
+  // Module / require support
+  void AddSearchPath(const std::string& path) const;
+  void RegisterModuleTable(const std::string& name, const std::vector<MetatableEntry>& entries) const;
 
   void CreateUserdataGlobal(const std::string& name, int ref_id);
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
@@ -309,6 +321,11 @@ private:
   std::unordered_map<int, int> userdata_ref_counts_;
   PropertyGetter property_getter_;
   PropertySetter property_setter_;
+  bool async_mode_ = false;
+
+  void InitState();
+  static int LibraryMask(const std::vector<std::string>& libraries);
+  bool HasPackageLibrary() const;
 
   void RegisterUserdataMetatable();
   void RegisterProxyUserdataMetatable();

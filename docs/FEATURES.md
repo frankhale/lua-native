@@ -357,6 +357,136 @@ The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no bi
 
 ---
 
+## File Execution (February 2026)
+
+### Overview
+
+`execute_file()` executes a Lua file directly from a filesystem path, mirroring `execute_script()` but using `luaL_loadfile` instead of `luaL_loadstring`. Return values, globals, callbacks, and error handling all work identically.
+
+### Architecture
+
+**Core layer:** `ExecuteFile` validates the filepath is non-empty (returning an early error string), then follows the exact same pattern as `ExecuteScript`: `luaL_loadfile` to compile, `lua_pcall` with `LUA_MULTRET` to execute, stack delta to count results, `ToLuaValue` to convert each result. Lua handles file-not-found errors naturally — `luaL_loadfile` returns a descriptive error string.
+
+**N-API layer:** `ExecuteFile` accepts a single string argument, delegates to `runtime->ExecuteFile(path)`, and converts results identically to `ExecuteScript` — single value returned directly, multiple values as `Napi::Array`, zero values as `undefined`, errors as JS exceptions.
+
+### Design Decisions
+
+**Empty path guard:** The core layer rejects empty paths before calling `luaL_loadfile`. This provides a clear error message rather than Lua's generic "cannot open" message for an empty string.
+
+**No path normalization:** File paths are passed directly to `luaL_loadfile` without normalization or resolution. This keeps the implementation simple and lets the caller control path handling. Relative paths resolve against the process working directory, matching standard filesystem behavior.
+
+---
+
+## Opt-In Standard Library Loading (February 2026)
+
+### Overview
+
+Standard library loading is now opt-in. The default `LuaRuntime()` constructor creates a bare Lua state with no standard libraries loaded. Users choose what to load via preset strings (`'all'`, `'safe'`) or an explicit array of library names. This is the primary mechanism for sandboxing untrusted scripts.
+
+### Architecture
+
+**Core layer:** The `LuaRuntime()` default constructor creates a bare state (no libraries). The `LuaRuntime(bool openStdLibs)` constructor was removed. Two static helpers provide named library lists:
+
+- `LuaRuntime::AllLibraries()` — returns a `vector<string>` of all 10 standard library names
+- `LuaRuntime::SafeLibraries()` — returns a `vector<string>` of all libraries except `io`, `os`, and `debug`
+
+The `LuaRuntime(const std::vector<std::string>& libraries)` constructor loads the specified libraries. All constructors share common initialization via a private `InitState()` method that stores the runtime in the registry and registers userdata metatables.
+
+A static map (`kLibFlags`) maps user-facing library names to Lua 5.5's bitmask constants (`LUA_GLIBK`, `LUA_LOADLIBK`, etc.). The static `LibraryMask()` method OR's the requested library flags into a single integer. The constructor calls `luaL_openselectedlibs(L_, mask, 0)` — a Lua 5.5 API that loads exactly the specified libraries in a single call.
+
+Unknown library names throw `std::runtime_error` with a descriptive message including the bad name.
+
+**N-API layer:** The `LuaContext` constructor checks for a second argument (options object). The `options.libraries` field accepts:
+
+- A preset string `'all'` — resolved to `LuaRuntime::AllLibraries()`
+- A preset string `'safe'` — resolved to `LuaRuntime::SafeLibraries()`
+- An array of library name strings — passed directly to the `vector<string>` constructor
+- Omitted or empty array — creates a bare state via the default `LuaRuntime()` constructor
+
+Non-string elements in the array produce a `TypeError`. Unknown preset strings produce a `TypeError`.
+
+**TypeScript types:** `LuaLibraryPreset = 'all' | 'safe'` is a new type alias. `LuaInitOptions.libraries` accepts `LuaLibrary[] | LuaLibraryPreset`.
+
+**Available libraries:** `base`, `package`, `coroutine`, `table`, `io`, `os`, `string`, `math`, `utf8`, `debug`.
+
+### Design Decisions
+
+**`luaL_openselectedlibs` over `luaL_requiref`:** Lua 5.5 provides `luaL_openselectedlibs(L, load, preload)` which handles all library name registration internally. This is cleaner than calling `luaL_requiref` in a loop and avoids the special-case handling of the base library (which registers under `"_G"` rather than `"base"`).
+
+**Bare by default:** The default constructor creates a bare state to encourage explicit library selection. This is safer for sandboxing — users must opt in to potentially dangerous libraries like `io`, `os`, and `debug` rather than remembering to opt out. The `'all'` preset provides a convenient one-word escape hatch for scripts that need everything.
+
+**Static helpers over enum:** `AllLibraries()` and `SafeLibraries()` return plain vectors rather than using an enum or bitfield. This keeps the API consistent — both presets and manual lists use the same `vector<string>` constructor path.
+
+**Preset strings in the N-API layer:** Preset resolution (`'all'` and `'safe'`) happens in the N-API layer, not the core layer. The core layer only knows about `vector<string>`. This keeps the core layer simple and testable — presets are a convenience feature for the JS API.
+
+**Validation at construction:** Unknown library names throw immediately during `LuaRuntime` construction rather than silently ignoring them. This catches typos early.
+
+---
+
+## Async Execution (February 2026)
+
+### Overview
+
+`execute_script_async()` and `execute_file_async()` run Lua scripts on the libuv thread pool via `Napi::AsyncWorker`, returning Promises. This keeps the Node.js event loop free during CPU-heavy Lua computation. JS callbacks are disallowed in async mode — scripts that call registered JS functions get a clear error.
+
+### Architecture
+
+**AsyncWorker pattern:** Two classes (`LuaScriptAsyncWorker`, `LuaFileAsyncWorker`) extend `Napi::AsyncWorker`. The libuv worker thread calls `Execute()`, which is pure C++ (no N-API). The main thread calls `OnOK()`, where N-API conversions happen.
+
+- `Execute()`: Sets `async_mode_` on the runtime, calls `ExecuteScript`/`ExecuteFile`, clears `async_mode_`. The result is stored in a `ScriptResult` member.
+- `OnOK()`: Clears the busy flag, converts the `ScriptResult` to N-API values via `CoreToNapi`, resolves or rejects the deferred Promise.
+- `OnError()`: Clears the busy flag, rejects the deferred Promise.
+
+**Busy flag:** `LuaContext` has an `is_busy_` flag that is set to `true` when an async operation starts and cleared in `OnOK()`/`OnError()`. All 8 sync methods (`execute_script`, `execute_file`, `set_global`, `get_global`, `set_userdata`, `set_metatable`, `create_coroutine`, `resume`) check this flag and throw if set. The async methods also check it, preventing concurrent async operations on the same context.
+
+**Callback guard:** `LuaRuntime::async_mode_` is checked in `LuaCallHostFunction` right after the host function lookup. If set, the function returns a Lua error (`luaL_error`) with a message including "async mode" and the function name. This is caught by `lua_pcall` and propagated through the `ScriptResult` error path.
+
+### Design Decisions
+
+**Why a busy flag instead of a mutex:** A mutex would allow queuing sync operations behind an async one, which would still block the event loop (defeating the purpose). The busy flag provides a clear, immediate error: "you started an async operation, wait for it to complete before touching this context." This is simpler and more predictable.
+
+**Why disallow JS callbacks in async mode:** N-API calls (`Napi::Function::Call`, `Napi::Value` construction) are only safe on the main thread. The `Execute()` method runs on a worker thread. Rather than adding complex marshalling to bounce callbacks back to the main thread (which would negate the async benefit for callback-heavy scripts), Phase 1 takes the simple approach: callbacks are blocked with a clear error. Users can set up globals before the async call and read results after.
+
+**Why one operation per context:** Lua states are not thread-safe — a single `lua_State*` must not be accessed from multiple threads simultaneously. The busy flag enforces this invariant. For true concurrency, users should create multiple `LuaContext` instances (each with its own `lua_State`).
+
+**Result conversion on the main thread:** `OnOK()` runs on the main thread, where N-API calls are safe. The `ScriptResult` (a `variant<vector<LuaPtr>, string>`) is a pure C++ type that was populated on the worker thread. The conversion to `Napi::Value` via `CoreToNapi` mirrors the existing sync path exactly.
+
+---
+
+## Module / Require Integration (February 2026)
+
+### Overview
+
+`add_search_path()` appends filesystem search paths to Lua's `package.path`, enabling `require()` to find `.lua` module files. `register_module()` pre-loads a JavaScript object into `package.loaded`, making it available via `require(name)` without any filesystem search. Functions within the module object become callable from Lua.
+
+### Architecture
+
+**Core layer:**
+- `HasPackageLibrary()` (private helper): Checks that the `package` global is a table. Used by both methods to validate the prerequisite.
+- `AddSearchPath(path)`: Uses `StackGuard`. Gets `package.path`, appends the new path with `;` separator, sets it back.
+- `RegisterModuleTable(name, entries)`: Uses `StackGuard`. Gets `package.loaded`, creates a new Lua table, iterates the entries vector — for function entries, pushes a `lua_pushcclosure` with `LuaCallHostFunction` (function name as upvalue); for value entries, pushes via `PushLuaValue`. Sets the table in `package.loaded[name]`.
+
+**N-API layer:**
+- `AddSearchPath`: Busy check, string validation, `?` placeholder validation, delegates to core.
+- `RegisterModule`: Busy check, argument validation (string + object), iterates JS object properties. Functions are stored via `StoreHostFunction` + `CreateJsCallbackWrapper` with generated names (`__module_<id>_<key>`). Non-function values are converted via `NapiToCoreInstance`. Builds a `vector<MetatableEntry>` and delegates to `RegisterModuleTable`.
+- `next_module_id_` counter ensures unique function names across multiple `register_module` calls.
+
+Both methods require the `package` library to be loaded. The `'safe'` and `'all'` presets include `package` by default.
+
+### Design Decisions
+
+**Approach C — Build the module table directly in Lua:** Three approaches were considered (see `docs/REQUIRE.md` for the full comparison). The chosen approach builds the Lua table directly on the Lua stack inside `RegisterModuleTable`, pushing closures for functions inline. This avoids creating temporary Lua globals (Approach A's global-then-nil pattern) and cleanly separates concerns between the N-API and core layers.
+
+**Reuses `MetatableEntry`:** The `MetatableEntry` struct has exactly the right shape for module entries (key + is_function flag + func_name or value). Rather than creating a duplicate struct, it's reused directly. The name is semantically off but the structure is identical.
+
+**`StoreHostFunction` over `RegisterFunction`:** Module functions are stored via `StoreHostFunction` (same as `set_metatable`), which places them in `host_functions_` without creating Lua globals. The closures are pushed directly into the module table. This prevents namespace pollution — internal function names like `__module_1_clamp` never appear as Lua globals.
+
+**`?` placeholder validation in N-API layer:** The core layer doesn't validate path format — it just manipulates `package.path`. The `?` check is a user-facing concern handled at the N-API boundary.
+
+**JS modules win over filesystem modules:** If a JS-registered module and a filesystem module share the same name, the JS module wins because `package.loaded` is checked before any searcher runs. This is standard Lua behavior for pre-loaded modules.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -369,3 +499,7 @@ The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no bi
 | Full userdata with properties | High | February 2026 |
 | Explicit metatables | Moderate | February 2026 |
 | Reference-based tables with Proxy | High | February 2026 |
+| File execution | Low | February 2026 |
+| Opt-in standard library loading with presets | Low | February 2026 |
+| Async execution (Phase 1) | Moderate | February 2026 |
+| Module / require integration | Moderate | February 2026 |

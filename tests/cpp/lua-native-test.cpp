@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <limits>
 
 #include "core/lua-runtime.h"
@@ -18,7 +22,7 @@ static LuaPtr getField(LuaRuntime& rt, const LuaPtr& val, const std::string& key
 }
 
 TEST(LuaRuntimeCore, ReturnsNumbersAndStrings) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return 42, 'ok'");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -28,7 +32,7 @@ TEST(LuaRuntimeCore, ReturnsNumbersAndStrings) {
 }
 
 TEST(LuaRuntimeCore, HandlesBooleansAndNil) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return true, false, nil");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -39,7 +43,7 @@ TEST(LuaRuntimeCore, HandlesBooleansAndNil) {
 }
 
 TEST(LuaRuntimeCore, ArraysAndTables) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return {1, 2, 3}, { a = 1, b = 'x' }");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -57,7 +61,7 @@ TEST(LuaRuntimeCore, ArraysAndTables) {
 }
 
 TEST(LuaRuntimeCore, RegisterFunctionAndCall) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.RegisterFunction("adder", [](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t a = std::get<int64_t>(args[0]->value);
     int64_t b = std::get<int64_t>(args[1]->value);
@@ -72,7 +76,7 @@ TEST(LuaRuntimeCore, RegisterFunctionAndCall) {
 }
 
 TEST(LuaRuntimeCore, SetGlobalAndGetGlobal) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetGlobal("x", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42))));
   const auto gv = rt.GetGlobal("x");
   ASSERT_NE(gv, nullptr);
@@ -84,14 +88,14 @@ TEST(LuaRuntimeCore, SetGlobalAndGetGlobal) {
 }
 
 TEST(LuaRuntimeCore, ErrorPropagation) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   auto res = rt.ExecuteScript("error('boom')");
   ASSERT_TRUE(std::holds_alternative<std::string>(res));
   EXPECT_NE(std::get<std::string>(res).find("boom"), std::string::npos);
 }
 
 TEST(LuaRuntimeCore, ArrayVsMapDetection) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   // Sparse numeric keys -> should be a map with string keys "1" and "3"
   const auto res = rt.ExecuteScript("local t = {}; t[1]=10; t[3]=30; return t");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
@@ -105,7 +109,7 @@ TEST(LuaRuntimeCore, ArrayVsMapDetection) {
 }
 
 TEST(LuaRuntimeCore, EmptyTableIsArray) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return {}");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -116,7 +120,7 @@ TEST(LuaRuntimeCore, EmptyTableIsArray) {
 }
 
 TEST(LuaRuntimeCore, DeepRecursionCap) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   // Build a nested table 105 levels deep: t.child.child....
   // This should return an error because it exceeds the depth limit
   const auto res = rt.ExecuteScript(R"(
@@ -131,7 +135,7 @@ TEST(LuaRuntimeCore, DeepRecursionCap) {
 }
 
 TEST(LuaRuntimeCore, DeepRecursionAtLimit) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   // Build a nested table exactly at the depth limit (100 levels)
   // This should succeed because depth never exceeds kMaxDepth
   const auto res = rt.ExecuteScript(R"(
@@ -159,7 +163,7 @@ TEST(LuaRuntimeCore, DeepRecursionAtLimit) {
 }
 
 TEST(LuaRuntimeCore, NumericEdgeCases) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return math.maxinteger, math.mininteger, 1.5");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -170,7 +174,7 @@ TEST(LuaRuntimeCore, NumericEdgeCases) {
 }
 
 TEST(LuaRuntimeCore, SpecialDoubles) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return math.huge, -math.huge, 0/0");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -181,7 +185,7 @@ TEST(LuaRuntimeCore, SpecialDoubles) {
 }
 
 TEST(LuaRuntimeCore, MultipleReturnsFive) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return 1,2,3,4,5");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -192,7 +196,7 @@ TEST(LuaRuntimeCore, MultipleReturnsFive) {
 }
 
 TEST(LuaRuntimeCore, BinaryAndUtf8Strings) {
-  const LuaRuntime rt;
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
   const auto res = rt.ExecuteScript("return string.char(97,0,98), 'héllo'");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
@@ -208,7 +212,7 @@ TEST(LuaRuntimeCore, BinaryAndUtf8Strings) {
 }
 
 TEST(LuaRuntimeCore, HostFunctionReturnsArrayAndTable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.RegisterFunction("mkArray", [](const std::vector<LuaPtr>&) -> LuaPtr {
     LuaArray a;
     a.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(10))));
@@ -237,7 +241,7 @@ TEST(LuaRuntimeCore, HostFunctionReturnsArrayAndTable) {
 }
 
 TEST(LuaRuntimeCore, HostFunctionException) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.RegisterFunction("oops", [](const std::vector<LuaPtr>&) -> LuaPtr {
     throw std::runtime_error("bad things");
   });
@@ -247,7 +251,7 @@ TEST(LuaRuntimeCore, HostFunctionException) {
 }
 
 TEST(LuaRuntimeCore, SetGlobalComplexStructures) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   // Set global array t = {5,6}
   {
     LuaArray arr;
@@ -275,7 +279,7 @@ TEST(LuaRuntimeCore, SetGlobalComplexStructures) {
 }
 
 TEST(LuaRuntimeCore, FunctionReregistrationUsesLatest) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.RegisterFunction("f", [](const std::vector<LuaPtr>&) -> LuaPtr {
     return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
   });
@@ -291,7 +295,7 @@ TEST(LuaRuntimeCore, FunctionReregistrationUsesLatest) {
 // ========== Userdata Tests ==========
 
 TEST(LuaRuntimeUserdata, CreateUserdataGlobalSetsGlobal) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.CreateUserdataGlobal("handle", 42);
 
   // The global should exist and be userdata
@@ -303,7 +307,7 @@ TEST(LuaRuntimeUserdata, CreateUserdataGlobalSetsGlobal) {
 }
 
 TEST(LuaRuntimeUserdata, CreateProxyUserdataGlobalSetsGlobal) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.CreateProxyUserdataGlobal("proxy", 7);
 
   const auto res = rt.ExecuteScript("return type(proxy)");
@@ -314,7 +318,7 @@ TEST(LuaRuntimeUserdata, CreateProxyUserdataGlobalSetsGlobal) {
 }
 
 TEST(LuaRuntimeUserdata, OpaqueUserdataReturnHasCorrectRefId) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.CreateUserdataGlobal("handle", 99);
 
   const auto res = rt.ExecuteScript("return handle");
@@ -329,7 +333,7 @@ TEST(LuaRuntimeUserdata, OpaqueUserdataReturnHasCorrectRefId) {
 }
 
 TEST(LuaRuntimeUserdata, ProxyUserdataReturnHasProxyFlag) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.CreateProxyUserdataGlobal("proxy", 55);
 
   const auto res = rt.ExecuteScript("return proxy");
@@ -344,7 +348,7 @@ TEST(LuaRuntimeUserdata, ProxyUserdataReturnHasProxyFlag) {
 }
 
 TEST(LuaRuntimeUserdata, RefCountIncrementDecrement) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   int gc_called_for = -1;
   rt.SetUserdataGCCallback([&](int ref_id) {
     gc_called_for = ref_id;
@@ -363,7 +367,7 @@ TEST(LuaRuntimeUserdata, RefCountIncrementDecrement) {
 }
 
 TEST(LuaRuntimeUserdata, GCCallbackNotCalledWithoutCallback) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   // No GC callback set - should not crash
   rt.IncrementUserdataRefCount(5);
   rt.DecrementUserdataRefCount(5);
@@ -371,7 +375,7 @@ TEST(LuaRuntimeUserdata, GCCallbackNotCalledWithoutCallback) {
 }
 
 TEST(LuaRuntimeUserdata, GCCallbackFiresOnLuaCollection) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   int gc_ref_id = -1;
   rt.SetUserdataGCCallback([&](int ref_id) {
     gc_ref_id = ref_id;
@@ -388,7 +392,7 @@ TEST(LuaRuntimeUserdata, GCCallbackFiresOnLuaCollection) {
 }
 
 TEST(LuaRuntimeUserdata, MultipleRefsSameIdOnlyOneCallback) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   int gc_count = 0;
   rt.SetUserdataGCCallback([&](int ref_id) {
     if (ref_id == 20) gc_count++;
@@ -410,7 +414,7 @@ TEST(LuaRuntimeUserdata, MultipleRefsSameIdOnlyOneCallback) {
 }
 
 TEST(LuaRuntimeUserdata, PropertyGetterViaIndex) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetPropertyHandlers(
     // Getter: return property values based on key
     [](int ref_id, const std::string& key) -> LuaPtr {
@@ -451,7 +455,7 @@ TEST(LuaRuntimeUserdata, PropertyGetterViaIndex) {
 }
 
 TEST(LuaRuntimeUserdata, PropertySetterViaNewIndex) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   std::string last_key;
   int64_t last_value = 0;
   int setter_ref_id = -1;
@@ -479,7 +483,7 @@ TEST(LuaRuntimeUserdata, PropertySetterViaNewIndex) {
 }
 
 TEST(LuaRuntimeUserdata, PropertyGetterAndSetterRoundTrip) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   std::unordered_map<std::string, LuaPtr> store;
 
   rt.SetPropertyHandlers(
@@ -509,7 +513,7 @@ TEST(LuaRuntimeUserdata, PropertyGetterAndSetterRoundTrip) {
 }
 
 TEST(LuaRuntimeUserdata, OpaqueUserdataCannotBeIndexed) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetPropertyHandlers(
     [](int, const std::string&) -> LuaPtr {
       return std::make_shared<LuaValue>(LuaValue::from(std::string("should not reach")));
@@ -525,7 +529,7 @@ TEST(LuaRuntimeUserdata, OpaqueUserdataCannotBeIndexed) {
 }
 
 TEST(LuaRuntimeUserdata, UserdataPassthroughViaHostFunction) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   int received_ref_id = -1;
 
   rt.SetUserdataGCCallback([](int) {});
@@ -552,7 +556,7 @@ TEST(LuaRuntimeUserdata, UserdataPassthroughViaHostFunction) {
 }
 
 TEST(LuaRuntimeUserdata, ProxyUserdataPassthroughPreservesProxyFlag) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
 
   rt.SetPropertyHandlers(
     [](int, const std::string& key) -> LuaPtr {
@@ -582,7 +586,7 @@ TEST(LuaRuntimeUserdata, ProxyUserdataPassthroughPreservesProxyFlag) {
 }
 
 TEST(LuaRuntimeUserdata, ForeignUserdataDetectedAsOpaque) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
 
   // io.tmpfile() creates a userdata with io library's metatable
   const auto res = rt.ExecuteScript("return io.tmpfile()");
@@ -597,7 +601,7 @@ TEST(LuaRuntimeUserdata, ForeignUserdataDetectedAsOpaque) {
 }
 
 TEST(LuaRuntimeUserdata, ForeignUserdataRoundTripViaHostFunction) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
 
   LuaPtr captured_ud;
   rt.RegisterFunction("capture", [&](const std::vector<LuaPtr>& args) -> LuaPtr {
@@ -629,7 +633,7 @@ TEST(LuaRuntimeUserdata, MultipleUserdataIndependence) {
   // gc_ids must be declared before rt so it outlives the runtime destructor,
   // which fires __gc callbacks during lua_close() for remaining userdata
   std::vector<int> gc_ids;
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetUserdataGCCallback([&](int ref_id) {
     gc_ids.push_back(ref_id);
   });
@@ -657,7 +661,7 @@ TEST(LuaRuntimeUserdata, MultipleUserdataIndependence) {
 }
 
 TEST(LuaRuntimeUserdata, PropertyGetterWithDifferentRefIds) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetPropertyHandlers(
     [](int ref_id, const std::string& key) -> LuaPtr {
       if (key == "id") {
@@ -680,7 +684,7 @@ TEST(LuaRuntimeUserdata, PropertyGetterWithDifferentRefIds) {
 }
 
 TEST(LuaRuntimeUserdata, PropertyGetterExceptionBecomesLuaError) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetPropertyHandlers(
     [](int, const std::string&) -> LuaPtr {
       throw std::runtime_error("access denied");
@@ -696,7 +700,7 @@ TEST(LuaRuntimeUserdata, PropertyGetterExceptionBecomesLuaError) {
 }
 
 TEST(LuaRuntimeUserdata, PropertySetterExceptionBecomesLuaError) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetPropertyHandlers(
     nullptr,
     [](int, const std::string&, const LuaPtr&) {
@@ -712,7 +716,7 @@ TEST(LuaRuntimeUserdata, PropertySetterExceptionBecomesLuaError) {
 }
 
 TEST(LuaRuntimeUserdata, UserdataStoredInLocalVariable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   int gc_ref_id = -1;
   rt.SetUserdataGCCallback([&](int ref_id) {
     gc_ref_id = ref_id;
@@ -736,7 +740,7 @@ TEST(LuaRuntimeUserdata, NullGCCallbackSafeOnDestruction) {
   // Verify that destroying a runtime with active userdata and a null GC callback
   // doesn't crash (the __gc metamethod fires during lua_close)
   {
-    LuaRuntime rt;
+    LuaRuntime rt(LuaRuntime::AllLibraries());
     rt.CreateUserdataGlobal("handle", 1);
     // No GC callback set - destruction should be safe
   }
@@ -747,7 +751,7 @@ TEST(LuaRuntimeUserdata, NullPropertyHandlersSafeOnDestruction) {
   // Verify that destroying a runtime with active proxy userdata and null handlers
   // doesn't crash
   {
-    LuaRuntime rt;
+    LuaRuntime rt(LuaRuntime::AllLibraries());
     rt.CreateProxyUserdataGlobal("proxy", 1);
     // No property handlers set - destruction should be safe
   }
@@ -755,7 +759,7 @@ TEST(LuaRuntimeUserdata, NullPropertyHandlersSafeOnDestruction) {
 }
 
 TEST(LuaRuntimeUserdata, DecrementUnknownRefIdIsNoOp) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   bool callback_fired = false;
   rt.SetUserdataGCCallback([&](int) {
     callback_fired = true;
@@ -769,7 +773,7 @@ TEST(LuaRuntimeUserdata, DecrementUnknownRefIdIsNoOp) {
 // ========== Metatable Tests ==========
 
 TEST(LuaRuntimeMetatable, StoreHostFunctionDoesNotCreateGlobal) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__hidden_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
     return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42)));
   });
@@ -783,7 +787,7 @@ TEST(LuaRuntimeMetatable, StoreHostFunctionDoesNotCreateGlobal) {
 }
 
 TEST(LuaRuntimeMetatable, StoreHostFunctionIsCallableViaClosure) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
     return std::make_shared<LuaValue>(LuaValue::from(std::string("stored")));
   });
@@ -806,7 +810,7 @@ TEST(LuaRuntimeMetatable, StoreHostFunctionIsCallableViaClosure) {
 }
 
 TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonExistentGlobal) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   std::vector<MetatableEntry> entries;
   EXPECT_THROW({
     rt.SetGlobalMetatable("nonexistent", entries);
@@ -820,7 +824,7 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonExistentGlobal) {
 }
 
 TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonTable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetGlobal("num", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42))));
   std::vector<MetatableEntry> entries;
   EXPECT_THROW({
@@ -835,7 +839,7 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonTable) {
 }
 
 TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForStringGlobal) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetGlobal("s", std::make_shared<LuaValue>(LuaValue::from(std::string("hello"))));
   std::vector<MetatableEntry> entries;
   EXPECT_THROW({
@@ -844,7 +848,7 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForStringGlobal) {
 }
 
 TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForBoolGlobal) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetGlobal("b", std::make_shared<LuaValue>(LuaValue::from(true)));
   std::vector<MetatableEntry> entries;
   EXPECT_THROW({
@@ -853,7 +857,7 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForBoolGlobal) {
 }
 
 TEST(LuaRuntimeMetatable, ToStringMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_tostring", [](const std::vector<LuaPtr>&) -> LuaPtr {
     return std::make_shared<LuaValue>(LuaValue::from(std::string("custom_repr")));
   });
@@ -876,7 +880,7 @@ TEST(LuaRuntimeMetatable, ToStringMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, ToStringReceivesTableArg) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_ts", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     EXPECT_EQ(args.size(), 1u);
     auto x = std::get<int64_t>(getField(rt, args[0], "x")->value);
@@ -899,7 +903,7 @@ TEST(LuaRuntimeMetatable, ToStringReceivesTableArg) {
 }
 
 TEST(LuaRuntimeMetatable, AddMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_add", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "value")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "value")->value);
@@ -922,7 +926,7 @@ TEST(LuaRuntimeMetatable, AddMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, SubMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_sub", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "v")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "v")->value);
@@ -944,7 +948,7 @@ TEST(LuaRuntimeMetatable, SubMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, MulMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_mul", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "v")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "v")->value);
@@ -966,7 +970,7 @@ TEST(LuaRuntimeMetatable, MulMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, DivMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_div", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     double va = static_cast<double>(std::get<int64_t>(getField(rt, args[0], "v")->value));
     double vb = static_cast<double>(std::get<int64_t>(getField(rt, args[1], "v")->value));
@@ -988,7 +992,7 @@ TEST(LuaRuntimeMetatable, DivMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, UnmMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_unm", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t v = std::get<int64_t>(getField(rt, args[0], "v")->value);
     return std::make_shared<LuaValue>(LuaValue::from(-v));
@@ -1009,7 +1013,7 @@ TEST(LuaRuntimeMetatable, UnmMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, ModMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_mod", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "v")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "v")->value);
@@ -1031,7 +1035,7 @@ TEST(LuaRuntimeMetatable, ModMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, ConcatMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_concat", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     std::string sa = std::get<std::string>(getField(rt, args[0], "t")->value);
     std::string sb = std::get<std::string>(getField(rt, args[1], "t")->value);
@@ -1053,7 +1057,7 @@ TEST(LuaRuntimeMetatable, ConcatMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, LenMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_len", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t n = std::get<int64_t>(getField(rt, args[0], "count")->value);
     return std::make_shared<LuaValue>(LuaValue::from(n));
@@ -1074,7 +1078,7 @@ TEST(LuaRuntimeMetatable, LenMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, EqMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_eq", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "id")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "id")->value);
@@ -1098,7 +1102,7 @@ TEST(LuaRuntimeMetatable, EqMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, LtMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_lt", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "v")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "v")->value);
@@ -1128,7 +1132,7 @@ TEST(LuaRuntimeMetatable, LtMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, LeMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_le", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t va = std::get<int64_t>(getField(rt, args[0], "v")->value);
     int64_t vb = std::get<int64_t>(getField(rt, args[1], "v")->value);
@@ -1151,7 +1155,7 @@ TEST(LuaRuntimeMetatable, LeMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, CallMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_call", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     // args[0] is the table itself, args[1] is the argument passed in the call
     int64_t factor = std::get<int64_t>(getField(rt, args[0], "factor")->value);
@@ -1174,7 +1178,7 @@ TEST(LuaRuntimeMetatable, CallMetamethod) {
 }
 
 TEST(LuaRuntimeMetatable, IndexAsFunction) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_index", [](const std::vector<LuaPtr>& args) -> LuaPtr {
     // args[0] = table, args[1] = key
     std::string key = std::get<std::string>(args[1]->value);
@@ -1196,7 +1200,7 @@ TEST(LuaRuntimeMetatable, IndexAsFunction) {
 }
 
 TEST(LuaRuntimeMetatable, IndexAsTable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
 
   (void)rt.ExecuteScript("obj = {}");
   LuaTable fallback;
@@ -1216,7 +1220,7 @@ TEST(LuaRuntimeMetatable, IndexAsTable) {
 }
 
 TEST(LuaRuntimeMetatable, NewIndexAsFunction) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   std::string captured_key;
   int64_t captured_value = 0;
 
@@ -1246,7 +1250,7 @@ TEST(LuaRuntimeMetatable, NewIndexAsFunction) {
 }
 
 TEST(LuaRuntimeMetatable, MultipleMetamethods) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_ts", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t v = std::get<int64_t>(getField(rt, args[0], "v")->value);
     return std::make_shared<LuaValue>(LuaValue::from(std::string("val:" + std::to_string(v))));
@@ -1305,7 +1309,7 @@ TEST(LuaRuntimeMetatable, MultipleMetamethods) {
 }
 
 TEST(LuaRuntimeMetatable, MetatableOnLuaCreatedTable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_ts", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t x = std::get<int64_t>(getField(rt, args[0], "x")->value);
     int64_t y = std::get<int64_t>(getField(rt, args[0], "y")->value);
@@ -1328,7 +1332,7 @@ TEST(LuaRuntimeMetatable, MetatableOnLuaCreatedTable) {
 }
 
 TEST(LuaRuntimeMetatable, EmptyMetatableEntriesDoesNotCrash) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {x = 1}");
   std::vector<MetatableEntry> entries; // empty
   rt.SetGlobalMetatable("t", entries);
@@ -1340,7 +1344,7 @@ TEST(LuaRuntimeMetatable, EmptyMetatableEntriesDoesNotCrash) {
 }
 
 TEST(LuaRuntimeMetatable, MetatableExceptionInHostFunction) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_bad", [](const std::vector<LuaPtr>&) -> LuaPtr {
     throw std::runtime_error("metamethod error");
   });
@@ -1360,7 +1364,7 @@ TEST(LuaRuntimeMetatable, MetatableExceptionInHostFunction) {
 }
 
 TEST(LuaRuntimeMetatable, StackBalanceAfterSetGlobalMetatable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_ts", [](const std::vector<LuaPtr>&) -> LuaPtr {
     return std::make_shared<LuaValue>(LuaValue::from(std::string("ok")));
   });
@@ -1381,7 +1385,7 @@ TEST(LuaRuntimeMetatable, StackBalanceAfterSetGlobalMetatable) {
 }
 
 TEST(LuaRuntimeMetatable, StackBalanceAfterFailedSetGlobalMetatable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   int top_before = lua_gettop(rt.RawState());
 
   std::vector<MetatableEntry> entries;
@@ -1396,7 +1400,7 @@ TEST(LuaRuntimeMetatable, StackBalanceAfterFailedSetGlobalMetatable) {
 }
 
 TEST(LuaRuntimeMetatable, MetatableWithStaticValue) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {}");
 
   std::vector<MetatableEntry> entries;
@@ -1414,7 +1418,7 @@ TEST(LuaRuntimeMetatable, MetatableWithStaticValue) {
 }
 
 TEST(LuaRuntimeMetatable, ReplacingMetatable) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_ts1", [](const std::vector<LuaPtr>&) -> LuaPtr {
     return std::make_shared<LuaValue>(LuaValue::from(std::string("first")));
   });
@@ -1462,7 +1466,7 @@ TEST(LuaRuntimeMetatable, ReplacingMetatable) {
 // ========== Table Reference Tests ==========
 
 TEST(LuaRuntimeTableRef, ToLuaValueProducesTableRefForMetatabled) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {x = 1}");
 
   // Set a metatable on t
@@ -1480,7 +1484,7 @@ TEST(LuaRuntimeTableRef, ToLuaValueProducesTableRefForMetatabled) {
 }
 
 TEST(LuaRuntimeTableRef, ToLuaValueProducesTableForPlain) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   // Plain table (no metatable) should still be LuaTable/LuaArray
   {
     const auto res = rt.ExecuteScript("return {a = 1, b = 2}");
@@ -1499,7 +1503,7 @@ TEST(LuaRuntimeTableRef, ToLuaValueProducesTableForPlain) {
 }
 
 TEST(LuaRuntimeTableRef, PushLuaValueRoundTrips) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {x = 42}");
 
   std::vector<MetatableEntry> entries;
@@ -1522,7 +1526,7 @@ TEST(LuaRuntimeTableRef, PushLuaValueRoundTrips) {
 }
 
 TEST(LuaRuntimeTableRef, GetTableFieldBasicRead) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {x = 10, y = 'hello'}");
 
   std::vector<MetatableEntry> entries;
@@ -1547,7 +1551,7 @@ TEST(LuaRuntimeTableRef, GetTableFieldBasicRead) {
 }
 
 TEST(LuaRuntimeTableRef, GetTableFieldTriggersIndex) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_index", [](const std::vector<LuaPtr>& args) -> LuaPtr {
     std::string key = std::get<std::string>(args[1]->value);
     return std::make_shared<LuaValue>(LuaValue::from(std::string("indexed_" + key)));
@@ -1570,7 +1574,7 @@ TEST(LuaRuntimeTableRef, GetTableFieldTriggersIndex) {
 }
 
 TEST(LuaRuntimeTableRef, SetTableFieldTriggersNewindex) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   std::string captured_key;
   int64_t captured_value = 0;
 
@@ -1600,7 +1604,7 @@ TEST(LuaRuntimeTableRef, SetTableFieldTriggersNewindex) {
 }
 
 TEST(LuaRuntimeTableRef, HasTableFieldBasicCheck) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {x = 1}");
 
   std::vector<MetatableEntry> entries;
@@ -1619,7 +1623,7 @@ TEST(LuaRuntimeTableRef, HasTableFieldBasicCheck) {
 }
 
 TEST(LuaRuntimeTableRef, GetTableKeysReturnsAllKeys) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {a = 1, b = 2, c = 3}");
 
   std::vector<MetatableEntry> entries;
@@ -1642,7 +1646,7 @@ TEST(LuaRuntimeTableRef, GetTableKeysReturnsAllKeys) {
 }
 
 TEST(LuaRuntimeTableRef, GetTableLengthBasic) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {10, 20, 30}");
 
   std::vector<MetatableEntry> entries;
@@ -1660,7 +1664,7 @@ TEST(LuaRuntimeTableRef, GetTableLengthBasic) {
 }
 
 TEST(LuaRuntimeTableRef, GetTableLengthWithMetamethod) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_len", [&rt](const std::vector<LuaPtr>& args) -> LuaPtr {
     int64_t n = std::get<int64_t>(getField(rt, args[0], "count")->value);
     return std::make_shared<LuaValue>(LuaValue::from(n));
@@ -1682,7 +1686,7 @@ TEST(LuaRuntimeTableRef, GetTableLengthWithMetamethod) {
 }
 
 TEST(LuaRuntimeTableRef, IntegerKeyHandling) {
-  LuaRuntime rt;
+  LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("t = {10, 20, 30}");
 
   std::vector<MetatableEntry> entries;
@@ -1709,6 +1713,581 @@ TEST(LuaRuntimeTableRef, IntegerKeyHandling) {
   rt.SetTableField(tableRef.ref, "2", newVal);
   auto updated = rt.GetTableField(tableRef.ref, "2");
   EXPECT_EQ(std::get<int64_t>(updated->value), 99);
+}
+
+// --- File Execution ---
+
+// Helper to write a temporary Lua file for testing
+class LuaFileTest : public ::testing::Test {
+protected:
+  std::string tmp_path_;
+
+  void WriteFile(const std::string& content) {
+    std::string tpl = (std::filesystem::temp_directory_path() / "lua_test_XXXXXX").string();
+    int fd = mkstemp(tpl.data());
+    close(fd);
+    tmp_path_ = tpl + ".lua";
+    std::rename(tpl.c_str(), tmp_path_.c_str());
+    std::ofstream ofs(tmp_path_);
+    ofs << content;
+    ofs.close();
+  }
+
+  void TearDown() override {
+    if (!tmp_path_.empty()) {
+      std::remove(tmp_path_.c_str());
+    }
+  }
+};
+
+TEST_F(LuaFileTest, ExecuteFileReturnsValues) {
+  WriteFile("return 42, 'hello'");
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 42);
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "hello");
+}
+
+TEST_F(LuaFileTest, ExecuteFileReturnsTable) {
+  WriteFile("return { x = 10, y = 20 }");
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  const auto& tbl = std::get<LuaTable>(vals[0]->value);
+  EXPECT_EQ(std::get<int64_t>(tbl.at("x")->value), 10);
+  EXPECT_EQ(std::get<int64_t>(tbl.at("y")->value), 20);
+}
+
+TEST_F(LuaFileTest, ExecuteFileSetsGlobals) {
+  WriteFile("my_global = 'from file'");
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  auto val = rt.GetGlobal("my_global");
+  EXPECT_EQ(std::get<std::string>(val->value), "from file");
+}
+
+TEST_F(LuaFileTest, ExecuteFileWithCallbacks) {
+  WriteFile("return add(3, 4)");
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.RegisterFunction("add", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    auto a = std::get<int64_t>(args[0]->value);
+    auto b = std::get<int64_t>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(a + b));
+  });
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 7);
+}
+
+TEST_F(LuaFileTest, ExecuteFileNotFound) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile("/nonexistent/path/to/file.lua");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  const auto& err = std::get<std::string>(res);
+  EXPECT_NE(err.find("cannot open"), std::string::npos);
+}
+
+TEST_F(LuaFileTest, ExecuteFileSyntaxError) {
+  WriteFile("this is not valid lua");
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+}
+
+TEST_F(LuaFileTest, ExecuteFileEmptyPath) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile("");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_EQ(std::get<std::string>(res), "File path cannot be empty");
+}
+
+TEST_F(LuaFileTest, ExecuteFileNoReturnValue) {
+  WriteFile("local x = 42");
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteFile(tmp_path_);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_TRUE(std::get<std::vector<LuaPtr>>(res).empty());
+}
+
+// --- Standard Library Loading ---
+
+TEST(LuaRuntimeLibraries, BareStateByDefault) {
+  const LuaRuntime rt;
+  // Basic Lua works without any libraries
+  const auto res = rt.ExecuteScript("return 1 + 2");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 3);
+  // Standard library functions are not available
+  const auto res2 = rt.ExecuteScript("return math.floor(3.7)");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res2));
+}
+
+TEST(LuaRuntimeLibraries, AllLibsViaHelper) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.ExecuteScript("return math.floor(3.7)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 3);
+  const auto res2 = rt.ExecuteScript("return string.upper('hello')");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res2)[0]->value), "HELLO");
+  const auto res3 = rt.ExecuteScript("return type(io)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res3));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res3)[0]->value), "table");
+}
+
+TEST(LuaRuntimeLibraries, SafeLibsViaHelper) {
+  const LuaRuntime rt(LuaRuntime::SafeLibraries());
+  // Safe libs should be available
+  const auto res = rt.ExecuteScript("return math.floor(3.7)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 3);
+  const auto res2 = rt.ExecuteScript("return string.upper('hello')");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res2)[0]->value), "HELLO");
+  // Dangerous libs should NOT be available
+  const auto res3 = rt.ExecuteScript("return type(io)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res3));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res3)[0]->value), "nil");
+  const auto res4 = rt.ExecuteScript("return type(os)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res4));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res4)[0]->value), "nil");
+  const auto res5 = rt.ExecuteScript("return type(debug)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res5));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res5)[0]->value), "nil");
+}
+
+TEST(LuaRuntimeLibraries, SelectiveLoading) {
+  const LuaRuntime rt(std::vector<std::string>{"base", "math"});
+  const auto res = rt.ExecuteScript("return math.floor(3.7)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 3);
+  const auto res2 = rt.ExecuteScript("return type(string)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res2)[0]->value), "nil");
+}
+
+TEST(LuaRuntimeLibraries, EmptyLibrariesCreatesBareState) {
+  const LuaRuntime rt(std::vector<std::string>{});
+  const auto res = rt.ExecuteScript("return 1 + 2");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 3);
+}
+
+TEST(LuaRuntimeLibraries, UnknownLibraryThrows) {
+  EXPECT_THROW({
+    LuaRuntime rt(std::vector<std::string>{"nonexistent"});
+  }, std::runtime_error);
+}
+
+TEST(LuaRuntimeLibraries, UnknownLibraryErrorMessage) {
+  try {
+    LuaRuntime rt(std::vector<std::string>{"fakename"});
+    FAIL() << "Expected std::runtime_error";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("Unknown Lua library"), std::string::npos);
+    EXPECT_NE(std::string(e.what()).find("fakename"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeLibraries, OmittedLibsNotAvailable) {
+  const LuaRuntime rt(std::vector<std::string>{"base", "string"});
+  const auto res = rt.ExecuteScript("return type(math)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "nil");
+  const auto res2 = rt.ExecuteScript("return type(io)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res2)[0]->value), "nil");
+}
+
+TEST(LuaRuntimeLibraries, HostFunctionsWorkWithSelectiveLibs) {
+  LuaRuntime rt(std::vector<std::string>{"base"});
+  rt.RegisterFunction("double_it", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    auto n = std::get<int64_t>(args[0]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(n * 2));
+  });
+  const auto res = rt.ExecuteScript("return double_it(21)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 42);
+}
+
+// ============================================
+// ASYNC MODE
+// ============================================
+
+TEST(LuaRuntimeAsync, AsyncModeFlagDefaultsOff) {
+  const LuaRuntime rt;
+  EXPECT_FALSE(rt.IsAsyncMode());
+}
+
+TEST(LuaRuntimeAsync, AsyncModeBlocksHostFunctions) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.RegisterFunction("greet", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("hello")));
+  });
+
+  // Works normally
+  auto res = rt.ExecuteScript("return greet()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "hello");
+
+  // Blocked in async mode
+  rt.SetAsyncMode(true);
+  auto res2 = rt.ExecuteScript("return greet()");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res2));
+  EXPECT_NE(std::get<std::string>(res2).find("async mode"), std::string::npos);
+
+  // Works again after clearing
+  rt.SetAsyncMode(false);
+  auto res3 = rt.ExecuteScript("return greet()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res3));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res3)[0]->value), "hello");
+}
+
+TEST(LuaRuntimeAsync, PureLuaWorksInAsyncMode) {
+  LuaRuntime rt;
+  rt.SetAsyncMode(true);
+  auto res = rt.ExecuteScript("return 6 * 7");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 42);
+  rt.SetAsyncMode(false);
+}
+
+TEST(LuaRuntimeAsync, StdlibWorksInAsyncMode) {
+  LuaRuntime rt(std::vector<std::string>{"base", "string"});
+  rt.SetAsyncMode(true);
+  auto res = rt.ExecuteScript("return string.upper('hello')");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value), "HELLO");
+  rt.SetAsyncMode(false);
+}
+
+// ========== Module / Require Tests ==========
+
+TEST(LuaRuntimeModule, AddSearchPathAppendsToPackagePath) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.AddSearchPath("./modules/?.lua");
+
+  const auto res = rt.ExecuteScript("return package.path");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  const auto& path = std::get<std::string>(vals[0]->value);
+  EXPECT_NE(path.find("./modules/?.lua"), std::string::npos);
+}
+
+TEST(LuaRuntimeModule, AddSearchPathMultiplePaths) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.AddSearchPath("./a/?.lua");
+  rt.AddSearchPath("./b/?.lua");
+
+  const auto res = rt.ExecuteScript("return package.path");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& path = std::get<std::string>(std::get<std::vector<LuaPtr>>(res)[0]->value);
+  EXPECT_NE(path.find("./a/?.lua"), std::string::npos);
+  EXPECT_NE(path.find("./b/?.lua"), std::string::npos);
+}
+
+TEST(LuaRuntimeModule, AddSearchPathThrowsWithoutPackageLib) {
+  const LuaRuntime rt(std::vector<std::string>{"base"});
+  EXPECT_THROW({
+    rt.AddSearchPath("./modules/?.lua");
+  }, std::runtime_error);
+
+  try {
+    rt.AddSearchPath("./modules/?.lua");
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("package"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeModule, AddSearchPathStackBalance) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int top_before = lua_gettop(rt.RawState());
+  rt.AddSearchPath("./test/?.lua");
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableWithFunctions) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_add", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    int64_t a = std::get<int64_t>(args[0]->value);
+    int64_t b = std::get<int64_t>(args[1]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(a + b));
+  });
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "add";
+  e.is_function = true;
+  e.func_name = "__mod_add";
+  entries.push_back(std::move(e));
+  rt.RegisterModuleTable("mymod", entries);
+
+  const auto res = rt.ExecuteScript("local m = require('mymod'); return m.add(3, 4)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 7);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableWithValues) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  std::vector<MetatableEntry> entries;
+  {
+    MetatableEntry e;
+    e.key = "name";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(std::string("testmod")));
+    entries.push_back(std::move(e));
+  }
+  {
+    MetatableEntry e;
+    e.key = "version";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(2)));
+    entries.push_back(std::move(e));
+  }
+  rt.RegisterModuleTable("info", entries);
+
+  const auto res = rt.ExecuteScript("local m = require('info'); return m.name, m.version");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "testmod");
+  EXPECT_EQ(std::get<int64_t>(vals[1]->value), 2);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableMixed) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_greet", [](const std::vector<LuaPtr>& args) -> LuaPtr {
+    std::string name = std::get<std::string>(args[0]->value);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("hello " + name)));
+  });
+
+  std::vector<MetatableEntry> entries;
+  {
+    MetatableEntry e;
+    e.key = "greet";
+    e.is_function = true;
+    e.func_name = "__mod_greet";
+    entries.push_back(std::move(e));
+  }
+  {
+    MetatableEntry e;
+    e.key = "version";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(std::string("1.0")));
+    entries.push_back(std::move(e));
+  }
+  rt.RegisterModuleTable("mixed", entries);
+
+  const auto res = rt.ExecuteScript(R"(
+    local m = require('mixed')
+    return m.greet('world'), m.version
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "hello world");
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "1.0");
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableThrowsWithoutPackageLib) {
+  const LuaRuntime rt(std::vector<std::string>{"base"});
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({
+    rt.RegisterModuleTable("mymod", entries);
+  }, std::runtime_error);
+
+  try {
+    rt.RegisterModuleTable("mymod", entries);
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("package"), std::string::npos);
+  }
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableStackBalance) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+  });
+
+  int top_before = lua_gettop(rt.RawState());
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "fn";
+  e.is_function = true;
+  e.func_name = "__mod_fn";
+  entries.push_back(std::move(e));
+  rt.RegisterModuleTable("stacktest", entries);
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableCaching) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "val";
+  e.is_function = false;
+  e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42)));
+  entries.push_back(std::move(e));
+  rt.RegisterModuleTable("cached", entries);
+
+  // Require twice — should return the same cached module
+  const auto res = rt.ExecuteScript(R"(
+    local m1 = require('cached')
+    local m2 = require('cached')
+    return m1 == m2, m1.val
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<bool>(vals[0]->value), true);
+  EXPECT_EQ(std::get<int64_t>(vals[1]->value), 42);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableEmptyModule) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  std::vector<MetatableEntry> entries; // empty
+  rt.RegisterModuleTable("empty", entries);
+
+  const auto res = rt.ExecuteScript("local m = require('empty'); return type(m)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "table");
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableReRegistration) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  // Register first version
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "ver";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("versioned", entries);
+  }
+
+  // Re-register with new version
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "ver";
+    e.is_function = false;
+    e.value = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(2)));
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("versioned", entries);
+  }
+
+  // Re-registration overwrites package.loaded, so require returns new version
+  const auto res = rt.ExecuteScript("local m = require('versioned'); return m.ver");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+}
+
+TEST(LuaRuntimeModule, AddSearchPathAndRequireFile) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  // Get the path to the test fixtures directory
+  // This test assumes the test binary is run from the project root
+  rt.AddSearchPath("./tests/fixtures/modules/?.lua");
+
+  const auto res = rt.ExecuteScript(R"(
+    local m = require('testmod')
+    return m.add(10, 20), m.name
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 30);
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "testmod");
+}
+
+TEST(LuaRuntimeModule, ModuleNamespaceIsolation) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.StoreHostFunction("__mod_a_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("from_a")));
+  });
+  rt.StoreHostFunction("__mod_b_fn", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("from_b")));
+  });
+
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "fn";
+    e.is_function = true;
+    e.func_name = "__mod_a_fn";
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("mod_a", entries);
+  }
+  {
+    std::vector<MetatableEntry> entries;
+    MetatableEntry e;
+    e.key = "fn";
+    e.is_function = true;
+    e.func_name = "__mod_b_fn";
+    entries.push_back(std::move(e));
+    rt.RegisterModuleTable("mod_b", entries);
+  }
+
+  const auto res = rt.ExecuteScript(R"(
+    local a = require('mod_a')
+    local b = require('mod_b')
+    return a.fn(), b.fn()
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "from_a");
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "from_b");
+}
+
+TEST(LuaRuntimeModule, AddSearchPathStackBalanceOnFailure) {
+  LuaRuntime rt(std::vector<std::string>{"base"});
+  int top_before = lua_gettop(rt.RawState());
+
+  try {
+    rt.AddSearchPath("./modules/?.lua");
+  } catch (...) {
+    // expected
+  }
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
+}
+
+TEST(LuaRuntimeModule, RegisterModuleTableStackBalanceOnFailure) {
+  LuaRuntime rt(std::vector<std::string>{"base"});
+  int top_before = lua_gettop(rt.RawState());
+
+  std::vector<MetatableEntry> entries;
+  try {
+    rt.RegisterModuleTable("mymod", entries);
+  } catch (...) {
+    // expected
+  }
+
+  int top_after = lua_gettop(rt.RawState());
+  EXPECT_EQ(top_before, top_after);
 }
 
 int main(int argc, char **argv) {

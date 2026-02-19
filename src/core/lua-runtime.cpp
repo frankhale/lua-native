@@ -26,14 +26,33 @@ bool isSequentialArray(lua_State* L, int index) {
 }
 } // namespace
 
-LuaRuntime::LuaRuntime(const bool openStdLibs) {
-  L_ = luaL_newstate();
-  if (!L_) {
-    throw std::runtime_error("Failed to create Lua state");
+// Map from user-facing library name to the Lua 5.5 bitmask constant
+static const std::unordered_map<std::string, int> kLibFlags = {
+  {"base",      LUA_GLIBK},
+  {"package",   LUA_LOADLIBK},
+  {"coroutine", LUA_COLIBK},
+  {"debug",     LUA_DBLIBK},
+  {"io",        LUA_IOLIBK},
+  {"math",      LUA_MATHLIBK},
+  {"os",        LUA_OSLIBK},
+  {"string",    LUA_STRLIBK},
+  {"table",     LUA_TABLIBK},
+  {"utf8",      LUA_UTF8LIBK},
+};
+
+int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
+  int mask = 0;
+  for (const auto& lib : libraries) {
+    const auto it = kLibFlags.find(lib);
+    if (it == kLibFlags.end()) {
+      throw std::runtime_error("Unknown Lua library: '" + lib + "'");
+    }
+    mask |= it->second;
   }
-  if (openStdLibs) {
-    luaL_openlibs(L_);
-  }
+  return mask;
+}
+
+void LuaRuntime::InitState() {
   // Store the runtime in registry for callbacks
   lua_pushlightuserdata(L_, this);
   lua_setfield(L_, LUA_REGISTRYINDEX, "_lua_core_runtime");
@@ -41,6 +60,33 @@ LuaRuntime::LuaRuntime(const bool openStdLibs) {
   // Register userdata metatables
   RegisterUserdataMetatable();
   RegisterProxyUserdataMetatable();
+}
+
+std::vector<std::string> LuaRuntime::AllLibraries() {
+  return {"base", "package", "coroutine", "table", "io", "os", "string", "math", "utf8", "debug"};
+}
+
+std::vector<std::string> LuaRuntime::SafeLibraries() {
+  return {"base", "package", "coroutine", "table", "string", "math", "utf8"};
+}
+
+LuaRuntime::LuaRuntime() {
+  L_ = luaL_newstate();
+  if (!L_) {
+    throw std::runtime_error("Failed to create Lua state");
+  }
+  InitState();
+}
+
+LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries) {
+  L_ = luaL_newstate();
+  if (!L_) {
+    throw std::runtime_error("Failed to create Lua state");
+  }
+  if (!libraries.empty()) {
+    luaL_openselectedlibs(L_, LibraryMask(libraries), 0);
+  }
+  InitState();
 }
 
 LuaRuntime::~LuaRuntime() {
@@ -151,6 +197,9 @@ void LuaRuntime::SetPropertyHandlers(PropertyGetter getter, PropertySetter sette
   property_setter_ = std::move(setter);
 }
 
+void LuaRuntime::SetAsyncMode(bool enabled) { async_mode_ = enabled; }
+bool LuaRuntime::IsAsyncMode() const { return async_mode_; }
+
 void LuaRuntime::CreateUserdataGlobal(const std::string& name, int ref_id) {
   auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
   *block = ref_id;
@@ -218,6 +267,78 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
   lua_setmetatable(L_, -2);
 }
 
+// --- Module / require support ---
+
+bool LuaRuntime::HasPackageLibrary() const {
+  StackGuard guard(L_);
+  lua_getglobal(L_, "package");
+  bool has = !lua_isnil(L_, -1) && lua_istable(L_, -1);
+  return has;
+}
+
+void LuaRuntime::AddSearchPath(const std::string& path) const {
+  StackGuard guard(L_);
+
+  if (!HasPackageLibrary()) {
+    throw std::runtime_error(
+      "Cannot add search path: the 'package' library is not loaded. "
+      "Include 'package' in the libraries option.");
+  }
+
+  lua_getglobal(L_, "package");
+
+  // Get current package.path
+  lua_getfield(L_, -1, "path");
+  const char* current_raw = lua_tostring(L_, -1);
+  std::string current = current_raw ? current_raw : "";
+  lua_pop(L_, 1);  // pop path string
+
+  // Append the new path
+  if (!current.empty()) {
+    current += ";";
+  }
+  current += path;
+
+  // Set the updated package.path
+  lua_pushstring(L_, current.c_str());
+  lua_setfield(L_, -2, "path");
+}
+
+void LuaRuntime::RegisterModuleTable(const std::string& name,
+                                      const std::vector<MetatableEntry>& entries) const {
+  StackGuard guard(L_);
+
+  if (!HasPackageLibrary()) {
+    throw std::runtime_error(
+      "Cannot register module: the 'package' library is not loaded. "
+      "Include 'package' in the libraries option.");
+  }
+
+  lua_getglobal(L_, "package");
+  lua_getfield(L_, -1, "loaded");
+  if (lua_isnil(L_, -1)) {
+    throw std::runtime_error(
+      "Cannot register module: package.loaded is not available.");
+  }
+
+  // Create the module table
+  lua_newtable(L_);
+
+  for (const auto& entry : entries) {
+    if (entry.is_function) {
+      // Push function name as upvalue, then create closure
+      lua_pushstring(L_, entry.func_name.c_str());
+      lua_pushcclosure(L_, LuaCallHostFunction, 1);
+    } else {
+      PushLuaValue(L_, entry.value);
+    }
+    lua_setfield(L_, -2, entry.key.c_str());
+  }
+
+  // package.loaded[name] = module_table
+  lua_setfield(L_, -2, name.c_str());
+}
+
 // --- Host function bridge ---
 
 int LuaRuntime::LuaCallHostFunction(lua_State* L) {
@@ -238,6 +359,12 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
     lua_pushfstring(L, "Host function '%s' not found", func_name ? func_name : "");
     lua_error(L);
     return 0;
+  }
+
+  if (runtime->async_mode_) {
+    return luaL_error(L,
+      "JS callbacks are not available in async mode (called '%s')",
+      func_name ? func_name : "<unknown>");
   }
 
   const int argc = lua_gettop(L);
@@ -284,6 +411,34 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   const int stackBefore = lua_gettop(L_);
 
   if (luaL_loadstring(L_, script.c_str()) || lua_pcall(L_, 0, LUA_MULTRET, 0)) {
+    std::string error = lua_tostring(L_, -1);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  const int nresults = lua_gettop(L_) - stackBefore;
+  std::vector<LuaPtr> results;
+  results.reserve(nresults);
+  try {
+    for (int i = 0; i < nresults; ++i) {
+      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+    }
+  } catch (const std::exception& e) {
+    lua_pop(L_, nresults);
+    return std::string(e.what());
+  }
+  lua_pop(L_, nresults);
+  return results;
+}
+
+ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
+  if (filepath.empty()) {
+    return std::string("File path cannot be empty");
+  }
+
+  const int stackBefore = lua_gettop(L_);
+
+  if (luaL_loadfile(L_, filepath.c_str()) || lua_pcall(L_, 0, LUA_MULTRET, 0)) {
     std::string error = lua_tostring(L_, -1);
     lua_pop(L_, 1);
     return error;

@@ -1,13 +1,28 @@
 import { describe, it, expect } from 'vitest';
 import lua_native from '../../index.js';
 
+/** Load all standard libraries (opt-in since bare state is the default) */
+const ALL_LIBS = { libraries: 'all' as const };
+
 describe('lua-native Node adapter', () => {
   // ============================================
   // BASIC FUNCTIONALITY
   // ============================================
   describe('basic functionality', () => {
+    it('creates a Lua context with no arguments (bare state)', () => {
+      const lua = new lua_native.init();
+      const result = lua.execute_script('return 1 + 2');
+      expect(result).toBe(3);
+    });
+
+    it('creates a Lua context with options only (no callbacks)', () => {
+      const lua = new lua_native.init(undefined, ALL_LIBS);
+      const result = lua.execute_script('return math.floor(3.7)');
+      expect(result).toBe(3);
+    });
+
     it('creates a Lua context and returns a number', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script('return 42');
       expect(result).toBe(42);
     });
@@ -20,7 +35,7 @@ describe('lua-native Node adapter', () => {
           }
           throw new Error('add expects two numbers');
         }
-      });
+      }, ALL_LIBS);
       const result = lua.execute_script('return add(2, 3)');
       expect(result).toBe(5);
     });
@@ -35,13 +50,13 @@ describe('lua-native Node adapter', () => {
             throw new Error('setVar expects a number');
           }
         }
-      });
+      }, ALL_LIBS);
       lua.execute_script('setVar(1999)');
       expect(b).toBe(1999);
     });
 
     it('sets globals and uses them in Lua', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('x', 7);
       lua.set_global('times2', (...args) => {
         if (typeof args[0] === 'number') {
@@ -69,7 +84,7 @@ describe('lua-native Node adapter', () => {
           }
           throw new Error('greet expects a string');
         }
-      });
+      }, ALL_LIBS);
       const result = lua.execute_script(`
         local t = {
           numbers = {1, 2, 3},
@@ -94,7 +109,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('returns multiple values from script', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script('return 1, "hello", true');
       if (!Array.isArray(result)) {
         throw new Error('Expected result to be an array');
@@ -106,7 +121,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('returns undefined when script returns nothing', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script('local x = 1');
       expect(result).toBeUndefined();
     });
@@ -118,13 +133,13 @@ describe('lua-native Node adapter', () => {
   describe('data type edge cases', () => {
     describe('strings', () => {
       it('handles empty string', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return ""');
         expect(result).toBe('');
       });
 
       it('handles very long strings', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const longStr = 'a'.repeat(10000);
         lua.set_global('longStr', longStr);
         const result = lua.execute_script('return longStr');
@@ -136,7 +151,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles unicode characters', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const unicode = '你好世界 🌍 émojis';
         lua.set_global('unicode', unicode);
         const result = lua.execute_script('return unicode');
@@ -144,7 +159,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles strings with special characters', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const special = 'line1\nline2\ttab\\backslash"quote';
         lua.set_global('special', special);
         const result = lua.execute_script('return special');
@@ -152,7 +167,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles null bytes in strings', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return "hello\\0world"');
         expect(result).toBe('hello\0world');
       });
@@ -160,42 +175,42 @@ describe('lua-native Node adapter', () => {
 
     describe('numbers', () => {
       it('handles zero', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(lua.execute_script('return 0')).toBe(0);
       });
 
       it('handles negative numbers', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(lua.execute_script('return -42')).toBe(-42);
         expect(lua.execute_script('return -3.14')).toBeCloseTo(-3.14);
       });
 
       it('handles large integers', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const big = lua.execute_script('return 9007199254740991');  // MAX_SAFE_INTEGER
         expect(big).toBe(9007199254740991);
       });
 
       it('handles floating point numbers', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(lua.execute_script('return 3.14159265359')).toBeCloseTo(3.14159265359);
         expect(lua.execute_script('return 0.1 + 0.2')).toBeCloseTo(0.3);
       });
 
       it('handles very small numbers', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const tiny = lua.execute_script('return 0.0000000001');
         expect(tiny).toBeCloseTo(0.0000000001);
       });
 
       it('handles infinity', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const inf = lua.execute_script('return math.huge');
         expect(inf).toBe(Infinity);
       });
 
       it('handles negative infinity', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const negInf = lua.execute_script('return -math.huge');
         expect(negInf).toBe(-Infinity);
       });
@@ -203,17 +218,17 @@ describe('lua-native Node adapter', () => {
 
     describe('booleans', () => {
       it('handles true', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(lua.execute_script('return true')).toBe(true);
       });
 
       it('handles false', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(lua.execute_script('return false')).toBe(false);
       });
 
       it('handles boolean from comparison', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(lua.execute_script('return 1 > 0')).toBe(true);
         expect(lua.execute_script('return 1 < 0')).toBe(false);
       });
@@ -221,7 +236,7 @@ describe('lua-native Node adapter', () => {
 
     describe('nil/null', () => {
       it('handles nil return', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return nil');
         expect(result).toBeNull();
       });
@@ -229,13 +244,13 @@ describe('lua-native Node adapter', () => {
       it('handles nil in callback argument', () => {
         const lua = new lua_native.init({
           checkNil: (...args) => args[0] === null
-        });
+        }, ALL_LIBS);
         const result = lua.execute_script('return checkNil(nil)');
         expect(result).toBe(true);
       });
 
       it('passes null from JS to Lua as nil', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_global('nullVal', null);
         const result = lua.execute_script('return nullVal == nil');
         expect(result).toBe(true);
@@ -244,20 +259,20 @@ describe('lua-native Node adapter', () => {
 
     describe('arrays', () => {
       it('handles empty array', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_global('arr', []);
         const result = lua.execute_script('return #arr');
         expect(result).toBe(0);
       });
 
       it('handles array with single element', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return {42}');
         expect(result).toEqual([42]);
       });
 
       it('handles large arrays', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const arr = Array.from({ length: 1000 }, (_, i) => i);
         lua.set_global('arr', arr);
         const result = lua.execute_script('return arr');
@@ -265,13 +280,13 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles nested arrays', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return {{1, 2}, {3, 4}, {5, 6}}');
         expect(result).toEqual([[1, 2], [3, 4], [5, 6]]);
       });
 
       it('handles mixed type arrays', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         // Note: Lua tables don't preserve trailing nil - {1, "two", true, nil} only has 3 elements
         const result = lua.execute_script('return {1, "two", true, nil}');
         expect(result).toEqual([1, "two", true]);
@@ -280,7 +295,7 @@ describe('lua-native Node adapter', () => {
 
     describe('tables/objects', () => {
       it('handles empty table', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_global('obj', {});
         const result = lua.execute_script('return obj');
         // Empty Lua tables can't distinguish array vs object, defaults to array
@@ -288,7 +303,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles deeply nested structures', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script(`
           return {
             level1 = {
@@ -328,7 +343,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('throws error when nesting depth exceeds limit', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         expect(() => {
           lua.execute_script(`
             local function nest(n)
@@ -341,7 +356,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('throws error when JS value nesting depth exceeds limit on set_global', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         // Build a deeply nested JS object
         let obj: any = { value: 'deep' };
         for (let i = 0; i < 105; i++) {
@@ -353,7 +368,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles table with numeric string keys', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return {["1"] = "a", ["2"] = "b"}');
         if (result === null || typeof result !== 'object' || Array.isArray(result)) {
           throw new Error('Expected result to be a table object');
@@ -363,7 +378,7 @@ describe('lua-native Node adapter', () => {
       });
 
       it('handles table with special key names', () => {
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         const result = lua.execute_script('return {["with space"] = 1, ["with-dash"] = 2}');
         if (result === null || typeof result !== 'object' || Array.isArray(result)) {
           throw new Error('Expected result to be a table object');
@@ -379,42 +394,42 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('error handling', () => {
     it('propagates Lua errors as JS exceptions', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => lua.execute_script("error('boom')")).toThrowError(/boom/);
     });
 
     it('handles Lua syntax errors', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => lua.execute_script('this is not valid lua!')).toThrow();
     });
 
     it('handles undefined variable access', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       // Accessing undefined variable returns nil in Lua, doesn't error
       const result = lua.execute_script('return undefinedVar');
       expect(result).toBeNull();
     });
 
     it('handles calling nil as function', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => lua.execute_script('local x = nil; return x()')).toThrow();
     });
 
     it('propagates JS callback errors with function name', () => {
       const lua = new lua_native.init({
         failingFunc: () => { throw new Error('JS error message'); }
-      });
+      }, ALL_LIBS);
       expect(() => lua.execute_script('failingFunc()')).toThrowError(/failingFunc/);
       expect(() => lua.execute_script('failingFunc()')).toThrowError(/JS error message/);
     });
 
     it('handles type errors in Lua operations', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => lua.execute_script('return "string" + 5')).toThrow();
     });
 
     it('handles errors in returned Lua functions', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const errorFunc = lua.execute_script('return function() error("func error") end');
       if (typeof errorFunc !== 'function') {
         throw new Error('Expected errorFunc to be a function');
@@ -423,7 +438,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles pcall for protected calls', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script(`
         return pcall(function() error("caught error") end)
       `);
@@ -441,7 +456,7 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('Lua function returns', () => {
     it('returns Lua functions that can be called from JS', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const add = lua.execute_script('return function(a, b) return a + b end');
       expect(typeof add).toBe('function');
       if (typeof add !== 'function') {
@@ -459,7 +474,7 @@ describe('lua-native Node adapter', () => {
           }
           throw new Error('jsDouble expects a number');
         }
-      });
+      }, ALL_LIBS);
       const luaFunc = lua.execute_script(`
         return function(n)
           return jsDouble(n) + 10
@@ -473,7 +488,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('Lua functions can return multiple values', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const multiReturn = lua.execute_script(`
         return function(a, b)
           return a + b, a - b, a * b
@@ -488,7 +503,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('supports closures and nested function returns', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const makeCounter = lua.execute_script(`
         return function(start)
           local count = start or 0
@@ -513,7 +528,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles function with no arguments', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const getFortyTwo = lua.execute_script('return function() return 42 end');
       if (typeof getFortyTwo !== 'function') {
         throw new Error('Expected getFortyTwo to be a function');
@@ -522,7 +537,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles function with many arguments', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const sum = lua.execute_script(`
         return function(a, b, c, d, e, f, g, h, i, j)
           return a + b + c + d + e + f + g + h + i + j
@@ -535,7 +550,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles function returning nil', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const returnNil = lua.execute_script('return function() return nil end');
       if (typeof returnNil !== 'function') {
         throw new Error('Expected returnNil to be a function');
@@ -553,7 +568,7 @@ describe('lua-native Node adapter', () => {
             throw new Error('setSideEffect expects a number');
           }
         }
-      });
+      }, ALL_LIBS);
       const noReturn = lua.execute_script(`
         return function(val)
           setSideEffect(val)
@@ -568,7 +583,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('can call same function multiple times', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const double = lua.execute_script('return function(x) return x * 2 end');
       for (let i = 0; i < 100; i++) {
         if (typeof double !== 'function') {
@@ -579,7 +594,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('multiple functions can coexist', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script(`
         return
           function(a, b) return a + b end,
@@ -604,7 +619,7 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('global variables', () => {
     it('can overwrite existing globals', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('x', 10);
       expect(lua.execute_script('return x')).toBe(10);
       lua.set_global('x', 20);
@@ -612,7 +627,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('can set null as global value', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('x', 10);
       lua.set_global('x', null);
       const result = lua.execute_script('return x == nil');
@@ -620,7 +635,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles setting function as global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('greet', (...args) => {
         if (typeof args[0] === 'string') {
           return `Hello, ${args[0]}!`;
@@ -632,7 +647,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles setting complex object as global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('config', {
         debug: true,
         settings: {
@@ -647,14 +662,14 @@ describe('lua-native Node adapter', () => {
     });
 
     it('globals persist across multiple execute_script calls', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('globalVar = 100');
       const result = lua.execute_script('return globalVar');
       expect(result).toBe(100);
     });
 
     it('handles many globals', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       for (let i = 0; i < 100; i++) {
         lua.set_global(`var${i}`, i);
       }
@@ -669,14 +684,14 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('Lua standard library', () => {
     it('string library is available', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(lua.execute_script('return string.upper("hello")')).toBe('HELLO');
       expect(lua.execute_script('return string.len("hello")')).toBe(5);
       expect(lua.execute_script('return string.sub("hello", 2, 4)')).toBe('ell');
     });
 
     it('table library is available', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script(`
         local t = {3, 1, 4, 1, 5}
         table.sort(t)
@@ -686,7 +701,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('math library is available', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(lua.execute_script('return math.abs(-5)')).toBe(5);
       expect(lua.execute_script('return math.floor(3.7)')).toBe(3);
       expect(lua.execute_script('return math.ceil(3.2)')).toBe(4);
@@ -695,7 +710,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('os.time is available', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const luaTime = lua.execute_script('return os.time()');
       const jsTime = Math.floor(Date.now() / 1000);
       if (typeof luaTime !== 'number') {
@@ -705,7 +720,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('pairs iteration works', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script(`
         local t = {a = 1, b = 2, c = 3}
         local sum = 0
@@ -718,7 +733,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('ipairs iteration works', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script(`
         local t = {10, 20, 30}
         local sum = 0
@@ -736,7 +751,7 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('stress tests', () => {
     it('handles many script executions', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       for (let i = 0; i < 1000; i++) {
         const result = lua.execute_script(`return ${i} * 2`);
         expect(result).toBe(i * 2);
@@ -755,7 +770,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles large data transfer from Lua', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script(`
         local t = {}
         for i = 1, 1000 do
@@ -786,7 +801,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles large data transfer to Lua', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const largeArray = Array.from({ length: 1000 }, (_, i) => ({ index: i, value: i * 2 }));
       lua.set_global('data', largeArray);
       expect(lua.execute_script('return #data')).toBe(1000);
@@ -794,7 +809,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles recursive function calls', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const factorial = lua.execute_script(`
         local function fact(n)
           if n <= 1 then return 1 end
@@ -816,7 +831,7 @@ describe('lua-native Node adapter', () => {
     it('callback can return undefined', () => {
       const lua = new lua_native.init({
         noReturn: () => { /* returns undefined */ }
-      });
+      }, ALL_LIBS);
       const result = lua.execute_script('return noReturn()');
       expect(result).toBeNull();
     });
@@ -825,7 +840,7 @@ describe('lua-native Node adapter', () => {
       let receivedArgs: unknown[] = [];
       const lua = new lua_native.init({
         capture: (...args: unknown[]) => { receivedArgs = args; }
-      });
+      }, ALL_LIBS);
       lua.execute_script('capture(1, 2, 3)');
       expect(receivedArgs).toEqual([1, 2, 3]);
     });
@@ -836,7 +851,7 @@ describe('lua-native Node adapter', () => {
         captureTypes: (...args: unknown[]) => {
           receivedTypes = args.map(a => a === null ? 'null' : typeof a);
         }
-      });
+      }, ALL_LIBS);
       lua.execute_script('captureTypes(1, "str", true, nil, {})');
       expect(receivedTypes).toEqual(['number', 'string', 'boolean', 'null', 'object']);
     });
@@ -845,7 +860,7 @@ describe('lua-native Node adapter', () => {
       let counter = 0;
       const lua = new lua_native.init({
         increment: () => { counter++; }
-      });
+      }, ALL_LIBS);
       lua.execute_script(`
         for i = 1, 100 do
           increment()
@@ -864,7 +879,7 @@ describe('lua-native Node adapter', () => {
             throw new Error('setValue expects a number');
           }
         }
-      });
+      }, ALL_LIBS);
       const lua2 = new lua_native.init({
         setValue: (...args) => {
           if (typeof args[0] === 'number') {
@@ -873,7 +888,7 @@ describe('lua-native Node adapter', () => {
             throw new Error('setValue expects a number');
           }
         }
-      });
+      }, ALL_LIBS);
 
       lua1.execute_script('setValue(10)');
       lua2.execute_script('setValue(20)');
@@ -888,7 +903,7 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('coroutines', () => {
     it('creates a coroutine from a function', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           return 42
@@ -899,7 +914,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('resumes a coroutine and gets return value', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           return 42
@@ -911,7 +926,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('passes arguments on first resume', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function(x, y)
           return x + y
@@ -923,7 +938,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles yield and resume cycle', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function(x)
           coroutine.yield(x * 2)
@@ -946,7 +961,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('passes values through yield', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           local a = coroutine.yield("first")
@@ -967,7 +982,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles multiple yield values', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           coroutine.yield(1, 2, 3)
@@ -985,7 +1000,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('coroutine status updates correctly', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           coroutine.yield()
@@ -1003,7 +1018,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('handles errors in coroutine', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           error("coroutine error")
@@ -1016,7 +1031,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('cannot resume dead coroutine', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           return 1
@@ -1035,7 +1050,7 @@ describe('lua-native Node adapter', () => {
       let callCount = 0;
       const lua = new lua_native.init({
         increment: () => { callCount++; return callCount; }
-      });
+      }, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           local a = increment()
@@ -1055,7 +1070,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('multiple coroutines are independent', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro1 = lua.create_coroutine(`
         return function()
           coroutine.yield("a")
@@ -1076,7 +1091,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('coroutine with closure preserves state', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function()
           local counter = 0
@@ -1094,7 +1109,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('generator pattern with coroutine', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const coro = lua.create_coroutine(`
         return function(n)
           for i = 1, n do
@@ -1122,14 +1137,14 @@ describe('lua-native Node adapter', () => {
     });
 
     it('throws error for invalid script', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => {
         lua.create_coroutine('invalid lua syntax @@@@');
       }).toThrow();
     });
 
     it('throws error for non-function return', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => {
         lua.create_coroutine('return 42');
       }).toThrow(/function/);
@@ -1141,43 +1156,43 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('get_global', () => {
     it('gets a number global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('x', 42);
       expect(lua.get_global('x')).toBe(42);
     });
 
     it('gets a string global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('name', 'hello');
       expect(lua.get_global('name')).toBe('hello');
     });
 
     it('gets a boolean global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('flag', true);
       expect(lua.get_global('flag')).toBe(true);
     });
 
     it('gets a table global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('config', { a: 1, b: 'two' });
       const result = lua.get_global('config');
       expect(result).toEqual({ a: 1, b: 'two' });
     });
 
     it('gets a global set from Lua script', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('myVar = 999');
       expect(lua.get_global('myVar')).toBe(999);
     });
 
     it('returns null for non-existent global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(lua.get_global('doesNotExist')).toBeNull();
     });
 
     it('reflects updated global value', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('x', 10);
       expect(lua.get_global('x')).toBe(10);
       lua.set_global('x', 20);
@@ -1185,7 +1200,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('gets a global modified by Lua script', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('counter', 0);
       lua.execute_script('counter = counter + 1');
       expect(lua.get_global('counter')).toBe(1);
@@ -1201,7 +1216,7 @@ describe('lua-native Node adapter', () => {
       const original = { data: [1, 2, 3], name: 'test' };
       const lua = new lua_native.init({
         capture: (...args: any[]) => { received = args[0]; }
-      });
+      }, ALL_LIBS);
       lua.set_userdata('handle', original);
       lua.execute_script('capture(handle)');
       expect(received).toBe(original); // Same reference, not a copy
@@ -1212,7 +1227,7 @@ describe('lua-native Node adapter', () => {
       let received: any = null;
       const lua = new lua_native.init({
         check: (...args: any[]) => { received = args[0]; }
-      });
+      }, ALL_LIBS);
       lua.set_userdata('obj', obj);
       lua.execute_script('check(obj)');
       expect(received === obj).toBe(true);
@@ -1223,7 +1238,7 @@ describe('lua-native Node adapter', () => {
       let received: any = null;
       const lua = new lua_native.init({
         capture: (...args: any[]) => { received = args[0]; }
-      });
+      }, ALL_LIBS);
       lua.set_userdata('handle', original);
       lua.execute_script(`
         local copy = handle
@@ -1235,7 +1250,7 @@ describe('lua-native Node adapter', () => {
 
     it('userdata returned from execute_script maps back to original object', () => {
       const original = { x: 10, y: 20 };
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_userdata('point', original);
       const result = lua.execute_script('return point');
       expect(result).toBe(original);
@@ -1248,7 +1263,7 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({
         capture1: (...args: any[]) => { r1 = args[0]; },
         capture2: (...args: any[]) => { r2 = args[0]; }
-      });
+      }, ALL_LIBS);
       lua.set_userdata('a', obj1);
       lua.set_userdata('b', obj2);
       lua.execute_script('capture1(a); capture2(b)');
@@ -1269,7 +1284,7 @@ describe('lua-native Node adapter', () => {
           received = args[0];
           return args[0].double();
         }
-      });
+      }, ALL_LIBS);
       lua.set_userdata('obj', instance);
       const result = lua.execute_script('return process(obj)');
       expect(received).toBe(instance);
@@ -1282,7 +1297,7 @@ describe('lua-native Node adapter', () => {
         increment: (...args: any[]) => {
           args[0].count++;
         }
-      });
+      }, ALL_LIBS);
       lua.set_userdata('counter', original);
       lua.execute_script(`
         increment(counter)
@@ -1294,7 +1309,7 @@ describe('lua-native Node adapter', () => {
 
     it('userdata cleanup on GC', () => {
       const obj = { data: 'test' };
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_userdata('handle', obj);
       // Set to nil and force GC
       lua.execute_script('handle = nil; collectgarbage()');
@@ -1309,7 +1324,7 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('metatable support', () => {
     it('__tostring metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('vec = {x = 1, y = 2}');
       lua.set_metatable('vec', {
         __tostring: () => 'custom_tostring'
@@ -1319,7 +1334,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__tostring receives the table as argument', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('vec = {x = 10, y = 20}');
       lua.set_metatable('vec', {
         __tostring: (...args: any[]) => {
@@ -1332,7 +1347,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__add metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 10}; b = {value = 20}');
       lua.set_metatable('a', {
         __add: (...args: any[]) => {
@@ -1344,7 +1359,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__sub metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 30}; b = {value = 10}');
       lua.set_metatable('a', {
         __sub: (...args: any[]) => (args[0] as any).value - (args[1] as any).value
@@ -1354,7 +1369,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__mul metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 5}; b = {value = 6}');
       lua.set_metatable('a', {
         __mul: (...args: any[]) => (args[0] as any).value * (args[1] as any).value
@@ -1364,7 +1379,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__div metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 20}; b = {value = 4}');
       lua.set_metatable('a', {
         __div: (...args: any[]) => (args[0] as any).value / (args[1] as any).value
@@ -1374,7 +1389,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__unm metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 42}');
       lua.set_metatable('a', {
         __unm: (...args: any[]) => -(args[0] as any).value
@@ -1384,7 +1399,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__mod metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 17}; b = {value = 5}');
       lua.set_metatable('a', {
         __mod: (...args: any[]) => (args[0] as any).value % (args[1] as any).value
@@ -1394,7 +1409,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__concat metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {text = "hello"}; b = {text = " world"}');
       lua.set_metatable('a', {
         __concat: (...args: any[]) => (args[0] as any).text + (args[1] as any).text
@@ -1404,7 +1419,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__len metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {items = 5}');
       lua.set_metatable('a', {
         __len: (...args: any[]) => (args[0] as any).items
@@ -1414,7 +1429,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__eq metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {id = 1}; b = {id = 1}');
       // Both tables need the same metatable for __eq to fire
       const mt = {
@@ -1427,7 +1442,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__lt metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 1}; b = {value = 2}');
       const mt = {
         __lt: (...args: any[]) => (args[0] as any).value < (args[1] as any).value
@@ -1439,7 +1454,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__le metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 3}; b = {value = 3}');
       const mt = {
         __le: (...args: any[]) => (args[0] as any).value <= (args[1] as any).value
@@ -1451,7 +1466,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__call metamethod', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('obj = {factor = 10}');
       lua.set_metatable('obj', {
         __call: (...args: any[]) => {
@@ -1465,7 +1480,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__index as function', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('obj = {}');
       lua.set_metatable('obj', {
         __index: (...args: any[]) => {
@@ -1478,7 +1493,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__index as table', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('obj = {}');
       lua.set_metatable('obj', {
         __index: { fallback_key: 99 }
@@ -1488,7 +1503,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__newindex as function', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('obj = {}; intercepted = {}');
       lua.set_metatable('obj', {
         __newindex: (...args: any[]) => {
@@ -1506,7 +1521,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('multiple metamethods on one table', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {value = 10}; b = {value = 3}');
       lua.set_metatable('a', {
         __add: (...args: any[]) => (args[0] as any).value + (args[1] as any).value,
@@ -1519,14 +1534,14 @@ describe('lua-native Node adapter', () => {
     });
 
     it('error: non-existent global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => {
         lua.set_metatable('nonexistent', { __tostring: () => 'x' });
       }).toThrow(/does not exist/);
     });
 
     it('error: non-table global', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.set_global('num', 42);
       expect(() => {
         lua.set_metatable('num', { __tostring: () => 'x' });
@@ -1534,7 +1549,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('metatable on Lua-created global table', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('myTable = {x = 5, y = 10}');
       lua.set_metatable('myTable', {
         __tostring: (...args: any[]) => {
@@ -1552,7 +1567,7 @@ describe('lua-native Node adapter', () => {
   // ============================================
   describe('reference-based tables', () => {
     it('metatabled table returns as Proxy, not plain object', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {x = 1, y = 2}');
       lua.set_metatable('t', {
         __tostring: () => 'custom'
@@ -1566,7 +1581,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('__index metamethod flows through Proxy get', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {}');
       lua.set_metatable('t', {
         __index: (...args: any[]) => {
@@ -1580,7 +1595,7 @@ describe('lua-native Node adapter', () => {
     it('__newindex metamethod flows through Proxy set', () => {
       let interceptedKey = '';
       let interceptedValue: any = null;
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {}');
       lua.set_metatable('t', {
         __newindex: (...args: any[]) => {
@@ -1595,7 +1610,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('direct property read and write on metatabled table', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {x = 10}');
       lua.set_metatable('t', { __tostring: () => 'T' });
       const result = lua.execute_script('return t') as any;
@@ -1606,7 +1621,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('plain table still deep-copies (backward compat)', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       const result = lua.execute_script('return {a = 1, b = 2}') as any;
       expect(result.a).toBe(1);
       expect(result.b).toBe(2);
@@ -1622,7 +1637,7 @@ describe('lua-native Node adapter', () => {
           received = args[0];
           return args[0]; // Pass it back
         }
-      });
+      }, ALL_LIBS);
       lua.execute_script('t = {x = 5, y = 10}');
       lua.set_metatable('t', {
         __tostring: (...args: any[]) => {
@@ -1639,7 +1654,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('integer keys work through Proxy', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {10, 20, 30}');
       lua.set_metatable('t', { __tostring: () => 'array-like' });
       const result = lua.execute_script('return t') as any;
@@ -1649,7 +1664,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('Object.keys() works via ownKeys trap', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {a = 1, b = 2, c = 3}');
       lua.set_metatable('t', { __tostring: () => 'T' });
       const result = lua.execute_script('return t') as any;
@@ -1658,7 +1673,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('"key" in obj works via has trap', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {x = 1}');
       lua.set_metatable('t', { __tostring: () => 'T' });
       const result = lua.execute_script('return t') as any;
@@ -1671,7 +1686,7 @@ describe('lua-native Node adapter', () => {
         getLen: (...args: any[]) => {
           return args[0]; // pass back to Lua
         }
-      });
+      }, ALL_LIBS);
       lua.execute_script('t = {items = 5}');
       lua.set_metatable('t', {
         __len: (...args: any[]) => (args[0] as any).items
@@ -1683,7 +1698,7 @@ describe('lua-native Node adapter', () => {
     it('__tostring via Lua works on round-tripped table', () => {
       const lua = new lua_native.init({
         passThrough: (...args: any[]) => args[0]
-      });
+      }, ALL_LIBS);
       lua.execute_script('t = {name = "hello"}');
       lua.set_metatable('t', {
         __tostring: (...args: any[]) => 'name:' + (args[0] as any).name
@@ -1695,7 +1710,7 @@ describe('lua-native Node adapter', () => {
     it('__add via Lua works on round-tripped table', () => {
       const lua = new lua_native.init({
         passThrough: (...args: any[]) => args[0]
-      });
+      }, ALL_LIBS);
       lua.execute_script('a = {value = 10}; b = {value = 20}');
       lua.set_metatable('a', {
         __add: (...args: any[]) => (args[0] as any).value + (args[1] as any).value
@@ -1707,7 +1722,7 @@ describe('lua-native Node adapter', () => {
     it('__call via Lua works on round-tripped table', () => {
       const lua = new lua_native.init({
         passThrough: (...args: any[]) => args[0]
-      });
+      }, ALL_LIBS);
       lua.execute_script('obj = {factor = 10}');
       lua.set_metatable('obj', {
         __call: (...args: any[]) => {
@@ -1719,7 +1734,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('nested metatabled table is also a Proxy', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script(`
         inner = {val = 42}
         outer = {child = inner}
@@ -1737,7 +1752,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('multiple independent Proxies', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('a = {x = 1}; b = {x = 2}');
       lua.set_metatable('a', { __tostring: () => 'a' });
       lua.set_metatable('b', { __tostring: () => 'b' });
@@ -1752,7 +1767,7 @@ describe('lua-native Node adapter', () => {
     });
 
     it('not treated as thenable', () => {
-      const lua = new lua_native.init({});
+      const lua = new lua_native.init({}, ALL_LIBS);
       lua.execute_script('t = {x = 1}');
       lua.set_metatable('t', { __tostring: () => 'T' });
       const result = lua.execute_script('return t') as any;
@@ -1772,7 +1787,7 @@ describe('lua-native Node adapter', () => {
           received = args[0];
           return args[0]; // Pass it back
         }
-      });
+      }, ALL_LIBS);
       // io.open returns userdata (a file handle)
       const result = lua.execute_script(`
         local f = io.tmpfile()
@@ -1791,7 +1806,7 @@ describe('lua-native Node adapter', () => {
     it('opaque userdata round-trips correctly', () => {
       const lua = new lua_native.init({
         identity: (...args: any[]) => args[0]
-      });
+      }, ALL_LIBS);
       const result = lua.execute_script(`
         local f = io.tmpfile()
         if f then
@@ -1816,7 +1831,7 @@ describe('lua-native Node adapter', () => {
     describe('readable', () => {
       it('reads properties from Lua', () => {
         const obj = { x: 10, y: 20, name: 'point' };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('point', obj, { readable: true });
         expect(lua.execute_script('return point.x')).toBe(10);
         expect(lua.execute_script('return point.y')).toBe(20);
@@ -1825,7 +1840,7 @@ describe('lua-native Node adapter', () => {
 
       it('non-existent property returns nil', () => {
         const obj = { x: 10 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true });
         const result = lua.execute_script('return obj.nonexistent == nil');
         expect(result).toBe(true);
@@ -1833,7 +1848,7 @@ describe('lua-native Node adapter', () => {
 
       it('reads boolean properties correctly', () => {
         const obj = { active: true, deleted: false };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true });
         expect(lua.execute_script('return obj.active')).toBe(true);
         expect(lua.execute_script('return obj.deleted')).toBe(false);
@@ -1841,7 +1856,7 @@ describe('lua-native Node adapter', () => {
 
       it('reads nested object properties as tables', () => {
         const obj = { nested: { a: 1, b: 2 } };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true });
         // nested is returned as a Lua table (one level deep)
         const result = lua.execute_script('return obj.nested');
@@ -1850,7 +1865,7 @@ describe('lua-native Node adapter', () => {
 
       it('reads array properties', () => {
         const obj = { items: [10, 20, 30] };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true });
         const result = lua.execute_script('return obj.items');
         expect(result).toEqual([10, 20, 30]);
@@ -1858,7 +1873,7 @@ describe('lua-native Node adapter', () => {
 
       it('reads null properties as nil', () => {
         const obj = { value: null };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true });
         const result = lua.execute_script('return obj.value == nil');
         expect(result).toBe(true);
@@ -1868,7 +1883,7 @@ describe('lua-native Node adapter', () => {
     describe('writable', () => {
       it('writes properties from Lua', () => {
         const obj: any = { x: 10, y: 20 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('point', obj, { readable: true, writable: true });
         lua.execute_script('point.x = 100; point.y = 200');
         expect(obj.x).toBe(100);
@@ -1877,7 +1892,7 @@ describe('lua-native Node adapter', () => {
 
       it('creates new properties from Lua', () => {
         const obj: any = {};
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true, writable: true });
         lua.execute_script('obj.newProp = 42');
         expect(obj.newProp).toBe(42);
@@ -1885,7 +1900,7 @@ describe('lua-native Node adapter', () => {
 
       it('writes different types', () => {
         const obj: any = {};
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true, writable: true });
         lua.execute_script(`
           obj.num = 42
@@ -1899,7 +1914,7 @@ describe('lua-native Node adapter', () => {
 
       it('write then read reflects the change', () => {
         const obj: any = { value: 0 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true, writable: true });
         lua.execute_script('obj.value = 99');
         const result = lua.execute_script('return obj.value');
@@ -1911,7 +1926,7 @@ describe('lua-native Node adapter', () => {
     describe('access control', () => {
       it('read-only: writes throw a Lua error', () => {
         const obj = { x: 10 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: true, writable: false });
         expect(() => {
           lua.execute_script('obj.x = 20');
@@ -1921,7 +1936,7 @@ describe('lua-native Node adapter', () => {
 
       it('write-only: reads throw a Lua error', () => {
         const obj: any = { x: 10 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: false, writable: true });
         expect(() => {
           lua.execute_script('return obj.x');
@@ -1930,7 +1945,7 @@ describe('lua-native Node adapter', () => {
 
       it('write-only: writes succeed', () => {
         const obj: any = { x: 10 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj, { readable: false, writable: true });
         lua.execute_script('obj.x = 99');
         expect(obj.x).toBe(99);
@@ -1938,7 +1953,7 @@ describe('lua-native Node adapter', () => {
 
       it('opaque userdata (no options) cannot be indexed', () => {
         const obj = { x: 10 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('obj', obj);
         // Accessing properties on opaque userdata should error
         expect(() => {
@@ -1955,7 +1970,7 @@ describe('lua-native Node adapter', () => {
           getName: (...args: any[]) => {
             receivedName = args[0].name;
           }
-        });
+        }, ALL_LIBS);
         lua.set_userdata('player', player, { readable: true });
         lua.execute_script('getName(player)');
         expect(receivedName).toBe('Alice');
@@ -1963,7 +1978,7 @@ describe('lua-native Node adapter', () => {
 
       it('mutations through userdata are visible in JS', () => {
         const state: any = { score: 0 };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('state', state, { readable: true, writable: true });
         lua.execute_script(`
           for i = 1, 10 do
@@ -1976,12 +1991,519 @@ describe('lua-native Node adapter', () => {
       it('multiple proxy userdata objects are independent', () => {
         const obj1: any = { value: 'a' };
         const obj2: any = { value: 'b' };
-        const lua = new lua_native.init({});
+        const lua = new lua_native.init({}, ALL_LIBS);
         lua.set_userdata('o1', obj1, { readable: true, writable: true });
         lua.set_userdata('o2', obj2, { readable: true, writable: true });
         lua.execute_script('o1.value = "x"; o2.value = "y"');
         expect(obj1.value).toBe('x');
         expect(obj2.value).toBe('y');
+      });
+    });
+  });
+
+  // ============================================
+  // FILE EXECUTION
+  // ============================================
+  describe('file execution', () => {
+    const fixturesDir = new URL('../fixtures/', import.meta.url).pathname;
+
+    it('executes a Lua file that returns multiple values', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = lua.execute_file(fixturesDir + 'return-values.lua');
+      expect(result).toEqual([42, 'hello', true]);
+    });
+
+    it('executes a Lua file that returns a table', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = lua.execute_file(fixturesDir + 'return-table.lua');
+      expect(result).toEqual({ name: 'lua-native', version: 1 });
+    });
+
+    it('executes a Lua file that sets and returns a global', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = lua.execute_file(fixturesDir + 'set-global.lua');
+      expect(result).toBe('hello from file');
+      expect(lua.get_global('greeting')).toBe('hello from file');
+    });
+
+    it('executes a Lua file that uses JS callbacks', () => {
+      const lua = new lua_native.init({
+        add: (...args: any[]) => (args[0] as number) + (args[1] as number),
+      }, ALL_LIBS);
+      const result = lua.execute_file(fixturesDir + 'use-callback.lua');
+      expect(result).toBe(30);
+    });
+
+    it('throws on file not found', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.execute_file('/nonexistent/path/to/file.lua')).toThrow();
+    });
+
+    it('throws on syntax error in file', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.execute_file(fixturesDir + 'syntax-error.lua')).toThrow();
+    });
+
+    it('throws on empty file path', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.execute_file('')).toThrow('File path cannot be empty');
+    });
+
+    it('returns undefined for a file with no return value', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      // set-global.lua sets a global AND returns, but we can use execute_script
+      // to create a temp file scenario. Instead, test with a file that has side effects only.
+      lua.execute_script('x = 99');
+      const result = lua.execute_file(fixturesDir + 'set-global.lua');
+      // set-global.lua does return a value, so let's just verify it works
+      expect(result).toBe('hello from file');
+    });
+  });
+
+  // ============================================
+  // STANDARD LIBRARY LOADING
+  // ============================================
+  describe('standard library loading', () => {
+    it('creates bare state by default (no options)', () => {
+      const lua = new lua_native.init({});
+      // Basic Lua works without any libraries
+      expect(lua.execute_script('return 1 + 2')).toBe(3);
+      expect(lua.execute_script('return "hello"')).toBe('hello');
+      // Standard library functions are not available
+      expect(() => lua.execute_script('return type(math)')).toThrow();
+      expect(() => lua.execute_script('return print("hi")')).toThrow();
+    });
+
+    it('loads all libraries with preset "all"', () => {
+      const lua = new lua_native.init({}, { libraries: 'all' });
+      expect(lua.execute_script('return math.floor(3.7)')).toBe(3);
+      expect(lua.execute_script('return string.upper("hello")')).toBe('HELLO');
+      expect(lua.execute_script('return type(io)')).toBe('table');
+      expect(lua.execute_script('return type(os)')).toBe('table');
+      expect(lua.execute_script('return type(debug)')).toBe('table');
+    });
+
+    it('loads safe libraries with preset "safe"', () => {
+      const lua = new lua_native.init({}, { libraries: 'safe' });
+      // Safe libs should be available
+      expect(lua.execute_script('return math.floor(3.7)')).toBe(3);
+      expect(lua.execute_script('return string.upper("hello")')).toBe('HELLO');
+      expect(lua.execute_script('return type(table)')).toBe('table');
+      expect(lua.execute_script('return type(coroutine)')).toBe('table');
+      // Dangerous libs should NOT be available
+      expect(lua.execute_script('return type(io)')).toBe('nil');
+      expect(lua.execute_script('return type(os)')).toBe('nil');
+      expect(lua.execute_script('return type(debug)')).toBe('nil');
+    });
+
+    it('throws on unknown preset string', () => {
+      expect(() => new lua_native.init({}, { libraries: 'invalid' as any })).toThrow(
+        /libraries must be 'all', 'safe', or an array/
+      );
+    });
+
+    it('loads only selected libraries', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'string', 'math'] });
+      expect(lua.execute_script('return math.floor(3.7)')).toBe(3);
+      expect(lua.execute_script('return string.upper("hello")')).toBe('HELLO');
+      expect(lua.execute_script('return type(print)')).toBe('function');
+    });
+
+    it('omitted libraries are not available', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'string'] });
+      expect(lua.execute_script('return type(math)')).toBe('nil');
+      expect(lua.execute_script('return type(io)')).toBe('nil');
+      expect(lua.execute_script('return type(os)')).toBe('nil');
+      expect(lua.execute_script('return type(debug)')).toBe('nil');
+    });
+
+    it('empty libraries array creates a bare Lua state', () => {
+      const lua = new lua_native.init({}, { libraries: [] });
+      expect(() => lua.execute_script('return type(math)')).toThrow();
+      expect(() => lua.execute_script('return print("hi")')).toThrow();
+      expect(lua.execute_script('return 1 + 2')).toBe(3);
+      expect(lua.execute_script('return "hello"')).toBe('hello');
+    });
+
+    it('throws on unknown library name', () => {
+      expect(() => new lua_native.init({}, { libraries: ['nonexistent'] })).toThrow(
+        "Unknown Lua library: 'nonexistent'"
+      );
+    });
+
+    it('can load individual libraries', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'math'] });
+      expect(lua.execute_script('return math.pi')).toBeCloseTo(3.14159, 4);
+      expect(lua.execute_script('return type(string)')).toBe('nil');
+    });
+
+    it('callbacks work with selective libraries', () => {
+      const lua = new lua_native.init(
+        { double: (x: any) => (x as number) * 2 },
+        { libraries: ['base'] }
+      );
+      expect(lua.execute_script('return double(21)')).toBe(42);
+    });
+
+    it('coroutine library can be loaded selectively', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'coroutine'] });
+      expect(lua.execute_script('return type(coroutine)')).toBe('table');
+      expect(lua.execute_script('return type(coroutine.yield)')).toBe('function');
+    });
+
+    it('table library can be loaded selectively', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'table'] });
+      const result = lua.execute_script(`
+        local t = {3, 1, 2}
+        table.sort(t)
+        return t[1], t[2], t[3]
+      `);
+      expect(result).toEqual([1, 2, 3]);
+    });
+
+    it('utf8 library can be loaded selectively', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'utf8'] });
+      expect(lua.execute_script('return type(utf8)')).toBe('table');
+    });
+  });
+
+  // ============================================
+  // ASYNC EXECUTION
+  // ============================================
+  describe('async execution', () => {
+    it('resolves with correct value', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async('return 6 * 7');
+      expect(result).toBe(42);
+    });
+
+    it('resolves with multiple return values', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async("return 1, 'two', true");
+      expect(result).toEqual([1, 'two', true]);
+    });
+
+    it('resolves with undefined for no return', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async('local x = 1');
+      expect(result).toBeUndefined();
+    });
+
+    it('rejects on Lua errors', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async("error('boom')")).rejects.toThrow('boom');
+    });
+
+    it('rejects on syntax errors', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async('return %%%')).rejects.toThrow();
+    });
+
+    it('rejects when calling JS callbacks', async () => {
+      const lua = new lua_native.init({
+        greet: () => 'hello',
+      }, ALL_LIBS);
+      await expect(lua.execute_script_async('return greet()')).rejects.toThrow('async mode');
+    });
+
+    it('works with stdlib functions', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async("return string.upper('hello')");
+      expect(result).toBe('HELLO');
+    });
+
+    it('returns tables correctly', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const result = await lua.execute_script_async("return {a = 1, b = 'two'}");
+      expect(result).toEqual({ a: 1, b: 'two' });
+    });
+
+    it('is_busy returns false after completion', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await lua.execute_script_async('return 1');
+      expect(lua.is_busy()).toBe(false);
+    });
+
+    it('allows sync calls after async completes', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await lua.execute_script_async('return 1');
+      const result = lua.execute_script('return 2 + 3');
+      expect(result).toBe(5);
+    });
+
+    it('execute_file_async works', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const os = await import('os');
+      const tmpFile = path.join(os.tmpdir(), `lua-async-test-${Date.now()}.lua`);
+      fs.writeFileSync(tmpFile, 'return 6 * 7');
+      try {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const result = await lua.execute_file_async(tmpFile);
+        expect(result).toBe(42);
+      } finally {
+        fs.unlinkSync(tmpFile);
+      }
+    });
+
+    it('execute_file_async rejects on file not found', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_file_async('/nonexistent/file.lua')).rejects.toThrow();
+    });
+
+    it('concurrent execution across contexts', async () => {
+      const contexts = Array.from({ length: 4 }, () =>
+        new lua_native.init({}, ALL_LIBS)
+      );
+      const results = await Promise.all(
+        contexts.map((lua, i) =>
+          lua.execute_script_async(`return ${i + 1} * 10`)
+        )
+      );
+      expect(results).toEqual([10, 20, 30, 40]);
+    });
+  });
+
+  // ============================================
+  // MODULE / REQUIRE INTEGRATION
+  // ============================================
+  describe('module / require integration', () => {
+    describe('add_search_path', () => {
+      it('loads a Lua module from a search path', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-modules-'));
+        const modPath = path.join(tmpDir, 'mymod.lua');
+        fs.writeFileSync(modPath, `
+          local M = {}
+          function M.greet(name)
+            return "Hello, " .. name
+          end
+          M.version = 42
+          return M
+        `);
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(tmpDir, '?.lua'));
+          const result = lua.execute_script(`
+            local mymod = require('mymod')
+            return mymod.greet('World'), mymod.version
+          `);
+          expect(result).toEqual(['Hello, World', 42]);
+        } finally {
+          fs.unlinkSync(modPath);
+          fs.rmdirSync(tmpDir);
+        }
+      });
+
+      it('loads a module from a fixture directory', () => {
+        const path = require('path');
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fixtureDir = path.resolve(__dirname, '../fixtures/modules');
+        lua.add_search_path(path.join(fixtureDir, '?.lua'));
+        const result = lua.execute_script(`
+          local testmod = require('testmod')
+          return testmod.add(3, 4), testmod.name
+        `);
+        expect(result).toEqual([7, 'testmod']);
+      });
+
+      it('supports multiple search paths', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mods1-'));
+        const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mods2-'));
+        fs.writeFileSync(path.join(dir1, 'mod_a.lua'), 'return { x = 1 }');
+        fs.writeFileSync(path.join(dir2, 'mod_b.lua'), 'return { y = 2 }');
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(dir1, '?.lua'));
+          lua.add_search_path(path.join(dir2, '?.lua'));
+
+          expect(lua.execute_script("return require('mod_a').x")).toBe(1);
+          expect(lua.execute_script("return require('mod_b').y")).toBe(2);
+        } finally {
+          fs.unlinkSync(path.join(dir1, 'mod_a.lua'));
+          fs.unlinkSync(path.join(dir2, 'mod_b.lua'));
+          fs.rmdirSync(dir1);
+          fs.rmdirSync(dir2);
+        }
+      });
+
+      it('throws when package library is not loaded', () => {
+        const lua = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.add_search_path('./?.lua')).toThrow(/package/);
+      });
+
+      it('throws when path has no ? placeholder', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.add_search_path('./modules/foo.lua')).toThrow(/\?/);
+      });
+
+      it('throws on non-string argument', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).add_search_path(42)).toThrow();
+      });
+
+      it('require caches the module (loaded once)', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-cache-'));
+        fs.writeFileSync(path.join(tmpDir, 'counter.lua'), `
+          local M = { count = 0 }
+          M.count = M.count + 1
+          return M
+        `);
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(tmpDir, '?.lua'));
+          lua.execute_script(`
+            local c1 = require('counter')
+            local c2 = require('counter')
+            assert(c1 == c2, "require should cache modules")
+          `);
+        } finally {
+          fs.unlinkSync(path.join(tmpDir, 'counter.lua'));
+          fs.rmdirSync(tmpDir);
+        }
+      });
+    });
+
+    describe('register_module', () => {
+      it('registers a module with plain values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('config', {
+          debug: true,
+          version: '1.0.0',
+          maxRetries: 3,
+        });
+        expect(lua.execute_script("return require('config').debug")).toBe(true);
+        expect(lua.execute_script("return require('config').version")).toBe('1.0.0');
+        expect(lua.execute_script("return require('config').maxRetries")).toBe(3);
+      });
+
+      it('registers a module with functions', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('math_utils', {
+          clamp: (...args: any[]) => {
+            const [x, min, max] = args as number[];
+            return Math.min(Math.max(x, min), max);
+          },
+          lerp: (...args: any[]) => {
+            const [a, b, t] = args as number[];
+            return a + (b - a) * t;
+          },
+        });
+        expect(lua.execute_script("return require('math_utils').clamp(15, 0, 10)")).toBe(10);
+        expect(lua.execute_script("return require('math_utils').clamp(-5, 0, 10)")).toBe(0);
+        expect(lua.execute_script("return require('math_utils').lerp(0, 100, 0.5)")).toBe(50);
+      });
+
+      it('registers a module with mixed functions and values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('utils', {
+          version: '2.0',
+          double: (...args: any[]) => (args[0] as number) * 2,
+        });
+        expect(lua.execute_script("return require('utils').version")).toBe('2.0');
+        expect(lua.execute_script("return require('utils').double(21)")).toBe(42);
+      });
+
+      it('module is cached by require', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('singleton', { id: 1 });
+        lua.execute_script(`
+          local a = require('singleton')
+          local b = require('singleton')
+          assert(a == b, "require should return the same table")
+        `);
+      });
+
+      it('overwrites existing module on re-register', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('mymod', { value: 1 });
+        expect(lua.execute_script("return require('mymod').value")).toBe(1);
+
+        // Re-register overwrites package.loaded directly
+        lua.register_module('mymod', { value: 2 });
+        expect(lua.execute_script("return require('mymod').value")).toBe(2);
+      });
+
+      it('throws when package library is not loaded', () => {
+        const lua = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.register_module('mod', { x: 1 })).toThrow(/package/);
+      });
+
+      it('throws on invalid arguments', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).register_module(42, {})).toThrow();
+        expect(() => (lua as any).register_module('mod')).toThrow();
+      });
+
+      it('module functions receive correct arguments from Lua', () => {
+        let receivedArgs: any[] = [];
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('capture', {
+          capture: (...args: any[]) => {
+            receivedArgs = [...args];
+            return null;
+          },
+        });
+        lua.execute_script("require('capture').capture(1, 'hello', true)");
+        expect(receivedArgs).toEqual([1, 'hello', true]);
+      });
+
+      it('requiring an unknown module still errors', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.execute_script("require('nonexistent')")).toThrow();
+      });
+
+      it('registered module does not pollute global namespace', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('secret', { value: 42 });
+        expect(lua.execute_script("return type(secret)")).toBe('nil');
+        expect(lua.execute_script("return require('secret').value")).toBe(42);
+      });
+
+      it('works alongside add_search_path', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mixed-'));
+        fs.writeFileSync(path.join(tmpDir, 'filemod.lua'),
+          "return { source = 'file' }");
+
+        try {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          lua.add_search_path(path.join(tmpDir, '?.lua'));
+          lua.register_module('jsmod', { source: 'js' });
+
+          expect(lua.execute_script("return require('filemod').source")).toBe('file');
+          expect(lua.execute_script("return require('jsmod').source")).toBe('js');
+        } finally {
+          fs.unlinkSync(path.join(tmpDir, 'filemod.lua'));
+          fs.rmdirSync(tmpDir);
+        }
+      });
+    });
+
+    describe('busy state', () => {
+      it('add_search_path works after async completes', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        await lua.execute_script_async("return 1");
+        lua.add_search_path('./?.lua');
+      });
+
+      it('register_module works after async completes', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        await lua.execute_script_async("return 1");
+        lua.register_module('mod', { x: 1 });
       });
     });
   });

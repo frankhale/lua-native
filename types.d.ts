@@ -111,6 +111,16 @@ export interface LuaContext {
   execute_script<T extends LuaValue | LuaValue[] = LuaValue>(script: string): T;
 
   /**
+   * Executes a Lua file and returns the result.
+   * Use the generic parameter to specify the expected return type.
+   * @param filepath The path to the Lua file to execute
+   * @returns The result of the file execution
+   * @example
+   * const result = lua.execute_file<number>('./scripts/init.lua');
+   */
+  execute_file<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): T;
+
+  /**
    * Sets a global variable or function in the Lua environment
    * @param name The name of the global variable or function
    * @param value The value to set (function, number, boolean, string, or object)
@@ -162,6 +172,36 @@ export interface LuaContext {
   set_metatable(name: string, metatable: MetatableDefinition): void;
 
   /**
+   * Appends a search path to Lua's `package.path` for module resolution.
+   * The path must contain a `?` placeholder that gets replaced by the module name.
+   * Requires the `package` library to be loaded.
+   *
+   * @param path Search path template (e.g., './modules/?.lua')
+   * @example
+   * lua.add_search_path('./lua_modules/?.lua');
+   * lua.add_search_path('./libs/?/init.lua');
+   * // Lua: local mod = require('mymod')  -- searches ./lua_modules/mymod.lua
+   */
+  add_search_path(path: string): void;
+
+  /**
+   * Registers a JavaScript object as a Lua module, making it available via `require(name)`.
+   * The module is pre-loaded into `package.loaded` — no filesystem search occurs.
+   * Functions in the module object become callable from Lua.
+   * Requires the `package` library to be loaded.
+   *
+   * @param name The module name used in `require(name)`
+   * @param module An object whose properties become the module's fields
+   * @example
+   * lua.register_module('utils', {
+   *   clamp: (x, min, max) => Math.min(Math.max(x, min), max),
+   *   version: '1.0.0',
+   * });
+   * // Lua: local utils = require('utils'); utils.clamp(5, 0, 10)
+   */
+  register_module(name: string, module: LuaTable | LuaCallbacks): void;
+
+  /**
    * Creates a coroutine from a Lua script that returns a function.
    * @param script A Lua script that returns a function to be used as the coroutine body
    * @returns A coroutine object that can be resumed
@@ -187,6 +227,77 @@ export interface LuaContext {
    * // result.values: yielded or returned values
    */
   resume(coroutine: LuaCoroutine, ...args: LuaValue[]): CoroutineResult;
+
+  /**
+   * Executes a Lua script string asynchronously on a worker thread.
+   * Returns a Promise that resolves with the result.
+   * JS callbacks are not available during async execution.
+   * @param script The Lua script to execute
+   * @returns Promise resolving with the result of the script execution
+   */
+  execute_script_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
+
+  /**
+   * Executes a Lua file asynchronously on a worker thread.
+   * Returns a Promise that resolves with the result.
+   * JS callbacks are not available during async execution.
+   * @param filepath The path to the Lua file to execute
+   * @returns Promise resolving with the result of the file execution
+   */
+  execute_file_async<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): Promise<T>;
+
+  /**
+   * Returns whether the context is currently busy with an async operation.
+   * While busy, sync methods will throw and new async calls will be rejected.
+   */
+  is_busy(): boolean;
+}
+
+/**
+ * Available Lua standard library names for selective loading
+ */
+export type LuaLibrary =
+  | 'base'
+  | 'package'
+  | 'coroutine'
+  | 'debug'
+  | 'io'
+  | 'math'
+  | 'os'
+  | 'string'
+  | 'table'
+  | 'utf8';
+
+/**
+ * Preset names for loading groups of standard libraries
+ * - 'all': Load all 10 standard libraries
+ * - 'safe': Load all except io, os, and debug (for sandboxing)
+ */
+export type LuaLibraryPreset = 'all' | 'safe';
+
+/**
+ * Options for configuring a new Lua context
+ */
+export interface LuaInitOptions {
+  /**
+   * Which Lua standard libraries to load. If omitted, NO libraries are loaded (bare state).
+   *
+   * - `'all'` — load all 10 standard libraries
+   * - `'safe'` — load all except io, os, and debug (for sandboxing)
+   * - `LuaLibrary[]` — load specific libraries by name
+   * - `[]` — bare state with no standard libraries
+   *
+   * @example
+   * // Load all libraries
+   * { libraries: 'all' }
+   *
+   * // Safe sandboxed environment
+   * { libraries: 'safe' }
+   *
+   * // Only load string and math
+   * { libraries: ['base', 'string', 'math'] }
+   */
+  libraries?: LuaLibrary[] | LuaLibraryPreset;
 }
 
 /**
@@ -196,6 +307,7 @@ export interface LuaNative {
   /**
    * Creates a new Lua context with the provided callbacks and values
    * @param callbacks Object containing functions and values to be available in Lua
+   * @param options Optional configuration for the Lua context
    */
-  init: new (callbacks?: LuaCallbacks) => LuaContext;
+  init: new (callbacks?: LuaCallbacks, options?: LuaInitOptions) => LuaContext;
 }
