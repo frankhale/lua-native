@@ -96,13 +96,42 @@ export interface CompileOptions {
 }
 
 /**
- * Options for set_userdata controlling property access from Lua
+ * A method function registered on userdata.
+ * The first argument is always the JS object (`self`), passed automatically
+ * when Lua calls `obj:method(args)`.
+ * Remaining arguments come from the Lua call.
+ */
+export interface UserdataMethod {
+  (self: any, ...args: LuaValue[]): LuaValue | LuaValue[] | void;
+}
+
+/**
+ * Options for set_userdata controlling property access and methods from Lua
  */
 export interface UserdataOptions {
   /** Allow Lua to read properties via __index */
   readable?: boolean;
   /** Allow Lua to write properties via __newindex */
   writable?: boolean;
+  /**
+   * Methods callable from Lua via `obj:method()` syntax.
+   * Each method receives the original JS object as the first argument (`self`).
+   *
+   * Methods take precedence over properties when names collide.
+   * Methods work independently of `readable`/`writable` — an opaque handle
+   * can have methods even if its properties are hidden.
+   *
+   * @example
+   * lua.set_userdata('player', playerObj, {
+   *   readable: true,
+   *   methods: {
+   *     move: (self, dx, dy) => { self.x += dx; self.y += dy; },
+   *     get_pos: (self) => [self.x, self.y],
+   *   }
+   * });
+   * // Lua: player:move(10, 20)
+   */
+  methods?: Record<string, UserdataMethod>;
 }
 
 /**

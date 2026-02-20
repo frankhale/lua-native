@@ -13,11 +13,16 @@ workarounds rank lowest.
 |---|---|---|---|
 | 1 | Memory Limits | Not started | No workaround — a script can OOM the process |
 | 1 | Execution Time Limits | Not started | No workaround — an infinite loop hangs the process |
+| 2 | Error Stack Traces | Not started | Universal in bridges (6/7); no workaround for useful errors |
+| 2 | Userdata Method Binding | Not started | Standard in bridges (6/7); no clean workaround |
 | 2 | GC Control | Not started | Small scope, complements sandboxing |
 | 2 | Context Reset | Not started | No workaround without re-registering everything |
+| 3 | Table Reference API | Not started | Universal in bridges (7/7); workaround: `execute_script` |
+| 3 | Environment Tables | Not started | Common in bridges (5/7); enables per-script sandboxing |
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
 | 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
+| 3 | Reference Lifecycle Management | Not started | Prevents memory leaks in long-lived contexts |
 | 4 | Dotted Path Globals | Not started | Workaround: `execute_script` |
 | 4 | Shared State Between Contexts | Not started | Workaround: `set_global` on each context |
 | — | ~~File Execution~~ | Completed | |
@@ -27,8 +32,9 @@ workarounds rank lowest.
 | — | ~~Bytecode Precompilation~~ | Completed | |
 
 **Recommended implementation order:** Tier 1 features should be implemented
-together as "sandboxing." Tier 2 follows naturally. Tier 3 and 4 can be driven
-by actual user requests.
+together as "sandboxing." Tier 2 follows naturally — error stack traces and
+userdata methods are standard across Lua bridges and relatively straightforward.
+Tier 3 and 4 can be driven by actual user requests.
 
 ---
 
@@ -133,7 +139,10 @@ Prevents infinite loops from hanging the process. The hook function checks the i
 
 ---
 
-## Tier 2 — Operational Control
+## Tier 2 — Bridge Quality & Operational Control
+
+These features are standard across Lua bridge libraries and address real gaps
+in debugging, ergonomics, and operational control.
 
 ### GC Control
 
@@ -222,6 +231,143 @@ with no easy workaround.
 - Set a global, reset, verify the global is gone.
 - Register a callback, reset, verify the callback still works.
 - Verify reset during async throws an error.
+
+---
+
+### Error Stack Traces
+
+Automatically include Lua stack traces in error messages by pushing
+`debug.traceback` as the message handler for `lua_pcall`:
+
+```typescript
+const lua = new lua_native.init({}, { libraries: 'all' });
+lua.execute_script('function foo() error("boom") end foo()');
+// Currently:  "[string \"...\"]:1: boom"
+// With traces: "[string \"...\"]:1: boom\nstack traceback:\n\t[string \"...\"]:1: in function 'foo'\n\t..."
+```
+
+Currently all `lua_pcall` calls pass `0` (no message handler), so errors only
+include the immediate error message with no call chain. This is the single most
+requested debugging improvement across Lua bridge libraries — 6 of 7 surveyed
+bridges integrate `debug.traceback` or equivalent.
+
+**Why tier 2:** The implementation is small and low-risk. Error messages without
+stack traces are a common source of frustration. No workaround exists from JS
+short of wrapping every call in `xpcall` from Lua.
+
+#### Implementation Plan
+
+**Core layer** (`lua-runtime.h/.cpp`):
+- Before each `lua_pcall`, push `debug.traceback` (if the debug library is
+  loaded) as the message handler:
+  ```cpp
+  int msgh = 0;
+  lua_getglobal(L_, "debug");
+  if (lua_istable(L_, -1)) {
+    lua_getfield(L_, -1, "traceback");
+    lua_remove(L_, -2);  // remove debug table
+    msgh = stackBefore + 1;  // position of traceback function
+    // adjust function position accordingly
+  } else {
+    lua_pop(L_, 1);
+  }
+  ```
+- Pass `msgh` instead of `0` to `lua_pcall`.
+- After pcall, remove the message handler from the stack.
+- Apply to `ExecuteScript`, `ExecuteFile`, `CallFunction`, and
+  `LoadBytecode`.
+
+**N-API layer**: No changes needed — errors already propagate as strings.
+
+**Types** (`types.d.ts`): No changes needed.
+
+**Tests**:
+- Execute a script that errors inside a nested function call, verify the error
+  message contains "stack traceback" and line numbers.
+- Verify stack traces work with `execute_file`.
+- Verify that when the debug library is NOT loaded, errors still work (just
+  without traces).
+- Verify traces appear for errors thrown from JS callbacks called by Lua.
+
+---
+
+### Userdata Method Binding
+
+Allow registering methods on userdata that are callable via Lua's `:` syntax
+(`obj:method(args)`). Currently userdata only supports property access via
+`__index`/`__newindex`. Method binding is the most common feature in Lua bridges
+(6 of 7 surveyed libraries support it) and is the expected way to expose
+object-oriented APIs to Lua.
+
+```typescript
+const player = { x: 0, y: 0, hp: 100 };
+
+lua.set_userdata('player', player, {
+  readable: true,
+  writable: true,
+  methods: {
+    move: (self, dx, dy) => { self.x += dx; self.y += dy; },
+    heal: (self, amount) => { self.hp = Math.min(100, self.hp + amount); },
+    get_pos: (self) => [self.x, self.y],
+  }
+});
+
+lua.execute_script(`
+  player:move(10, 20)       -- calls methods.move(player, 10, 20)
+  player:heal(25)
+  local x, y = player:get_pos()
+  print(x, y)               -- 10  20
+`);
+```
+
+**Why tier 2:** Without this, exposing object methods requires either polluting
+the global namespace with wrapper functions (`function player_move(p, dx, dy)`)
+or round-tripping through `execute_script` to define Lua-side method tables.
+Neither approach is ergonomic. Method binding on userdata is the standard
+pattern that Lua developers expect.
+
+#### Implementation Plan
+
+**Core layer** (`lua-runtime.h/.cpp`):
+- Extend the proxy userdata metatable's `__index` metamethod to check for
+  registered methods before falling back to property access:
+  ```cpp
+  int UserdataIndex(lua_State* L) {
+    // 1. Check if key matches a registered method name
+    // 2. If yes, push the method closure (which will receive self as first arg)
+    // 3. If no, fall through to property getter as today
+  }
+  ```
+- Store methods per-userdata-type as a map of name → host function, keyed by
+  the userdata's reference ID or a type identifier.
+- Methods receive the original JS object as the first argument (`self`),
+  matching Lua's `:` call convention.
+
+**N-API layer** (`lua-native.cpp`):
+- Extend `SetUserdata` to accept an optional `methods` object in options.
+- Each method value is stored as a `Napi::FunctionReference`.
+- When the `__index` metamethod fires and finds a method match, push a
+  C closure that calls the corresponding JS function with the userdata's
+  JS object prepended as the first argument.
+
+**Types** (`types.d.ts`):
+- Extend `UserdataOptions`:
+  ```typescript
+  interface UserdataOptions {
+    readable?: boolean;
+    writable?: boolean;
+    methods?: Record<string, (self: any, ...args: LuaValue[]) => LuaValue | void>;
+  }
+  ```
+
+**Tests**:
+- Register userdata with methods, call `obj:method()` from Lua, verify the
+  method fires and receives `self`.
+- Verify methods and property access coexist (read a property and call a method
+  on the same userdata).
+- Verify that method names don't shadow properties (or document the precedence).
+- Verify error messages when calling a non-existent method.
+- Test methods that return multiple values.
 
 ---
 
@@ -352,6 +498,181 @@ build-time constant. Low implementation effort.
 
 **Types** (`types.d.ts`):
 - Add `info(): { version: string, memoryKB: number }` to `LuaContext`.
+
+---
+
+### Table Reference API
+
+Provide a way to create, read, write, and iterate Lua tables from JS without
+round-tripping through `execute_script`. This is the single most universal Lua
+bridge feature — every surveyed library (7 of 7) provides some form of
+host-language table manipulation. Currently, plain tables are deep-copied on
+return and there is no way to hold a live reference to a plain Lua table.
+
+```typescript
+const tbl = lua.create_table();           // empty table in Lua
+tbl.set('name', 'Alice');
+tbl.set('scores', [95, 87, 92]);
+tbl.get('name');                          // 'Alice'
+tbl.length();                             // 1 (hash part) or array length
+lua.set_global('player', tbl);            // push to Lua as a global
+
+// Iterate over an existing table
+const config = lua.get_global_ref('config');  // live reference, not a copy
+for (const [k, v] of config.pairs()) {
+  console.log(k, v);
+}
+config.release();                         // explicitly free the registry ref
+```
+
+**Why tier 3:** The workaround (`execute_script` for all table manipulation)
+works but is verbose and incurs parsing overhead. For hot paths that frequently
+read/write Lua state, a direct API is significantly faster. However, the
+deep-copy approach works well enough for most use cases.
+
+#### Implementation Plan
+
+**Core layer** (`lua-runtime.h/.cpp`):
+- Add `int CreateTable()` — creates an empty table, stores in registry, returns
+  ref ID.
+- Add `void TableSet(int ref, const std::string& key, const LuaPtr& value)` —
+  pushes the table from registry, sets the field, pops.
+- Add `LuaPtr TableGet(int ref, const std::string& key)` — pushes table, gets
+  field, converts to LuaPtr.
+- Add `std::vector<std::pair<LuaPtr, LuaPtr>> TablePairs(int ref)` — iterates
+  `lua_next` and returns all key-value pairs.
+- Add `int TableLength(int ref)` — returns `lua_rawlen`.
+- Add `void ReleaseRef(int ref)` — calls `luaL_unref`.
+- Add `int GetGlobalRef(const std::string& name)` — gets the global, stores in
+  registry, returns ref ID.
+
+**N-API layer** (`lua-native.cpp`):
+- Expose a `LuaTableHandle` class or add methods directly to `LuaContext`:
+  `create_table()`, `table_set()`, `table_get()`, `table_pairs()`,
+  `table_length()`, `release_ref()`, `get_global_ref()`.
+
+**Types** (`types.d.ts`):
+- Add `LuaTableHandle` interface with `get`, `set`, `pairs`, `length`,
+  `release` methods.
+- Add `create_table(): LuaTableHandle` and
+  `get_global_ref(name: string): LuaTableHandle` to `LuaContext`.
+
+**Tests**:
+- Create a table, set/get values, verify round-trip.
+- Iterate pairs, verify all keys returned.
+- Push a table ref as a global, access from Lua, verify it's the same table.
+- Release a ref, verify it no longer works.
+- Get a global ref, modify from JS, verify Lua sees the change.
+
+---
+
+### Environment Tables
+
+Provide per-script or per-function environment isolation using Lua's `_ENV`
+mechanism. This goes beyond the `libraries` preset by allowing different scripts
+within the same context to have different sets of available globals.
+
+```typescript
+const lua = new lua_native.init({}, { libraries: 'safe' });
+
+// Create a restricted environment with only math and print
+const env = lua.create_environment({ whitelist: ['math', 'print'] });
+
+// Execute in the restricted environment — cannot access string, table, etc.
+lua.execute_script_in(env, `
+  print(math.sqrt(16))      -- works: 4
+  print(string.rep('x', 3)) -- error: 'string' is nil
+`);
+```
+
+5 of 7 surveyed bridges support environment manipulation. This is particularly
+valuable for multi-tenant sandboxing where different scripts need different
+permission levels within the same Lua state.
+
+**Why tier 3:** The `libraries` option covers the common case (one permission
+level per context). Per-script environments add flexibility but require creating
+separate contexts as a workaround. The implementation is moderately complex —
+`_ENV` in Lua 5.4+ requires setting the first upvalue of a loaded chunk.
+
+#### Implementation Plan
+
+**Core layer** (`lua-runtime.h/.cpp`):
+- Add `int CreateEnvironment(const std::vector<std::string>& whitelist)`:
+  - Create a new table.
+  - Copy whitelisted globals from the current state.
+  - Set the table's `__index` to itself (or optionally to `_G` for fallback).
+  - Store in registry, return ref ID.
+- Add `ScriptResult ExecuteInEnvironment(int envRef, const std::string& script)`:
+  - Load the chunk with `luaL_loadstring`.
+  - Push the environment table from registry.
+  - Set it as the first upvalue: `lua_setupvalue(L_, -2, 1)` (upvalue 1 of a
+    loaded chunk is `_ENV`).
+  - Call with `lua_pcall`.
+
+**N-API layer** (`lua-native.cpp`):
+- Add `create_environment(options)` and `execute_script_in(env, script)`.
+
+**Types** (`types.d.ts`):
+- Add `LuaEnvironment` opaque type.
+- Add `EnvironmentOptions` with `whitelist?: string[]` and
+  `inherit?: boolean` (whether unlisted globals fall through to `_G`).
+- Add `create_environment(options: EnvironmentOptions): LuaEnvironment`.
+- Add `execute_script_in(env: LuaEnvironment, script: string): LuaValue`.
+
+**Tests**:
+- Create an environment with only `math`, execute `math.sqrt(4)`, verify success.
+- In the same environment, attempt `io.open(...)`, verify it errors.
+- Verify the main context's globals are unaffected by the environment.
+- Test with `inherit: true` — unlisted globals should be readable.
+
+---
+
+### Reference Lifecycle Management
+
+Provide explicit control over registry references to prevent memory leaks in
+long-lived contexts. When Lua functions, coroutines, or metatabled tables are
+returned to JS, they are stored in the Lua registry via `luaL_ref`. Without
+explicit release, these references accumulate indefinitely.
+
+```typescript
+const fn = lua.execute_script<LuaFunction>('return function(x) return x * 2 end');
+fn(21);  // 42
+
+// When done with the function, release the registry reference
+lua.release(fn);
+
+// Attempting to call after release throws
+fn(21);  // Error: reference has been released
+```
+
+6 of 7 surveyed bridges provide some form of reference lifecycle management
+(RAII, explicit release, or scope-based cleanup).
+
+**Why tier 3:** Only matters for long-lived contexts that create many
+function/table references over time. Context Reset (tier 2) is the nuclear
+option. Most short-lived use cases never accumulate enough references to matter.
+
+#### Implementation Plan
+
+**Core layer** (`lua-runtime.h/.cpp`):
+- Add `void ReleaseRef(int ref)` — calls `luaL_unref(L_, LUA_REGISTRYINDEX, ref)`.
+- Track live reference IDs to prevent double-free.
+
+**N-API layer** (`lua-native.cpp`):
+- Add `release(value)` to `LuaContext`. Accepts any value that holds a registry
+  reference (LuaFunction, LuaCoroutine, LuaTableRef).
+- Extract the ref ID from the JS object and call `ReleaseRef`.
+- Mark the JS wrapper as released so subsequent use throws a clear error.
+
+**Types** (`types.d.ts`):
+- Add `release(value: LuaFunction | LuaCoroutine | LuaTableRef): void` to
+  `LuaContext`.
+
+**Tests**:
+- Create a function ref, release it, verify calling it throws.
+- Create many refs in a loop, release them, verify `gc('count')` decreases.
+- Double-release should not crash (no-op or warning).
+- Release a coroutine, verify resuming it throws.
 
 ---
 

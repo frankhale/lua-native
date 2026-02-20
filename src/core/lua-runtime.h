@@ -300,6 +300,11 @@ public:
   void IncrementUserdataRefCount(int ref_id);
   void DecrementUserdataRefCount(int ref_id);
 
+  /// Register a method table for a userdata ref_id.
+  /// method_map: maps Lua-facing method name -> host function name
+  void SetUserdataMethodTable(int ref_id,
+      const std::unordered_map<std::string, std::string>& method_map);
+
   // Table reference operations (for metatabled tables preserved as refs)
   [[nodiscard]] LuaPtr GetTableField(int registry_ref, const std::string& key) const;
   void SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const;
@@ -343,6 +348,7 @@ private:
   static int UserdataGC(lua_State* L);
   static int UserdataIndex(lua_State* L);
   static int UserdataNewIndex(lua_State* L);
+  static int UserdataMethodCall(lua_State* L);
 };
 
 } // namespace lua_core
