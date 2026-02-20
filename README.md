@@ -17,7 +17,7 @@ data structures.
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Global variable management (get and set)
-- Userdata support — pass JavaScript objects to Lua by reference with optional property access
+- Userdata support — pass JavaScript objects to Lua by reference with optional property access and method binding
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Module / require integration — register JS modules and add search paths for Lua's `require()`
@@ -256,11 +256,14 @@ try {
 Errors from JavaScript callbacks include the function name and original error message:
 
 ```javascript
-const lua = new lua_native.init({
-  riskyOperation: () => {
-    throw new Error("Database connection failed");
+const lua = new lua_native.init(
+  {
+    riskyOperation: () => {
+      throw new Error("Database connection failed");
+    },
   },
-}, { libraries: "all" });
+  { libraries: "all" },
+);
 
 try {
   lua.execute_script("riskyOperation()");
@@ -312,9 +315,12 @@ You can also pass an explicit array of library names:
 
 ```javascript
 // Only load base, string, and math
-const lua = new lua_native.init({}, {
-  libraries: ["base", "string", "math"],
-});
+const lua = new lua_native.init(
+  {},
+  {
+    libraries: ["base", "string", "math"],
+  },
+);
 
 lua.execute_script('print(string.upper("hello"))'); // "HELLO"
 lua.execute_script("print(math.floor(3.7))"); // 3
@@ -431,10 +437,12 @@ const fileResult = await lua.execute_file_async("./scripts/heavy.lua");
 Run multiple independent contexts concurrently with `Promise.all()`:
 
 ```javascript
-const contexts = [1, 2, 3, 4].map(() => new lua_native.init({}, { libraries: "all" }));
+const contexts = [1, 2, 3, 4].map(
+  () => new lua_native.init({}, { libraries: "all" }),
+);
 
 const results = await Promise.all(
-  contexts.map((lua, i) => lua.execute_script_async(`return ${i + 1} * 10`))
+  contexts.map((lua, i) => lua.execute_script_async(`return ${i + 1} * 10`)),
 );
 console.log(results); // [10, 20, 30, 40]
 ```
@@ -454,16 +462,21 @@ async execution. Calling a registered JS function from async Lua code will
 reject the promise with a clear error:
 
 ```javascript
-const lua = new lua_native.init({
-  greet: () => "hello",
-}, { libraries: "all" });
+const lua = new lua_native.init(
+  {
+    greet: () => "hello",
+  },
+  { libraries: "all" },
+);
 
 // This will reject — JS callbacks can't run on the worker thread
 await lua.execute_script_async("return greet()"); // Error: "JS callbacks are not available in async mode"
 
 // Workaround: set up data before async, compute in Lua
 lua.set_global("name", "World");
-const result = await lua.execute_script_async("return 'Hello, ' .. name .. '!'");
+const result = await lua.execute_script_async(
+  "return 'Hello, ' .. name .. '!'",
+);
 ```
 
 ### Bytecode Precompilation
@@ -478,7 +491,7 @@ import fs from "fs";
 const lua = new lua_native.init({}, { libraries: "all" });
 
 // Compile source to bytecode (returns a Buffer)
-const bytecode = lua.compile('return function(x) return x * 2 end');
+const bytecode = lua.compile("return function(x) return x * 2 end");
 
 // Save to disk for later
 fs.writeFileSync("my-script.luac", bytecode);
@@ -670,12 +683,15 @@ Userdata created by Lua libraries (e.g., `io.open()` file handles) can pass
 through JavaScript callbacks and back to Lua without losing their identity:
 
 ```javascript
-const lua = new lua_native.init({
-  processFile: (fileHandle) => {
-    // fileHandle is opaque to JS, but can be returned to Lua
-    return fileHandle;
+const lua = new lua_native.init(
+  {
+    processFile: (fileHandle) => {
+      // fileHandle is opaque to JS, but can be returned to Lua
+      return fileHandle;
+    },
   },
-}, { libraries: "all" });
+  { libraries: "all" },
+);
 
 lua.execute_script(`
   local f = io.tmpfile()
@@ -684,6 +700,73 @@ lua.execute_script(`
   f2:seek("set")
   print(f2:read("*a"))  -- "hello"
   f2:close()
+`);
+```
+
+#### Method Binding
+
+You can register JavaScript functions as methods on userdata, callable from Lua
+using the `:` method syntax (`obj:method(args)`). Methods receive the original
+JavaScript object as the first argument (`self`), followed by any Lua-provided
+arguments.
+
+```javascript
+const player = { x: 0, y: 0, name: "Alice" };
+
+lua.set_userdata("player", player, {
+  readable: true,
+  methods: {
+    move: (self, dx, dy) => {
+      self.x += dx;
+      self.y += dy;
+    },
+    get_pos: (self) => [self.x, self.y],
+    greet: (self) => `Hello, I'm ${self.name}!`,
+  },
+});
+
+lua.execute_script(`
+  player:move(10, 20)
+  local x, y = player:get_pos()
+  print(x, y)           -- 10  20
+  print(player:greet())  -- Hello, I'm Alice!
+  print(player.name)     -- Alice (property access still works)
+`);
+```
+
+Methods work independently of `readable`/`writable` — you can have methods on an
+otherwise opaque handle:
+
+```javascript
+const handle = { secret: 42 };
+
+lua.set_userdata("handle", handle, {
+  methods: {
+    get_value: (self) => self.secret,
+  },
+});
+
+lua.execute_script(`
+  print(handle:get_value())  -- 42
+  print(handle.secret)       -- nil (not readable)
+`);
+```
+
+When both methods and properties exist, methods take precedence over properties
+with the same name:
+
+```javascript
+const obj = { info: "property" };
+
+lua.set_userdata("obj", obj, {
+  readable: true,
+  methods: {
+    info: (self) => "method result",
+  },
+});
+
+lua.execute_script(`
+  print(obj:info())  -- "method result" (method wins)
 `);
 ```
 
@@ -911,6 +994,7 @@ import type {
   LuaFunction,
   LuaTableRef,
   MetatableDefinition,
+  UserdataMethod,
   UserdataOptions,
 } from "lua-native";
 
@@ -948,6 +1032,13 @@ console.log(fn(5, 3)); // 8
 // Type-safe userdata
 const opts: UserdataOptions = { readable: true, writable: true };
 lua.set_userdata("player", { name: "Alice", score: 0 }, opts);
+
+// Type-safe userdata with methods
+const move: UserdataMethod = (self, dx, dy) => {
+  self.x += dx;
+  self.y += dy;
+};
+lua.set_userdata("entity", { x: 0, y: 0 }, { methods: { move } });
 
 // Type-safe metatable
 lua.execute_script("vec = {x = 1, y = 2}");
@@ -1133,9 +1224,12 @@ passed by reference — Lua holds a handle to the original object, not a copy.
 
 - `name`: The global variable name in Lua
 - `value`: The JavaScript object to store as userdata
-- `options` (optional): Access control for property access from Lua
+- `options` (optional): Access control and methods for the userdata
   - `readable`: Allow Lua to read properties via `__index` (default: `false`)
   - `writable`: Allow Lua to write properties via `__newindex` (default: `false`)
+  - `methods`: Object mapping method names to functions callable from Lua via
+    `obj:method()` syntax. Each method receives the original JS object as its
+    first argument (`self`). Methods work independently of `readable`/`writable`.
 
 ### `LuaContext.set_metatable(name, metatable)`
 
@@ -1285,4 +1379,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-18 February 2026
+19 February 2026

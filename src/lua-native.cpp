@@ -358,6 +358,10 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
 
   bool readable = false;
   bool writable = false;
+  bool has_methods = false;
+
+  // Temporarily hold method functions until we can register them
+  std::vector<std::pair<std::string, Napi::Function>> method_funcs;
 
   if (info.Length() >= 3 && info[2].IsObject()) {
     auto options = info[2].As<Napi::Object>();
@@ -366,6 +370,18 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
     }
     if (options.Has("writable") && options.Get("writable").IsBoolean()) {
       writable = options.Get("writable").As<Napi::Boolean>().Value();
+    }
+    if (options.Has("methods") && options.Get("methods").IsObject()) {
+      auto methodsObj = options.Get("methods").As<Napi::Object>();
+      Napi::Array methodKeys = methodsObj.GetPropertyNames();
+      for (uint32_t i = 0; i < methodKeys.Length(); i++) {
+        std::string methodName = methodKeys.Get(i).As<Napi::String>().Utf8Value();
+        Napi::Value methodVal = methodsObj.Get(methodName);
+        if (methodVal.IsFunction()) {
+          method_funcs.emplace_back(methodName, methodVal.As<Napi::Function>());
+        }
+      }
+      has_methods = !method_funcs.empty();
     }
   }
 
@@ -377,10 +393,27 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   entry.writable = writable;
   js_userdata_[ref_id] = std::move(entry);
 
-  if (readable || writable) {
+  bool needs_proxy = readable || writable || has_methods;
+  if (needs_proxy) {
     runtime->CreateProxyUserdataGlobal(name, ref_id);
   } else {
     runtime->CreateUserdataGlobal(name, ref_id);
+  }
+
+  // Register methods if present
+  if (has_methods) {
+    std::unordered_map<std::string, std::string> method_map;
+
+    for (auto& [methodName, methodFunc] : method_funcs) {
+      std::string func_name = "__ud_method_" + std::to_string(ref_id)
+                            + "_" + methodName;
+
+      js_callbacks[func_name] = Napi::Persistent(methodFunc);
+      runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+      method_map[methodName] = func_name;
+    }
+
+    runtime->SetUserdataMethodTable(ref_id, method_map);
   }
 
   return env.Undefined();

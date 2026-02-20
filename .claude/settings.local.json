@@ -20,7 +20,13 @@
       "Bash(node:*)",
       "Bash(/Users/frankhale/DEV/lua-native/build/Debug/lua-native-test:*)",
       "Bash(gh pr create:*)",
-      "Bash(./build/Debug/lua-native-test:*)"
+      "Bash(./build/Debug/lua-native-test:*)",
+      "WebSearch",
+      "WebFetch(domain:sol2.readthedocs.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.moonsharp.org)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(git -C /Users/frankhale/DEV/lua-native log --oneline -10)"
     ]
   }
 }

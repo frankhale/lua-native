@@ -149,12 +149,43 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
-  if (runtime && runtime->property_getter_) {
+  if (!runtime) {
+    lua_pushnil(L);
+    return 1;
+  }
+
+  // 1. Check for a registered method
+  bool has_method_table = false;
+  std::string registry_key = "_ud_methods_" + std::to_string(*block);
+  lua_getfield(L, LUA_REGISTRYINDEX, registry_key.c_str());
+  if (lua_istable(L, -1)) {
+    has_method_table = true;
+    lua_getfield(L, -1, key);
+    if (lua_isstring(L, -1)) {
+      // Found a method. The value is the host function name.
+      // Push a closure that calls the host function with self prepended.
+      // upvalue 1: host function name
+      lua_pushcclosure(L, UserdataMethodCall, 1);
+      lua_remove(L, -2);  // remove method table
+      return 1;
+    }
+    lua_pop(L, 1);  // pop nil (key not found in method table)
+  }
+  lua_pop(L, 1);  // pop method table (or nil if no table)
+
+  // 2. Fall through to property access
+  if (runtime->property_getter_) {
     try {
       auto result = runtime->property_getter_(*block, key);
       PushLuaValue(L, result);
       return 1;
     } catch (const std::exception& e) {
+      // If this userdata has methods but isn't readable, return nil
+      // instead of erroring (methods work independently of readable)
+      if (has_method_table) {
+        lua_pushnil(L);
+        return 1;
+      }
       lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
       lua_error(L);
     }
@@ -225,11 +256,104 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
   if (it != userdata_ref_counts_.end()) {
     if (--it->second <= 0) {
       userdata_ref_counts_.erase(it);
+
+      // Clean up method table if one exists
+      std::string registry_key = "_ud_methods_" + std::to_string(ref_id);
+      lua_pushnil(L_);
+      lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
+
       if (userdata_gc_callback_) {
         userdata_gc_callback_(ref_id);
       }
     }
   }
+}
+
+void LuaRuntime::SetUserdataMethodTable(
+    int ref_id,
+    const std::unordered_map<std::string, std::string>& method_map) {
+  StackGuard guard(L_);
+
+  // Create a table: { method_name = "host_func_name", ... }
+  lua_newtable(L_);
+  for (const auto& [name, func_name] : method_map) {
+    lua_pushstring(L_, func_name.c_str());
+    lua_setfield(L_, -2, name.c_str());
+  }
+
+  // Store in registry: _ud_methods_<ref_id> = table
+  std::string registry_key = "_ud_methods_" + std::to_string(ref_id);
+  lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
+}
+
+int LuaRuntime::UserdataMethodCall(lua_State* L) {
+  // upvalue 1: host function name (string)
+  // When called as obj:method(a, b), the stack has: obj, a, b
+  const char* func_name = lua_tostring(L, lua_upvalueindex(1));
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  if (!runtime) {
+    lua_pushstring(L, "LuaRuntime not found in registry");
+    lua_error(L);
+    return 0;
+  }
+
+  const auto it = runtime->host_functions_.find(func_name ? func_name : "");
+  if (it == runtime->host_functions_.end()) {
+    lua_pushfstring(L, "Method '%s' not found", func_name ? func_name : "");
+    lua_error(L);
+    return 0;
+  }
+
+  if (runtime->async_mode_) {
+    return luaL_error(L,
+      "JS callbacks are not available in async mode (called method '%s')",
+      func_name ? func_name : "<unknown>");
+  }
+
+  // Convert all arguments (including self at position 1)
+  const int argc = lua_gettop(L);
+  std::vector<LuaPtr> args;
+  args.reserve(argc);
+  try {
+    for (int i = 1; i <= argc; ++i) {
+      args.push_back(ToLuaValue(L, i));
+    }
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "Error converting arguments for method '%s': %s",
+                    func_name ? func_name : "<unknown>", e.what());
+    lua_error(L);
+    return 0;
+  }
+
+  // Call the host function
+  LuaPtr resultHolder;
+  try {
+    resultHolder = it->second(args);
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "Method '%s' threw an exception: %s",
+                    func_name ? func_name : "<unknown>", e.what());
+    lua_error(L);
+    return 0;
+  } catch (...) {
+    lua_pushfstring(L, "Method '%s' threw an unknown exception",
+                    func_name ? func_name : "<unknown>");
+    lua_error(L);
+    return 0;
+  }
+
+  try {
+    PushLuaValue(L, resultHolder);
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "Error converting return value from method '%s': %s",
+                    func_name ? func_name : "<unknown>", e.what());
+    lua_error(L);
+    return 0;
+  }
+  return 1;
 }
 
 // --- Metatable support ---

@@ -2002,6 +2002,240 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // USERDATA - METHOD BINDING
+  // ============================================
+  describe('userdata - method binding', () => {
+    it('calls a method with : syntax', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { value: 0 };
+      lua.set_userdata('obj', obj, {
+        methods: {
+          set_value: (self: any, v: any) => { self.value = v; },
+        }
+      });
+      lua.execute_script('obj:set_value(42)');
+      expect(obj.value).toBe(42);
+    });
+
+    it('receives the original JS object as self', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const original = { x: 10, y: 20 };
+      let receivedSelf: any = null;
+      lua.set_userdata('obj', original, {
+        methods: {
+          check: (self: any) => { receivedSelf = self; },
+        }
+      });
+      lua.execute_script('obj:check()');
+      expect(receivedSelf).toBe(original);
+    });
+
+    it('mutates self and JS sees the change', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const player = { hp: 100, x: 0, y: 0 };
+      lua.set_userdata('player', player, {
+        methods: {
+          move: (self: any, dx: any, dy: any) => {
+            self.x += dx;
+            self.y += dy;
+          },
+          take_damage: (self: any, amount: any) => {
+            self.hp -= amount;
+          },
+        }
+      });
+      lua.execute_script(`
+        player:move(10, 20)
+        player:take_damage(25)
+      `);
+      expect(player.x).toBe(10);
+      expect(player.y).toBe(20);
+      expect(player.hp).toBe(75);
+    });
+
+    it('returns a value from a method', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { x: 3, y: 4 };
+      lua.set_userdata('vec', obj, {
+        methods: {
+          length: (self: any) => Math.sqrt(self.x ** 2 + self.y ** 2),
+        }
+      });
+      const result = lua.execute_script('return vec:length()');
+      expect(result).toBe(5);
+    });
+
+    it('returns multiple values from a method', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { x: 10, y: 20 };
+      lua.set_userdata('obj', obj, {
+        readable: true,
+        methods: {
+          get_pos: (self: any) => [self.x, self.y],
+        }
+      });
+      // The array return from JS becomes a Lua table, returned as a single value
+      const result = lua.execute_script('return obj:get_pos()') as any;
+      expect(Array.isArray(result)).toBe(true);
+      expect(result[0]).toBe(10);
+      expect(result[1]).toBe(20);
+    });
+
+    it('methods and readable properties coexist', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { name: 'Alice', score: 0 };
+      lua.set_userdata('obj', obj, {
+        readable: true,
+        writable: true,
+        methods: {
+          add_score: (self: any, points: any) => { self.score += points; },
+          describe: (self: any) => `${self.name}: ${self.score}`,
+        }
+      });
+      // Read a property
+      const name = lua.execute_script('return obj.name');
+      expect(name).toBe('Alice');
+      // Call a method
+      lua.execute_script('obj:add_score(100)');
+      expect(obj.score).toBe(100);
+      // Method that reads properties
+      const desc = lua.execute_script('return obj:describe()');
+      expect(desc).toBe('Alice: 100');
+      // Write a property
+      lua.execute_script('obj.name = "Bob"');
+      expect(obj.name).toBe('Bob');
+    });
+
+    it('methods work without readable/writable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { secret: 42 };
+      lua.set_userdata('obj', obj, {
+        methods: {
+          get_secret: (self: any) => self.secret,
+        }
+      });
+      // Method works
+      const result = lua.execute_script('return obj:get_secret()');
+      expect(result).toBe(42);
+      // Property access returns nil (not readable)
+      const prop = lua.execute_script('return obj.secret');
+      expect(prop).toBeNull();
+    });
+
+    it('method takes precedence over property with same name', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { value: 'property' };
+      lua.set_userdata('obj', obj, {
+        readable: true,
+        methods: {
+          value: (self: any) => 'method',
+        }
+      });
+      // Since 'value' is a method, calling it as a function should work
+      const result = lua.execute_script('return obj:value()');
+      expect(result).toBe('method');
+    });
+
+    it('non-existent key returns nil when readable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { x: 1 };
+      lua.set_userdata('obj', obj, {
+        readable: true,
+        methods: {
+          foo: (self: any) => 'bar',
+        }
+      });
+      const result = lua.execute_script('return obj.nonexistent');
+      expect(result).toBeNull();
+    });
+
+    it('non-existent key returns nil when not readable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { x: 1 };
+      lua.set_userdata('obj', obj, {
+        methods: {
+          foo: (self: any) => 'bar',
+        }
+      });
+      const result = lua.execute_script('return obj.nonexistent');
+      expect(result).toBeNull();
+    });
+
+    it('error in method produces a Lua error', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = {};
+      lua.set_userdata('obj', obj, {
+        methods: {
+          fail: () => { throw new Error('method failed'); },
+        }
+      });
+      expect(() => lua.execute_script('obj:fail()')).toThrow(/method failed/);
+    });
+
+    it('multiple userdata with shared method definitions', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const a = { val: 10 };
+      const b = { val: 20 };
+      const methods = {
+        get_val: (self: any) => self.val,
+        set_val: (self: any, v: any) => { self.val = v; },
+      };
+      lua.set_userdata('a', a, { methods });
+      lua.set_userdata('b', b, { methods });
+
+      expect(lua.execute_script('return a:get_val()')).toBe(10);
+      expect(lua.execute_script('return b:get_val()')).toBe(20);
+
+      lua.execute_script('a:set_val(99)');
+      expect(a.val).toBe(99);
+      expect(b.val).toBe(20);  // b unchanged
+    });
+
+    it('method receives additional arguments correctly', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { items: [] as string[] };
+      lua.set_userdata('obj', obj, {
+        methods: {
+          add: (self: any, item: any) => { self.items.push(item); },
+          add_many: (self: any, ...args: any[]) => {
+            for (const arg of args) self.items.push(arg);
+          },
+        }
+      });
+      lua.execute_script('obj:add("first")');
+      lua.execute_script('obj:add_many("second", "third", "fourth")');
+      expect(obj.items).toEqual(['first', 'second', 'third', 'fourth']);
+    });
+
+    it('method can return a table', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const obj = { data: { a: 1, b: 2 } };
+      lua.set_userdata('obj', obj, {
+        methods: {
+          get_data: (self: any) => self.data,
+        }
+      });
+      const result = lua.execute_script('return obj:get_data()') as any;
+      expect(result.a).toBe(1);
+      expect(result.b).toBe(2);
+    });
+
+    it('method with no return value', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let called = false;
+      const obj = {};
+      lua.set_userdata('obj', obj, {
+        methods: {
+          ping: () => { called = true; },
+        }
+      });
+      const result = lua.execute_script('return obj:ping()');
+      expect(called).toBe(true);
+      expect(result).toBeNull();
+    });
+  });
+
+  // ============================================
   // FILE EXECUTION
   // ============================================
   describe('file execution', () => {
