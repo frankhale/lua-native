@@ -1,26 +1,27 @@
 cmake_minimum_required(VERSION 3.31)
 
-project(lua-native)
-
-set(CMAKE_CXX_STANDARD 17)
-
-# Output info about build type and platform
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "Platform: ${CMAKE_SYSTEM_NAME}")
-message(STATUS "Architecture: ${CMAKE_SYSTEM_PROCESSOR}")
-message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-
 # Use VCPKG_ROOT environment variable if set
 if(DEFINED ENV{VCPKG_ROOT})
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 endif()
 
 # Set vcpkg triplet based on OS and architecture
+# NOTE: CMAKE_SYSTEM_PROCESSOR is not available until after project(), so we
+# use CMAKE_HOST_SYSTEM_PROCESSOR (available at CMake startup) with a uname
+# fallback to detect the architecture before the vcpkg toolchain runs.
+if(NOT DEFINED _LUA_NATIVE_DETECTED_ARCH)
+    if(CMAKE_HOST_SYSTEM_PROCESSOR)
+        set(_LUA_NATIVE_DETECTED_ARCH "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    elseif(APPLE OR UNIX)
+        execute_process(COMMAND uname -m OUTPUT_VARIABLE _LUA_NATIVE_DETECTED_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    endif()
+endif()
+
 if(WIN32)
     set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "Vcpkg target triplet")
 elseif(APPLE)
     # Check for Apple Silicon vs Intel
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    if(_LUA_NATIVE_DETECTED_ARCH MATCHES "arm64|aarch64")
         set(VCPKG_TARGET_TRIPLET "arm64-osx" CACHE STRING "Vcpkg target triplet")
     else()
         set(VCPKG_TARGET_TRIPLET "x64-osx" CACHE STRING "Vcpkg target triplet")
@@ -30,7 +31,12 @@ else()
     set(VCPKG_TARGET_TRIPLET "x64-unknown" CACHE STRING "Vcpkg target triplet")
 endif()
 
+project(lua-native)
+
+set(CMAKE_CXX_STANDARD 17)
+
 # Set platform-specific compiler and linker flags
+# NOTE: Must be after project() so CMAKE_CXX_COMPILER_ID and MSVC are available.
 if(WIN32 AND MSVC)
     # Windows with MSVC - static runtime and function-level linking
     set(PLATFORM_COMPILER_FLAGS /MT$<$<CONFIG:Debug>:d> /Gy)
@@ -62,6 +68,12 @@ elseif(APPLE)
         set(PLATFORM_LINKER_FLAGS "-static-libgcc;-static-libstdc++")
     endif()
 endif()
+
+# Output info about build type and platform
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Platform: ${CMAKE_SYSTEM_NAME}")
+message(STATUS "Architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
 # Find Lua via vcpkg
 find_package(Lua REQUIRED)

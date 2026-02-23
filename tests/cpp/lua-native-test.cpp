@@ -2512,6 +2512,265 @@ TEST(LuaRuntimeBytecode, CompileFileAndLoadBytecodeMatch) {
   ASSERT_EQ(bcVals.size(), fileVals.size());
 }
 
+// --- Table Reference API tests ---
+
+TEST(LuaRuntimeTableAPI, CreateTableReturnsValidRef) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int ref = rt.CreateTable();
+  EXPECT_NE(ref, LUA_NOREF);
+  EXPECT_NE(ref, LUA_REFNIL);
+
+  // Should be usable as a table
+  auto val = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42)));
+  rt.SetTableField(ref, "x", val);
+  auto result = rt.GetTableField(ref, "x");
+  EXPECT_EQ(std::get<int64_t>(result->value), 42);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, CreateTableFromTablePopulatesFields) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  LuaTable initial;
+  initial["name"] = std::make_shared<LuaValue>(LuaValue::from(std::string("Alice")));
+  initial["age"] = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(30)));
+
+  int ref = rt.CreateTableFrom(initial);
+  EXPECT_NE(ref, LUA_NOREF);
+
+  auto name = rt.GetTableField(ref, "name");
+  EXPECT_EQ(std::get<std::string>(name->value), "Alice");
+  auto age = rt.GetTableField(ref, "age");
+  EXPECT_EQ(std::get<int64_t>(age->value), 30);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, CreateTableFromArrayCreatesSequence) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  LuaArray initial;
+  initial.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(10))));
+  initial.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(20))));
+  initial.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(30))));
+
+  int ref = rt.CreateTableFrom(initial);
+  EXPECT_NE(ref, LUA_NOREF);
+
+  // Lua arrays are 1-indexed
+  auto v1 = rt.GetTableField(ref, "1");
+  EXPECT_EQ(std::get<int64_t>(v1->value), 10);
+  auto v2 = rt.GetTableField(ref, "2");
+  EXPECT_EQ(std::get<int64_t>(v2->value), 20);
+  auto v3 = rt.GetTableField(ref, "3");
+  EXPECT_EQ(std::get<int64_t>(v3->value), 30);
+
+  EXPECT_EQ(rt.GetTableLength(ref), 3);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, GetGlobalRefReturnsRefForTable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("myconfig = { host = 'localhost', port = 5432 }");
+
+  auto result = rt.GetGlobalRef("myconfig");
+  ASSERT_TRUE(std::holds_alternative<int>(result));
+  int ref = std::get<int>(result);
+  EXPECT_NE(ref, LUA_NOREF);
+
+  auto host = rt.GetTableField(ref, "host");
+  EXPECT_EQ(std::get<std::string>(host->value), "localhost");
+  auto port = rt.GetTableField(ref, "port");
+  EXPECT_EQ(std::get<int64_t>(port->value), 5432);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, GetGlobalRefReturnsErrorForNonTable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("mynum = 42");
+
+  auto result = rt.GetGlobalRef("mynum");
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+  EXPECT_NE(std::get<std::string>(result).find("not a table"), std::string::npos);
+}
+
+TEST(LuaRuntimeTableAPI, GetGlobalRefReturnsErrorForNil) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  auto result = rt.GetGlobalRef("nonexistent");
+  ASSERT_TRUE(std::holds_alternative<std::string>(result));
+  EXPECT_NE(std::get<std::string>(result).find("not a table"), std::string::npos);
+}
+
+TEST(LuaRuntimeTableAPI, TablePairsIteratesAllEntries) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("t = { a = 1, b = 'hello', c = true }");
+
+  auto result = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(result));
+  int ref = std::get<int>(result);
+
+  auto pairs = rt.TablePairs(ref);
+  EXPECT_EQ(pairs.size(), 3u);
+
+  // Collect into a map for order-independent checking
+  std::unordered_map<std::string, LuaPtr> map;
+  for (auto& [k, v] : pairs) {
+    map[std::get<std::string>(k->value)] = v;
+  }
+  EXPECT_EQ(std::get<int64_t>(map["a"]->value), 1);
+  EXPECT_EQ(std::get<std::string>(map["b"]->value), "hello");
+  EXPECT_EQ(std::get<bool>(map["c"]->value), true);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, TablePairsWithNumericKeys) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("t = { 'x', 'y', 'z' }");
+
+  auto result = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(result));
+  int ref = std::get<int>(result);
+
+  auto pairs = rt.TablePairs(ref);
+  EXPECT_EQ(pairs.size(), 3u);
+
+  // Keys should be integers 1, 2, 3
+  std::vector<int64_t> keys;
+  for (auto& [k, v] : pairs) {
+    keys.push_back(std::get<int64_t>(k->value));
+  }
+  std::sort(keys.begin(), keys.end());
+  EXPECT_EQ(keys[0], 1);
+  EXPECT_EQ(keys[1], 2);
+  EXPECT_EQ(keys[2], 3);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, TableIPairsIteratesSequence) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("t = { 10, 20, 30, 40 }");
+
+  auto result = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(result));
+  int ref = std::get<int>(result);
+
+  auto ipairs = rt.TableIPairs(ref);
+  ASSERT_EQ(ipairs.size(), 4u);
+  EXPECT_EQ(ipairs[0].first, 1);
+  EXPECT_EQ(std::get<int64_t>(ipairs[0].second->value), 10);
+  EXPECT_EQ(ipairs[1].first, 2);
+  EXPECT_EQ(std::get<int64_t>(ipairs[1].second->value), 20);
+  EXPECT_EQ(ipairs[2].first, 3);
+  EXPECT_EQ(std::get<int64_t>(ipairs[2].second->value), 30);
+  EXPECT_EQ(ipairs[3].first, 4);
+  EXPECT_EQ(std::get<int64_t>(ipairs[3].second->value), 40);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, TableIPairsStopsAtNil) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  // Create table with a gap: {10, 20, nil, 40}
+  (void)rt.ExecuteScript("t = {}; t[1]=10; t[2]=20; t[4]=40");
+
+  auto result = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(result));
+  int ref = std::get<int>(result);
+
+  auto ipairs = rt.TableIPairs(ref);
+  // Should stop at index 3 (nil)
+  ASSERT_EQ(ipairs.size(), 2u);
+  EXPECT_EQ(ipairs[0].first, 1);
+  EXPECT_EQ(std::get<int64_t>(ipairs[0].second->value), 10);
+  EXPECT_EQ(ipairs[1].first, 2);
+  EXPECT_EQ(std::get<int64_t>(ipairs[1].second->value), 20);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, ReleaseTableRefFreesSlot) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int ref = rt.CreateTable();
+  EXPECT_NE(ref, LUA_NOREF);
+
+  auto val = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+  rt.SetTableField(ref, "x", val);
+
+  rt.ReleaseTableRef(ref);
+
+  // Double release should be safe (no-op)
+  rt.ReleaseTableRef(ref);
+  rt.ReleaseTableRef(LUA_NOREF);
+  rt.ReleaseTableRef(LUA_REFNIL);
+}
+
+TEST(LuaRuntimeTableAPI, CreateTableSetAsGlobalAccessFromLua) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int ref = rt.CreateTable();
+
+  auto val1 = std::make_shared<LuaValue>(LuaValue::from(std::string("world")));
+  rt.SetTableField(ref, "hello", val1);
+
+  // Set the table as a global using LuaTableRef
+  rt.SetGlobal("mytable", std::make_shared<LuaValue>(
+    LuaValue::from(LuaTableRef(ref, rt.RawState()))));
+
+  auto res = rt.ExecuteScript("return mytable.hello");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "world");
+}
+
+TEST(LuaRuntimeTableAPI, LiveMutationVisibleFromLua) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  // Create table via Lua and get a ref
+  (void)rt.ExecuteScript("shared = { x = 1 }");
+  auto result = rt.GetGlobalRef("shared");
+  ASSERT_TRUE(std::holds_alternative<int>(result));
+  int ref = std::get<int>(result);
+
+  // Mutate via C++ API
+  rt.SetTableField(ref, "x", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(99))));
+
+  // Verify Lua sees the change
+  auto res = rt.ExecuteScript("return shared.x");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 99);
+
+  // Mutate from Lua
+  (void)rt.ExecuteScript("shared.x = 200");
+
+  // Verify C++ API sees the change
+  auto val = rt.GetTableField(ref, "x");
+  EXPECT_EQ(std::get<int64_t>(val->value), 200);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, TablePairsEmptyTable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int ref = rt.CreateTable();
+  auto pairs = rt.TablePairs(ref);
+  EXPECT_TRUE(pairs.empty());
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeTableAPI, TableIPairsEmptyTable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int ref = rt.CreateTable();
+  auto ipairs = rt.TableIPairs(ref);
+  EXPECT_TRUE(ipairs.empty());
+  rt.ReleaseTableRef(ref);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

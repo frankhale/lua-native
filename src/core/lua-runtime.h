@@ -312,6 +312,15 @@ public:
   [[nodiscard]] std::vector<std::string> GetTableKeys(int registry_ref) const;
   [[nodiscard]] int GetTableLength(int registry_ref) const;
 
+  // Table reference API — create and manage live table references
+  [[nodiscard]] int CreateTable();
+  [[nodiscard]] int CreateTableFrom(const LuaTable& initial);
+  [[nodiscard]] int CreateTableFrom(const LuaArray& initial);
+  [[nodiscard]] std::variant<int, std::string> GetGlobalRef(const std::string& name);
+  [[nodiscard]] std::vector<std::pair<LuaPtr, LuaPtr>> TablePairs(int registry_ref) const;
+  [[nodiscard]] std::vector<std::pair<int64_t, LuaPtr>> TableIPairs(int registry_ref) const;
+  void ReleaseTableRef(int registry_ref);
+
   [[nodiscard]] lua_State* RawState() const { return L_; }
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);

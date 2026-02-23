@@ -26,7 +26,8 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:www.moonsharp.org)",
       "WebFetch(domain:docs.rs)",
-      "Bash(git -C /Users/frankhale/DEV/lua-native log --oneline -10)"
+      "Bash(git -C /Users/frankhale/DEV/lua-native log --oneline -10)",
+      "Bash(grep:*)"
     ]
   }
 }

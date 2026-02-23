@@ -487,6 +487,52 @@ Both methods require the `package` library to be loaded. The `'safe'` and `'all'
 
 ---
 
+## Table Reference API (February 2026)
+
+### Overview
+
+`create_table()` creates a new Lua table and returns a live handle for direct manipulation from JavaScript. `get_global_ref()` returns a live handle to an existing global table. Both return `LuaTableHandle` objects that support `get`, `set`, `has`, `length`, `pairs`, `ipairs`, and `release` operations. Unlike `get_global()` which deep-copies plain tables, table handles maintain a live reference — mutations from either side are immediately visible to the other.
+
+### Architecture
+
+**Core layer:**
+- `CreateTable()`: Creates an empty table via `lua_newtable`, stores it in the Lua registry via `luaL_ref`, returns the registry reference integer.
+- `CreateTableFrom(LuaTable)`: Creates a table and populates it with string-keyed entries using `lua_setfield` for each entry.
+- `CreateTableFrom(LuaArray)`: Creates a table with `lua_createtable` (pre-sized for the array length) and populates it using `lua_seti` for 1-indexed entries, matching Lua's sequence convention.
+- `GetGlobalRef(name)`: Gets the named global, checks that it's a table (returning an error string if not), stores it in the registry, and returns the reference. Returns `std::variant<int, std::string>` — the int is the registry ref on success, the string is an error message on failure.
+- `TablePairs(registry_ref)`: Pushes the table from the registry, iterates with `lua_next()`, and returns all key-value pairs as `vector<pair<LuaPtr, LuaPtr>>`. Keys are converted directly to string or int64 types (not through `ToLuaValue` which would consume the key and break `lua_next` iteration).
+- `TableIPairs(registry_ref)`: Iterates from index 1 with `lua_geti`, stopping at the first nil value. Returns `vector<pair<int64_t, LuaPtr>>`.
+- `ReleaseTableRef(registry_ref)`: Guards against `LUA_NOREF` and `LUA_REFNIL`, then calls `luaL_unref` to free the registry slot.
+
+All methods that touch the Lua stack use `StackGuard` for automatic stack balancing.
+
+**N-API layer:**
+- Seven static table handle functions (`TableHandleGet`, `TableHandleSet`, `TableHandleHas`, `TableHandleLength`, `TableHandlePairs`, `TableHandleIPairs`, `TableHandleRelease`) are registered as methods on the handle object.
+- `CreateTableHandle(env, registry_ref)`: Creates a `LuaTableRefData` struct (pairing the registry ref with `shared_ptr<LuaRuntime>` and `LuaContext*`), stores it in the `lua_table_ref_data_` vector for lifetime management, and creates a plain JS object with:
+  - A non-enumerable `_tableRef` property containing a `Napi::External<LuaTableRefData>` for round-trip detection
+  - Seven method functions attached via `DefineProperties`, each receiving the `LuaTableRefData*` as function data
+- `CreateTableMethod`: Handles three cases — no arguments (empty table), array argument (`CreateTableFrom(LuaArray)`), and object argument (`CreateTableFrom(LuaTable)`)
+- `GetGlobalRef`: Validates the string argument, calls `runtime->GetGlobalRef()`, and on success creates a handle via `CreateTableHandle`
+- Both methods are registered as instance methods (`create_table`, `get_global_ref`) in `LuaContext::Init()`
+
+**Round-trip support:** Table handles carry a `_tableRef` external marker (same pattern as metatabled table Proxy objects). When a handle is passed back to Lua via `NapiToCoreInstance`, the marker is detected and the original `LuaTableRef` is reconstructed, pushing the actual Lua table rather than creating a copy.
+
+### Design Decisions
+
+**Plain JS objects with closures, not ObjectWrap:** Table handles are plain JS objects with closure-based methods rather than `Napi::ObjectWrap` instances. This matches the pattern used by coroutine handles (`{ _coroutine, status }`) and keeps the implementation simple. Each method function receives the `LuaTableRefData*` through N-API's function data mechanism.
+
+**Released state tracked by `ref == LUA_NOREF`:** After `release()`, the `LuaTableRef.ref` field is set to `LUA_NOREF`. All handle methods check this value and throw "table handle has been released" if set. Double release is a no-op. This avoids needing a separate boolean flag.
+
+**`pairs()` key conversion avoids `ToLuaValue`:** During `lua_next` iteration, keys must remain on the stack for the next iteration. Using `ToLuaValue` on the key would consume it. Instead, `TablePairs` reads key type directly (`lua_type`) and converts to string or int64 without popping, then converts the value via `ToLuaValue`.
+
+**`ipairs()` stops at first nil:** Matches Lua's `ipairs()` semantics — iterates from index 1 and stops at the first nil gap. This is the expected behavior for Lua sequences.
+
+**`get_global_ref` validates table type:** Returns an error if the global is not a table (including nil). This is a deliberate choice — the API is specifically for table manipulation. Non-table globals should use `get_global()` instead.
+
+**Metamethod support through existing infrastructure:** `get`, `set`, `has`, and `length` all use the existing `GetTableField`, `SetTableField`, `HasTableField`, and `GetTableLength` methods on `LuaRuntime`, which use `lua_getfield`/`lua_setfield`/`luaL_len` (not raw operations). This means metatabled tables accessed through `get_global_ref` will fire `__index`, `__newindex`, and `__len` metamethods naturally.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -503,3 +549,4 @@ Both methods require the `package` library to be loaded. The `'safe'` and `'all'
 | Opt-in standard library loading with presets | Low | February 2026 |
 | Async execution (Phase 1) | Moderate | February 2026 |
 | Module / require integration | Moderate | February 2026 |
+| Table reference API | Moderate | February 2026 |

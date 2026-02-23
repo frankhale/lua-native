@@ -93,6 +93,8 @@ public:
     Napi::Value Compile(const Napi::CallbackInfo& info);
     Napi::Value CompileFile(const Napi::CallbackInfo& info);
     Napi::Value LoadBytecode(const Napi::CallbackInfo& info);
+    Napi::Value CreateTableMethod(const Napi::CallbackInfo& info);
+    Napi::Value GetGlobalRef(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 
@@ -119,6 +121,7 @@ private:
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);
+    Napi::Object CreateTableHandle(Napi::Env env, int registry_ref);
 
 public:
     static lua_core::LuaValue NapiToCore(const Napi::Value& value, int depth = 0);

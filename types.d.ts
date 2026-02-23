@@ -24,6 +24,7 @@ export type LuaValue =
   | LuaValue[]
   | LuaTable
   | LuaTableRef
+  | LuaTableHandle
   | LuaFunction;
 
 /**
@@ -132,6 +133,47 @@ export interface UserdataOptions {
    * // Lua: player:move(10, 20)
    */
   methods?: Record<string, UserdataMethod>;
+}
+
+/**
+ * A handle to a Lua table stored in the Lua registry.
+ * Provides direct get/set/iterate access without execute_script.
+ *
+ * The handle holds a live reference — mutations from JS are visible
+ * in Lua and vice versa. Call release() when done to free the
+ * registry slot.
+ */
+export interface LuaTableHandle {
+  /** Get a field by key. Triggers __index if the table has a metatable. */
+  get(key: string | number): LuaValue;
+
+  /** Set a field by key. Triggers __newindex if the table has a metatable. */
+  set(key: string | number, value: LuaValue): void;
+
+  /** Check if a key exists in the table. */
+  has(key: string | number): boolean;
+
+  /** Get the table length (# operator). Triggers __len metamethod. */
+  length(): number;
+
+  /**
+   * Get all key-value pairs (like Lua pairs()).
+   * Returns an array of [key, value] tuples.
+   */
+  pairs(): Array<[string | number, LuaValue]>;
+
+  /**
+   * Get integer-keyed sequence entries (like Lua ipairs()).
+   * Iterates from index 1 until the first nil value.
+   * Returns an array of [index, value] tuples.
+   */
+  ipairs(): Array<[number, LuaValue]>;
+
+  /**
+   * Release the registry reference. After calling release(),
+   * all other methods throw. Safe to call multiple times.
+   */
+  release(): void;
 }
 
 /**
@@ -334,6 +376,38 @@ export interface LuaContext {
     bytecode: Buffer,
     chunkName?: string
   ): T;
+
+  /**
+   * Create a new Lua table, optionally pre-populated with values.
+   * Returns a handle for direct manipulation without execute_script.
+   *
+   * @param initial Optional initial values — a JS object for string keys,
+   *   or an array for 1-indexed integer keys
+   * @returns A live table handle
+   * @example
+   * const t = lua.create_table({ x: 1, y: 2 });
+   * t.set('z', 3);
+   * lua.set_global('point', t);
+   * t.release();
+   */
+  create_table(initial?: LuaTable | LuaValue[]): LuaTableHandle;
+
+  /**
+   * Get a live reference to a global table.
+   * Unlike get_global() which deep-copies plain tables, this returns a
+   * handle that reads/writes the actual Lua table in place.
+   *
+   * @param name The global variable name
+   * @returns A live table handle
+   * @throws If the global does not exist or is not a table
+   * @example
+   * lua.execute_script('config = { host = "localhost", port = 5432 }');
+   * const ref = lua.get_global_ref('config');
+   * ref.get('host');  // 'localhost'
+   * ref.set('debug', true);
+   * ref.release();
+   */
+  get_global_ref(name: string): LuaTableHandle;
 }
 
 /**
