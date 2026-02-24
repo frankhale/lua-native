@@ -25,6 +25,7 @@ data structures.
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
 - Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_bytecode()` for faster startup
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
+- Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
 - Cross-platform support (Windows, macOS)
@@ -348,6 +349,47 @@ Available library names: `base`, `package`, `coroutine`, `table`, `io`, `os`,
 
 Available presets: `'all'` (all 10 libraries), `'safe'` (all except `io`, `os`,
 `debug`).
+
+### Memory Limits
+
+Cap the total memory a Lua state can allocate, preventing untrusted scripts from
+crashing the host process:
+
+```javascript
+import lua_native from "lua-native";
+
+// Limit Lua to 10 MB of memory
+const lua = new lua_native.init({}, {
+  libraries: "safe",
+  maxMemory: 10 * 1024 * 1024,
+});
+
+// Normal scripts work fine within the limit
+lua.execute_script("local t = {}; for i = 1, 1000 do t[i] = i end");
+
+// Scripts that exceed the limit throw an out-of-memory error
+try {
+  lua.execute_script("local s = string.rep('x', 20 * 1024 * 1024)");
+} catch (error) {
+  console.error(error.message); // "not enough memory"
+}
+
+// The context remains usable after an OOM error
+lua.execute_script("return 1 + 1"); // 2
+```
+
+Monitor memory usage with `get_memory_usage()`:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all" });
+
+console.log(lua.get_memory_usage()); // bytes currently allocated by Lua
+lua.execute_script("big = string.rep('x', 100000)");
+console.log(lua.get_memory_usage()); // increased after allocation
+```
+
+Memory tracking works even without `maxMemory` — every Lua context tracks its
+memory usage automatically.
 
 ### Module / Require Integration
 
@@ -1185,6 +1227,13 @@ const answer: number = lua.load_bytecode<number>(bytecode);
 const fileBytecode: Buffer = lua.compile_file("./scripts/init.lua");
 lua.load_bytecode(fileBytecode);
 
+// Type-safe memory limits
+const limited: LuaContext = new lua_native.init({}, {
+  libraries: "safe",
+  maxMemory: 10 * 1024 * 1024,  // 10 MB
+});
+const usage: number = limited.get_memory_usage();
+
 // Type-safe library loading with presets
 const preset: LuaLibraryPreset = "safe";
 const sandboxed: LuaContext = new lua_native.init({}, { libraries: preset });
@@ -1234,6 +1283,9 @@ creates a bare Lua state with no callbacks and no standard libraries.
 
     Valid library names: `'base'`, `'package'`, `'coroutine'`, `'table'`, `'io'`,
     `'os'`, `'string'`, `'math'`, `'utf8'`, `'debug'`
+  - `maxMemory` (optional): Maximum memory in bytes that the Lua state can
+    allocate. When exceeded, Lua raises an out-of-memory error. `0` or omitted
+    means unlimited. Memory usage is tracked even without a limit.
 
 **Returns:** `LuaContext` instance
 
@@ -1298,6 +1350,12 @@ Returns whether the context is currently busy with an async operation.
 
 **Returns:** `boolean` — `true` while an async operation is in progress, `false`
 otherwise.
+
+### `LuaContext.get_memory_usage()`
+
+Returns the current memory usage of the Lua state in bytes.
+
+**Returns:** `number` — bytes currently allocated by the Lua state
 
 ### `LuaContext.add_search_path(path)`
 

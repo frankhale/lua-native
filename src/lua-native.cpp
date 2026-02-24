@@ -364,7 +364,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("compile_file", &LuaContext::CompileFile),
     InstanceMethod("load_bytecode", &LuaContext::LoadBytecode),
     InstanceMethod("create_table", &LuaContext::CreateTableMethod),
-    InstanceMethod("get_global_ref", &LuaContext::GetGlobalRef)
+    InstanceMethod("get_global_ref", &LuaContext::GetGlobalRef),
+    InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -381,12 +382,33 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
   // Check for options (second argument)
   if (info.Length() > 1 && info[1].IsObject()) {
     auto options = info[1].As<Napi::Object>();
+
+    // Check for maxMemory option
+    size_t max_memory = 0;
+    bool has_max_memory = false;
+    if (options.Has("maxMemory")) {
+      auto memVal = options.Get("maxMemory");
+      if (memVal.IsNumber()) {
+        double memNum = memVal.As<Napi::Number>().DoubleValue();
+        if (memNum < 0) {
+          Napi::RangeError::New(env, "maxMemory must be a non-negative number").ThrowAsJavaScriptException();
+          return;
+        }
+        max_memory = static_cast<size_t>(memNum);
+        has_max_memory = true;
+      } else if (!memVal.IsUndefined() && !memVal.IsNull()) {
+        Napi::TypeError::New(env, "maxMemory must be a number").ThrowAsJavaScriptException();
+        return;
+      }
+    }
+
+    // Parse libraries
+    std::vector<std::string> libraries;
+    bool has_libraries = false;
     if (options.Has("libraries")) {
       auto libsVal = options.Get("libraries");
       if (libsVal.IsArray()) {
-        // Array of specific library names
         auto arr = libsVal.As<Napi::Array>();
-        std::vector<std::string> libraries;
         libraries.reserve(arr.Length());
         for (uint32_t i = 0; i < arr.Length(); ++i) {
           if (!arr.Get(i).IsString()) {
@@ -395,30 +417,39 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
           }
           libraries.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
         }
-        try {
-          runtime = std::make_shared<lua_core::LuaRuntime>(libraries);
-        } catch (const std::runtime_error& e) {
-          Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-          return;
-        }
+        has_libraries = true;
       } else if (libsVal.IsString()) {
-        // Preset string: 'all' or 'safe'
         std::string preset = libsVal.As<Napi::String>().Utf8Value();
         if (preset == "all") {
-          runtime = std::make_shared<lua_core::LuaRuntime>(lua_core::LuaRuntime::AllLibraries());
+          libraries = lua_core::LuaRuntime::AllLibraries();
         } else if (preset == "safe") {
-          runtime = std::make_shared<lua_core::LuaRuntime>(lua_core::LuaRuntime::SafeLibraries());
+          libraries = lua_core::LuaRuntime::SafeLibraries();
         } else {
           Napi::TypeError::New(env, "libraries must be 'all', 'safe', or an array of library names").ThrowAsJavaScriptException();
           return;
         }
+        has_libraries = true;
       } else {
         Napi::TypeError::New(env, "libraries must be 'all', 'safe', or an array of library names").ThrowAsJavaScriptException();
         return;
       }
-    } else {
-      // options present but no libraries field -> bare state
-      runtime = std::make_shared<lua_core::LuaRuntime>();
+    }
+
+    // Create runtime with appropriate constructor
+    try {
+      if (has_max_memory) {
+        lua_core::RuntimeConfig config;
+        config.libraries = std::move(libraries);
+        config.max_memory = max_memory;
+        runtime = std::make_shared<lua_core::LuaRuntime>(config);
+      } else if (has_libraries) {
+        runtime = std::make_shared<lua_core::LuaRuntime>(libraries);
+      } else {
+        runtime = std::make_shared<lua_core::LuaRuntime>();
+      }
+    } catch (const std::runtime_error& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return;
     }
   } else {
     // No options at all -> bare state
@@ -926,6 +957,10 @@ Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
 
   int ref = std::get<int>(result);
   return CreateTableHandle(env, ref);
+}
+
+Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& info) {
+  return Napi::Number::New(env, static_cast<double>(runtime->GetMemoryUsage()));
 }
 
 LuaContext::~LuaContext() {

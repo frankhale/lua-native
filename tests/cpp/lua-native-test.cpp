@@ -2771,6 +2771,104 @@ TEST(LuaRuntimeTableAPI, TableIPairsEmptyTable) {
   rt.ReleaseTableRef(ref);
 }
 
+// --- Memory Limits Tests ---
+
+TEST(LuaRuntimeMemory, MemoryUsageTracking) {
+  // Default constructor tracks usage > 0 (Lua state itself uses memory)
+  LuaRuntime rt;
+  EXPECT_GT(rt.GetMemoryUsage(), 0u);
+}
+
+TEST(LuaRuntimeMemory, MemoryLimitConfigConstructor) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_memory = 1024 * 1024;  // 1 MB
+  LuaRuntime rt(config);
+  EXPECT_EQ(rt.GetMemoryLimit(), 1024u * 1024u);
+  EXPECT_GT(rt.GetMemoryUsage(), 0u);
+}
+
+TEST(LuaRuntimeMemory, MemoryLimitOOM) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_memory = 256 * 1024;  // 256 KB
+  LuaRuntime rt(config);
+
+  // Try to allocate a large string — should fail with OOM
+  const auto res = rt.ExecuteScript("return string.rep('x', 1024 * 1024)");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  const auto& err = std::get<std::string>(res);
+  EXPECT_TRUE(err.find("memory") != std::string::npos ||
+              err.find("mem") != std::string::npos)
+      << "Error should mention memory, got: " << err;
+}
+
+TEST(LuaRuntimeMemory, MemoryUnlimitedByDefault) {
+  // Default constructor has no limit (limit == 0)
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetMemoryLimit(), 0u);
+
+  // Large allocation should succeed
+  const auto res = rt.ExecuteScript("return string.rep('x', 100000)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value).size(), 100000u);
+}
+
+TEST(LuaRuntimeMemory, MemoryTrackingAccuracy) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  size_t before = rt.GetMemoryUsage();
+
+  // Create a table with many entries — should increase usage
+  (void)rt.ExecuteScript(R"(
+    t = {}
+    for i = 1, 1000 do
+      t[i] = string.rep('a', 100)
+    end
+  )");
+
+  size_t after_alloc = rt.GetMemoryUsage();
+  EXPECT_GT(after_alloc, before) << "Memory should increase after allocations";
+
+  // Free the table and collect garbage
+  (void)rt.ExecuteScript("t = nil");
+  lua_gc(rt.RawState(), LUA_GCCOLLECT);
+
+  size_t after_gc = rt.GetMemoryUsage();
+  EXPECT_LT(after_gc, after_alloc) << "Memory should decrease after GC";
+}
+
+TEST(LuaRuntimeMemory, MemoryConfigWithNoLimit) {
+  // RuntimeConfig with max_memory=0 means unlimited
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_memory = 0;
+  LuaRuntime rt(config);
+  EXPECT_EQ(rt.GetMemoryLimit(), 0u);
+
+  // Large allocation should succeed
+  const auto res = rt.ExecuteScript("return string.rep('x', 100000)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+}
+
+TEST(LuaRuntimeMemory, RecoveryAfterOOM) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_memory = 256 * 1024;  // 256 KB
+  LuaRuntime rt(config);
+
+  // Trigger OOM
+  const auto res1 = rt.ExecuteScript("return string.rep('x', 1024 * 1024)");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res1));
+
+  // Context should still work for small operations
+  const auto res2 = rt.ExecuteScript("return 1 + 2");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res2)[0]->value), 3);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

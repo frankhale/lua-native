@@ -334,6 +334,14 @@ export interface LuaContext {
   is_busy(): boolean;
 
   /**
+   * Returns the current memory usage of the Lua state in bytes.
+   * This is tracked by the custom allocator and works regardless of
+   * whether `maxMemory` was set.
+   * @returns The current memory usage in bytes
+   */
+  get_memory_usage(): number;
+
+  /**
    * Compiles Lua source code to bytecode without executing it.
    * The returned Buffer can be saved to disk or passed to `load_bytecode()`.
    *
@@ -455,6 +463,20 @@ export interface LuaInitOptions {
    * { libraries: ['base', 'string', 'math'] }
    */
   libraries?: LuaLibrary[] | LuaLibraryPreset;
+
+  /**
+   * Maximum memory (in bytes) the Lua state is allowed to allocate.
+   * When the limit is reached, Lua throws an out-of-memory error.
+   * Set to 0 or omit for unlimited memory.
+   *
+   * @example
+   * // Limit to 10 MB
+   * { maxMemory: 10 * 1024 * 1024 }
+   *
+   * // Limit to 256 KB (tight sandbox)
+   * { maxMemory: 256 * 1024 }
+   */
+  maxMemory?: number;
 }
 
 /**
