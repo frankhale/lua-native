@@ -977,6 +977,106 @@ int LuaRuntime::GetTableLength(int registry_ref) const {
   return static_cast<int>(luaL_len(L_, -1));
 }
 
+// --- Table reference API ---
+
+int LuaRuntime::CreateTable() {
+  lua_newtable(L_);
+  return luaL_ref(L_, LUA_REGISTRYINDEX);
+}
+
+int LuaRuntime::CreateTableFrom(const LuaTable& initial) {
+  lua_newtable(L_);
+  for (const auto& [key, value] : initial) {
+    PushLuaValue(L_, value);
+    lua_setfield(L_, -2, key.c_str());
+  }
+  return luaL_ref(L_, LUA_REGISTRYINDEX);
+}
+
+int LuaRuntime::CreateTableFrom(const LuaArray& initial) {
+  lua_createtable(L_, static_cast<int>(initial.size()), 0);
+  for (size_t i = 0; i < initial.size(); ++i) {
+    PushLuaValue(L_, initial[i]);
+    lua_seti(L_, -2, static_cast<lua_Integer>(i + 1));
+  }
+  return luaL_ref(L_, LUA_REGISTRYINDEX);
+}
+
+std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name) {
+  lua_getglobal(L_, name.c_str());
+  if (!lua_istable(L_, -1)) {
+    std::string type_name = lua_typename(L_, lua_type(L_, -1));
+    lua_pop(L_, 1);
+    return "global '" + name + "' is not a table (got " + type_name + ")";
+  }
+  return luaL_ref(L_, LUA_REGISTRYINDEX);
+}
+
+std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) const {
+  StackGuard guard(L_);
+  std::vector<std::pair<LuaPtr, LuaPtr>> result;
+
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  if (!lua_istable(L_, -1)) {
+    return result;
+  }
+
+  lua_pushnil(L_);
+  while (lua_next(L_, -2) != 0) {
+    LuaPtr value = ToLuaValue(L_, lua_absindex(L_, -1));
+    // Convert key: read without consuming (lua_next needs the key on stack)
+    LuaPtr key;
+    int key_type = lua_type(L_, -2);
+    if (key_type == LUA_TSTRING) {
+      size_t len;
+      const char* str = lua_tolstring(L_, -2, &len);
+      key = std::make_shared<LuaValue>(LuaValue::from(std::string(str, len)));
+    } else if (key_type == LUA_TNUMBER) {
+      if (lua_isinteger(L_, -2)) {
+        key = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(lua_tointeger(L_, -2))));
+      } else {
+        key = std::make_shared<LuaValue>(LuaValue::from(static_cast<double>(lua_tonumber(L_, -2))));
+      }
+    } else {
+      // Skip non-string/non-number keys
+      lua_pop(L_, 1);
+      continue;
+    }
+    result.emplace_back(std::move(key), std::move(value));
+    lua_pop(L_, 1);  // pop value, keep key for next iteration
+  }
+
+  return result;
+}
+
+std::vector<std::pair<int64_t, LuaPtr>> LuaRuntime::TableIPairs(int registry_ref) const {
+  StackGuard guard(L_);
+  std::vector<std::pair<int64_t, LuaPtr>> result;
+
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  if (!lua_istable(L_, -1)) {
+    return result;
+  }
+
+  for (int64_t i = 1; ; ++i) {
+    lua_geti(L_, -1, static_cast<lua_Integer>(i));
+    if (lua_isnil(L_, -1)) {
+      lua_pop(L_, 1);
+      break;
+    }
+    result.emplace_back(i, ToLuaValue(L_, lua_absindex(L_, -1)));
+    lua_pop(L_, 1);
+  }
+
+  return result;
+}
+
+void LuaRuntime::ReleaseTableRef(int registry_ref) {
+  if (registry_ref != LUA_NOREF && registry_ref != LUA_REFNIL) {
+    luaL_unref(L_, LUA_REGISTRYINDEX, registry_ref);
+  }
+}
+
 // --- Coroutine support ---
 
 std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFunctionRef& funcRef) const {

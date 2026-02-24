@@ -14,10 +14,10 @@ workarounds rank lowest.
 | 1 | Memory Limits | Not started | No workaround — a script can OOM the process |
 | 1 | Execution Time Limits | Not started | No workaround — an infinite loop hangs the process |
 | 2 | Error Stack Traces | Not started | Universal in bridges (6/7); no workaround for useful errors |
-| 2 | Userdata Method Binding | Not started | Standard in bridges (6/7); no clean workaround |
+| 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
 | 2 | GC Control | Not started | Small scope, complements sandboxing |
 | 2 | Context Reset | Not started | No workaround without re-registering everything |
-| 3 | Table Reference API | Not started | Universal in bridges (7/7); workaround: `execute_script` |
+| — | ~~Table Reference API~~ | Completed | Universal in bridges (7/7); workaround: `execute_script` |
 | 3 | Environment Tables | Not started | Common in bridges (5/7); enables per-script sandboxing |
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
@@ -291,86 +291,6 @@ short of wrapping every call in `xpcall` from Lua.
 
 ---
 
-### Userdata Method Binding
-
-Allow registering methods on userdata that are callable via Lua's `:` syntax
-(`obj:method(args)`). Currently userdata only supports property access via
-`__index`/`__newindex`. Method binding is the most common feature in Lua bridges
-(6 of 7 surveyed libraries support it) and is the expected way to expose
-object-oriented APIs to Lua.
-
-```typescript
-const player = { x: 0, y: 0, hp: 100 };
-
-lua.set_userdata('player', player, {
-  readable: true,
-  writable: true,
-  methods: {
-    move: (self, dx, dy) => { self.x += dx; self.y += dy; },
-    heal: (self, amount) => { self.hp = Math.min(100, self.hp + amount); },
-    get_pos: (self) => [self.x, self.y],
-  }
-});
-
-lua.execute_script(`
-  player:move(10, 20)       -- calls methods.move(player, 10, 20)
-  player:heal(25)
-  local x, y = player:get_pos()
-  print(x, y)               -- 10  20
-`);
-```
-
-**Why tier 2:** Without this, exposing object methods requires either polluting
-the global namespace with wrapper functions (`function player_move(p, dx, dy)`)
-or round-tripping through `execute_script` to define Lua-side method tables.
-Neither approach is ergonomic. Method binding on userdata is the standard
-pattern that Lua developers expect.
-
-#### Implementation Plan
-
-**Core layer** (`lua-runtime.h/.cpp`):
-- Extend the proxy userdata metatable's `__index` metamethod to check for
-  registered methods before falling back to property access:
-  ```cpp
-  int UserdataIndex(lua_State* L) {
-    // 1. Check if key matches a registered method name
-    // 2. If yes, push the method closure (which will receive self as first arg)
-    // 3. If no, fall through to property getter as today
-  }
-  ```
-- Store methods per-userdata-type as a map of name → host function, keyed by
-  the userdata's reference ID or a type identifier.
-- Methods receive the original JS object as the first argument (`self`),
-  matching Lua's `:` call convention.
-
-**N-API layer** (`lua-native.cpp`):
-- Extend `SetUserdata` to accept an optional `methods` object in options.
-- Each method value is stored as a `Napi::FunctionReference`.
-- When the `__index` metamethod fires and finds a method match, push a
-  C closure that calls the corresponding JS function with the userdata's
-  JS object prepended as the first argument.
-
-**Types** (`types.d.ts`):
-- Extend `UserdataOptions`:
-  ```typescript
-  interface UserdataOptions {
-    readable?: boolean;
-    writable?: boolean;
-    methods?: Record<string, (self: any, ...args: LuaValue[]) => LuaValue | void>;
-  }
-  ```
-
-**Tests**:
-- Register userdata with methods, call `obj:method()` from Lua, verify the
-  method fires and receives `self`.
-- Verify methods and property access coexist (read a property and call a method
-  on the same userdata).
-- Verify that method names don't shadow properties (or document the precedence).
-- Verify error messages when calling a non-existent method.
-- Test methods that return multiple values.
-
----
-
 ## Tier 3 — Developer Tooling
 
 ### Debug Hooks
@@ -498,71 +418,6 @@ build-time constant. Low implementation effort.
 
 **Types** (`types.d.ts`):
 - Add `info(): { version: string, memoryKB: number }` to `LuaContext`.
-
----
-
-### Table Reference API
-
-Provide a way to create, read, write, and iterate Lua tables from JS without
-round-tripping through `execute_script`. This is the single most universal Lua
-bridge feature — every surveyed library (7 of 7) provides some form of
-host-language table manipulation. Currently, plain tables are deep-copied on
-return and there is no way to hold a live reference to a plain Lua table.
-
-```typescript
-const tbl = lua.create_table();           // empty table in Lua
-tbl.set('name', 'Alice');
-tbl.set('scores', [95, 87, 92]);
-tbl.get('name');                          // 'Alice'
-tbl.length();                             // 1 (hash part) or array length
-lua.set_global('player', tbl);            // push to Lua as a global
-
-// Iterate over an existing table
-const config = lua.get_global_ref('config');  // live reference, not a copy
-for (const [k, v] of config.pairs()) {
-  console.log(k, v);
-}
-config.release();                         // explicitly free the registry ref
-```
-
-**Why tier 3:** The workaround (`execute_script` for all table manipulation)
-works but is verbose and incurs parsing overhead. For hot paths that frequently
-read/write Lua state, a direct API is significantly faster. However, the
-deep-copy approach works well enough for most use cases.
-
-#### Implementation Plan
-
-**Core layer** (`lua-runtime.h/.cpp`):
-- Add `int CreateTable()` — creates an empty table, stores in registry, returns
-  ref ID.
-- Add `void TableSet(int ref, const std::string& key, const LuaPtr& value)` —
-  pushes the table from registry, sets the field, pops.
-- Add `LuaPtr TableGet(int ref, const std::string& key)` — pushes table, gets
-  field, converts to LuaPtr.
-- Add `std::vector<std::pair<LuaPtr, LuaPtr>> TablePairs(int ref)` — iterates
-  `lua_next` and returns all key-value pairs.
-- Add `int TableLength(int ref)` — returns `lua_rawlen`.
-- Add `void ReleaseRef(int ref)` — calls `luaL_unref`.
-- Add `int GetGlobalRef(const std::string& name)` — gets the global, stores in
-  registry, returns ref ID.
-
-**N-API layer** (`lua-native.cpp`):
-- Expose a `LuaTableHandle` class or add methods directly to `LuaContext`:
-  `create_table()`, `table_set()`, `table_get()`, `table_pairs()`,
-  `table_length()`, `release_ref()`, `get_global_ref()`.
-
-**Types** (`types.d.ts`):
-- Add `LuaTableHandle` interface with `get`, `set`, `pairs`, `length`,
-  `release` methods.
-- Add `create_table(): LuaTableHandle` and
-  `get_global_ref(name: string): LuaTableHandle` to `LuaContext`.
-
-**Tests**:
-- Create a table, set/get values, verify round-trip.
-- Iterate pairs, verify all keys returned.
-- Push a table ref as a global, access from Lua, verify it's the same table.
-- Release a ref, verify it no longer works.
-- Get a global ref, modify from JS, verify Lua sees the change.
 
 ---
 
@@ -767,3 +622,11 @@ Implemented. See `execute_script_async()` and `execute_file_async()` in the API 
 ### ~~Bytecode Precompilation~~ (Completed)
 
 Implemented. See `compile()`, `compile_file()`, and `load_bytecode()` in the API documentation.
+
+### ~~Userdata Method Binding~~ (Completed)
+
+Implemented. See `set_userdata()` with the `methods` option in the API documentation.
+
+### ~~Table Reference API~~ (Completed)
+
+Implemented. See `create_table()`, `get_global_ref()`, and the `LuaTableHandle` interface in the API documentation.

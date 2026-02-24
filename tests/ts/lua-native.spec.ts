@@ -2906,4 +2906,375 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // TABLE REFERENCE API
+  // ============================================
+  describe('table reference API', () => {
+    describe('create_table', () => {
+      it('creates an empty table handle', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        expect(t).toBeDefined();
+        expect(typeof t.get).toBe('function');
+        expect(typeof t.set).toBe('function');
+        expect(typeof t.has).toBe('function');
+        expect(typeof t.length).toBe('function');
+        expect(typeof t.pairs).toBe('function');
+        expect(typeof t.ipairs).toBe('function');
+        expect(typeof t.release).toBe('function');
+        t.release();
+      });
+
+      it('creates a table with object initializer', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ name: 'Alice', age: 30 });
+        expect(t.get('name')).toBe('Alice');
+        expect(t.get('age')).toBe(30);
+        t.release();
+      });
+
+      it('creates a table with array initializer (1-indexed)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table([10, 20, 30]);
+        expect(t.get(1)).toBe(10);
+        expect(t.get(2)).toBe(20);
+        expect(t.get(3)).toBe(30);
+        expect(t.length()).toBe(3);
+        t.release();
+      });
+
+      it('creates an empty table when called with no args', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        expect(t.length()).toBe(0);
+        expect(t.pairs()).toEqual([]);
+        t.release();
+      });
+    });
+
+    describe('handle.get and handle.set', () => {
+      it('sets and gets string-keyed values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        t.set('x', 42);
+        t.set('y', 'hello');
+        t.set('z', true);
+        expect(t.get('x')).toBe(42);
+        expect(t.get('y')).toBe('hello');
+        expect(t.get('z')).toBe(true);
+        t.release();
+      });
+
+      it('sets and gets numeric-keyed values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        t.set(1, 'first');
+        t.set(2, 'second');
+        expect(t.get(1)).toBe('first');
+        expect(t.get(2)).toBe('second');
+        t.release();
+      });
+
+      it('returns null for missing keys', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        expect(t.get('nonexistent')).toBeNull();
+        t.release();
+      });
+
+      it('overwrites existing values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ x: 1 });
+        expect(t.get('x')).toBe(1);
+        t.set('x', 99);
+        expect(t.get('x')).toBe(99);
+        t.release();
+      });
+
+      it('can set null to remove a field', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ x: 1 });
+        expect(t.has('x')).toBe(true);
+        t.set('x', null);
+        expect(t.has('x')).toBe(false);
+        t.release();
+      });
+    });
+
+    describe('handle.has', () => {
+      it('returns true for existing keys', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 'x' });
+        expect(t.has('a')).toBe(true);
+        expect(t.has('b')).toBe(true);
+        t.release();
+      });
+
+      it('returns false for missing keys', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1 });
+        expect(t.has('missing')).toBe(false);
+        t.release();
+      });
+
+      it('works with numeric keys', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table([10, 20]);
+        expect(t.has(1)).toBe(true);
+        expect(t.has(2)).toBe(true);
+        expect(t.has(3)).toBe(false);
+        t.release();
+      });
+    });
+
+    describe('handle.length', () => {
+      it('returns sequence length for array-like tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table([1, 2, 3, 4, 5]);
+        expect(t.length()).toBe(5);
+        t.release();
+      });
+
+      it('returns 0 for empty tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        expect(t.length()).toBe(0);
+        t.release();
+      });
+
+      it('returns 0 for hash-only tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2 });
+        expect(t.length()).toBe(0);
+        t.release();
+      });
+    });
+
+    describe('handle.pairs', () => {
+      it('returns all key-value pairs', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ x: 1, y: 2, z: 3 });
+        const p = t.pairs();
+        expect(p.length).toBe(3);
+
+        const map = new Map(p);
+        expect(map.get('x')).toBe(1);
+        expect(map.get('y')).toBe(2);
+        expect(map.get('z')).toBe(3);
+        t.release();
+      });
+
+      it('returns empty array for empty table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        expect(t.pairs()).toEqual([]);
+        t.release();
+      });
+
+      it('returns numeric keys for array tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table(['a', 'b', 'c']);
+        const p = t.pairs();
+        expect(p.length).toBe(3);
+
+        // Sort by key for consistent comparison
+        p.sort((a, b) => (a[0] as number) - (b[0] as number));
+        expect(p[0][0]).toBe(1);
+        expect(p[0][1]).toBe('a');
+        expect(p[1][0]).toBe(2);
+        expect(p[1][1]).toBe('b');
+        expect(p[2][0]).toBe(3);
+        expect(p[2][1]).toBe('c');
+        t.release();
+      });
+
+      it('supports for..of iteration', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2 });
+        const collected: [string | number, unknown][] = [];
+        for (const [k, v] of t.pairs()) {
+          collected.push([k, v]);
+        }
+        expect(collected.length).toBe(2);
+        t.release();
+      });
+    });
+
+    describe('handle.ipairs', () => {
+      it('iterates sequential integer keys', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table([10, 20, 30]);
+        const ip = t.ipairs();
+        expect(ip.length).toBe(3);
+        expect(ip[0]).toEqual([1, 10]);
+        expect(ip[1]).toEqual([2, 20]);
+        expect(ip[2]).toEqual([3, 30]);
+        t.release();
+      });
+
+      it('returns empty array for hash-only tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2 });
+        expect(t.ipairs()).toEqual([]);
+        t.release();
+      });
+
+      it('stops at first nil', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = {}; t[1] = 10; t[2] = 20; t[4] = 40');
+        const ref = lua.get_global_ref('t');
+        const ip = ref.ipairs();
+        expect(ip.length).toBe(2);
+        expect(ip[0]).toEqual([1, 10]);
+        expect(ip[1]).toEqual([2, 20]);
+        ref.release();
+      });
+    });
+
+    describe('handle.release', () => {
+      it('methods throw after release', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ x: 1 });
+        t.release();
+        expect(() => t.get('x')).toThrow('released');
+        expect(() => t.set('x', 2)).toThrow('released');
+        expect(() => t.has('x')).toThrow('released');
+        expect(() => t.length()).toThrow('released');
+        expect(() => t.pairs()).toThrow('released');
+        expect(() => t.ipairs()).toThrow('released');
+      });
+
+      it('double release is a no-op', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        t.release();
+        expect(() => t.release()).not.toThrow();
+      });
+    });
+
+    describe('get_global_ref', () => {
+      it('returns a live reference to a global table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script("config = { host = 'localhost', port = 5432 }");
+        const ref = lua.get_global_ref('config');
+        expect(ref.get('host')).toBe('localhost');
+        expect(ref.get('port')).toBe(5432);
+        ref.release();
+      });
+
+      it('throws for non-table globals', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('mynum = 42');
+        expect(() => lua.get_global_ref('mynum')).toThrow('not a table');
+      });
+
+      it('throws for nil globals', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.get_global_ref('nonexistent')).toThrow('not a table');
+      });
+
+      it('throws for string globals', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script("mystr = 'hello'");
+        expect(() => lua.get_global_ref('mystr')).toThrow('not a table');
+      });
+    });
+
+    describe('live mutations', () => {
+      it('JS mutations are visible in Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('data = { x = 1 }');
+        const ref = lua.get_global_ref('data');
+        ref.set('x', 99);
+        const result = lua.execute_script<number>('return data.x');
+        expect(result).toBe(99);
+        ref.release();
+      });
+
+      it('Lua mutations are visible via handle', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('data = { x = 1 }');
+        const ref = lua.get_global_ref('data');
+        lua.execute_script('data.x = 200');
+        expect(ref.get('x')).toBe(200);
+        ref.release();
+      });
+
+      it('new fields from JS are visible in Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('data = {}');
+        const ref = lua.get_global_ref('data');
+        ref.set('name', 'test');
+        const result = lua.execute_script<string>('return data.name');
+        expect(result).toBe('test');
+        ref.release();
+      });
+
+      it('new fields from Lua are visible via handle', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('data = {}');
+        const ref = lua.get_global_ref('data');
+        lua.execute_script("data.name = 'fromLua'");
+        expect(ref.get('name')).toBe('fromLua');
+        ref.release();
+      });
+    });
+
+    describe('set_global with table handle', () => {
+      it('sets a table handle as a global accessible from Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ greeting: 'hello' });
+        lua.set_global('mytable', t);
+        const result = lua.execute_script<string>('return mytable.greeting');
+        expect(result).toBe('hello');
+        t.release();
+      });
+
+      it('table handle and Lua global reference the same table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ x: 1 });
+        lua.set_global('shared', t);
+
+        // Modify via Lua
+        lua.execute_script('shared.x = 42');
+
+        // Change visible via handle
+        expect(t.get('x')).toBe(42);
+        t.release();
+      });
+    });
+
+    describe('passing handles as values', () => {
+      it('a handle can be set as a field of another handle', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const parent = lua.create_table();
+        const child = lua.create_table({ val: 123 });
+        parent.set('child', child);
+        lua.set_global('parent', parent);
+
+        const result = lua.execute_script<number>('return parent.child.val');
+        expect(result).toBe(123);
+
+        child.release();
+        parent.release();
+      });
+    });
+
+    describe('metatabled table handles', () => {
+      it('get_global_ref works with metatabled tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('mt = { x = 10 }');
+        lua.set_metatable('mt', {
+          __len: () => 42,
+        });
+
+        const ref = lua.get_global_ref('mt');
+        expect(ref.get('x')).toBe(10);
+        ref.set('y', 20);
+        expect(ref.get('y')).toBe(20);
+        ref.release();
+      });
+    });
+  });
 });

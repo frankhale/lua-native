@@ -2,6 +2,7 @@
 
 prebuilds/
 build-test/
+.cmake/
 CMakeFiles
 CMakeCache.txt
 

@@ -13,13 +13,14 @@ data structures.
 
 ## Features
 
-- Execute Lua scripts and files from Node.js
+- Execute Lua scripts and files from Node.js, Bun or Deno
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Global variable management (get and set)
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access and method binding
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
+- Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
 - Module / require integration — register JS modules and add search paths for Lua's `require()`
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
 - Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_bytecode()` for faster startup
@@ -977,6 +978,115 @@ const plain = lua.execute_script("return {a = 1, b = 2}");
 // plain is a regular JS object: { a: 1, b: 2 }
 ```
 
+### Table Reference API
+
+The table reference API lets you create, read, write, and iterate Lua tables
+directly from JavaScript without round-tripping through `execute_script`. Table
+handles hold a live reference to the Lua table — mutations from JS are visible in
+Lua and vice versa.
+
+#### Creating Tables
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Create an empty table
+const t = lua.create_table();
+
+// Create with an object initializer (string keys)
+const point = lua.create_table({ x: 10, y: 20 });
+
+// Create with an array initializer (1-indexed in Lua)
+const list = lua.create_table([100, 200, 300]);
+```
+
+#### Reading and Writing Fields
+
+```javascript
+const t = lua.create_table();
+
+t.set("name", "Alice");
+t.set("score", 95);
+t.set(1, "first");
+
+console.log(t.get("name")); // 'Alice'
+console.log(t.get("score")); // 95
+console.log(t.get(1)); // 'first'
+console.log(t.get("missing")); // null
+
+console.log(t.has("name")); // true
+console.log(t.has("missing")); // false
+console.log(t.length()); // 1 (sequence length — the # operator)
+```
+
+#### Iterating Tables
+
+```javascript
+const t = lua.create_table({ a: 1, b: 2, c: 3 });
+
+// pairs() — all key-value pairs (like Lua pairs())
+for (const [key, value] of t.pairs()) {
+  console.log(key, value); // 'a' 1, 'b' 2, 'c' 3
+}
+
+// ipairs() — integer sequence from 1 (like Lua ipairs())
+const list = lua.create_table([10, 20, 30]);
+for (const [index, value] of list.ipairs()) {
+  console.log(index, value); // 1 10, 2 20, 3 30
+}
+```
+
+#### Live References to Global Tables
+
+`get_global_ref()` returns a live handle to an existing global table. Changes
+through the handle are immediately visible in Lua, and Lua-side changes are
+visible through the handle:
+
+```javascript
+lua.execute_script('config = { host = "localhost", port = 5432, debug = false }');
+
+const config = lua.get_global_ref("config");
+console.log(config.get("host")); // 'localhost'
+
+// Modify from JS — visible in Lua
+config.set("debug", true);
+lua.execute_script("print(config.debug)"); // true
+
+// Modify from Lua — visible in JS
+lua.execute_script("config.port = 3306");
+console.log(config.get("port")); // 3306
+
+config.release(); // free the registry reference when done
+```
+
+#### Setting Tables as Globals
+
+Table handles can be passed to `set_global()` to make them accessible from Lua:
+
+```javascript
+const player = lua.create_table({ name: "Alice", hp: 100 });
+lua.set_global("player", player);
+
+lua.execute_script('print(player.name)'); // Alice
+player.release();
+```
+
+#### Releasing Handles
+
+Call `release()` when you're done with a handle to free the Lua registry slot.
+After release, all methods throw:
+
+```javascript
+const t = lua.create_table();
+t.set("x", 1);
+t.release();
+
+// t.get('x');  // Error: table handle has been released
+// t.release(); // safe — double release is a no-op
+```
+
 ## TypeScript Support
 
 The module includes comprehensive TypeScript definitions:
@@ -992,6 +1102,7 @@ import type {
   LuaLibraryPreset,
   CoroutineResult,
   LuaFunction,
+  LuaTableHandle,
   LuaTableRef,
   MetatableDefinition,
   UserdataMethod,
@@ -1083,6 +1194,23 @@ sandboxed.execute_script('print(string.upper("safe"))'); // "SAFE"
 const options: LuaInitOptions = { libraries: ["base", "string", "math"] };
 const custom: LuaContext = new lua_native.init({}, options);
 custom.execute_script('print(string.upper("custom"))'); // "CUSTOM"
+
+// Type-safe table reference API
+const handle: LuaTableHandle = lua.create_table({ x: 1, y: 2 });
+handle.set("z", 3);
+const val: LuaValue = handle.get("x"); // LuaValue
+const exists: boolean = handle.has("z");
+const len: number = handle.length();
+const entries: Array<[string | number, LuaValue]> = handle.pairs();
+const seq: Array<[number, LuaValue]> = handle.ipairs();
+lua.set_global("point", handle);
+handle.release();
+
+// Type-safe get_global_ref
+lua.execute_script("data = { items = {1, 2, 3} }");
+const ref: LuaTableHandle = lua.get_global_ref("data");
+ref.set("count", 3);
+ref.release();
 ```
 
 ## API Reference
@@ -1318,6 +1446,48 @@ JavaScript type), identical to `execute_script`.
 **Throws:** Error if the bytecode is invalid, corrupted, or from an incompatible
 Lua version.
 
+### `LuaContext.create_table(initial?)`
+
+Creates a new Lua table, optionally pre-populated with values. Returns a live
+handle for direct manipulation without `execute_script`.
+
+**Parameters:**
+
+- `initial` (optional): Initial values — a JS object for string keys, or an
+  array for 1-indexed integer keys
+
+**Returns:** `LuaTableHandle` — a live reference to the table
+
+### `LuaContext.get_global_ref(name)`
+
+Gets a live reference to an existing global table. Unlike `get_global()` which
+deep-copies plain tables, this returns a handle that reads and writes the actual
+Lua table in place.
+
+**Parameters:**
+
+- `name`: The global variable name
+
+**Returns:** `LuaTableHandle` — a live reference to the table
+
+**Throws:** Error if the global does not exist or is not a table
+
+### `LuaTableHandle`
+
+A handle to a Lua table stored in the Lua registry. Provides direct get/set/iterate
+access. The handle holds a live reference — mutations from JS are visible in Lua
+and vice versa. Call `release()` when done to free the registry slot.
+
+**Methods:**
+
+- `get(key: string | number): LuaValue` — Get a field by key. Triggers `__index` if the table has a metatable.
+- `set(key: string | number, value: LuaValue): void` — Set a field by key. Triggers `__newindex` if the table has a metatable.
+- `has(key: string | number): boolean` — Check if a key exists in the table.
+- `length(): number` — Get the table length (`#` operator). Triggers `__len` metamethod.
+- `pairs(): Array<[string | number, LuaValue]>` — Get all key-value pairs (like Lua `pairs()`).
+- `ipairs(): Array<[number, LuaValue]>` — Get integer-keyed sequence entries (like Lua `ipairs()`). Iterates from index 1 until the first nil.
+- `release(): void` — Release the registry reference. After calling `release()`, all other methods throw. Safe to call multiple times.
+
 ## Data Type Conversion
 
 | Lua Type              | JavaScript Type | Notes                                                                                                         |
@@ -1337,7 +1507,7 @@ Lua version.
 
 - **Nesting depth limit** — Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
 - **`set_metatable()` only for globals** — `set_metatable()` works on global tables only. To set metatables on non-global tables, use `setmetatable()` in Lua code.
-- **Plain tables are copied, not referenced** — When Lua tables _without metatables_ are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Tables _with metatables_ are returned as live Proxy objects that maintain a reference to the original Lua table.
+- **Plain tables are copied, not referenced** — When Lua tables _without metatables_ are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Tables _with metatables_ are returned as live Proxy objects that maintain a reference to the original Lua table. Use `create_table()` or `get_global_ref()` to get live handles to plain tables.
 
 ## Development
 

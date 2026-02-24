@@ -119,6 +119,184 @@ static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo
   return env.Undefined();
 }
 
+// --- Table handle method functions ---
+
+static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1) {
+    Napi::TypeError::New(env, "get() requires a key argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string key;
+  if (info[0].IsNumber()) {
+    key = std::to_string(info[0].As<Napi::Number>().Int64Value());
+  } else if (info[0].IsString()) {
+    key = info[0].As<Napi::String>().Utf8Value();
+  } else {
+    Napi::TypeError::New(env, "get() key must be a string or number").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    auto result = data->runtime->GetTableField(data->tableRef.ref, key);
+    return data->context->CoreToNapi(*result);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+}
+
+static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 2) {
+    Napi::TypeError::New(env, "set() requires key and value arguments").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string key;
+  if (info[0].IsNumber()) {
+    key = std::to_string(info[0].As<Napi::Number>().Int64Value());
+  } else if (info[0].IsString()) {
+    key = info[0].As<Napi::String>().Utf8Value();
+  } else {
+    Napi::TypeError::New(env, "set() key must be a string or number").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    auto value = std::make_shared<lua_core::LuaValue>(
+      data->context->NapiToCoreInstance(info[1]));
+    data->runtime->SetTableField(data->tableRef.ref, key, value);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+  }
+  return env.Undefined();
+}
+
+static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1) {
+    Napi::TypeError::New(env, "has() requires a key argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string key;
+  if (info[0].IsNumber()) {
+    key = std::to_string(info[0].As<Napi::Number>().Int64Value());
+  } else if (info[0].IsString()) {
+    key = info[0].As<Napi::String>().Utf8Value();
+  } else {
+    Napi::TypeError::New(env, "has() key must be a string or number").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    bool exists = data->runtime->HasTableField(data->tableRef.ref, key);
+    return Napi::Boolean::New(env, exists);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+}
+
+static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    int len = data->runtime->GetTableLength(data->tableRef.ref);
+    return Napi::Number::New(env, len);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+}
+
+static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    auto pairs = data->runtime->TablePairs(data->tableRef.ref);
+    Napi::Array result = Napi::Array::New(env, pairs.size());
+    for (size_t i = 0; i < pairs.size(); ++i) {
+      Napi::Array entry = Napi::Array::New(env, 2);
+      entry.Set(static_cast<uint32_t>(0),
+                data->context->CoreToNapi(*pairs[i].first));
+      entry.Set(static_cast<uint32_t>(1),
+                data->context->CoreToNapi(*pairs[i].second));
+      result.Set(static_cast<uint32_t>(i), entry);
+    }
+    return result;
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+}
+
+static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    auto ipairs = data->runtime->TableIPairs(data->tableRef.ref);
+    Napi::Array result = Napi::Array::New(env, ipairs.size());
+    for (size_t i = 0; i < ipairs.size(); ++i) {
+      Napi::Array entry = Napi::Array::New(env, 2);
+      entry.Set(static_cast<uint32_t>(0),
+                Napi::Number::New(env, static_cast<double>(ipairs[i].first)));
+      entry.Set(static_cast<uint32_t>(1),
+                data->context->CoreToNapi(*ipairs[i].second));
+      result.Set(static_cast<uint32_t>(i), entry);
+    }
+    return result;
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+}
+
+static Napi::Value TableHandleRelease(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    // Already released — no-op
+    return env.Undefined();
+  }
+
+  data->runtime->ReleaseTableRef(data->tableRef.ref);
+  data->tableRef.ref = LUA_NOREF;
+  return env.Undefined();
+}
+
 static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
@@ -184,7 +362,9 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("register_module", &LuaContext::RegisterModule),
     InstanceMethod("compile", &LuaContext::Compile),
     InstanceMethod("compile_file", &LuaContext::CompileFile),
-    InstanceMethod("load_bytecode", &LuaContext::LoadBytecode)
+    InstanceMethod("load_bytecode", &LuaContext::LoadBytecode),
+    InstanceMethod("create_table", &LuaContext::CreateTableMethod),
+    InstanceMethod("get_global_ref", &LuaContext::GetGlobalRef)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -651,6 +831,101 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
   const Napi::Array array = Napi::Array::New(env, values.size());
   for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
   return array;
+}
+
+Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
+  auto data = std::make_unique<LuaTableRefData>(
+    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()),
+    this
+  );
+  auto* dataPtr = data.get();
+  lua_table_ref_data_.push_back(std::move(data));
+
+  Napi::Object handle = Napi::Object::New(env);
+
+  // Store _tableRef as non-enumerable for round-trip detection (same pattern as Proxy)
+  auto external = Napi::External<LuaTableRefData>::New(env, dataPtr);
+  auto Object = env.Global().Get("Object").As<Napi::Object>();
+  auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
+  Napi::Object descriptor = Napi::Object::New(env);
+  descriptor.Set("value", external);
+  descriptor.Set("enumerable", Napi::Boolean::New(env, false));
+  descriptor.Set("configurable", Napi::Boolean::New(env, true));
+  defineProperty.Call({handle, Napi::String::New(env, "_tableRef"), descriptor});
+
+  // Attach methods
+  handle.Set("get", Napi::Function::New(env, TableHandleGet, "get", dataPtr));
+  handle.Set("set", Napi::Function::New(env, TableHandleSet, "set", dataPtr));
+  handle.Set("has", Napi::Function::New(env, TableHandleHas, "has", dataPtr));
+  handle.Set("length", Napi::Function::New(env, TableHandleLength, "length", dataPtr));
+  handle.Set("pairs", Napi::Function::New(env, TableHandlePairs, "pairs", dataPtr));
+  handle.Set("ipairs", Napi::Function::New(env, TableHandleIPairs, "ipairs", dataPtr));
+  handle.Set("release", Napi::Function::New(env, TableHandleRelease, "release", dataPtr));
+
+  return handle;
+}
+
+Napi::Value LuaContext::CreateTableMethod(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  int ref;
+  if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
+    try {
+      if (info[0].IsArray()) {
+        auto arr = info[0].As<Napi::Array>();
+        lua_core::LuaArray luaArr;
+        luaArr.reserve(arr.Length());
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+          luaArr.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(arr.Get(i))));
+        }
+        ref = runtime->CreateTableFrom(luaArr);
+      } else if (info[0].IsObject()) {
+        auto obj = info[0].As<Napi::Object>();
+        lua_core::LuaTable luaTbl;
+        auto keys = obj.GetPropertyNames();
+        for (uint32_t i = 0; i < keys.Length(); ++i) {
+          std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
+          luaTbl[key] = std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(obj.Get(key)));
+        }
+        ref = runtime->CreateTableFrom(luaTbl);
+      } else {
+        Napi::TypeError::New(env, "create_table() argument must be an object or array").ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  } else {
+    ref = runtime->CreateTable();
+  }
+
+  return CreateTableHandle(env, ref);
+}
+
+Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "get_global_ref() requires a string name").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string name = info[0].As<Napi::String>().Utf8Value();
+  auto result = runtime->GetGlobalRef(name);
+
+  if (auto* error = std::get_if<std::string>(&result)) {
+    Napi::Error::New(env, *error).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  int ref = std::get<int>(result);
+  return CreateTableHandle(env, ref);
 }
 
 LuaContext::~LuaContext() {

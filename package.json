@@ -23,6 +23,8 @@
     "install": "cross-env GYP_DEFINES=\"skip_test=1\" node-gyp-build",
     "build-debug": "node-gyp rebuild --debug -- -Dskip_test=0",
     "build-release": "node-gyp rebuild --release -- -Dskip_test=1",
+    "build-cmake-debug": "node cmake-build.js debug -- -Dskip_test=0",
+    "build-cmake-release": "node cmake-build.js release -- -Dskip_test=1",
     "clean": "node-gyp clean",
     "start": "vitest",
     "test": "vitest",
@@ -52,8 +54,8 @@
     "node-gyp-build": "^4.8.4"
   },
   "devDependencies": {
-    "@types/node": "^25.0.9",
-    "cross-env": "^10.0.0",
-    "vitest": "^4.0.17"
+    "@types/node": "^25.3.0",
+    "cross-env": "^10.1.0",
+    "vitest": "^4.0.18"
   }
 }
