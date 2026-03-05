@@ -52,6 +52,33 @@ int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
   return mask;
 }
 
+void* LuaRuntime::LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize) {
+  auto* alloc = static_cast<MemoryAllocator*>(ud);
+
+  if (nsize == 0) {
+    // Free: when ptr is non-null, osize is the old block size
+    if (ptr) {
+      alloc->current -= osize;
+      free(ptr);
+    }
+    return nullptr;
+  }
+
+  // For new allocations (ptr == NULL), osize is the Lua type tag, not a size
+  size_t old_size = ptr ? osize : 0;
+
+  // Check limit (0 means unlimited)
+  if (alloc->limit > 0 && alloc->current - old_size + nsize > alloc->limit) {
+    return nullptr;  // Lua handles this as OOM
+  }
+
+  void* new_ptr = realloc(ptr, nsize);
+  if (new_ptr) {
+    alloc->current = alloc->current - old_size + nsize;
+  }
+  return new_ptr;
+}
+
 void LuaRuntime::InitState() {
   // Store the runtime in registry for callbacks
   lua_pushlightuserdata(L_, this);
@@ -71,7 +98,7 @@ std::vector<std::string> LuaRuntime::SafeLibraries() {
 }
 
 LuaRuntime::LuaRuntime() {
-  L_ = luaL_newstate();
+  L_ = lua_newstate(LuaAllocator, &allocator_, 0);
   if (!L_) {
     throw std::runtime_error("Failed to create Lua state");
   }
@@ -79,12 +106,24 @@ LuaRuntime::LuaRuntime() {
 }
 
 LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries) {
-  L_ = luaL_newstate();
+  L_ = lua_newstate(LuaAllocator, &allocator_, 0);
   if (!L_) {
     throw std::runtime_error("Failed to create Lua state");
   }
   if (!libraries.empty()) {
     luaL_openselectedlibs(L_, LibraryMask(libraries), 0);
+  }
+  InitState();
+}
+
+LuaRuntime::LuaRuntime(const RuntimeConfig& config) {
+  allocator_.limit = config.max_memory;
+  L_ = lua_newstate(LuaAllocator, &allocator_, 0);
+  if (!L_) {
+    throw std::runtime_error("Failed to create Lua state");
+  }
+  if (!config.libraries.empty()) {
+    luaL_openselectedlibs(L_, LibraryMask(config.libraries), 0);
   }
   InitState();
 }

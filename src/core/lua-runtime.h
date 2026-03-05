@@ -182,6 +182,16 @@ struct LuaTableRef {
   }
 };
 
+struct MemoryAllocator {
+  size_t current = 0;
+  size_t limit = 0;  // 0 = unlimited
+};
+
+struct RuntimeConfig {
+  std::vector<std::string> libraries;
+  size_t max_memory = 0;  // 0 = unlimited
+};
+
 struct MetatableEntry {
   std::string key;
   bool is_function;
@@ -246,6 +256,7 @@ public:
 
   LuaRuntime();
   explicit LuaRuntime(const std::vector<std::string>& libraries);
+  explicit LuaRuntime(const RuntimeConfig& config);
   ~LuaRuntime();
 
   static std::vector<std::string> AllLibraries();
@@ -321,6 +332,9 @@ public:
   [[nodiscard]] std::vector<std::pair<int64_t, LuaPtr>> TableIPairs(int registry_ref) const;
   void ReleaseTableRef(int registry_ref);
 
+  [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
+  [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
+
   [[nodiscard]] lua_State* RawState() const { return L_; }
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
@@ -335,6 +349,9 @@ public:
   static constexpr const char* kProxyUserdataMetaName = "lua_native_proxy_userdata";
 
 private:
+  // allocator_ must be declared before L_ so it outlives the Lua state
+  // (C++ destroys members in reverse declaration order, and lua_close calls the allocator)
+  MemoryAllocator allocator_;
   lua_State* L_ { nullptr };
   std::unordered_map<std::string, Function> host_functions_;
   std::vector<std::pair<void*, void (*)(void*)>> stored_function_data_;
@@ -349,6 +366,7 @@ private:
   void InitState();
   static int LibraryMask(const std::vector<std::string>& libraries);
   bool HasPackageLibrary() const;
+  static void* LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize);
 
   void RegisterUserdataMetatable();
   void RegisterProxyUserdataMetatable();

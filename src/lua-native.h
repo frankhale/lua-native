@@ -95,6 +95,7 @@ public:
     Napi::Value LoadBytecode(const Napi::CallbackInfo& info);
     Napi::Value CreateTableMethod(const Napi::CallbackInfo& info);
     Napi::Value GetGlobalRef(const Napi::CallbackInfo& info);
+    Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 

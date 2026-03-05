@@ -3277,4 +3277,104 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // MEMORY LIMITS
+  // ============================================
+  describe('memory limits', () => {
+    describe('get_memory_usage()', () => {
+      it('returns a positive number without maxMemory', () => {
+        const lua = new lua_native.init(undefined, ALL_LIBS);
+        const usage = lua.get_memory_usage();
+        expect(usage).toBeGreaterThan(0);
+        expect(typeof usage).toBe('number');
+      });
+
+      it('returns a positive number with maxMemory', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxMemory: 10 * 1024 * 1024 });
+        const usage = lua.get_memory_usage();
+        expect(usage).toBeGreaterThan(0);
+      });
+
+      it('memory usage increases after allocations', () => {
+        const lua = new lua_native.init(undefined, ALL_LIBS);
+        const before = lua.get_memory_usage();
+        lua.execute_script(`
+          big_table = {}
+          for i = 1, 1000 do
+            big_table[i] = string.rep('a', 100)
+          end
+        `);
+        const after = lua.get_memory_usage();
+        expect(after).toBeGreaterThan(before);
+      });
+    });
+
+    describe('maxMemory enforcement', () => {
+      it('normal scripts work within limit', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxMemory: 1024 * 1024 });
+        const result = lua.execute_script('return 1 + 2');
+        expect(result).toBe(3);
+      });
+
+      it('throws OOM when exceeding limit with string.rep', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxMemory: 256 * 1024 });
+        expect(() => {
+          lua.execute_script("return string.rep('x', 1024 * 1024)");
+        }).toThrow(/memory/i);
+      });
+
+      it('throws OOM when exceeding limit with table accumulation', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxMemory: 256 * 1024 });
+        expect(() => {
+          lua.execute_script(`
+            t = {}
+            for i = 1, 1000000 do
+              t[i] = string.rep('x', 100)
+            end
+          `);
+        }).toThrow(/memory/i);
+      });
+
+      it('context recovers after OOM — can still run small scripts', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxMemory: 256 * 1024 });
+
+        // Trigger OOM
+        expect(() => {
+          lua.execute_script("return string.rep('x', 1024 * 1024)");
+        }).toThrow();
+
+        // Small script should still work
+        const result = lua.execute_script('return 42');
+        expect(result).toBe(42);
+      });
+    });
+
+    describe('maxMemory: 0 means unlimited', () => {
+      it('allows large allocations with maxMemory: 0', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxMemory: 0 });
+        const result = lua.execute_script<string>("return string.rep('x', 100000)");
+        expect(result.length).toBe(100000);
+      });
+    });
+
+    describe('negative maxMemory rejected', () => {
+      it('throws RangeError for negative maxMemory', () => {
+        expect(() => {
+          new lua_native.init(undefined, { libraries: 'all', maxMemory: -1 } as any);
+        }).toThrow(/non-negative/);
+      });
+    });
+
+    describe('callbacks work with memory limit set', () => {
+      it('JS callbacks work within memory limit', () => {
+        const lua = new lua_native.init(
+          { add: (a: number, b: number) => a + b },
+          { libraries: 'all', maxMemory: 1024 * 1024 }
+        );
+        const result = lua.execute_script('return add(10, 20)');
+        expect(result).toBe(30);
+      });
+    });
+  });
 });

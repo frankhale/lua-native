@@ -533,6 +533,41 @@ All methods that touch the Lua stack use `StackGuard` for automatic stack balanc
 
 ---
 
+## Memory Limits (February 2026)
+
+### Overview
+
+`maxMemory` caps the total memory a Lua state can allocate. A custom allocator (`lua_Alloc`) tracks every allocation and returns `NULL` when the limit would be exceeded, which Lua handles gracefully as an out-of-memory error. `get_memory_usage()` reports current memory consumption even without a limit set.
+
+### Architecture
+
+**Core layer:**
+- `MemoryAllocator` struct with `current` (bytes in use) and `limit` (0 = unlimited). Declared as a member of `LuaRuntime` **before** `L_` so the allocator outlives the Lua state during destruction.
+- `LuaAllocator` static function matching the `lua_Alloc` signature. All Lua states are created with `lua_newstate(LuaAllocator, &allocator_, 0)` — even without a limit, the allocator tracks usage with negligible overhead.
+- `RuntimeConfig` struct with `libraries` and `max_memory` fields. A new constructor `LuaRuntime(const RuntimeConfig& config)` accepts it, setting the allocator limit before creating the state.
+- `GetMemoryUsage()` and `GetMemoryLimit()` inline getters return the allocator's current and limit values.
+
+**Allocator logic:**
+- `nsize == 0`: free the block, subtract `osize` from `current`.
+- `ptr == NULL` (new allocation): `osize` is a Lua type tag (not a size), treated as 0.
+- Otherwise: check `limit > 0 && current - old_size + nsize > limit`. If exceeded, return `NULL`. On success, `realloc` and update `current`.
+
+**N-API layer:**
+- `LuaContext` constructor parses `options.maxMemory` (number). Negative values throw a `TypeError`. When present, a `RuntimeConfig` is built and passed to the new core constructor.
+- `get_memory_usage()` instance method returns `runtime->GetMemoryUsage()` as a JS number.
+
+### Design Decisions
+
+**Always use custom allocator:** Rather than conditionally switching between `luaL_newstate` (default allocator) and `lua_newstate` (custom allocator), all states use the custom allocator. With `limit=0`, it just tracks usage — the overhead is a single size_t addition per allocation. This makes `get_memory_usage()` universally available.
+
+**`RuntimeConfig` struct:** Instead of adding more constructor overloads for each new option, a config struct groups them. This is future-proof for Execution Time Limits (the next Tier 1 feature).
+
+**Member ordering:** `allocator_` is declared before `L_` in the class definition. C++ destroys members in reverse declaration order, so `L_` (and thus `lua_close`, which calls the allocator during teardown) is destroyed before `allocator_`. This prevents use-after-free during destruction.
+
+**OOM recovery:** After an OOM error, the Lua state remains usable — Lua catches the `NULL` return from the allocator and raises a recoverable error via `lua_pcall`. The context can continue running smaller scripts.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -550,3 +585,4 @@ All methods that touch the Lua stack use `StackGuard` for automatic stack balanc
 | Async execution (Phase 1) | Moderate | February 2026 |
 | Module / require integration | Moderate | February 2026 |
 | Table reference API | Moderate | February 2026 |
+| Memory limits | Low | February 2026 |

@@ -11,7 +11,7 @@ workarounds rank lowest.
 
 | Tier | Feature | Status | Rationale |
 |---|---|---|---|
-| 1 | Memory Limits | Not started | No workaround — a script can OOM the process |
+| 1 | ~~Memory Limits~~ | Completed | No workaround — a script can OOM the process |
 | 1 | Execution Time Limits | Not started | No workaround — an infinite loop hangs the process |
 | 2 | Error Stack Traces | Not started | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
@@ -45,52 +45,9 @@ These two features are the most important remaining work. Without them, the
 nothing to prevent resource exhaustion. Together, memory limits and execution
 limits make it safe to run untrusted Lua code.
 
-### Memory Limits
+### ~~Memory Limits~~ (Completed)
 
-Cap memory usage via `lua_setallocf` with a custom allocator that tracks and limits total allocation:
-
-```typescript
-const lua = new lua_native.init({}, {
-  maxMemory: 10 * 1024 * 1024  // 10 MB
-});
-```
-
-Prevents a Lua script from consuming unbounded memory. The custom allocator wraps the default allocator, tracking cumulative bytes and returning `NULL` when the limit is exceeded (which Lua handles gracefully as an out-of-memory error).
-
-**Why tier 1:** There is no workaround from JavaScript. A single `string.rep('x', 1e9)` in Lua can crash the host process. This is the single most important missing feature for anyone running user-provided scripts.
-
-#### Implementation Plan
-
-**Core layer** (`lua-runtime.h/.cpp`):
-- Add a `MemoryAllocator` struct stored as a member of `LuaRuntime`:
-  ```cpp
-  struct MemoryAllocator {
-    size_t current = 0;
-    size_t limit = 0;  // 0 = unlimited
-  };
-  ```
-- Add a static allocator function matching the `lua_Alloc` signature:
-  ```cpp
-  static void* LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize);
-  ```
-  Logic: if `nsize == 0`, free and subtract `osize`. Otherwise, check if `current - osize + nsize > limit`; if so return `NULL`. Otherwise, realloc, update `current`, and return the pointer.
-- When `maxMemory > 0`, call `lua_setallocf(L_, LuaAllocator, &allocator_)` after creating the state. Note: `lua_newstate` can be used instead of `luaL_newstate` to set the allocator from the start.
-- Add a getter: `size_t GetMemoryUsage() const` that returns `allocator_.current`.
-- Add a new constructor overload or configuration method: `void SetMemoryLimit(size_t bytes)`.
-
-**N-API layer** (`lua-native.h/.cpp`):
-- Read `options.maxMemory` (number) in the `LuaContext` constructor and pass to `LuaRuntime`.
-- Optionally expose `get_memory_usage()` as an instance method for diagnostics.
-
-**Types** (`types.d.ts`):
-- Add `maxMemory?: number` to `LuaInitOptions`.
-- Add `get_memory_usage(): number` to `LuaContext`.
-
-**Tests**:
-- Allocate a large string in Lua (`string.rep('x', 20*1024*1024)`) with a 10MB limit, verify it throws an out-of-memory error.
-- Verify normal scripts work within the memory limit.
-- Verify `get_memory_usage()` returns a reasonable value.
-- C++ tests: Verify the allocator tracks correctly across alloc/realloc/free cycles.
+Implemented. See `maxMemory` option in `LuaInitOptions` and `get_memory_usage()` in the API documentation.
 
 ---
 
@@ -630,3 +587,7 @@ Implemented. See `set_userdata()` with the `methods` option in the API documenta
 ### ~~Table Reference API~~ (Completed)
 
 Implemented. See `create_table()`, `get_global_ref()`, and the `LuaTableHandle` interface in the API documentation.
+
+### ~~Memory Limits~~ (Completed)
+
+Implemented. See `maxMemory` option in `LuaInitOptions` and `get_memory_usage()` in the API documentation.
