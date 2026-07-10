@@ -384,6 +384,13 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
     return 0;
   }
 
+  // A method that returned a JS Promise while in the async driver suspends the
+  // coroutine until it settles (see LuaCallHostFunction).
+  if (runtime->await_pending_) {
+    runtime->await_pending_ = false;
+    return lua_yieldk(L, 0, static_cast<lua_KContext>(0), AsyncContinuation);
+  }
+
   try {
     PushLuaValue(L, resultHolder);
   } catch (const std::exception& e) {
@@ -666,6 +673,13 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
                     func_name ? func_name : "<unknown>");
     lua_error(L);
     return 0;
+  }
+
+  // The host call returned a JS Promise while in the async driver: suspend the
+  // coroutine until it settles. AsyncContinuation delivers the resolved value.
+  if (runtime->await_pending_) {
+    runtime->await_pending_ = false;
+    return lua_yieldk(L, 0, static_cast<lua_KContext>(0), AsyncContinuation);
   }
 
   try {
@@ -1362,6 +1376,108 @@ CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) co
     return CoroutineStatus::Suspended;
   }
   return CoroutineStatus::Dead;
+}
+
+// --- Coroutine-driven async execution ---
+
+void LuaRuntime::SetAwaitDriverMode(bool enabled) { await_driver_mode_ = enabled; }
+bool LuaRuntime::IsAwaitDriverMode() const { return await_driver_mode_; }
+void LuaRuntime::RequestAwaitYield() { await_pending_ = true; }
+void LuaRuntime::RequestCancel() { cancel_requested_ = true; }
+bool LuaRuntime::IsCancelRequested() const { return cancel_requested_; }
+void LuaRuntime::ClearCancel() { cancel_requested_ = false; }
+
+std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
+    const std::string& script) const {
+  StackGuard guard(L_);
+
+  // Load the script chunk as a function on the main stack.
+  if (luaL_loadstring(L_, script.c_str()) != LUA_OK) {
+    const char* msg = lua_tostring(L_, -1);
+    return std::string(msg ? msg : "failed to load script");
+  }
+  // Stack: [chunk]. Create the thread (pushed on top).
+  lua_State* thread = lua_newthread(L_);
+  if (!thread) {
+    return std::string("Failed to create coroutine thread");
+  }
+  // Stack: [chunk, thread]. Anchor the thread (pops it).
+  const int threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);
+  // Stack: [chunk]. Move the chunk onto the thread as its body.
+  lua_xmove(L_, thread, 1);
+
+  return LuaThreadRef(threadRef, L_, thread);
+}
+
+// Continuation resumed after a host call suspended to await a JS promise.
+// The resume argument (resolved value, or rejection message) sits on top.
+int LuaRuntime::AsyncContinuation(lua_State* L, int status, lua_KContext ctx) {
+  (void)status;
+  (void)ctx;
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  if (runtime && runtime->await_is_error_) {
+    // Raise the rejection as a Lua error (the message is on top of the stack).
+    return lua_error(L);
+  }
+  // Return the resolved value (on top) as the awaited call's result.
+  return 1;
+}
+
+AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
+    const std::vector<LuaPtr>& args, bool arg_is_error) {
+  AsyncStepResult result;
+
+  if (!threadRef.thread) {
+    result.state = AsyncStepResult::State::Error;
+    result.error = "invalid coroutine thread";
+    return result;
+  }
+
+  await_is_error_ = arg_is_error;
+
+  try {
+    for (const auto& arg : args) {
+      PushLuaValue(threadRef.thread, arg);
+    }
+  } catch (const std::exception& e) {
+    result.state = AsyncStepResult::State::Error;
+    result.error = std::string("Error converting resume value: ") + e.what();
+    return result;
+  }
+
+  int nresults = 0;
+  const int status = lua_resume(threadRef.thread, L_,
+                                static_cast<int>(args.size()), &nresults);
+
+  if (status == LUA_YIELD) {
+    // Suspended to await a promise; discard any yielded values (we yield none).
+    if (nresults > 0) lua_pop(threadRef.thread, nresults);
+    result.state = AsyncStepResult::State::Awaiting;
+  } else if (status == LUA_OK) {
+    try {
+      for (int i = 1; i <= nresults; ++i) {
+        result.values.push_back(ToLuaValue(threadRef.thread, i));
+      }
+    } catch (const std::exception& e) {
+      result.values.clear();
+      lua_settop(threadRef.thread, 0);
+      result.state = AsyncStepResult::State::Error;
+      result.error = e.what();
+      return result;
+    }
+    lua_settop(threadRef.thread, 0);
+    result.state = AsyncStepResult::State::Finished;
+  } else {
+    const char* msg = lua_tostring(threadRef.thread, -1);
+    result.error = msg ? msg : "unknown error";
+    lua_settop(threadRef.thread, 0);
+    result.state = AsyncStepResult::State::Error;
+  }
+
+  return result;
 }
 
 } // namespace lua_core

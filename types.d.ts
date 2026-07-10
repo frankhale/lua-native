@@ -363,6 +363,47 @@ export interface LuaContext {
   execute_file_async<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): Promise<T>;
 
   /**
+   * Executes a Lua script as a coroutine on the **main thread**, transparently
+   * awaiting JavaScript Promises returned by host functions.
+   *
+   * Unlike `execute_script_async` (which runs on a worker thread and forbids
+   * callbacks), this runs on the main thread, so:
+   * - JS callbacks work normally.
+   * - When a host function (global, module function, or `obj:method()`) returns
+   *   a Promise, the Lua coroutine suspends until it settles and resumes with
+   *   the resolved value. A rejection is raised as a Lua error (catchable with
+   *   `pcall`); an uncaught rejection rejects the returned Promise.
+   *
+   * The event loop stays free during the `await` gaps. Only one async operation
+   * may run per context at a time (`is_busy()` is true meanwhile).
+   *
+   * Calling a Promise-returning host function in synchronous `execute_script`
+   * throws — such functions must be awaited via `execute_async`.
+   *
+   * @param script The Lua script to execute
+   * @returns Promise resolving with the script's return value(s)
+   * @example
+   * const lua = new lua_native.init({
+   *   fetchUser: async (id) => (await db.get(id)),
+   * }, { libraries: 'all' });
+   * const name = await lua.execute_async(`
+   *   local user = fetchUser(42)   -- suspends until the JS Promise resolves
+   *   return user.name
+   * `);
+   */
+  execute_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
+
+  /**
+   * Cancels an in-flight `execute_async` run. The returned Promise from the
+   * cancelled `execute_async` rejects with an "execution cancelled" error, and
+   * the suspended coroutine is abandoned. No-op if nothing is running.
+   *
+   * Because JavaScript is single-threaded, this can only take effect while the
+   * script is suspended awaiting a Promise (not during a synchronous Lua loop).
+   */
+  cancel(): void;
+
+  /**
    * Returns whether the context is currently busy with an async operation.
    * While busy, sync methods will throw and new async calls will be rejected.
    */

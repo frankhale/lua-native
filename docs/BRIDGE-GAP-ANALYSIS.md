@@ -84,7 +84,15 @@ net-new findings.
 
 ## Net-new gaps (not currently tracked anywhere)
 
-### A. Asynchronous & concurrency interop
+### A. Asynchronous & concurrency interop — ✅ A1–A3 implemented (July 2026)
+
+> **Status:** A1 (await JS Promises from Lua), A2 (callbacks during async), and
+> A3 (cancellation) are implemented via `execute_async()` + `cancel()` — a
+> main-thread coroutine driver that suspends on host Promises via `lua_yieldk`.
+> A4 (coroutine-as-async-iterator) and A5 (worker pool) remain deferred (both
+> have workarounds; A5 is deferred by design). See the "Coroutine-Driven Async
+> Execution" section in [`FEATURES.md`](./FEATURES.md) and `execute_async()` in
+> the API. The original gap analysis is retained below.
 
 The single biggest divergence from modern bridges. Today `lua-native` async is
 "fire a whole script on a worker thread, and JS callbacks are *forbidden* while it
@@ -290,16 +298,16 @@ with no reasonable JS-side workaround and broad demand.
 
 | # | Gap | Impact | Workaround exists? | Rec. tier |
 |---|---|---|---|---|
-| A1 | ⭐ Await JS Promises from Lua | Very high | No | **1** |
+| A1 | ✅ Await JS Promises from Lua — **done** | Very high | No | **1** |
+| A2 | ✅ Callbacks during async — **done** | Medium | No | **1** |
+| A3 | ✅ Caller-initiated cancellation — **done** | Medium | No | **1** |
 | B1 | ✅ Built-in type fidelity (BigInt/Date/Map/Set/Buffer) — **done** | High (correctness) | Partial, error-prone | **1** |
 | E1 | ⭐ `print`/output redirection | High | No | **1** |
 | C1–C3 | ✅ Class/usertype + operator binding — **done** | High | Verbose Lua glue | **2** |
 | D1 | JS Error fidelity across boundary | Medium-high | No | **2** |
 | E3 | Bytecode text-only / untrusted-chunk guard | Medium (security) | No | **2** |
 | B2 | ✅ Pluggable type-converter registry — **done** | Medium | No | **2** |
-| A2 | Callbacks during async (falls out of A1) | Medium | No | **2** |
 | E2 | Dynamic `require` via JS searcher | Medium | `register_module` (static only) | **3** |
-| A3 | Caller-initiated cancellation | Medium | No | **3** |
 | A4 | Coroutine as (async) iterator | Low-med | Manual `resume` loop | **3** |
 | D2/D3 | Structured errors / pcall surface | Low-med | try/catch + Lua `pcall` | **3** |
 | F1 | Metatables on non-global tables | Low-med | `execute_script` | **3** |

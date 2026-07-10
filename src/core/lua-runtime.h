@@ -215,6 +215,14 @@ struct CoroutineResult {
   std::optional<std::string> error;
 };
 
+// Result of one step of the coroutine-driven async executor.
+struct AsyncStepResult {
+  enum class State { Finished, Awaiting, Error };
+  State state = State::Error;
+  std::vector<LuaPtr> values;  // return values when Finished
+  std::string error;           // message when Error
+};
+
 struct LuaValue {
   using Variant = std::variant<
       std::monostate,  // nil
@@ -295,6 +303,21 @@ public:
   [[nodiscard]] CoroutineResult ResumeCoroutine(const LuaThreadRef& threadRef,
                                                  const std::vector<LuaPtr>& args) const;
   [[nodiscard]] CoroutineStatus GetCoroutineStatus(const LuaThreadRef& threadRef) const;
+
+  // Coroutine-driven async execution (main thread; awaits JS promises).
+  // Loads `script` as a chunk on a fresh coroutine thread.
+  [[nodiscard]] std::variant<LuaThreadRef, std::string> CreateCoroutineFromScript(
+      const std::string& script) const;
+  // Resumes the async coroutine one step. `args` are the values to resume with
+  // (the resolved promise value, or the rejection message when arg_is_error).
+  [[nodiscard]] AsyncStepResult ResumeAsyncStep(const LuaThreadRef& threadRef,
+      const std::vector<LuaPtr>& args, bool arg_is_error);
+  void SetAwaitDriverMode(bool enabled);
+  [[nodiscard]] bool IsAwaitDriverMode() const;
+  void RequestAwaitYield();
+  void RequestCancel();
+  [[nodiscard]] bool IsCancelRequested() const;
+  void ClearCancel();
 
   // Userdata support
   void SetUserdataGCCallback(UserdataGCCallback cb);
@@ -379,6 +402,12 @@ private:
   PropertySetter property_setter_;
   bool async_mode_ = false;
 
+  // Coroutine-driven async (main-thread promise awaiting) state
+  bool await_driver_mode_ = false;  // true while execute_async is driving
+  bool await_pending_ = false;      // set by a host call that returned a promise
+  bool await_is_error_ = false;     // next resume delivers a rejection to raise
+  bool cancel_requested_ = false;   // execute_async was cancelled
+
   void InitState();
   static int LibraryMask(const std::vector<std::string>& libraries);
   bool HasPackageLibrary() const;
@@ -393,6 +422,7 @@ private:
   static int UserdataNewIndex(lua_State* L);
   static int UserdataMethodCall(lua_State* L);
   static int ClassIndex(lua_State* L);
+  static int AsyncContinuation(lua_State* L, int status, lua_KContext ctx);
 };
 
 } // namespace lua_core

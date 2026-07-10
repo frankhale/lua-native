@@ -462,6 +462,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("resume", &LuaContext::ResumeCoroutine),
     InstanceMethod("execute_script_async", &LuaContext::ExecuteScriptAsync),
     InstanceMethod("execute_file_async", &LuaContext::ExecuteFileAsync),
+    InstanceMethod("execute_async", &LuaContext::ExecuteAsync),
+    InstanceMethod("cancel", &LuaContext::Cancel),
     InstanceMethod("is_busy", &LuaContext::IsBusyMethod),
     InstanceMethod("add_search_path", &LuaContext::AddSearchPath),
     InstanceMethod("register_module", &LuaContext::RegisterModule),
@@ -1186,6 +1188,16 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
     }
     try {
       const Napi::Value result = js_callbacks[name].Call(jsArgs);
+      if (result.IsPromise()) {
+        if (!runtime->IsAwaitDriverMode()) {
+          throw std::runtime_error(
+            "'" + name + "' returned a Promise; call it inside execute_async() to await it");
+        }
+        // Stash the promise and signal LuaCallHostFunction to suspend.
+        async_pending_promise_ = Napi::Persistent(result.As<Napi::Object>());
+        runtime->RequestAwaitYield();
+        return std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::nil());
+      }
       return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
     } catch (const Napi::Error& e) {
       throw std::runtime_error(e.Message());
@@ -1337,6 +1349,146 @@ Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
   auto* worker = new LuaFileAsyncWorker(runtime, filepath, this, deferred);
   worker->Queue();
   return deferred.Promise();
+}
+
+// --- Coroutine-driven async execution (execute_async / cancel) ---
+
+Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string script = info[0].As<Napi::String>().Utf8Value();
+
+  auto co = runtime->CreateCoroutineFromScript(script);
+  if (std::holds_alternative<std::string>(co)) {
+    // Reject (rather than throw) so `.catch` and `await` both see the error.
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Reject(Napi::Error::New(env, std::get<std::string>(co)).Value());
+    return deferred.Promise();
+  }
+
+  is_busy_ = true;
+  runtime->ClearCancel();
+  runtime->SetAwaitDriverMode(true);
+  async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
+  async_deferred_.emplace(Napi::Promise::Deferred::New(env));
+
+  Napi::Promise promise = async_deferred_->Promise();
+  // Initial resume (no arguments) — runs until the script finishes or awaits.
+  DriveAsync({}, false);
+  return promise;
+}
+
+void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
+  auto step = runtime->ResumeAsyncStep(*async_co_, args, is_error);
+
+  if (step.state == lua_core::AsyncStepResult::State::Awaiting) {
+    if (async_pending_promise_.IsEmpty()) {
+      // The coroutine yielded without a pending host Promise — e.g. user code
+      // called coroutine.yield at the top level. That has no resumer here.
+      auto deferred = *async_deferred_;
+      FinishAsync();
+      deferred.Reject(Napi::Error::New(env,
+        "coroutine.yield is not supported at the top level of execute_async; "
+        "only awaiting a host Promise suspends execution").Value());
+      return;
+    }
+    // Attach continuation callbacks to the pending promise.
+    Napi::Object promise = async_pending_promise_.Value();
+    async_pending_promise_.Reset();
+    auto thenFn = promise.Get("then").As<Napi::Function>();
+    auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", this);
+    auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", this);
+    thenFn.Call(promise, {onResolve, onReject});
+    return;
+  }
+
+  // Finished or errored: settle the promise and tear down.
+  auto deferred = *async_deferred_;
+  if (step.state == lua_core::AsyncStepResult::State::Finished) {
+    Napi::Value resolved;
+    if (step.values.empty()) {
+      resolved = env.Undefined();
+    } else if (step.values.size() == 1) {
+      resolved = CoreToNapi(*step.values[0]);
+    } else {
+      Napi::Array arr = Napi::Array::New(env, step.values.size());
+      for (size_t i = 0; i < step.values.size(); ++i) arr.Set(i, CoreToNapi(*step.values[i]));
+      resolved = arr;
+    }
+    FinishAsync();
+    deferred.Resolve(resolved);
+  } else {
+    Napi::Error err = Napi::Error::New(env, step.error);
+    FinishAsync();
+    deferred.Reject(err.Value());
+  }
+}
+
+Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error) {
+  // The run may already be gone (e.g. cancelled while awaiting).
+  if (!async_co_ || !async_deferred_) return env.Undefined();
+
+  if (runtime->IsCancelRequested()) {
+    auto deferred = *async_deferred_;
+    FinishAsync();
+    deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
+    return env.Undefined();
+  }
+
+  std::vector<lua_core::LuaPtr> args;
+  if (is_error) {
+    std::string msg;
+    if (value.IsObject() && value.As<Napi::Object>().Has("message")) {
+      msg = value.As<Napi::Object>().Get("message").ToString().Utf8Value();
+    } else {
+      msg = value.ToString().Utf8Value();
+    }
+    args.push_back(std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(msg)));
+  } else {
+    args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
+  }
+  DriveAsync(std::move(args), is_error);
+  return env.Undefined();
+}
+
+void LuaContext::FinishAsync() {
+  runtime->SetAwaitDriverMode(false);
+  runtime->ClearCancel();
+  if (async_co_) {
+    async_co_->release();
+    async_co_.reset();
+  }
+  async_deferred_.reset();
+  async_pending_promise_.Reset();
+  is_busy_ = false;
+}
+
+Napi::Value LuaContext::OnAwaitResolveStatic(const Napi::CallbackInfo& info) {
+  auto* ctx = static_cast<LuaContext*>(info.Data());
+  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), false);
+}
+
+Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
+  auto* ctx = static_cast<LuaContext*>(info.Data());
+  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), true);
+}
+
+Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
+  if (async_co_ && async_deferred_) {
+    // Abandon the suspended coroutine and reject immediately. Any pending
+    // promise settlement becomes a no-op (async_co_ is cleared).
+    auto deferred = *async_deferred_;
+    FinishAsync();
+    deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
+  }
+  return env.Undefined();
 }
 
 // --- AsyncWorker OnOK/OnError implementations ---

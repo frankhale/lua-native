@@ -3831,4 +3831,235 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // ASYNCHRONOUS & CONCURRENCY INTEROP (A1 + A2 + A3)
+  // ============================================
+  describe('async / concurrency interop', () => {
+    const sleep = <T>(ms: number, value?: T): Promise<T> =>
+      new Promise((resolve) => setTimeout(() => resolve(value as T), ms));
+
+    describe('A1 — awaiting JS promises from Lua', () => {
+      it('transparently awaits a Promise returned by a host function', async () => {
+        const lua = new lua_native.init(
+          { fetchUser: async (id: number) => { await sleep(5); return { id, name: `User${id}` }; } },
+          ALL_LIBS
+        );
+        const r = await lua.execute_async(`
+          local u = fetchUser(7)
+          return u.name
+        `);
+        expect(r).toBe('User7');
+      });
+
+      it('awaits multiple promises sequentially', async () => {
+        const lua = new lua_native.init(
+          { getN: async (n: number) => { await sleep(3); return n * 10; } },
+          ALL_LIBS
+        );
+        const r = await lua.execute_async(`
+          local a = getN(1)
+          local b = getN(2)
+          local c = getN(3)
+          return a + b + c
+        `);
+        expect(r).toBe(60);
+      });
+
+      it('awaits an already-resolved Promise', async () => {
+        const lua = new lua_native.init(
+          { now: () => Promise.resolve(42) },
+          ALL_LIBS
+        );
+        expect(await lua.execute_async('return now()')).toBe(42);
+      });
+
+      it('resolves undefined when the script returns nothing', async () => {
+        const lua = new lua_native.init(
+          { ping: async () => { await sleep(2); return true; } },
+          ALL_LIBS
+        );
+        const r = await lua.execute_async('ping()');
+        expect(r).toBeUndefined();
+      });
+
+      it('returns multiple values', async () => {
+        const lua = new lua_native.init(
+          { two: async () => { await sleep(2); return 2; } },
+          ALL_LIBS
+        );
+        const [a, b] = await lua.execute_async('local x = two(); return x, x * 5');
+        expect(a).toBe(2);
+        expect(b).toBe(10);
+      });
+
+      it('awaits a Promise from an object method (obj:method())', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_userdata('api', {}, {
+          methods: { load: async () => { await sleep(3); return 'loaded'; } },
+        });
+        expect(await lua.execute_async('return api:load()')).toBe('loaded');
+      });
+
+      it('awaits a Promise from a class method', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Client', {
+          construct: () => ({}),
+          methods: { get: async (_self, id: number) => { await sleep(3); return id * 2; } },
+        });
+        expect(await lua.execute_async('return Client.new():get(21)')).toBe(42);
+      });
+    });
+
+    describe('A2 — callbacks during async execution', () => {
+      it('runs synchronous JS callbacks in async mode', async () => {
+        const lua = new lua_native.init({ add: (a: number, b: number) => a + b }, ALL_LIBS);
+        expect(await lua.execute_async('return add(2, 3)')).toBe(5);
+      });
+
+      it('mixes sync callbacks and awaited promises', async () => {
+        const lua = new lua_native.init(
+          {
+            double: (n: number) => n * 2,
+            fetchBase: async () => { await sleep(3); return 5; },
+          },
+          ALL_LIBS
+        );
+        const r = await lua.execute_async('return double(fetchBase())');
+        expect(r).toBe(10);
+      });
+    });
+
+    describe('rejections', () => {
+      it('raises a rejected Promise as a Lua error catchable by pcall', async () => {
+        const lua = new lua_native.init(
+          { willFail: () => Promise.reject(new Error('boom')) },
+          ALL_LIBS
+        );
+        const [ok, err] = await lua.execute_async(`
+          local ok, err = pcall(function() return willFail() end)
+          return ok, err
+        `);
+        expect(ok).toBe(false);
+        expect(String(err)).toMatch(/boom/);
+      });
+
+      it('rejects the returned Promise on an uncaught rejection', async () => {
+        const lua = new lua_native.init(
+          { willFail: () => Promise.reject(new Error('kaboom')) },
+          ALL_LIBS
+        );
+        await expect(lua.execute_async('return willFail()')).rejects.toThrow(/kaboom/);
+      });
+
+      it('rejects on a Lua runtime error', async () => {
+        const lua = new lua_native.init(
+          { ok: async () => { await sleep(2); return 1; } },
+          ALL_LIBS
+        );
+        await expect(
+          lua.execute_async('ok(); error("script failed")')
+        ).rejects.toThrow(/script failed/);
+      });
+
+      it('rejects on a compile error', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        await expect(lua.execute_async('this is not lua !!!')).rejects.toThrow();
+      });
+
+      it('rejects a top-level coroutine.yield (no resumer)', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        await expect(
+          lua.execute_async('coroutine.yield(5); return 1')
+        ).rejects.toThrow(/yield is not supported/);
+      });
+    });
+
+    describe('synchronous execution guard', () => {
+      it('throws when a Promise-returning host function is called synchronously', () => {
+        const lua = new lua_native.init({ fetchThing: async () => 1 }, ALL_LIBS);
+        expect(() => lua.execute_script('return fetchThing()')).toThrow(/execute_async/);
+      });
+    });
+
+    describe('busy state', () => {
+      it('reports busy while awaiting and clears when done', async () => {
+        const lua = new lua_native.init(
+          { slow: async () => { await sleep(20); return 1; } },
+          ALL_LIBS
+        );
+        const p = lua.execute_async('return slow()');
+        expect(lua.is_busy()).toBe(true);
+        await p;
+        expect(lua.is_busy()).toBe(false);
+      });
+
+      it('rejects/throws a second async run while one is in flight', async () => {
+        const lua = new lua_native.init(
+          { slow: async () => { await sleep(20); return 1; } },
+          ALL_LIBS
+        );
+        const p = lua.execute_async('return slow()');
+        expect(() => lua.execute_async('return 1')).toThrow(/busy/);
+        await p;
+      });
+
+      it('is reusable after an async run completes', async () => {
+        const lua = new lua_native.init(
+          { val: async () => { await sleep(3); return 7; } },
+          ALL_LIBS
+        );
+        expect(await lua.execute_async('return val()')).toBe(7);
+        expect(await lua.execute_async('return val() + 1')).toBe(8);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('A3 — cancellation', () => {
+      it('cancel() rejects the in-flight run while it is awaiting', async () => {
+        const lua = new lua_native.init(
+          { slow: async () => { await sleep(50); return 1; } },
+          ALL_LIBS
+        );
+        const p = lua.execute_async('local x = slow(); return x');
+        // Cancel on the next tick, while the coroutine is suspended awaiting.
+        await sleep(5);
+        lua.cancel();
+        await expect(p).rejects.toThrow(/cancelled/);
+        expect(lua.is_busy()).toBe(false);
+      });
+
+      it('cancel() is a no-op when nothing is running', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.cancel()).not.toThrow();
+      });
+
+      it('is reusable after a cancellation', async () => {
+        const lua = new lua_native.init(
+          { slow: async () => { await sleep(50); return 1; }, fast: async () => 9 },
+          ALL_LIBS
+        );
+        const p = lua.execute_async('return slow()');
+        await sleep(5);
+        lua.cancel();
+        await expect(p).rejects.toThrow(/cancelled/);
+        expect(await lua.execute_async('return fast()')).toBe(9);
+      });
+    });
+
+    describe('concurrency across contexts', () => {
+      it('runs independent contexts concurrently', async () => {
+        const make = (base: number) =>
+          new lua_native.init(
+            { get: async () => { await sleep(10); return base; } },
+            ALL_LIBS
+          );
+        const ctxs = [1, 2, 3, 4].map(make);
+        const results = await Promise.all(
+          ctxs.map((lua, i) => lua.execute_async(`return get() * ${i + 1}`))
+        );
+        expect(results).toEqual([1, 4, 9, 16]);
+      });
+    });
+  });
 });

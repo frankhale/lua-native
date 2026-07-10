@@ -748,6 +748,99 @@ throws a descriptive error — an instance needs property/method storage.
 
 ---
 
+## Coroutine-Driven Async Execution (July 2026)
+
+### Overview
+
+`execute_async(script)` runs Lua as a coroutine **on the main thread** and
+transparently awaits JavaScript Promises returned by host functions. This is
+distinct from `execute_script_async` (which runs on a libuv worker thread and
+forbids callbacks). When a host function returns a Promise, the Lua coroutine
+suspends until it settles and resumes with the resolved value — so Lua code reads
+naturally:
+
+```lua
+local user = fetchUser(42)   -- fetchUser is `async () => ...`; suspends here
+return user.name
+```
+
+`cancel()` aborts an in-flight run. This closes gaps A1 (await promises), A2
+(callbacks work during async, since we are on the main thread), and A3
+(cancellation) from the gap analysis. A4 (coroutine-as-async-iterator) and A5
+(worker pool) remain deferred.
+
+### Architecture
+
+The mechanism is a **main-thread coroutine driver** built on `lua_yieldk`:
+
+**Core layer (`lua-runtime.cpp`):**
+
+- `CreateCoroutineFromScript` loads the script chunk as a function on a fresh
+  Lua thread (coroutine) and anchors it in the registry.
+- The host dispatchers (`LuaCallHostFunction` and `UserdataMethodCall`), after
+  invoking the JS function, check `await_pending_`. If set, they suspend the
+  coroutine with `lua_yieldk(L, 0, 0, AsyncContinuation)` instead of pushing a
+  return value.
+- `AsyncContinuation` is the `lua_KFunction` resumed when the promise settles.
+  It returns the resume argument (the resolved value) as the awaited call's
+  result, or — when `await_is_error_` is set — raises it as a Lua error via
+  `lua_error` (so rejections are catchable with `pcall`).
+- `ResumeAsyncStep` performs one `lua_resume` and reports whether the coroutine
+  **Finished** (with return values), is **Awaiting** (yielded to await a
+  promise), or **Errored**. It sets `await_is_error_` before resuming so the
+  continuation knows whether the resume value is a result or a rejection.
+
+**Binding layer (`lua-native.cpp`):**
+
+- `CreateJsCallbackWrapper` inspects each host call's result with `IsPromise()`.
+  In async-driver mode it stashes the promise (`async_pending_promise_`), calls
+  `RequestAwaitYield()`, and returns nil (the continuation supplies the real
+  value later). Outside the driver, a returned Promise throws a descriptive
+  error.
+- `ExecuteAsync` creates the coroutine, enters driver mode, and calls
+  `DriveAsync` for the initial resume. `DriveAsync` inspects the step result:
+  **Finished** → resolve the JS Promise; **Errored** → reject it; **Awaiting** →
+  attach `then(onResolve, onReject)` to the stashed promise. The `then`
+  callbacks (`OnAwaitResolveStatic`/`OnAwaitRejectStatic`, carrying the context
+  as function data) call back into `DriveAsync` with the settled value, driving
+  the coroutine forward one await at a time.
+- `Cancel` abandons the suspended coroutine, tears down driver state, and
+  rejects the run's Promise; a later settlement of the outstanding promise
+  becomes a no-op (the drive state is gone).
+
+### Design Decisions
+
+**Main thread, not a worker.** Awaiting a JS Promise and running JS callbacks
+both require the main thread (N-API is not thread-safe). Running the coroutine on
+the main thread makes both work; the event loop stays free during the `await`
+gaps because control returns to it while the promise is pending.
+
+**`lua_yieldk` for transparent await.** Suspending from *inside* a C host call
+(rather than requiring an explicit Lua `await(...)`) needs a yield across the
+C-call boundary, which `lua_yieldk` provides via a continuation. The result: any
+host function returning a Promise suspends automatically — no special Lua syntax.
+
+**Rejections become Lua errors.** A rejected promise is raised inside Lua via
+`lua_error`, so scripts can `pcall` around awaited calls; an uncaught rejection
+propagates out and rejects the JS Promise. This mirrors how synchronous host
+exceptions already surface.
+
+**One run per context, guarded by `is_busy_`.** A single `lua_State` is not
+reentrant, so `execute_async` sets `is_busy_` for the whole run (including await
+gaps). Concurrent async/sync calls on the same context throw; true concurrency
+uses multiple contexts (each its own `lua_State`).
+
+**Cancellation is settle-time, not preemptive.** Because JavaScript is
+single-threaded, `cancel()` can only run while the coroutine is suspended
+awaiting a promise (never mid-CPU-loop). It therefore rejects immediately and
+abandons the suspended coroutine rather than needing an interrupt hook.
+
+**Promise-returning host calls are rejected in sync mode.** Calling such a
+function from `execute_script` throws (there is no coroutine to suspend),
+pointing the user at `execute_async`.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -768,3 +861,4 @@ throws a descriptive error — an instance needs property/method storage.
 | Memory limits | Low | February 2026 |
 | Type-system fidelity (built-in types + converter registry) | Moderate | July 2026 |
 | Class / usertype binding (constructor, methods, operators) | High | July 2026 |
+| Coroutine-driven async (await JS promises, callbacks, cancel) | High | July 2026 |

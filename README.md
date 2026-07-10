@@ -27,6 +27,7 @@ data structures.
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
 - Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_bytecode()` for faster startup
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
+- Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
 - Coroutine support with yield/resume semantics
 - Comprehensive error handling
@@ -621,6 +622,92 @@ const result = await lua.execute_script_async(
   "return 'Hello, ' .. name .. '!'",
 );
 ```
+
+### Awaiting JavaScript Promises (`execute_async`)
+
+`execute_script_async` runs on a worker thread and cannot call back into
+JavaScript. `execute_async` is different: it runs Lua as a coroutine **on the
+main thread**, so JS callbacks work — and when a host function returns a
+**Promise**, the Lua coroutine transparently suspends until it resolves, then
+continues with the resolved value. No special Lua syntax is needed.
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init(
+  {
+    // An async JS function — returns a Promise.
+    fetchUser: async (id) => {
+      const res = await fetch(`https://api.example.com/users/${id}`);
+      return res.json(); // { id, name }
+    },
+    // A synchronous callback — also works during execute_async.
+    upper: (s) => s.toUpperCase(),
+  },
+  { libraries: "all" },
+);
+
+const name = await lua.execute_async(`
+  local user = fetchUser(42)     -- suspends here until the Promise resolves
+  return upper(user.name)        -- sync callbacks work too
+`);
+console.log(name); // e.g. "ADA"
+```
+
+Awaits compose naturally — sequential calls, loops, and multiple values all work:
+
+```javascript
+const total = await lua.execute_async(`
+  local sum = 0
+  for i = 1, 3 do
+    sum = sum + getAmount(i)   -- each getAmount(i) awaits a Promise
+  end
+  return sum
+`);
+```
+
+Promise-returning methods on userdata and class instances are awaited too:
+
+```javascript
+lua.register_class("Client", {
+  construct: () => ({}),
+  methods: { get: async (self, id) => (await db.get(id)) },
+});
+const row = await lua.execute_async('return Client.new():get(7)');
+```
+
+**Rejections** surface as Lua errors, so scripts can `pcall` them; an uncaught
+rejection rejects the returned Promise:
+
+```javascript
+lua.set_global("risky", () => Promise.reject(new Error("nope")));
+
+// Caught inside Lua:
+const [ok, err] = await lua.execute_async(`
+  local ok, err = pcall(function() return risky() end)
+  return ok, err
+`); // [false, "...nope"]
+
+// Uncaught -> the returned Promise rejects:
+await lua.execute_async("return risky()").catch((e) => console.log(e.message)); // "nope"
+```
+
+**Cancellation** — `cancel()` aborts an in-flight run (its Promise rejects). It
+takes effect while the script is suspended awaiting a Promise:
+
+```javascript
+const p = lua.execute_async("local x = slowCall(); return x");
+setTimeout(() => lua.cancel(), 100);
+await p.catch((e) => console.log(e.message)); // "execution cancelled"
+```
+
+Notes:
+
+- Only one async run per context at a time — `is_busy()` is `true` meanwhile, and
+  concurrent calls throw. Use separate contexts for true concurrency.
+- Calling a Promise-returning host function from **synchronous** `execute_script`
+  throws — such functions must be awaited via `execute_async`.
+- Only native `Promise` results suspend; other values are converted as usual.
 
 ### Bytecode Precompilation
 
@@ -1446,6 +1533,14 @@ const fahrenheit = lua.execute_script("return temp.fahrenheit"); // 68
 lua.set_global("big", 9007199254740993n);
 const back = lua.execute_script<bigint>("return big"); // 9007199254740993n
 
+// Type-safe promise-aware async execution
+const asyncLua: LuaContext = new lua_native.init(
+  { load: async (id: number): Promise<number> => id * 2 },
+  { libraries: "all" },
+);
+const doubled: number = await asyncLua.execute_async<number>("return load(21)"); // 42
+asyncLua.cancel(); // aborts an in-flight run (no-op here)
+
 // Type-safe library loading with presets
 const preset: LuaLibraryPreset = "safe";
 const sandboxed: LuaContext = new lua_native.init({}, { libraries: preset });
@@ -1555,6 +1650,40 @@ Executes a Lua file asynchronously on a worker thread.
 JS callbacks are not available during async execution.
 
 **Throws:** Error if the context is busy with another async operation.
+
+### `LuaContext.execute_async(script)`
+
+Executes a Lua script as a coroutine on the **main thread**, transparently
+awaiting JavaScript Promises returned by host functions. Unlike
+`execute_script_async`, JS callbacks work normally.
+
+**Parameters:**
+
+- `script`: String containing Lua code to execute
+
+**Behavior:**
+
+- When a host function (global, module function, or `obj:method()`) returns a
+  `Promise`, the Lua coroutine suspends until it settles, then resumes with the
+  resolved value.
+- A rejected Promise is raised as a Lua error (catchable with `pcall`); an
+  uncaught rejection rejects the returned Promise.
+- Only one async run per context at a time (`is_busy()` is `true` meanwhile).
+
+**Returns:** `Promise` resolving with the script's return value(s), or rejecting
+on error/cancellation.
+
+**Throws:** Error if the context is busy with another async operation. (Compile
+errors reject the returned Promise rather than throwing.)
+
+### `LuaContext.cancel()`
+
+Cancels an in-flight `execute_async` run: its Promise rejects with an "execution
+cancelled" error and the suspended coroutine is abandoned. No-op if nothing is
+running. Because JavaScript is single-threaded, this takes effect while the
+script is suspended awaiting a Promise (not during a synchronous Lua loop).
+
+**Returns:** `void`
 
 ### `LuaContext.is_busy()`
 

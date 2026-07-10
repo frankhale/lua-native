@@ -7,6 +7,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <optional>
 
 #include "core/lua-runtime.h"
 
@@ -83,6 +84,8 @@ public:
     Napi::Value ExecuteFile(const Napi::CallbackInfo& info);
     Napi::Value ExecuteScriptAsync(const Napi::CallbackInfo& info);
     Napi::Value ExecuteFileAsync(const Napi::CallbackInfo& info);
+    Napi::Value ExecuteAsync(const Napi::CallbackInfo& info);
+    Napi::Value Cancel(const Napi::CallbackInfo& info);
     Napi::Value IsBusyMethod(const Napi::CallbackInfo& info);
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
     Napi::Value GetGlobal(const Napi::CallbackInfo& info);
@@ -117,6 +120,18 @@ private:
     std::vector<std::unique_ptr<LuaTableRefData>> lua_table_ref_data_;
 
     bool is_busy_ = false;
+
+    // In-flight coroutine-driven async execution state (execute_async).
+    // Only one runs at a time (guarded by is_busy_).
+    std::optional<lua_core::LuaThreadRef> async_co_;
+    std::optional<Napi::Promise::Deferred> async_deferred_;
+    Napi::ObjectReference async_pending_promise_;
+
+    void DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error);
+    Napi::Value OnAwaitSettled(const Napi::Value& value, bool is_error);
+    void FinishAsync();
+    static Napi::Value OnAwaitResolveStatic(const Napi::CallbackInfo& info);
+    static Napi::Value OnAwaitRejectStatic(const Napi::CallbackInfo& info);
 
     // User-registered JS->Lua type converters, consulted (in registration
     // order) before built-in type handling. Each entry is a {match, convert}
