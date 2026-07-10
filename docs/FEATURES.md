@@ -568,6 +568,186 @@ All methods that touch the Lua stack use `StackGuard` for automatic stack balanc
 
 ---
 
+## Type-System Fidelity (July 2026)
+
+### Overview
+
+The JS→Lua conversion path (`NapiToCoreInstance`) previously handled only
+primitives, arrays, plain objects, and functions. Every other JS type silently
+degraded — `BigInt`/`Symbol` became `nil`, and `Date`/`Map`/`Set`/`Buffer`/
+`TypedArray`/`RegExp` became empty tables. Two features close this gap:
+
+- **B1 — Built-in type handling:** common JS built-ins now convert to their
+  natural Lua representation, and 64-bit integer precision is preserved in both
+  directions.
+- **B2 — Custom type converters:** `register_type_converter(match, convert)`
+  lets applications control how their own types cross into Lua (and override the
+  built-in handling).
+
+### Type Mapping (JS → Lua)
+
+| JS type | Lua result | Notes |
+|---|---|---|
+| `BigInt` | integer | Throws if outside signed 64-bit range |
+| `Symbol` | — | Rejected with a descriptive error (cannot cross) |
+| `Buffer` | string | Binary-safe (embedded nulls preserved) |
+| `TypedArray` (any) | string | Raw bytes, honoring `byteOffset`/`byteLength` |
+| `ArrayBuffer` | string | Raw bytes |
+| `Date` | number | Epoch milliseconds (`getTime()`) |
+| `Map` | table | Keys stringified, matching plain-object behavior; values recurse |
+| `Set` | array | Values recurse |
+| `RegExp` | string | The `.source` pattern (flags dropped) |
+
+Reverse direction (`CoreToNapi`): a Lua integer whose magnitude exceeds
+`2^53 - 1` is returned as a JS `BigInt` (rather than a lossy `Number`), so 64-bit
+integers round-trip exactly. Smaller integers remain `Number`.
+
+### Architecture
+
+**Binding layer (`lua-native.cpp`):**
+
+- Two free helpers: `IsInstanceOfGlobal` (uses `napi_instanceof` against a named
+  global constructor — robust for `Map`/`Set`/`RegExp`, which have no dedicated
+  N-API predicate) and `BinaryBytesToString` (copies Buffer/TypedArray/
+  ArrayBuffer bytes into a binary-safe `std::string`, guarding zero-length
+  views).
+- `ConvertBuiltinType(value, depth, recurse)` centralizes the built-in
+  conversions and takes a `recurse` callback so nested `Map`/`Set` elements pass
+  back through the caller's conversion path (preserving markers and converters).
+  It is shared by both `NapiToCoreInstance` and the static `NapiToCore`.
+- `NapiToCoreInstance` gains `napi_bigint` and `napi_symbol` cases, and inside
+  the object branch runs (in order): internal round-trip markers → user
+  converters → `ConvertBuiltinType` → array → plain object.
+- `CoreToNapi` emits `Napi::BigInt::New` for out-of-safe-range `int64_t`.
+
+**Converter registry:** `type_converters_` on `LuaContext` is an ordered vector
+of `{match, convert}` `Napi::FunctionReference` pairs. During conversion, each
+`match` is called with the value; the first truthy match's `convert` produces a
+JS value that is then converted normally (via `NapiToCoreInstance`, so a
+converter may return any Lua-convertible value, including nested structures).
+
+### Design Decisions
+
+**Converters run after internal markers, before built-ins.** Metatabled-table
+Proxies (`_tableRef`) and userdata handles (`_userdata`) are detected *before*
+converters so reference round-tripping is never hijacked by a catch-all
+converter. Converters then take precedence over the built-in `Date`/`Map`/etc.
+handling, so an application can override those if desired.
+
+**Converters see objects only.** The converter loop lives in the `napi_object`
+branch, so primitives, functions, `BigInt`, and `Symbol` bypass it. This keeps
+primitive conversion fast and predictable; the registry targets the reference
+types where custom handling is actually needed.
+
+**BigInt only on overflow (out).** Returning `BigInt` for *every* Lua integer
+would be a broad breaking change and awkward for the common case. Emitting it
+only above `2^53 - 1` changes behavior solely for values that were already being
+corrupted by precision loss — a pure improvement.
+
+**Symbol rejects rather than nils.** A silent `nil` hides bugs. Since a JS
+`Symbol` has no meaningful Lua representation, conversion throws with a clear
+message (surfaced as a JS error by the existing `set_global`/callback try/catch
+wrappers).
+
+**Map/Set via `Array.from`.** Rather than reimplementing Map/Set iteration
+through the N-API, the helper calls the global `Array.from` to materialize
+entries/values, then walks the resulting array — simple and spec-correct.
+
+---
+
+## Class / Usertype Binding (July 2026)
+
+### Overview
+
+`register_class(name, definition)` lets Lua **construct and drive** JavaScript
+objects, going beyond `set_userdata` (which only exposes a *pre-existing*
+instance). A registered class produces a global constructor table so Lua can
+write `local p = Player.new("Link", 100)`, call methods (`p:take_damage(10)`),
+read/write properties (`p.health`), and use overloaded operators (`a + b`,
+`a == b`, `tostring(a)`).
+
+Three capabilities, per the roadmap:
+
+- **C1 — Constructor binding:** `Class.new(...)` invokes the JS `construct`
+  function and returns a fresh instance bound to the class.
+- **C2 — Shared per-class metatable:** one metatable per class carries the
+  methods, `__index`/`__newindex` (property access), and `__gc`, rather than
+  wiring each instance individually.
+- **C3 — Operator overloading:** `metamethods` (e.g. `__add`, `__eq`, `__lt`,
+  `__len`, `__concat`, `__unm`, `__tostring`, `__call`) dispatch to JS.
+
+### Architecture
+
+**Core layer (`lua-runtime.cpp`):**
+
+- `RegisterClass(class_name, constructor_func_name, method_map, metamethods)`
+  builds three things:
+  1. A shared instance metatable `_class_mt_<class_name>` with `__gc`
+     (`UserdataGC`), `__index` (a new `ClassIndex` closure carrying the class
+     name), `__newindex` (reuses `UserdataNewIndex` → the property setter),
+     `__name`, a `__lua_native_class` marker, and one `LuaCallHostFunction`
+     closure per metamethod (the same bridge `set_metatable` uses).
+  2. A shared method table in the registry at `_class_methods_<class_name>`
+     mapping method name → host function name.
+  3. A global table `<class_name>` whose `new` field is a `LuaCallHostFunction`
+     closure over the constructor host function.
+- `ClassIndex` resolves `instance.key` by first checking the shared class
+  method table (returning a bound `UserdataMethodCall` closure) and then falling
+  through to the property getter — mirroring `UserdataIndex` but class-scoped
+  rather than per-instance.
+- `LuaUserdataRef` gained a `class_name` field. When non-empty, `PushLuaValue`
+  materializes the instance with the class metatable (instead of the opaque/
+  proxy metatables). `ToLuaValue` recognizes a class instance by the
+  `__lua_native_class` marker on its metatable and reconstructs a JS-backed
+  (`opaque = false`) `LuaUserdataRef` carrying the class name — so `self` and
+  operands arrive in JS as the original instance object, not an opaque handle.
+
+**Binding layer (`lua-native.cpp`):**
+
+- `RegisterClass` validates the definition, then registers three kinds of host
+  functions via the existing bridge: the constructor (`__class_ctor_<id>`),
+  each method (`__class_method_<id>_<name>`), and each metamethod
+  (`__class_mm_<id>_<key>`). Methods and metamethods reuse
+  `CreateJsCallbackWrapper`; the constructor uses a dedicated
+  `CreateConstructorWrapper`.
+- `CreateConstructorWrapper` calls the JS `construct` function, requires an
+  object result, allocates a `ref_id`, stores the instance in `js_userdata_`
+  (with the class's `readable`/`writable` flags), tags it with non-enumerable
+  `__luaClassRef`/`__luaClassName` markers, and returns a class-bound
+  `LuaUserdataRef`. `LuaCallHostFunction` then pushes it as class userdata.
+- `NapiToCoreInstance` detects the `__luaClassRef` marker (alongside the
+  existing `_tableRef`/`_userdata` markers) so that a class instance passed
+  *back* into Lua re-materializes as the same class userdata rather than
+  deep-copying to a table.
+
+### Design Decisions
+
+**Reuses the userdata/host-function machinery.** Instances are ordinary
+JS-backed userdata (an `int ref_id` block in `js_userdata_`), method dispatch
+reuses `UserdataMethodCall`, property access reuses the existing
+getter/setter callbacks, and operators reuse `LuaCallHostFunction` — exactly the
+bridge behind `set_metatable`. The only genuinely new pieces are the per-class
+metatable, `ClassIndex`, and the constructor wrapper.
+
+**Shared metatable, shared method table.** Methods live once per class in the
+registry (not per instance), so constructing many instances is cheap. `__gc`
+still balances the per-instance ref count.
+
+**Instance identity round-trips; freshly built JS objects do not.** An instance
+created by `Class.new` is tagged, so passing it out to JS and back (or returning
+`self`/an operand from a method) preserves its identity and class binding.
+However, an object a JS handler constructs *itself* (e.g. `return new Vec(...)`
+inside `__add`) is **not** tagged, so it arrives in Lua as a plain table.
+Metamethods/methods that must yield a usable instance should mutate and return
+`self`, or the instance should be built via `Class.new` in Lua. This matches the
+library's existing userdata round-trip model (JS objects are userdata only when
+the library created the binding).
+
+**`construct` must return an object.** Returning a primitive, array, or function
+throws a descriptive error — an instance needs property/method storage.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -586,3 +766,5 @@ All methods that touch the Lua stack use `StackGuard` for automatic stack balanc
 | Module / require integration | Moderate | February 2026 |
 | Table reference API | Moderate | February 2026 |
 | Memory limits | Low | February 2026 |
+| Type-system fidelity (built-in types + converter registry) | Moderate | July 2026 |
+| Class / usertype binding (constructor, methods, operators) | High | July 2026 |

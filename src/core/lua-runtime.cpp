@@ -395,6 +395,115 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
   return 1;
 }
 
+// --- Class / usertype support ---
+
+void LuaRuntime::RegisterClass(
+    const std::string& class_name,
+    const std::string& constructor_func_name,
+    const std::unordered_map<std::string, std::string>& method_map,
+    const std::vector<MetatableEntry>& metamethods) {
+  StackGuard guard(L_);
+
+  // 1. Create the shared per-class instance metatable.
+  const std::string mt_name = "_class_mt_" + class_name;
+  luaL_newmetatable(L_, mt_name.c_str());
+
+  lua_pushcfunction(L_, UserdataGC);
+  lua_setfield(L_, -2, "__gc");
+
+  // __index closure carries the class name as an upvalue so it can find the
+  // shared method table, then falls through to property access.
+  lua_pushstring(L_, class_name.c_str());
+  lua_pushcclosure(L_, ClassIndex, 1);
+  lua_setfield(L_, -2, "__index");
+
+  // __newindex reuses the property-setter path (honors the writable flag).
+  lua_pushcfunction(L_, UserdataNewIndex);
+  lua_setfield(L_, -2, "__newindex");
+
+  // __name aids default tostring() and error messages.
+  lua_pushstring(L_, class_name.c_str());
+  lua_setfield(L_, -2, "__name");
+
+  // Marker so ToLuaValue recognizes instances as JS-backed class userdata
+  // (and recovers the class name) rather than treating them as opaque.
+  lua_pushstring(L_, class_name.c_str());
+  lua_setfield(L_, -2, "__lua_native_class");
+
+  // Operator overloads / other metamethods dispatch through the host bridge.
+  for (const auto& mm : metamethods) {
+    lua_pushstring(L_, mm.func_name.c_str());
+    lua_pushcclosure(L_, LuaCallHostFunction, 1);
+    lua_setfield(L_, -2, mm.key.c_str());
+  }
+  lua_pop(L_, 1);  // pop metatable
+
+  // 2. Store the shared method table in the registry: { name = host_func_name }.
+  lua_newtable(L_);
+  for (const auto& [name, func_name] : method_map) {
+    lua_pushstring(L_, func_name.c_str());
+    lua_setfield(L_, -2, name.c_str());
+  }
+  const std::string methods_key = "_class_methods_" + class_name;
+  lua_setfield(L_, LUA_REGISTRYINDEX, methods_key.c_str());
+
+  // 3. Create the class global table with a `new` constructor function.
+  lua_newtable(L_);
+  lua_pushstring(L_, constructor_func_name.c_str());
+  lua_pushcclosure(L_, LuaCallHostFunction, 1);
+  lua_setfield(L_, -2, "new");
+  lua_setglobal(L_, class_name.c_str());
+}
+
+int LuaRuntime::ClassIndex(lua_State* L) {
+  auto* block = static_cast<int*>(lua_touserdata(L, 1));
+  if (!block) { lua_pushnil(L); return 1; }
+
+  const char* key = lua_tostring(L, 2);
+  if (!key) { lua_pushnil(L); return 1; }
+
+  const char* class_name = lua_tostring(L, lua_upvalueindex(1));
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (!runtime) { lua_pushnil(L); return 1; }
+
+  // 1. Look up the key in the shared class method table.
+  bool has_methods = false;
+  const std::string methods_key =
+      "_class_methods_" + std::string(class_name ? class_name : "");
+  lua_getfield(L, LUA_REGISTRYINDEX, methods_key.c_str());
+  if (lua_istable(L, -1)) {
+    has_methods = true;
+    lua_getfield(L, -1, key);
+    if (lua_isstring(L, -1)) {
+      // Found: value is the host function name. Return a bound method closure.
+      lua_pushcclosure(L, UserdataMethodCall, 1);  // consumes name as upvalue 1
+      lua_remove(L, -2);  // remove method table
+      return 1;
+    }
+    lua_pop(L, 1);  // pop nil (key not a method)
+  }
+  lua_pop(L, 1);  // pop method table (or nil)
+
+  // 2. Fall through to property access.
+  if (runtime->property_getter_) {
+    try {
+      auto result = runtime->property_getter_(*block, key);
+      PushLuaValue(L, result);
+      return 1;
+    } catch (const std::exception& e) {
+      // Class with methods but not readable: return nil rather than erroring
+      // (methods work independently of readable, matching userdata behavior).
+      if (has_methods) { lua_pushnil(L); return 1; }
+      return luaL_error(L, "Error reading property '%s': %s", key, e.what());
+    }
+  }
+  lua_pushnil(L);
+  return 1;
+}
+
 // --- Metatable support ---
 
 void LuaRuntime::StoreHostFunction(const std::string& name, Function fn) {
@@ -871,6 +980,22 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
             LuaUserdataRef(*block, L)));
         }
       }
+      // Check if it's a registered class instance (per-class metatable carries
+      // a __lua_native_class marker). Treat as JS-backed userdata.
+      if (lua_getmetatable(L, abs_index)) {
+        lua_getfield(L, -1, "__lua_native_class");
+        if (lua_isstring(L, -1)) {
+          std::string class_name = lua_tostring(L, -1);
+          lua_pop(L, 2);  // marker + metatable
+          auto* block = static_cast<int*>(lua_touserdata(L, abs_index));
+          if (block) {
+            return std::make_shared<LuaValue>(LuaValue::from(
+              LuaUserdataRef(*block, L, false, LUA_NOREF, false, std::move(class_name))));
+          }
+        } else {
+          lua_pop(L, 2);  // non-string field + metatable
+        }
+      }
       // Lua-created userdata (from libraries like io) - store as opaque registry ref
       lua_pushvalue(L, abs_index);
       const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -929,7 +1054,13 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             // JS-created userdata - create a new userdata block with same ref_id
             auto* block = static_cast<int*>(lua_newuserdata(L, sizeof(int)));
             *block = v.ref_id;
-            luaL_setmetatable(L, v.proxy ? kProxyUserdataMetaName : kUserdataMetaName);
+            if (!v.class_name.empty()) {
+              // Class instance - use the per-class metatable
+              std::string mt_name = "_class_mt_" + v.class_name;
+              luaL_setmetatable(L, mt_name.c_str());
+            } else {
+              luaL_setmetatable(L, v.proxy ? kProxyUserdataMetaName : kUserdataMetaName);
+            }
             // Increment ref count so __gc balances correctly
             lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
             auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));

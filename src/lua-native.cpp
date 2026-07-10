@@ -3,6 +3,111 @@
 
 #include <cmath>
 #include <limits>
+#include <optional>
+#include <functional>
+
+// --- Built-in JS type conversion helpers (JS -> Lua) ---
+
+// Defines a non-enumerable, non-writable-safe marker property on an object
+// (used to tag class instances so they round-trip back to Lua userdata).
+static void DefineHiddenProp(Napi::Env env, Napi::Object obj,
+                             const char* key, Napi::Value value) {
+  auto Object = env.Global().Get("Object").As<Napi::Object>();
+  auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
+  Napi::Object desc = Napi::Object::New(env);
+  desc.Set("value", value);
+  desc.Set("enumerable", Napi::Boolean::New(env, false));
+  desc.Set("configurable", Napi::Boolean::New(env, true));
+  desc.Set("writable", Napi::Boolean::New(env, true));
+  defineProperty.Call({obj, Napi::String::New(env, key), desc});
+}
+
+// True when `value` is an instance of the named global constructor
+// (e.g. "Map", "Set", "RegExp"). Robust against subclassing.
+static bool IsInstanceOfGlobal(const Napi::Value& value, const char* ctorName) {
+  Napi::Env env = value.Env();
+  Napi::Value ctor = env.Global().Get(ctorName);
+  if (!ctor.IsFunction()) return false;
+  bool result = false;
+  napi_instanceof(env, value, ctor, &result);
+  return result;
+}
+
+// Copies the raw bytes of a Buffer/TypedArray/ArrayBuffer into a std::string
+// (binary-safe). Guards zero-length views to avoid constructing from nullptr.
+static std::string BinaryBytesToString(const Napi::Value& value) {
+  if (value.IsBuffer()) {
+    auto buf = value.As<Napi::Buffer<char>>();
+    return buf.Length() ? std::string(buf.Data(), buf.Length()) : std::string();
+  }
+  if (value.IsTypedArray()) {
+    auto ta = value.As<Napi::TypedArray>();
+    auto ab = ta.ArrayBuffer();
+    const size_t len = ta.ByteLength();
+    const char* base = static_cast<const char*>(ab.Data());
+    return len ? std::string(base + ta.ByteOffset(), len) : std::string();
+  }
+  auto ab = value.As<Napi::ArrayBuffer>();
+  const size_t len = ab.ByteLength();
+  return len ? std::string(static_cast<const char*>(ab.Data()), len) : std::string();
+}
+
+// Converts common JS built-in reference types to LuaValue. Returns nullopt if
+// `value` is not one of the handled types. `recurse` converts nested values
+// (Map values, Set elements) through the caller's conversion path so that
+// markers/converters continue to apply.
+static std::optional<lua_core::LuaValue> ConvertBuiltinType(
+    const Napi::Value& value, int depth,
+    const std::function<lua_core::LuaValue(const Napi::Value&, int)>& recurse) {
+  Napi::Env env = value.Env();
+
+  // Binary data -> binary-safe Lua string (Buffer is also a TypedArray, so it
+  // must be checked first, but BinaryBytesToString handles the ordering).
+  if (value.IsBuffer() || value.IsTypedArray() || value.IsArrayBuffer()) {
+    return lua_core::LuaValue::from(BinaryBytesToString(value));
+  }
+
+  // Date -> epoch milliseconds (double)
+  if (value.IsDate()) {
+    return lua_core::LuaValue::from(value.As<Napi::Date>().ValueOf());
+  }
+
+  // Map -> Lua table. Keys are stringified, matching plain-object behavior.
+  if (IsInstanceOfGlobal(value, "Map")) {
+    Napi::Function arrayFrom =
+      env.Global().Get("Array").As<Napi::Object>().Get("from").As<Napi::Function>();
+    Napi::Array entries = arrayFrom.Call({value}).As<Napi::Array>();
+    lua_core::LuaTable tbl;
+    for (uint32_t i = 0; i < entries.Length(); ++i) {
+      Napi::Array pair = entries.Get(i).As<Napi::Array>();
+      std::string k = pair.Get(static_cast<uint32_t>(0)).ToString().Utf8Value();
+      tbl.emplace(std::move(k), std::make_shared<lua_core::LuaValue>(
+        recurse(pair.Get(static_cast<uint32_t>(1)), depth + 1)));
+    }
+    return lua_core::LuaValue::from(std::move(tbl));
+  }
+
+  // Set -> Lua array
+  if (IsInstanceOfGlobal(value, "Set")) {
+    Napi::Function arrayFrom =
+      env.Global().Get("Array").As<Napi::Object>().Get("from").As<Napi::Function>();
+    Napi::Array vals = arrayFrom.Call({value}).As<Napi::Array>();
+    lua_core::LuaArray arr;
+    arr.reserve(vals.Length());
+    for (uint32_t i = 0; i < vals.Length(); ++i) {
+      arr.push_back(std::make_shared<lua_core::LuaValue>(recurse(vals.Get(i), depth + 1)));
+    }
+    return lua_core::LuaValue::from(std::move(arr));
+  }
+
+  // RegExp -> its source pattern string (flags are dropped)
+  if (IsInstanceOfGlobal(value, "RegExp")) {
+    return lua_core::LuaValue::from(
+      value.As<Napi::Object>().Get("source").ToString().Utf8Value());
+  }
+
+  return std::nullopt;
+}
 
 // --- Proxy trap functions for LuaTableRef ---
 
@@ -365,7 +470,9 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("load_bytecode", &LuaContext::LoadBytecode),
     InstanceMethod("create_table", &LuaContext::CreateTableMethod),
     InstanceMethod("get_global_ref", &LuaContext::GetGlobalRef),
-    InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage)
+    InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage),
+    InstanceMethod("register_type_converter", &LuaContext::RegisterTypeConverter),
+    InstanceMethod("register_class", &LuaContext::RegisterClass)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -627,6 +734,88 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
     runtime->SetUserdataMethodTable(ref_id, method_map);
   }
 
+  return env.Undefined();
+}
+
+Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
+    Napi::TypeError::New(env,
+      "register_class(name, definition) requires a string name and an object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string class_name = info[0].As<Napi::String>().Utf8Value();
+  auto def = info[1].As<Napi::Object>();
+
+  if (!def.Has("construct") || !def.Get("construct").IsFunction()) {
+    Napi::TypeError::New(env,
+      "register_class() definition requires a 'construct' function")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  auto constructFn = def.Get("construct").As<Napi::Function>();
+
+  bool readable = false;
+  bool writable = false;
+  if (def.Has("readable") && def.Get("readable").IsBoolean()) {
+    readable = def.Get("readable").As<Napi::Boolean>().Value();
+  }
+  if (def.Has("writable") && def.Get("writable").IsBoolean()) {
+    writable = def.Get("writable").As<Napi::Boolean>().Value();
+  }
+
+  const int class_id = next_class_id_++;
+
+  // Constructor host function (special wrapper: builds + registers an instance).
+  const std::string ctor_name = "__class_ctor_" + std::to_string(class_id);
+  js_callbacks[ctor_name] = Napi::Persistent(constructFn);
+  runtime->StoreHostFunction(ctor_name,
+    CreateConstructorWrapper(ctor_name, class_name, readable, writable));
+
+  // Instance methods (obj:method()).
+  std::unordered_map<std::string, std::string> method_map;
+  if (def.Has("methods") && def.Get("methods").IsObject()) {
+    auto methods = def.Get("methods").As<Napi::Object>();
+    Napi::Array keys = methods.GetPropertyNames();
+    for (uint32_t i = 0; i < keys.Length(); ++i) {
+      std::string name = keys.Get(i).As<Napi::String>().Utf8Value();
+      Napi::Value val = methods.Get(name);
+      if (val.IsFunction()) {
+        std::string func_name = "__class_method_" + std::to_string(class_id) + "_" + name;
+        js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+        runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+        method_map[name] = func_name;
+      }
+    }
+  }
+
+  // Metamethods (operator overloads, __tostring, __call, etc.).
+  std::vector<lua_core::MetatableEntry> metamethods;
+  if (def.Has("metamethods") && def.Get("metamethods").IsObject()) {
+    auto mms = def.Get("metamethods").As<Napi::Object>();
+    Napi::Array keys = mms.GetPropertyNames();
+    for (uint32_t i = 0; i < keys.Length(); ++i) {
+      std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
+      Napi::Value val = mms.Get(key);
+      if (val.IsFunction()) {
+        std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
+        js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+        runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+        lua_core::MetatableEntry entry;
+        entry.key = key;
+        entry.is_function = true;
+        entry.func_name = func_name;
+        metamethods.push_back(std::move(entry));
+      }
+    }
+  }
+
+  runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
   return env.Undefined();
 }
 
@@ -963,6 +1152,23 @@ Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& info) {
   return Napi::Number::New(env, static_cast<double>(runtime->GetMemoryUsage()));
 }
 
+Napi::Value LuaContext::RegisterTypeConverter(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 2 || !info[0].IsFunction() || !info[1].IsFunction()) {
+    Napi::TypeError::New(env,
+      "register_type_converter(match, convert) requires two functions")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  type_converters_.emplace_back(
+    Napi::Persistent(info[0].As<Napi::Function>()),
+    Napi::Persistent(info[1].As<Napi::Function>()));
+  return env.Undefined();
+}
+
 LuaContext::~LuaContext() {
   // Clear callbacks to prevent accessing member state during lua_close()
   if (runtime) {
@@ -984,6 +1190,52 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
     } catch (const Napi::Error& e) {
       throw std::runtime_error(e.Message());
     }
+  };
+}
+
+lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
+    const std::string& name, const std::string& class_name,
+    bool readable, bool writable) {
+  return [this, name, class_name, readable, writable](
+      const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    std::vector<napi_value> jsArgs;
+    jsArgs.reserve(args.size());
+    for (const auto& a : args) {
+      jsArgs.push_back(CoreToNapi(*a));
+    }
+
+    Napi::Value instance;
+    try {
+      instance = js_callbacks[name].Call(jsArgs);
+    } catch (const Napi::Error& e) {
+      throw std::runtime_error(e.Message());
+    }
+
+    if (!instance.IsObject() || instance.IsArray() || instance.IsFunction()) {
+      throw std::runtime_error(
+        "Class '" + class_name + "' constructor must return an object");
+    }
+
+    // Register the new instance as JS-backed userdata.
+    const int ref_id = next_userdata_id_++;
+    auto instObj = instance.As<Napi::Object>();
+    // Tag the instance so that passing the JS object back into Lua re-materializes
+    // it as the same class userdata instead of deep-copying it to a table.
+    DefineHiddenProp(env, instObj, "__luaClassRef", Napi::Number::New(env, ref_id));
+    DefineHiddenProp(env, instObj, "__luaClassName", Napi::String::New(env, class_name));
+
+    UserdataEntry entry;
+    entry.object = Napi::Persistent(instObj);
+    entry.readable = readable;
+    entry.writable = writable;
+    js_userdata_[ref_id] = std::move(entry);
+
+    // Return a class-bound userdata reference; PushLuaValue materializes it
+    // with the per-class metatable.
+    return std::make_shared<lua_core::LuaValue>(
+      lua_core::LuaValue::from(lua_core::LuaUserdataRef(
+        ref_id, runtime->RawState(), /*opaque=*/false, LUA_NOREF,
+        /*proxy=*/false, class_name)));
   };
 }
 
@@ -1175,6 +1427,15 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   if (type == napi_boolean) {
     return lua_core::LuaValue::from(value.As<Napi::Boolean>().Value());
   }
+  if (type == napi_bigint) {
+    bool lossless = false;
+    const int64_t i = value.As<Napi::BigInt>().Int64Value(&lossless);
+    if (!lossless) {
+      throw std::runtime_error(
+        "BigInt value is out of range for a 64-bit Lua integer");
+    }
+    return lua_core::LuaValue::from(i);
+  }
   if (type == napi_number) {
     const double num = value.As<Napi::Number>().DoubleValue();
     if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
@@ -1188,6 +1449,9 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   }
   if (type == napi_string) {
     return lua_core::LuaValue::from(value.As<Napi::String>().Utf8Value());
+  }
+  if (type == napi_symbol) {
+    throw std::runtime_error("Cannot convert a JavaScript Symbol to a Lua value");
   }
 
   if (type == napi_object) {
@@ -1213,6 +1477,35 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
             data->userdataRef.proxy));
         }
       }
+
+      // Check if it's a registered class instance round-tripping back to Lua.
+      if (obj.Has("__luaClassRef")) {
+        Napi::Value r = obj.Get("__luaClassRef");
+        Napi::Value cn = obj.Get("__luaClassName");
+        if (r.IsNumber() && cn.IsString()) {
+          const int ref_id = r.As<Napi::Number>().Int32Value();
+          if (js_userdata_.find(ref_id) != js_userdata_.end()) {
+            return lua_core::LuaValue::from(lua_core::LuaUserdataRef(
+              ref_id, runtime->RawState(), /*opaque=*/false, LUA_NOREF,
+              /*proxy=*/false, cn.As<Napi::String>().Utf8Value()));
+          }
+        }
+      }
+    }
+
+    // B2: user-registered converters get first look at objects (after internal
+    // round-trip markers, before built-in type handling). A converter returns a
+    // JS value that is then converted normally.
+    for (auto& conv : type_converters_) {
+      if (conv.first.Value().Call({value}).ToBoolean().Value()) {
+        return NapiToCoreInstance(conv.second.Value().Call({value}), depth + 1);
+      }
+    }
+
+    // B1: common built-in JS types (binary data, Date, Map, Set, RegExp)
+    if (auto builtin = ConvertBuiltinType(value, depth,
+          [this](const Napi::Value& v, int d) { return NapiToCoreInstance(v, d); })) {
+      return std::move(*builtin);
     }
 
     if (value.IsArray()) {
@@ -1251,6 +1544,15 @@ lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
   if (type == napi_boolean) {
     return lua_core::LuaValue::from(value.As<Napi::Boolean>().Value());
   }
+  if (type == napi_bigint) {
+    bool lossless = false;
+    const int64_t i = value.As<Napi::BigInt>().Int64Value(&lossless);
+    if (!lossless) {
+      throw std::runtime_error(
+        "BigInt value is out of range for a 64-bit Lua integer");
+    }
+    return lua_core::LuaValue::from(i);
+  }
   if (type == napi_number) {
     const double num = value.As<Napi::Number>().DoubleValue();
     if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
@@ -1265,8 +1567,17 @@ lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
   if (type == napi_string) {
     return lua_core::LuaValue::from(value.As<Napi::String>().Utf8Value());
   }
+  if (type == napi_symbol) {
+    throw std::runtime_error("Cannot convert a JavaScript Symbol to a Lua value");
+  }
 
   if (type == napi_object) {
+    // Common built-in JS types (binary data, Date, Map, Set, RegExp)
+    if (auto builtin = ConvertBuiltinType(value, depth,
+          [](const Napi::Value& v, int d) { return NapiToCore(v, d); })) {
+      return std::move(*builtin);
+    }
+
     if (value.IsArray()) {
       const auto arr = value.As<Napi::Array>();
       lua_core::LuaArray coreArr;
@@ -1299,6 +1610,12 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
         } else if constexpr (std::is_same_v<T, bool>) {
           return Napi::Boolean::New(env, v);
         } else if constexpr (std::is_same_v<T, int64_t>) {
+          // Values beyond ±(2^53 - 1) can't be represented exactly as a JS
+          // Number, so emit a BigInt to preserve Lua's 64-bit integer.
+          constexpr int64_t kMaxSafeInteger = 9007199254740991LL;  // 2^53 - 1
+          if (v > kMaxSafeInteger || v < -kMaxSafeInteger) {
+            return Napi::BigInt::New(env, v);
+          }
           return Napi::Number::New(env, static_cast<double>(v));
         } else if constexpr (std::is_same_v<T, double>) {
           return Napi::Number::New(env, v);

@@ -5,6 +5,8 @@
 #include <string>
 #include <unordered_map>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "core/lua-runtime.h"
 
@@ -96,6 +98,8 @@ public:
     Napi::Value CreateTableMethod(const Napi::CallbackInfo& info);
     Napi::Value GetGlobalRef(const Napi::CallbackInfo& info);
     Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
+    Napi::Value RegisterTypeConverter(const Napi::CallbackInfo& info);
+    Napi::Value RegisterClass(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 
@@ -114,14 +118,23 @@ private:
 
     bool is_busy_ = false;
 
+    // User-registered JS->Lua type converters, consulted (in registration
+    // order) before built-in type handling. Each entry is a {match, convert}
+    // pair of JS functions.
+    std::vector<std::pair<Napi::FunctionReference, Napi::FunctionReference>> type_converters_;
+
     // Userdata reference tracking
     std::unordered_map<int, UserdataEntry> js_userdata_;
     int next_userdata_id_ = 1;
     int next_metatable_id_ = 1;
     int next_module_id_ = 1;
+    int next_class_id_ = 1;
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);
+    lua_core::LuaRuntime::Function CreateConstructorWrapper(
+        const std::string& name, const std::string& class_name,
+        bool readable, bool writable);
     Napi::Object CreateTableHandle(Napi::Env env, int registry_ref);
 
 public:

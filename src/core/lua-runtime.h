@@ -109,18 +109,21 @@ struct LuaUserdataRef {
   lua_State* L;
   bool opaque;          // true = Lua-created userdata (can't inspect internals)
   bool proxy;           // true = property access enabled (__index/__newindex)
+  std::string class_name;  // non-empty => instance bound to a registered class metatable
 
   LuaUserdataRef(int id, lua_State* state, bool is_opaque = false,
-                 int reg_ref = LUA_NOREF, bool is_proxy = false)
+                 int reg_ref = LUA_NOREF, bool is_proxy = false,
+                 std::string cls = "")
     : ref_id(id), registry_ref(reg_ref), L(state),
-      opaque(is_opaque), proxy(is_proxy) {}
+      opaque(is_opaque), proxy(is_proxy), class_name(std::move(cls)) {}
 
   LuaUserdataRef(const LuaUserdataRef&) = default;
   LuaUserdataRef& operator=(const LuaUserdataRef&) = default;
 
   LuaUserdataRef(LuaUserdataRef&& other) noexcept
     : ref_id(other.ref_id), registry_ref(other.registry_ref),
-      L(other.L), opaque(other.opaque), proxy(other.proxy) {
+      L(other.L), opaque(other.opaque), proxy(other.proxy),
+      class_name(std::move(other.class_name)) {
     other.registry_ref = LUA_NOREF;
     other.L = nullptr;
   }
@@ -133,6 +136,7 @@ struct LuaUserdataRef {
       L = other.L;
       opaque = other.opaque;
       proxy = other.proxy;
+      class_name = std::move(other.class_name);
       other.registry_ref = LUA_NOREF;
       other.L = nullptr;
     }
@@ -316,6 +320,18 @@ public:
   void SetUserdataMethodTable(int ref_id,
       const std::unordered_map<std::string, std::string>& method_map);
 
+  /// Register a class/usertype. Creates a global table `class_name` with a
+  /// `new` function that invokes the constructor host function, plus a shared
+  /// per-class instance metatable (methods, property access, metamethods).
+  /// constructor_func_name: host function that builds+registers an instance and
+  ///   returns a class-bound LuaUserdataRef.
+  /// method_map: instance method name -> host function name (obj:method()).
+  /// metamethods: operator/metamethod entries (all is_function == true).
+  void RegisterClass(const std::string& class_name,
+      const std::string& constructor_func_name,
+      const std::unordered_map<std::string, std::string>& method_map,
+      const std::vector<MetatableEntry>& metamethods);
+
   // Table reference operations (for metatabled tables preserved as refs)
   [[nodiscard]] LuaPtr GetTableField(int registry_ref, const std::string& key) const;
   void SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const;
@@ -376,6 +392,7 @@ private:
   static int UserdataIndex(lua_State* L);
   static int UserdataNewIndex(lua_State* L);
   static int UserdataMethodCall(lua_State* L);
+  static int ClassIndex(lua_State* L);
 };
 
 } // namespace lua_core

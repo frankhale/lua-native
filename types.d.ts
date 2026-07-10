@@ -20,6 +20,7 @@ export type LuaValue =
   | null
   | boolean
   | number
+  | bigint
   | string
   | LuaValue[]
   | LuaTable
@@ -133,6 +134,40 @@ export interface UserdataOptions {
    * // Lua: player:move(10, 20)
    */
   methods?: Record<string, UserdataMethod>;
+}
+
+/**
+ * Defines a JavaScript class/usertype registered with `register_class()`.
+ * Lua can construct instances via `ClassName.new(...)`, call methods with
+ * `instance:method()`, access properties, and use overloaded operators.
+ */
+export interface ClassDefinition {
+  /**
+   * Constructor invoked when Lua calls `ClassName.new(...)`. Receives the Lua
+   * call arguments and must return the instance object. Lua holds the returned
+   * object by reference (as userdata), not a copy.
+   */
+  construct: (...args: LuaValue[]) => object;
+
+  /**
+   * Instance methods callable from Lua via `instance:method(args)`. Each method
+   * receives the instance object as the first argument (`self`).
+   */
+  methods?: Record<string, UserdataMethod>;
+
+  /**
+   * Metamethods for the class — operator overloads and hooks such as `__add`,
+   * `__eq`, `__lt`, `__le`, `__len`, `__concat`, `__unm`, `__tostring`, and
+   * `__call`. Each receives its Lua operands (instances arrive as their JS
+   * objects) and returns the result.
+   */
+  metamethods?: Record<string, LuaCallback>;
+
+  /** Allow Lua to read instance properties via `instance.prop` (default: false) */
+  readable?: boolean;
+
+  /** Allow Lua to write instance properties via `instance.prop = v` (default: false) */
+  writable?: boolean;
 }
 
 /**
@@ -416,6 +451,72 @@ export interface LuaContext {
    * ref.release();
    */
   get_global_ref(name: string): LuaTableHandle;
+
+  /**
+   * Registers a custom JS→Lua converter for values crossing into Lua.
+   *
+   * Converters are consulted in registration order, after internal round-trip
+   * markers (metatabled-table Proxies and userdata handles) but before the
+   * built-in handling of objects, arrays, and built-in types (Date, Map, Set,
+   * Buffer, etc.). This lets application-specific types cross the boundary
+   * under your control — and lets you override the built-in behavior for
+   * types like Date or typed arrays.
+   *
+   * `match` is called with each object-typed value; if it returns a truthy
+   * value, `convert` is called and its return value is converted to Lua
+   * normally (so a converter may return a string, number, array, plain
+   * object, etc.). Converters do not see primitives, functions, BigInt, or
+   * Symbol values.
+   *
+   * @param match Predicate deciding whether this converter applies to a value
+   * @param convert Maps a matched value to a Lua-convertible JS value
+   * @example
+   * class Money { constructor(public cents: number) {} }
+   * lua.register_type_converter(
+   *   (v) => v instanceof Money,
+   *   (v: Money) => ({ cents: v.cents, dollars: v.cents / 100 })
+   * );
+   * lua.set_global('price', new Money(1299));
+   * lua.execute_script('return price.dollars'); // 12.99
+   */
+  register_type_converter(
+    match: (value: unknown) => boolean,
+    convert: (value: any) => LuaValue
+  ): void;
+
+  /**
+   * Registers a JavaScript class/usertype so Lua can construct and drive its
+   * instances. Creates a global table `name` with a `new(...)` constructor.
+   *
+   * When Lua calls `name.new(...)`, the definition's `construct` function runs
+   * and its returned object is held by reference as userdata bound to a shared
+   * per-class metatable — so methods, property access, and overloaded operators
+   * all dispatch back to JavaScript. Instances are garbage-collected by Lua.
+   *
+   * @param name The global class name in Lua (also the constructor table name)
+   * @param definition Constructor, methods, metamethods, and property access flags
+   * @example
+   * class Vec {
+   *   constructor(public x: number, public y: number) {}
+   * }
+   * lua.register_class('Vec', {
+   *   construct: (x, y) => new Vec(x, y),
+   *   readable: true,
+   *   methods: {
+   *     length: (self) => Math.hypot(self.x, self.y),
+   *   },
+   *   metamethods: {
+   *     __add: (a, b) => new Vec(a.x + b.x, a.y + b.y),
+   *     __tostring: (self) => `(${self.x}, ${self.y})`,
+   *   },
+   * });
+   * lua.execute_script(`
+   *   local a = Vec.new(3, 4)
+   *   print(a:length())        -- 5
+   *   print(tostring(a + Vec.new(1, 1)))  -- (4, 5)
+   * `);
+   */
+  register_class(name: string, definition: ClassDefinition): void;
 }
 
 /**

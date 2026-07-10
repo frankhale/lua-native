@@ -3377,4 +3377,458 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // TYPE-SYSTEM FIDELITY (B1 + B2)
+  // ============================================
+  describe('type-system fidelity', () => {
+    describe('BigInt', () => {
+      it('converts a JS BigInt to a Lua integer', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('n', 42n as any);
+        expect(lua.execute_script('return n')).toBe(42);
+        expect(lua.execute_script('return math.type(n)')).toBe('integer');
+      });
+
+      it('preserves 64-bit precision beyond Number.MAX_SAFE_INTEGER', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const big = 9007199254740993n; // 2^53 + 1, not exactly representable as a double
+        lua.set_global('n', big as any);
+        const back = lua.execute_script('return n');
+        expect(typeof back).toBe('bigint');
+        expect(back).toBe(big);
+      });
+
+      it('returns large Lua integers as BigInt', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const r = lua.execute_script('return math.maxinteger');
+        expect(typeof r).toBe('bigint');
+        expect(r).toBe(9223372036854775807n);
+      });
+
+      it('returns small Lua integers as Number', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const r = lua.execute_script('return 123');
+        expect(typeof r).toBe('number');
+        expect(r).toBe(123);
+      });
+
+      it('throws for a BigInt out of int64 range', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.set_global('n', (2n ** 100n) as any)).toThrow(/out of range/);
+      });
+    });
+
+    describe('Symbol', () => {
+      it('rejects a JS Symbol with a clear error', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.set_global('s', Symbol('x') as any)).toThrow(/Symbol/);
+      });
+    });
+
+    describe('binary data', () => {
+      it('converts a Buffer to a binary-safe Lua string', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('buf', Buffer.from('hello') as any);
+        expect(lua.execute_script('return buf')).toBe('hello');
+        expect(lua.execute_script('return #buf')).toBe(5);
+      });
+
+      it('preserves embedded null bytes from a Buffer', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('buf', Buffer.from([0x00, 0x01, 0xff]) as any);
+        expect(lua.execute_script('return #buf')).toBe(3);
+        expect(lua.execute_script('return string.byte(buf, 3)')).toBe(255);
+      });
+
+      it('converts a Uint8Array to a Lua string', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('ta', new Uint8Array([104, 105]) as any); // "hi"
+        expect(lua.execute_script('return ta')).toBe('hi');
+      });
+
+      it('honors a typed-array byteOffset (subarray view)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const sub = new Uint8Array([1, 2, 3, 4, 5]).subarray(2); // [3,4,5], offset 2
+        lua.set_global('sub', sub as any);
+        expect(lua.execute_script('return #sub')).toBe(3);
+        expect(lua.execute_script('return string.byte(sub, 1)')).toBe(3);
+      });
+
+      it('uses raw byte length for wide typed arrays', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('u16', new Uint16Array([1, 2]) as any); // 4 bytes
+        expect(lua.execute_script('return #u16')).toBe(4);
+      });
+
+      it('converts an ArrayBuffer to a Lua string', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('ab', new Uint8Array([65, 66, 67]).buffer as any); // "ABC"
+        expect(lua.execute_script('return ab')).toBe('ABC');
+      });
+
+      it('handles an empty Buffer', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('buf', Buffer.alloc(0) as any);
+        expect(lua.execute_script('return #buf')).toBe(0);
+      });
+    });
+
+    describe('Date', () => {
+      it('converts a Date to epoch milliseconds', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('d', new Date(1234) as any);
+        expect(lua.execute_script('return d')).toBe(1234);
+      });
+    });
+
+    describe('Map', () => {
+      it('converts a Map to a Lua table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('m', new Map([['a', 1], ['b', 2]]) as any);
+        expect(lua.execute_script('return m.a')).toBe(1);
+        expect(lua.execute_script('return m.b')).toBe(2);
+      });
+
+      it('recurses into nested Map values', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('m', new Map<string, any>([['nested', new Map([['x', 5]])]]) as any);
+        expect(lua.execute_script('return m.nested.x')).toBe(5);
+      });
+    });
+
+    describe('Set', () => {
+      it('converts a Set to a Lua array', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('s', new Set([10, 20, 30]) as any);
+        expect(lua.execute_script('return #s')).toBe(3);
+        expect(lua.execute_script('return s[1]')).toBe(10);
+        expect(lua.execute_script('return s[3]')).toBe(30);
+      });
+    });
+
+    describe('RegExp', () => {
+      it('converts a RegExp to its source pattern string', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('re', /foo\d+/g as any);
+        expect(lua.execute_script('return re')).toBe('foo\\d+');
+      });
+    });
+
+    describe('custom type converters (register_type_converter)', () => {
+      class Money {
+        constructor(public cents: number) {}
+      }
+
+      it('applies a registered converter for a custom class', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v) => v instanceof Money,
+          (v: Money) => ({ cents: v.cents, dollars: v.cents / 100 })
+        );
+        lua.set_global('price', new Money(1299) as any);
+        expect(lua.execute_script('return price.cents')).toBe(1299);
+        expect(lua.execute_script('return price.dollars')).toBe(12.99);
+      });
+
+      it('lets a converter override built-in handling (Date)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v) => v instanceof Date,
+          () => 'custom-date'
+        );
+        lua.set_global('d', new Date() as any);
+        expect(lua.execute_script('return d')).toBe('custom-date');
+      });
+
+      it('consults converters in registration order (first match wins)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(() => true, () => 'first');
+        lua.register_type_converter(() => true, () => 'second');
+        lua.set_global('o', {} as any);
+        expect(lua.execute_script('return o')).toBe('first');
+      });
+
+      it('does not intercept internal round-trip markers (reference integrity)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('shared = setmetatable({ v = 7 }, {})');
+        const proxy = lua.get_global('shared'); // metatabled table -> Proxy w/ _tableRef
+        lua.register_type_converter(() => true, () => 'HIJACKED');
+        lua.set_global('roundtrip', proxy);
+        // The proxy must round-trip as the original table, not be hijacked.
+        expect(lua.execute_script('return roundtrip.v')).toBe(7);
+      });
+
+      it('does not intercept plain primitives', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(() => true, () => 'converted');
+        lua.set_global('n', 5);
+        lua.set_global('s', 'hi');
+        expect(lua.execute_script('return n')).toBe(5);
+        expect(lua.execute_script('return s')).toBe('hi');
+      });
+
+      it('throws when arguments are not both functions', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).register_type_converter(null, () => {})).toThrow(/two functions/);
+        expect(() => (lua as any).register_type_converter(() => true)).toThrow(/two functions/);
+      });
+    });
+  });
+
+  // ============================================
+  // CLASS / USERTYPE BINDING (C1 + C2 + C3)
+  // ============================================
+  describe('class / usertype binding', () => {
+    class Vec {
+      constructor(public x: number, public y: number) {}
+    }
+
+    function makeVecContext() {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_class('Vec', {
+        construct: (x, y) => new Vec(x as number, y as number),
+        readable: true,
+        writable: true,
+        methods: {
+          length: (self) => Math.hypot(self.x, self.y),
+          add_in_place: (self, other) => {
+            self.x += other.x;
+            self.y += other.y;
+            return self;
+          },
+          coords: (self) => [self.x, self.y],
+        },
+        metamethods: {
+          __add: (a, b) => ({ x: a.x + b.x, y: a.y + b.y }),
+          __eq: (a, b) => a.x === b.x && a.y === b.y,
+          __lt: (a, b) => a.x * a.x + a.y * a.y < b.x * b.x + b.y * b.y,
+          __le: (a, b) => a.x * a.x + a.y * a.y <= b.x * b.x + b.y * b.y,
+          __unm: (a) => ({ x: -a.x, y: -a.y }),
+          __tostring: (self) => `(${self.x}, ${self.y})`,
+          __concat: (a, b) =>
+            (typeof a === 'string' ? a : `(${a.x},${a.y})`) +
+            (typeof b === 'string' ? b : `(${b.x},${b.y})`),
+        },
+      });
+      return lua;
+    }
+
+    describe('C1 — construction', () => {
+      it('constructs an instance via Class.new()', () => {
+        const lua = makeVecContext();
+        const [x, y] = lua.execute_script('local v = Vec.new(3, 4); return v.x, v.y');
+        expect(x).toBe(3);
+        expect(y).toBe(4);
+      });
+
+      it('passes constructor arguments through', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const seen: any[] = [];
+        lua.register_class('Thing', {
+          construct: (...args) => {
+            seen.push(args);
+            return { sum: (args as number[]).reduce((a, b) => a + b, 0) };
+          },
+          readable: true,
+        });
+        const r = lua.execute_script('return Thing.new(1, 2, 3).sum');
+        expect(r).toBe(6);
+        expect(seen[0]).toEqual([1, 2, 3]);
+      });
+
+      it('creates independent instances', () => {
+        const lua = makeVecContext();
+        const [ax, bx] = lua.execute_script(`
+          local a = Vec.new(1, 1)
+          local b = Vec.new(9, 9)
+          a.x = 5
+          return a.x, b.x
+        `);
+        expect(ax).toBe(5);
+        expect(bx).toBe(9);
+      });
+
+      it('throws if the constructor does not return an object', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Bad', { construct: () => 42 as any });
+        expect(() => lua.execute_script('return Bad.new()')).toThrow(/must return an object/);
+      });
+    });
+
+    describe('C2 — methods & properties', () => {
+      it('calls instance methods with self', () => {
+        const lua = makeVecContext();
+        expect(lua.execute_script('return Vec.new(3, 4):length()')).toBe(5);
+      });
+
+      it('returns multiple values from a method', () => {
+        const lua = makeVecContext();
+        const [x, y] = lua.execute_script('return Vec.new(7, 8):coords()');
+        expect(x).toBe(7);
+        expect(y).toBe(8);
+      });
+
+      it('mutates instance state through a method that returns self', () => {
+        const lua = makeVecContext();
+        const [x, y] = lua.execute_script(`
+          local v = Vec.new(1, 2)
+          v:add_in_place(Vec.new(10, 20))
+          return v.x, v.y
+        `);
+        expect(x).toBe(11);
+        expect(y).toBe(22);
+      });
+
+      it('reads and writes properties', () => {
+        const lua = makeVecContext();
+        const [before, after] = lua.execute_script(`
+          local v = Vec.new(1, 1)
+          local before = v.x
+          v.x = 99
+          return before, v.x
+        `);
+        expect(before).toBe(1);
+        expect(after).toBe(99);
+      });
+
+      it('methods work even when the class is not readable', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Secret', {
+          construct: (v) => ({ hidden: v }),
+          methods: { reveal: (self) => self.hidden },
+        });
+        expect(lua.execute_script('return Secret.new(42):reveal()')).toBe(42);
+        // property read is nil because the class is not readable
+        expect(lua.execute_script('return Secret.new(42).hidden')).toBeNull();
+      });
+    });
+
+    describe('C3 — operator overloading', () => {
+      it('__add', () => {
+        const lua = makeVecContext();
+        const sum = lua.execute_script('return Vec.new(1, 2) + Vec.new(3, 4)');
+        expect(sum).toEqual({ x: 4, y: 6 });
+      });
+
+      it('__tostring', () => {
+        const lua = makeVecContext();
+        expect(lua.execute_script('return tostring(Vec.new(3, 4))')).toBe('(3, 4)');
+      });
+
+      it('__eq', () => {
+        const lua = makeVecContext();
+        expect(lua.execute_script('return Vec.new(1, 2) == Vec.new(1, 2)')).toBe(true);
+        expect(lua.execute_script('return Vec.new(1, 2) == Vec.new(9, 9)')).toBe(false);
+      });
+
+      it('__lt and __le', () => {
+        const lua = makeVecContext();
+        expect(lua.execute_script('return Vec.new(1, 1) < Vec.new(5, 5)')).toBe(true);
+        expect(lua.execute_script('return Vec.new(5, 5) <= Vec.new(5, 5)')).toBe(true);
+        expect(lua.execute_script('return Vec.new(9, 9) < Vec.new(1, 1)')).toBe(false);
+      });
+
+      it('__unm', () => {
+        const lua = makeVecContext();
+        expect(lua.execute_script('local n = -Vec.new(2, 3); return n.x, n.y')).toEqual([-2, -3]);
+      });
+
+      it('__concat', () => {
+        const lua = makeVecContext();
+        expect(lua.execute_script('return Vec.new(1, 2) .. "!"')).toBe('(1,2)!');
+      });
+
+      it('__len', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Bag', {
+          construct: (...items) => ({ items }),
+          metamethods: { __len: (self) => self.items.length },
+        });
+        expect(lua.execute_script('return #Bag.new(10, 20, 30)')).toBe(3);
+      });
+
+      it('__call', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Multiplier', {
+          construct: (factor) => ({ factor }),
+          metamethods: { __call: (self, n) => self.factor * n },
+        });
+        expect(lua.execute_script('return Multiplier.new(10)(5)')).toBe(50);
+      });
+    });
+
+    describe('round-trip identity', () => {
+      it('an instance passed to JS returns as the same object', () => {
+        const lua = makeVecContext();
+        let captured: any = null;
+        lua.set_global('inspect', (v: any) => {
+          captured = v;
+          return v.x + v.y;
+        });
+        const r = lua.execute_script('local v = Vec.new(3, 4); return inspect(v)');
+        expect(r).toBe(7);
+        expect(captured).toBeInstanceOf(Vec);
+      });
+
+      it('an instance round-tripped through JS still works as a class instance', () => {
+        const lua = makeVecContext();
+        lua.set_global('echo', (v: any) => v); // returns the same instance
+        const [len, str] = lua.execute_script(`
+          local v = Vec.new(3, 4)
+          local v2 = echo(v)
+          return v2:length(), tostring(v2)
+        `);
+        expect(len).toBe(5);
+        expect(str).toBe('(3, 4)');
+      });
+    });
+
+    describe('multiple classes coexist', () => {
+      it('keeps methods and metatables separate per class', () => {
+        const lua = makeVecContext();
+        lua.register_class('Counter', {
+          construct: (start) => ({ n: start }),
+          readable: true,
+          methods: { inc: (self) => { self.n += 1; return self; } },
+        });
+        const [vlen, cn] = lua.execute_script(`
+          local v = Vec.new(3, 4)
+          local c = Counter.new(0)
+          c:inc(); c:inc()
+          return v:length(), c.n
+        `);
+        expect(vlen).toBe(5);
+        expect(cn).toBe(2);
+      });
+    });
+
+    describe('garbage collection', () => {
+      it('reclaims instances without leaking or crashing', () => {
+        const lua = makeVecContext();
+        lua.execute_script(`
+          for i = 1, 500 do
+            local v = Vec.new(i, i)
+            local _ = v:length()
+          end
+          collectgarbage('collect')
+        `);
+        // Still fully usable afterwards
+        expect(lua.execute_script('return Vec.new(3, 4):length()')).toBe(5);
+      });
+    });
+
+    describe('validation', () => {
+      it('throws when the definition lacks a construct function', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.register_class('X', {} as any)).toThrow(/construct/);
+      });
+
+      it('throws when arguments are invalid', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).register_class('X')).toThrow(/requires/);
+        expect(() => (lua as any).register_class(123, {})).toThrow(/requires/);
+      });
+    });
+  });
 });

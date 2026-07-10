@@ -16,8 +16,10 @@ data structures.
 - Execute Lua scripts and files from Node.js, Bun or Deno
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
+- Type-system fidelity — `BigInt`, `Date`, `Map`, `Set`, `Buffer`/`TypedArray`, and `RegExp` convert to natural Lua representations, with 64-bit integer precision preserved in both directions; register app-specific converters with `register_type_converter()`
 - Global variable management (get and set)
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access and method binding
+- Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, and use overloaded operators
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
@@ -203,6 +205,104 @@ console.log(result);
 //   msg: 'Hello, World!'
 // }
 ```
+
+### JavaScript Type Conversion
+
+Common JavaScript built-in types convert to their natural Lua representations
+when passed into Lua (via `set_global`, callbacks, `create_table`, etc.):
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// BigInt -> Lua integer (64-bit)
+lua.set_global("big", 9007199254740993n);
+lua.execute_script("return math.type(big)"); // "integer"
+
+// Date -> epoch milliseconds
+lua.set_global("when", new Date(1234));
+lua.execute_script("return when"); // 1234
+
+// Buffer / TypedArray / ArrayBuffer -> binary-safe Lua string
+lua.set_global("buf", Buffer.from("hello"));
+lua.execute_script("return #buf"); // 5
+
+// Map -> table, Set -> array
+lua.set_global("m", new Map([["a", 1], ["b", 2]]));
+lua.execute_script("return m.a"); // 1
+lua.set_global("s", new Set([10, 20, 30]));
+lua.execute_script("return #s"); // 3
+
+// RegExp -> its source pattern string
+lua.set_global("re", /foo\d+/g);
+lua.execute_script("return re"); // "foo\\d+"
+```
+
+Full JavaScript → Lua mapping for built-in types:
+
+| JavaScript type                         | Lua result       | Notes                                             |
+| --------------------------------------- | ---------------- | ------------------------------------------------- |
+| `BigInt`                                | `integer`        | Throws if outside signed 64-bit range             |
+| `Buffer` / `TypedArray` / `ArrayBuffer` | `string`         | Raw bytes, binary-safe (honors `byteOffset`)      |
+| `Date`                                  | `number`         | Epoch milliseconds                                |
+| `Map`                                   | `table`          | Keys stringified; values convert recursively      |
+| `Set`                                   | `table` (array)  | Values convert recursively                        |
+| `RegExp`                                | `string`         | The `.source` pattern (flags are dropped)         |
+| `Symbol`                                | —                | Rejected with an error (no Lua representation)     |
+
+64-bit integer precision is preserved in both directions: a Lua integer whose
+magnitude exceeds `2^53 - 1` is returned to JavaScript as a `BigInt` rather than
+a lossy `number`. Smaller integers remain a `number`.
+
+```javascript
+const max = lua.execute_script("return math.maxinteger");
+console.log(max); // 9223372036854775807n (BigInt — exact)
+
+const small = lua.execute_script("return 123");
+console.log(small); // 123 (number)
+```
+
+#### Custom Type Converters
+
+Register your own converters to control how application-specific types cross into
+Lua with `register_type_converter(match, convert)`. Converters are consulted in
+registration order; the first whose `match` returns truthy has its `convert`
+result passed into Lua (converted normally, so it may return any Lua-compatible
+value):
+
+```javascript
+class Money {
+  constructor(cents) {
+    this.cents = cents;
+  }
+}
+
+lua.register_type_converter(
+  (v) => v instanceof Money,
+  (v) => ({ cents: v.cents, dollars: v.cents / 100 }),
+);
+
+lua.set_global("price", new Money(1299));
+lua.execute_script("return price.dollars"); // 12.99
+```
+
+Converters run **after** internal round-trip markers (so reference-based tables
+and userdata are never hijacked) but **before** the built-in handling above — so
+you can also override how a built-in type like `Date` is converted:
+
+```javascript
+lua.register_type_converter(
+  (v) => v instanceof Date,
+  (v) => v.toISOString(),
+);
+
+lua.set_global("now", new Date("2026-07-10T00:00:00Z"));
+lua.execute_script("return now"); // "2026-07-10T00:00:00.000Z"
+```
+
+Converters apply only to object values — plain primitives, functions, `BigInt`,
+and `Symbol` bypass them.
 
 ### Returning Lua Functions
 
@@ -813,6 +913,89 @@ lua.execute_script(`
 `);
 ```
 
+### Classes / Usertypes
+
+While `set_userdata` exposes a single existing object, `register_class` lets Lua
+**construct and drive** your JavaScript objects. It creates a global constructor
+table so Lua can build instances with `ClassName.new(...)`, call methods with
+`instance:method()`, read/write properties, and use overloaded operators.
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+class Vec {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+  }
+}
+
+lua.register_class("Vec", {
+  // Called when Lua runs Vec.new(...); must return the instance object.
+  construct: (x, y) => new Vec(x, y),
+  readable: true, // Lua can read instance.x / instance.y
+  writable: true, // Lua can assign instance.x = ...
+  methods: {
+    // First argument is always the instance (self).
+    length: (self) => Math.hypot(self.x, self.y),
+    scale: (self, k) => {
+      self.x *= k;
+      self.y *= k;
+      return self; // returning self keeps it usable as a Vec (see note below)
+    },
+  },
+  metamethods: {
+    __add: (a, b) => ({ x: a.x + b.x, y: a.y + b.y }),
+    __eq: (a, b) => a.x === b.x && a.y === b.y,
+    __tostring: (self) => `(${self.x}, ${self.y})`,
+  },
+});
+
+lua.execute_script(`
+  local v = Vec.new(3, 4)
+  print(v:length())        -- 5
+  print(v.x, v.y)          -- 3  4
+  v:scale(2)
+  print(tostring(v))       -- (6, 8)
+
+  local sum = Vec.new(1, 2) + Vec.new(3, 4)
+  print(sum.x, sum.y)      -- 4  6
+
+  print(Vec.new(1, 1) == Vec.new(1, 1))  -- true
+`);
+```
+
+Supported metamethods include `__add`, `__sub`, `__mul`, `__div`, `__mod`,
+`__unm`, `__concat`, `__len`, `__eq`, `__lt`, `__le`, `__call`, and
+`__tostring`. Each receives its Lua operands — class instances arrive as their
+original JavaScript objects — and returns the result. Instances are
+garbage-collected by Lua; when the last Lua reference is collected, the backing
+JavaScript object is released.
+
+#### Instance identity and returning new instances
+
+An instance created by `ClassName.new(...)` keeps its identity across the
+boundary: pass it to a JS callback and back, and it is still the same class
+instance in Lua.
+
+```javascript
+lua.set_global("echo", (v) => v); // returns the same instance
+lua.execute_script(`
+  local v = Vec.new(3, 4)
+  print(echo(v):length())  -- 5 — still a Vec after the round-trip
+`);
+```
+
+There is one caveat: an object a JavaScript handler **constructs itself** (e.g.
+`return new Vec(...)` inside `__add`) comes back to Lua as a **plain table**, not
+a class instance — the library only treats objects as class userdata when they
+were created through `ClassName.new`. To return a usable instance from a
+method/operator, mutate and return `self` (as `scale` does above), or construct
+the instance in Lua via `ClassName.new`. This mirrors the userdata round-trip
+model described above.
+
 ### Metatables
 
 You can attach Lua metatables to global tables from JavaScript, enabling operator
@@ -1138,6 +1321,7 @@ import lua_native from "lua-native";
 import type {
   LuaCallbacks,
   LuaContext,
+  ClassDefinition,
   CompileOptions,
   LuaCoroutine,
   LuaInitOptions,
@@ -1193,6 +1377,19 @@ const move: UserdataMethod = (self, dx, dy) => {
 };
 lua.set_userdata("entity", { x: 0, y: 0 }, { methods: { move } });
 
+// Type-safe class / usertype binding
+class Vec {
+  constructor(public x: number, public y: number) {}
+}
+const vecClass: ClassDefinition = {
+  construct: (x, y) => new Vec(x as number, y as number),
+  readable: true,
+  methods: { length: (self) => Math.hypot(self.x, self.y) },
+  metamethods: { __tostring: (self) => `(${self.x}, ${self.y})` },
+};
+lua.register_class("Vec", vecClass);
+const vlen: number = lua.execute_script("return Vec.new(3, 4):length()"); // 5
+
 // Type-safe metatable
 lua.execute_script("vec = {x = 1, y = 2}");
 const mt: MetatableDefinition = {
@@ -1233,6 +1430,21 @@ const limited: LuaContext = new lua_native.init({}, {
   maxMemory: 10 * 1024 * 1024,  // 10 MB
 });
 const usage: number = limited.get_memory_usage();
+
+// Type-safe custom type converters
+class Temperature {
+  constructor(public celsius: number) {}
+}
+lua.register_type_converter(
+  (v): v is Temperature => v instanceof Temperature,
+  (t: Temperature) => ({ celsius: t.celsius, fahrenheit: t.celsius * 1.8 + 32 }),
+);
+lua.set_global("temp", new Temperature(20));
+const fahrenheit = lua.execute_script("return temp.fahrenheit"); // 68
+
+// 64-bit integers round-trip as bigint when they exceed Number.MAX_SAFE_INTEGER
+lua.set_global("big", 9007199254740993n);
+const back = lua.execute_script<bigint>("return big"); // 9007199254740993n
 
 // Type-safe library loading with presets
 const preset: LuaLibraryPreset = "safe";
@@ -1401,6 +1613,24 @@ Gets a global variable from the Lua environment.
 
 **Returns:** The value of the global (converted to JavaScript), or `null` if not set
 
+### `LuaContext.register_type_converter(match, convert)`
+
+Registers a custom JS→Lua converter for values crossing into Lua. Converters are
+consulted in registration order, after internal round-trip markers (Proxy tables
+and userdata handles) but before built-in type handling — letting
+application-specific types cross the boundary, and letting you override the
+built-in conversion of types like `Date` or typed arrays.
+
+**Parameters:**
+
+- `match`: Predicate `(value) => boolean` called with each object-typed value.
+  Returning truthy selects this converter.
+- `convert`: `(value) => LuaValue` mapping a matched value to a Lua-convertible
+  JS value (which is then converted normally). Converters do not see primitives,
+  functions, `BigInt`, or `Symbol` values.
+
+**Throws:** `TypeError` if either argument is not a function.
+
 ### `LuaContext.set_userdata(name, value, options?)`
 
 Sets a JavaScript object as userdata in the Lua environment. The object is
@@ -1429,6 +1659,38 @@ custom indexing, `__tostring`, `__call`, and other metamethods.
   and values are either callback functions or static Lua values
 
 **Throws:** Error if the global does not exist or is not a table
+
+### `LuaContext.register_class(name, definition)`
+
+Registers a JavaScript class/usertype so Lua can construct and drive its
+instances. Creates a global table `name` with a `new(...)` constructor.
+
+**Parameters:**
+
+- `name`: The global class name in Lua (also the constructor table name)
+- `definition`: Object describing the class
+  - `construct`: **Required.** Function invoked on `name.new(...)`; receives the
+    Lua arguments and must return the instance object (held by reference, not
+    copied)
+  - `methods` (optional): Map of method name → function, callable via
+    `instance:method(args)`. Each receives the instance as its first argument
+    (`self`)
+  - `metamethods` (optional): Map of metamethod name → function for operator
+    overloads and hooks (`__add`, `__eq`, `__lt`, `__le`, `__len`, `__concat`,
+    `__unm`, `__tostring`, `__call`, etc.)
+  - `readable` (optional): Allow Lua to read instance properties (default:
+    `false`)
+  - `writable` (optional): Allow Lua to write instance properties (default:
+    `false`)
+
+**Throws:** `TypeError` if `name` is not a string, `definition` is not an
+object, or `definition.construct` is not a function. A runtime error is raised
+if the constructor returns a non-object.
+
+**Note:** Instances created via `name.new(...)` keep their identity across the
+JS boundary. An object a JS handler constructs itself and returns (e.g.
+`new Vec(...)` inside `__add`) comes back to Lua as a plain table — return
+`self`, or construct via `name.new`, to yield a usable instance.
 
 ### `LuaContext.create_coroutine(script)`
 
@@ -1552,7 +1814,8 @@ and vice versa. Call `release()` when done to free the registry slot.
 | --------------------- | --------------- | ------------------------------------------------------------------------------------------------------------- |
 | `nil`                 | `null`          |                                                                                                               |
 | `boolean`             | `boolean`       |                                                                                                               |
-| `number`              | `number`        |                                                                                                               |
+| `number` (integer)    | `number` \| `bigint` | Integers beyond ±(2^53 − 1) become `bigint` to preserve 64-bit precision                                 |
+| `number` (float)      | `number`        |                                                                                                               |
 | `string`              | `string`        |                                                                                                               |
 | `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 (no metatable)                                                     |
 | `table` (object-like) | `Object`        | String or mixed keys (no metatable)                                                                           |
@@ -1560,6 +1823,10 @@ and vice versa. Call `release()` when done to free the registry slot.
 | `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS                                                                              |
 | `thread`              | `LuaCoroutine`  | Created via `create_coroutine()`                                                                              |
 | `userdata`            | `Object`        | JS-created via `set_userdata()`, returned by reference. Lua-created userdata passes through as opaque handles |
+
+For the reverse direction — how JavaScript built-in types (`BigInt`, `Date`,
+`Map`, `Set`, `Buffer`/`TypedArray`, `RegExp`) convert into Lua — see
+[JavaScript Type Conversion](#javascript-type-conversion).
 
 ## Limitations
 
@@ -1607,4 +1874,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-19 February 2026
+10 July 2026
