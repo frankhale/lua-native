@@ -415,12 +415,19 @@ describe('lua-native Node adapter', () => {
       expect(() => lua.execute_script('local x = nil; return x()')).toThrow();
     });
 
-    it('propagates JS callback errors with function name', () => {
+    it('propagates JS callback errors, preserving the original Error', () => {
+      // Error fidelity (D1): a thrown JS Error object is surfaced back to JS as
+      // the same Error instance, not a wrapped string.
+      const original = new Error('JS error message');
       const lua = new lua_native.init({
-        failingFunc: () => { throw new Error('JS error message'); }
+        failingFunc: () => { throw original; }
       }, ALL_LIBS);
-      expect(() => lua.execute_script('failingFunc()')).toThrowError(/failingFunc/);
       expect(() => lua.execute_script('failingFunc()')).toThrowError(/JS error message/);
+      try {
+        lua.execute_script('failingFunc()');
+      } catch (e) {
+        expect(e).toBe(original); // same instance — full fidelity
+      }
     });
 
     it('handles type errors in Lua operations', () => {
@@ -3938,7 +3945,7 @@ describe('lua-native Node adapter', () => {
         );
         const [ok, err] = await lua.execute_async(`
           local ok, err = pcall(function() return willFail() end)
-          return ok, err
+          return ok, err.message
         `);
         expect(ok).toBe(false);
         expect(String(err)).toMatch(/boom/);
@@ -4059,6 +4066,293 @@ describe('lua-native Node adapter', () => {
           ctxs.map((lua, i) => lua.execute_async(`return get() * ${i + 1}`))
         );
         expect(results).toEqual([1, 4, 9, 16]);
+      });
+    });
+  });
+
+  // ============================================
+  // ERROR FIDELITY (D1 + D2 + D3)
+  // ============================================
+  describe('error fidelity', () => {
+    describe('D2 — stack traces', () => {
+      it('includes a Lua traceback in error messages', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() =>
+          lua.execute_script('function foo() error("boom") end\nfoo()')
+        ).toThrow(/stack traceback/);
+      });
+
+      it('shows the call chain across nested functions', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        try {
+          lua.execute_script(`
+            function a() error("deep") end
+            function b() a() end
+            function c() b() end
+            c()
+          `);
+          throw new Error('should have thrown');
+        } catch (e: any) {
+          expect(e.message).toMatch(/deep/);
+          expect(e.message).toMatch(/stack traceback/);
+          expect(e.message).toMatch(/'a'/);
+        }
+      });
+
+      it('produces tracebacks even without the debug library loaded', () => {
+        const lua = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.execute_script('error("no debug lib")')).toThrow(/stack traceback/);
+      });
+
+      it('includes a traceback for errors in returned Lua functions', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fn = lua.execute_script<Function>('return function() error("fn boom") end');
+        expect(() => (fn as any)()).toThrow(/stack traceback/);
+      });
+    });
+
+    describe('D1 — JS Error fidelity', () => {
+      it('surfaces the original Error instance across the boundary', () => {
+        const original = new Error('original message');
+        const lua = new lua_native.init({ boom: () => { throw original; } }, ALL_LIBS);
+        try {
+          lua.execute_script('boom()');
+          throw new Error('should have thrown');
+        } catch (e) {
+          expect(e).toBe(original);
+        }
+      });
+
+      it('preserves the error name, custom properties, and subclass', () => {
+        class DBError extends Error {
+          code = 'E_DB';
+          constructor(m: string) { super(m); this.name = 'DBError'; }
+        }
+        const lua = new lua_native.init({ query: () => { throw new DBError('bad query'); } }, ALL_LIBS);
+        try {
+          lua.execute_script('query()');
+          throw new Error('should have thrown');
+        } catch (e: any) {
+          expect(e).toBeInstanceOf(DBError);
+          expect(e.name).toBe('DBError');
+          expect(e.message).toBe('bad query');
+          expect(e.code).toBe('E_DB');
+        }
+      });
+
+      it('exposes the JS error as a readable table inside Lua', () => {
+        const lua = new lua_native.init({
+          boom: () => { const e = new Error('lua sees this'); e.name = 'BoomError'; throw e; },
+        }, ALL_LIBS);
+        const r = lua.execute_script(`
+          local ok, err = pcall(boom)
+          return { ok = ok, message = err.message, name = err.name, hasStack = type(err.stack) }
+        `) as any;
+        expect(r.ok).toBe(false);
+        expect(r.message).toBe('lua sees this');
+        expect(r.name).toBe('BoomError');
+        expect(r.hasStack).toBe('string');
+      });
+
+      it('preserves fidelity through a userdata method', () => {
+        const original = new Error('method failure');
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_userdata('svc', {}, { methods: { call: () => { throw original; } } });
+        try {
+          lua.execute_script('svc:call()');
+          throw new Error('should have thrown');
+        } catch (e) {
+          expect(e).toBe(original);
+        }
+      });
+
+      it('preserves fidelity through async execution', async () => {
+        const original = new Error('async failure');
+        const lua = new lua_native.init(
+          { boom: async () => { await Promise.resolve(); throw original; } },
+          ALL_LIBS
+        );
+        await expect(lua.execute_async('return boom()')).rejects.toBe(original);
+      });
+
+      it('falls back to the string form for non-object throws', () => {
+        const lua = new lua_native.init({ boom: () => { throw 'raw string'; } }, ALL_LIBS);
+        expect(() => lua.execute_script('boom()')).toThrow(/raw string/);
+      });
+    });
+
+    describe('D3 — protected calls from JS', () => {
+      it('returns ok with the value on success', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const add = lua.execute_script<Function>('return function(a, b) return a + b end');
+        expect(lua.pcall(add as any, 2, 3)).toEqual({ ok: true, value: 5 });
+      });
+
+      it('returns ok:false with the error on failure', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fail = lua.execute_script<Function>('return function() error("nope") end');
+        const r = lua.pcall(fail as any);
+        expect(r.ok).toBe(false);
+        expect(String((r as any).error.message)).toMatch(/nope/);
+      });
+
+      it('preserves the original JS Error through pcall', () => {
+        const original = new Error('captured');
+        const lua = new lua_native.init({ boom: () => { throw original; } }, ALL_LIBS);
+        const call = lua.execute_script<Function>('return function() boom() end');
+        const r = lua.pcall(call as any);
+        expect(r.ok).toBe(false);
+        expect((r as any).error).toBe(original);
+      });
+
+      it('returns multiple Lua return values as an array', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const multi = lua.execute_script<Function>('return function() return 1, 2, 3 end');
+        expect(lua.pcall(multi as any)).toEqual({ ok: true, value: [1, 2, 3] });
+      });
+
+      it('throws for a non-function argument', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).pcall(42)).toThrow(/requires a function/);
+      });
+    });
+  });
+
+  // ============================================
+  // I/O, OUTPUT & MODULE RESOLUTION (E1 + E2 + E3)
+  // ============================================
+  describe('I/O, output, and module resolution', () => {
+    describe('E1 — output redirection', () => {
+      it('captures print() output via the print option', () => {
+        const out: string[] = [];
+        const lua = new lua_native.init({}, { libraries: 'all', print: (t: string) => out.push(t) });
+        lua.execute_script('print("hello", 42)\nprint("world")');
+        expect(out).toEqual(['hello\t42\n', 'world\n']);
+      });
+
+      it('formats faithfully (tabs, newline, __tostring)', () => {
+        const out: string[] = [];
+        const lua = new lua_native.init({}, { libraries: 'all', print: (t: string) => out.push(t) });
+        lua.execute_script(`
+          local obj = setmetatable({}, { __tostring = function() return "OBJ" end })
+          print(1, obj, true)
+        `);
+        expect(out).toEqual(['1\tOBJ\ttrue\n']);
+      });
+
+      it('redirects io.write without adding separators or a newline', () => {
+        const out: string[] = [];
+        const lua = new lua_native.init({}, { libraries: 'all', print: (t: string) => out.push(t) });
+        lua.execute_script('io.write("a"); io.write("b", "c")');
+        expect(out).toEqual(['a', 'bc']);
+      });
+
+      it('can be set and cleared at runtime via set_print_handler', () => {
+        const out: string[] = [];
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_print_handler((t: string) => out.push(t));
+        lua.execute_script('print("captured")');
+        expect(out).toEqual(['captured\n']);
+        // Clearing must not throw (output falls back to stdout).
+        expect(() => lua.set_print_handler(null)).not.toThrow();
+        expect(() => lua.execute_script('print("to stdout")')).not.toThrow();
+      });
+
+      it('the print option overrides a callback-provided print', () => {
+        const viaOption: string[] = [];
+        const viaCallback: string[] = [];
+        const lua = new lua_native.init(
+          { print: (...args: any[]) => viaCallback.push(args.join(',')) },
+          { libraries: 'all', print: (t: string) => viaOption.push(t) }
+        );
+        lua.execute_script('print("x")');
+        expect(viaOption).toEqual(['x\n']);
+        expect(viaCallback).toEqual([]);
+      });
+    });
+
+    describe('E2 — dynamic require via a JS searcher', () => {
+      it('resolves a module from returned Lua source', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.add_searcher((name: string) =>
+          name === 'greeter'
+            ? 'return { hi = function(n) return "Hi, " .. n end }'
+            : null
+        );
+        expect(lua.execute_script('return require("greeter").hi("Ada")')).toBe('Hi, Ada');
+      });
+
+      it('caches the module (require returns the same table)', () => {
+        let calls = 0;
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.add_searcher((name: string) => {
+          if (name === 'counter') { calls++; return 'return { n = 1 }'; }
+          return null;
+        });
+        expect(lua.execute_script('return require("counter") == require("counter")')).toBe(true);
+        expect(calls).toBe(1);
+      });
+
+      it('lets require fall through when the searcher returns null', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.add_searcher(() => null);
+        expect(() => lua.execute_script('require("missing")')).toThrow(/module 'missing'/);
+      });
+
+      it('coexists with register_module', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('static', { tag: 'S' });
+        lua.add_searcher((name: string) =>
+          name === 'dynamic' ? 'return { tag = "D" }' : null
+        );
+        const [s, d] = lua.execute_script('return require("static").tag, require("dynamic").tag');
+        expect(s).toBe('S');
+        expect(d).toBe('D');
+      });
+
+      it('reports source errors from the searcher', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.add_searcher(() => 'this is not valid lua @@@');
+        expect(() => lua.execute_script('require("bad")')).toThrow();
+      });
+
+      it('throws when the package library is not loaded', () => {
+        const lua = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.add_searcher(() => null)).toThrow(/package/);
+      });
+
+      it('throws for a non-function argument', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).add_searcher(42)).toThrow(/requires a function/);
+      });
+    });
+
+    describe('E3 — bytecode / untrusted-chunk guard', () => {
+      const compiled = () => {
+        const c = new lua_native.init({}, ALL_LIBS);
+        return c.compile('return 42');
+      };
+
+      it('loads bytecode by default', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(lua.load_bytecode(compiled())).toBe(42);
+      });
+
+      it('rejects load_bytecode when allowBytecode is false', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+        expect(() => lua.load_bytecode(compiled())).toThrow(/disabled/);
+      });
+
+      it('forces load() to reject binary chunks when disabled', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+        lua.set_global('bc', compiled().toString('latin1'));
+        // A binary chunk fails to load (load returns nil, err).
+        expect(lua.execute_script('local f = load(bc); return f == nil')).toBe(true);
+      });
+
+      it('still allows text chunks via load() when disabled', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+        expect(lua.execute_script('return load("return 7")()')).toBe(7);
       });
     });
   });

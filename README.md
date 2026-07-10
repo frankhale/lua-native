@@ -23,14 +23,16 @@ data structures.
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
-- Module / require integration — register JS modules and add search paths for Lua's `require()`
+- Module / require integration — register JS modules, add search paths, or resolve modules dynamically with a JS searcher (`add_searcher`) for Lua's `require()`
+- Output redirection — route Lua `print()` / `io.write()` to a JS handler via `set_print_handler` or the `print` option
+- Bytecode guard — `allowBytecode: false` refuses untrusted binary chunks (blocks `load_bytecode` and forces `load()` to text-only)
 - Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
 - Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_bytecode()` for faster startup
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
 - Coroutine support with yield/resume semantics
-- Comprehensive error handling
+- Error fidelity — Lua errors carry stack tracebacks, thrown JS `Error` objects round-trip with full fidelity (type, message, stack, custom props), and `pcall()` runs a function protected, returning `{ ok, value/error }`
 - Cross-platform support (Windows, macOS)
 - TypeScript support with full type definitions
 
@@ -341,7 +343,8 @@ console.log(counter()); // 12
 
 ### Error Handling
 
-Lua errors are automatically converted to JavaScript exceptions:
+Lua errors are converted to JavaScript exceptions, and the message includes a
+**stack traceback** (available even when the `debug` library is not loaded):
 
 ```javascript
 import lua_native from "lua-native";
@@ -349,31 +352,65 @@ import lua_native from "lua-native";
 const lua = new lua_native.init({}, { libraries: "all" });
 
 try {
-  lua.execute_script("error('Something went wrong')");
+  lua.execute_script('function foo() error("boom") end\nfoo()');
 } catch (error) {
-  console.error("Lua error:", error.message);
-  // Output: Lua error: [string "error('Something went wrong')"]:1: Something went wrong
+  console.error(error.message);
+  // [string "..."]:1: boom
+  // stack traceback:
+  //   [C]: in function 'error'
+  //   [string "..."]:1: in function 'foo'
+  //   [string "..."]:2: in main chunk
 }
 ```
 
-Errors from JavaScript callbacks include the function name and original error message:
+#### JS Error fidelity
+
+A JavaScript `Error` thrown by a host function is **preserved end-to-end**. If it
+propagates uncaught back to JS, you get the *same* `Error` instance — type,
+message, stack, and custom properties intact:
 
 ```javascript
+class DBError extends Error {
+  constructor(msg) { super(msg); this.name = "DBError"; this.code = "E_DB"; }
+}
+
 const lua = new lua_native.init(
-  {
-    riskyOperation: () => {
-      throw new Error("Database connection failed");
-    },
-  },
+  { query: () => { throw new DBError("connection failed"); } },
   { libraries: "all" },
 );
 
 try {
-  lua.execute_script("riskyOperation()");
+  lua.execute_script("query()");
 } catch (error) {
-  console.error(error.message);
-  // Output: Host function 'riskyOperation' threw an exception: Database connection failed
+  console.log(error instanceof DBError); // true
+  console.log(error.name, error.code);   // "DBError" "E_DB"
 }
+```
+
+Inside Lua, the same error is a readable table, so scripts can inspect it:
+
+```javascript
+const info = lua.execute_script(`
+  local ok, err = pcall(query)
+  return { message = err.message, name = err.name }
+`);
+// { message: "connection failed", name: "DBError" }
+```
+
+(Non-object throws — `throw "string"`, `throw 42` — surface as a plain message.)
+
+#### Protected calls with `pcall`
+
+Call a function in protected mode and get a result object instead of an
+exception. The preserved error is returned in `error`:
+
+```javascript
+const fn = lua.execute_script(
+  'return function(x) if x < 0 then error("negative") end return x * 2 end'
+);
+
+lua.pcall(fn, 5);   // { ok: true, value: 10 }
+lua.pcall(fn, -1);  // { ok: false, error: Error("...negative...\nstack traceback...") }
 ```
 
 ### Standard Library Loading (Opt-In)
@@ -557,6 +594,62 @@ lua.execute_script(`
     print(helpers.format_debug())
   end
 `);
+```
+
+#### Dynamic Modules with a JS Searcher
+
+`register_module` is a static preload and `add_search_path` hits the filesystem.
+`add_searcher` resolves modules **lazily** through JavaScript — return the
+module's Lua source (or `null` to let the next searcher try). Sources can come
+from a bundle, database, or in-memory map:
+
+```javascript
+const modules = {
+  greet: 'return function(name) return "Hello, " .. name end',
+  mathx: 'return { square = function(x) return x * x end }',
+};
+
+lua.add_searcher((name) => modules[name] ?? null);
+
+lua.execute_script(`
+  local greet = require('greet')
+  local mathx = require('mathx')
+  return greet('Ada'), mathx.square(9)
+`); // ['Hello, Ada', 81]
+```
+
+Modules are cached like any `require`, so the searcher runs once per module.
+Searchers must be synchronous and return Lua **source** (not a value). Requires
+the `package` library.
+
+### Output Redirection
+
+Route Lua `print()` and `io.write()` to a JavaScript handler instead of the
+process stdout. The handler receives the fully-formatted text — exactly what
+would have been printed (arguments joined with tabs, `__tostring` applied, and a
+trailing newline for `print`):
+
+```javascript
+import lua_native from "lua-native";
+
+const lines = [];
+const lua = new lua_native.init({}, {
+  libraries: "all",
+  print: (text) => lines.push(text),
+});
+
+lua.execute_script('print("hello", 42)\nprint("world")');
+console.log(lines); // ["hello\t42\n", "world\n"]
+```
+
+You can also set or change the handler at runtime, and pass `null` to send output
+back to stdout:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all" });
+lua.set_print_handler((text) => process.stdout.write(`[lua] ${text}`));
+lua.execute_script('print("captured")'); // [lua] captured
+lua.set_print_handler(null);              // back to stdout
 ```
 
 ### Async Execution
@@ -771,6 +864,21 @@ square2(7); // 49
 - **No integrity checks** — Lua bytecode has no built-in tamper protection.
   Malformed bytecode can crash the Lua VM. If bytecode comes from an untrusted
   source, verify its integrity (e.g., via checksum or signature) before loading.
+- **Disable bytecode entirely for untrusted scripts** — Loading malicious
+  bytecode is the most likely way an untrusted script escapes a sandbox. Pass
+  `allowBytecode: false` to refuse it: `load_bytecode()` throws, and Lua's own
+  `load()` is forced to text-only mode so binary chunks are rejected.
+
+  ```javascript
+  const sandbox = new lua_native.init({}, {
+    libraries: "safe",
+    allowBytecode: false,
+  });
+
+  sandbox.load_bytecode(bytecode);              // throws: "bytecode loading is disabled..."
+  sandbox.execute_script('return load(evil)');  // load() returns nil for a binary chunk
+  sandbox.execute_script('return load("return 1")()'); // text still works -> 1
+  ```
 - **Strip debug info for production** — Use `{ stripDebug: true }` to remove
   local variable names and line numbers, producing smaller bytecode that doesn't
   leak source structure.
@@ -1418,6 +1526,7 @@ import type {
   LuaTableHandle,
   LuaTableRef,
   MetatableDefinition,
+  PcallResult,
   UserdataMethod,
   UserdataOptions,
 } from "lua-native";
@@ -1541,6 +1650,26 @@ const asyncLua: LuaContext = new lua_native.init(
 const doubled: number = await asyncLua.execute_async<number>("return load(21)"); // 42
 asyncLua.cancel(); // aborts an in-flight run (no-op here)
 
+// Type-safe protected calls
+const risky = lua.execute_script<LuaFunction>(
+  'return function(n) if n < 0 then error("neg") end return n end'
+);
+const pr: PcallResult = lua.pcall(risky, -5);
+if (!pr.ok) console.log((pr.error as Error).message); // "...neg..."
+
+// Type-safe output redirection and a dynamic module searcher
+const captured: string[] = [];
+const io: LuaContext = new lua_native.init({}, {
+  libraries: "safe",
+  allowBytecode: false, // reject untrusted bytecode
+  print: (text: string) => captured.push(text),
+});
+io.set_print_handler((text: string) => captured.push(text.toUpperCase()));
+io.add_searcher((name: string): string | null =>
+  name === "util" ? "return { double = function(x) return x * 2 end }" : null
+);
+io.execute_script('print(require("util").double(21))'); // captured: ["42\n"]
+
 // Type-safe library loading with presets
 const preset: LuaLibraryPreset = "safe";
 const sandboxed: LuaContext = new lua_native.init({}, { libraries: preset });
@@ -1593,6 +1722,11 @@ creates a bare Lua state with no callbacks and no standard libraries.
   - `maxMemory` (optional): Maximum memory in bytes that the Lua state can
     allocate. When exceeded, Lua raises an out-of-memory error. `0` or omitted
     means unlimited. Memory usage is tracked even without a limit.
+  - `print` (optional): Handler receiving `print()`/`io.write()` output as
+    formatted text (see `set_print_handler`). Takes precedence over a `print`
+    in the callbacks object.
+  - `allowBytecode` (optional): When `false`, refuses binary chunks —
+    `load_bytecode()` throws and `load()` is forced to text-only. Default `true`.
 
 **Returns:** `LuaContext` instance
 
@@ -1723,6 +1857,30 @@ search occurs.
 
 **Throws:** Error if the `package` library is not loaded.
 
+### `LuaContext.add_searcher(searcher)`
+
+Adds a JavaScript-backed module searcher for dynamic `require()`. When a required
+module is not already loaded or found by earlier searchers, `searcher(name)` is
+called; return the module's Lua **source** string to provide it, or
+`null`/`undefined` to fall through. Searchers must be synchronous.
+
+**Parameters:**
+
+- `searcher`: `(name: string) => string | null` — maps a module name to its Lua
+  source, or null if unknown
+
+**Throws:** `TypeError` if `searcher` is not a function; Error if the `package`
+library is not loaded.
+
+### `LuaContext.set_print_handler(handler)`
+
+Redirects Lua `print()` and `io.write()` output to a JS handler, which receives
+the fully-formatted output text. Pass `null` to restore output to stdout.
+
+**Parameters:**
+
+- `handler`: `((text: string) => void) | null`
+
 ### `LuaContext.set_global(name, value)`
 
 Sets a global variable or function in the Lua environment.
@@ -1820,6 +1978,24 @@ if the constructor returns a non-object.
 JS boundary. An object a JS handler constructs itself and returns (e.g.
 `new Vec(...)` inside `__add`) comes back to Lua as a plain table — return
 `self`, or construct via `name.new`, to yield a usable instance.
+
+### `LuaContext.pcall(fn, ...args)`
+
+Calls a function in protected mode, returning a result object instead of
+throwing.
+
+**Parameters:**
+
+- `fn`: The function to call (typically a Lua function returned to JS)
+- `...args`: Arguments to pass to the function
+
+**Returns:** `{ ok: true, value }` on success (where `value` is the return value,
+or an array for multiple Lua return values), or `{ ok: false, error }` on
+failure. `error` is the original JS `Error` when the failure came from a JS
+callback that threw; otherwise an `Error` whose message includes the Lua stack
+traceback.
+
+**Throws:** `TypeError` if `fn` is not a function.
 
 ### `LuaContext.create_coroutine(script)`
 

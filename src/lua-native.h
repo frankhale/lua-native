@@ -103,12 +103,30 @@ public:
     Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
     Napi::Value RegisterTypeConverter(const Napi::CallbackInfo& info);
     Napi::Value RegisterClass(const Napi::CallbackInfo& info);
+    Napi::Value Pcall(const Napi::CallbackInfo& info);
+    Napi::Value SetPrintHandler(const Napi::CallbackInfo& info);
+    Napi::Value AddSearcher(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 
     // Public so LuaFunctionCallbackStatic can use it
     Napi::Value CoreToNapi(const lua_core::LuaValue& value);
     lua_core::LuaValue NapiToCoreInstance(const Napi::Value& value, int depth = 0);
+
+    // Reconstructs the original JS error for a surfaced Lua error (or a plain
+    // Error from the string) and throws it. Public so LuaFunctionCallbackStatic
+    // can use it.
+    Napi::Value LuaErrorToJsValue(const std::string& fallback);
+    void ThrowLuaError(const std::string& fallback);
+
+    // RAII: clears the JS-error registry when the outermost Lua call begins.
+    struct CallScope {
+      LuaContext* ctx;
+      explicit CallScope(LuaContext* c) : ctx(c) {
+        if (ctx->call_depth_++ == 0) ctx->js_error_registry_.clear();
+      }
+      ~CallScope() { --ctx->call_depth_; }
+    };
 
 private:
     Napi::Env env;
@@ -144,6 +162,21 @@ private:
     int next_metatable_id_ = 1;
     int next_module_id_ = 1;
     int next_class_id_ = 1;
+    int next_searcher_id_ = 1;
+
+    // Output redirection (E1): JS handler for print()/io.write().
+    Napi::FunctionReference print_handler_;
+    void InstallPrintHandler(const Napi::Function& fn);
+
+    // Error fidelity (D1): keeps thrown JS Error objects alive so they can be
+    // reconstructed when a Lua error carrying their id surfaces back to JS.
+    std::unordered_map<int, Napi::ObjectReference> js_error_registry_;
+    int next_js_error_id_ = 1;
+    int call_depth_ = 0;  // clears the registry when the outermost call starts
+
+    // Stages a structured error table for a thrown JS value (object errors only)
+    // and returns the display message.
+    std::string StageJsError(const Napi::Value& value, const std::string& message);
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);

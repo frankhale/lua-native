@@ -425,11 +425,12 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   }
 
   // Call the Lua function
+  LuaContext::CallScope _cs(data->context);
   const auto result = data->runtime->CallFunction(data->funcRef, args);
 
   // Handle error case
   if (std::holds_alternative<std::string>(result)) {
-    Napi::Error::New(env, std::get<std::string>(result)).ThrowAsJavaScriptException();
+    data->context->ThrowLuaError(std::get<std::string>(result));
     return env.Undefined();
   }
 
@@ -474,7 +475,10 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("get_global_ref", &LuaContext::GetGlobalRef),
     InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage),
     InstanceMethod("register_type_converter", &LuaContext::RegisterTypeConverter),
-    InstanceMethod("register_class", &LuaContext::RegisterClass)
+    InstanceMethod("register_class", &LuaContext::RegisterClass),
+    InstanceMethod("pcall", &LuaContext::Pcall),
+    InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
+    InstanceMethod("add_searcher", &LuaContext::AddSearcher)
   });
 
   auto* constructor = new Napi::FunctionReference();
@@ -597,6 +601,19 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
 
   if (info.Length() > 0 && info[0].IsObject()) {
     RegisterCallbacks(info[0].As<Napi::Object>());
+  }
+
+  // Apply I/O options after callbacks so the print override wins over any
+  // callback-provided print, and after libraries are loaded.
+  if (info.Length() > 1 && info[1].IsObject()) {
+    auto options = info[1].As<Napi::Object>();
+    if (options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean() &&
+        !options.Get("allowBytecode").As<Napi::Boolean>().Value()) {
+      runtime->SetAllowBytecode(false);  // E3
+    }
+    if (options.Has("print") && options.Get("print").IsFunction()) {
+      InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
+    }
   }
 }
 
@@ -1039,10 +1056,11 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
     chunk_name = info[1].As<Napi::String>().Utf8Value();
   }
 
+  CallScope _cs(this);
   const auto res = runtime->LoadBytecode(bytecode, chunk_name);
 
   if (std::holds_alternative<std::string>(res)) {
-    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
 
@@ -1176,7 +1194,60 @@ LuaContext::~LuaContext() {
   if (runtime) {
     runtime->SetUserdataGCCallback(nullptr);
     runtime->SetPropertyHandlers(nullptr, nullptr);
+    runtime->SetOutputHandler(nullptr);
   }
+}
+
+std::string LuaContext::StageJsError(const Napi::Value& value, const std::string& message) {
+  // Only object errors carry structure worth preserving. For non-object throws
+  // (throw "str", throw 42) fall back to the value's string form.
+  if (!value.IsObject()) {
+    return message.empty() ? value.ToString().Utf8Value() : message;
+  }
+  auto obj = value.As<Napi::Object>();
+
+  const int id = next_js_error_id_++;
+  js_error_registry_.emplace(id, Napi::Persistent(obj));
+
+  lua_core::LuaTable t;
+  t.emplace("message",
+    std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(message)));
+  t.emplace("__jsErrorId",
+    std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(static_cast<int64_t>(id))));
+  if (obj.Get("name").IsString()) {
+    t.emplace("name", std::make_shared<lua_core::LuaValue>(
+      lua_core::LuaValue::from(obj.Get("name").As<Napi::String>().Utf8Value())));
+  }
+  if (obj.Get("stack").IsString()) {
+    t.emplace("stack", std::make_shared<lua_core::LuaValue>(
+      lua_core::LuaValue::from(obj.Get("stack").As<Napi::String>().Utf8Value())));
+  }
+  runtime->SetPendingErrorValue(
+    std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(std::move(t))));
+  return message;
+}
+
+Napi::Value LuaContext::LuaErrorToJsValue(const std::string& fallback) {
+  lua_core::LuaPtr ev = runtime->TakeLastErrorValue();
+  if (ev && std::holds_alternative<lua_core::LuaTable>(ev->value)) {
+    const auto& t = std::get<lua_core::LuaTable>(ev->value);
+    auto it = t.find("__jsErrorId");
+    if (it != t.end() && it->second &&
+        std::holds_alternative<int64_t>(it->second->value)) {
+      const int id = static_cast<int>(std::get<int64_t>(it->second->value));
+      auto rit = js_error_registry_.find(id);
+      if (rit != js_error_registry_.end()) {
+        Napi::Object original = rit->second.Value();
+        js_error_registry_.erase(rit);
+        return original;  // the original JS Error object, fully preserved
+      }
+    }
+  }
+  return Napi::Error::New(env, fallback).Value();
+}
+
+void LuaContext::ThrowLuaError(const std::string& fallback) {
+  Napi::Error(env, LuaErrorToJsValue(fallback)).ThrowAsJavaScriptException();
 }
 
 lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::string& name) {
@@ -1200,7 +1271,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
       }
       return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
     } catch (const Napi::Error& e) {
-      throw std::runtime_error(e.Message());
+      throw std::runtime_error(StageJsError(e.Value(), e.Message()));
     }
   };
 }
@@ -1220,7 +1291,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     try {
       instance = js_callbacks[name].Call(jsArgs);
     } catch (const Napi::Error& e) {
-      throw std::runtime_error(e.Message());
+      throw std::runtime_error(StageJsError(e.Value(), e.Message()));
     }
 
     if (!instance.IsObject() || instance.IsArray() || instance.IsFunction()) {
@@ -1263,9 +1334,10 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
 
   const std::string script = info[0].As<Napi::String>().Utf8Value();
 
+  CallScope _cs(this);
   const auto res = runtime->ExecuteScript(script);
   if (std::holds_alternative<std::string>(res)) {
-    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
 
@@ -1290,9 +1362,10 @@ Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
 
   const std::string filepath = info[0].As<Napi::String>().Utf8Value();
 
+  CallScope _cs(this);
   const auto res = runtime->ExecuteFile(filepath);
   if (std::holds_alternative<std::string>(res)) {
-    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
 
@@ -1374,6 +1447,7 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
   }
 
   is_busy_ = true;
+  js_error_registry_.clear();
   runtime->ClearCancel();
   runtime->SetAwaitDriverMode(true);
   async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
@@ -1425,9 +1499,10 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
     FinishAsync();
     deferred.Resolve(resolved);
   } else {
-    Napi::Error err = Napi::Error::New(env, step.error);
+    // Reconstruct the original JS Error if this was a raised JS callback error.
+    Napi::Value errValue = LuaErrorToJsValue(step.error);
     FinishAsync();
-    deferred.Reject(err.Value());
+    deferred.Reject(errValue);
   }
 }
 
@@ -1445,12 +1520,19 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error) 
   std::vector<lua_core::LuaPtr> args;
   if (is_error) {
     std::string msg;
-    if (value.IsObject() && value.As<Napi::Object>().Has("message")) {
-      msg = value.As<Napi::Object>().Get("message").ToString().Utf8Value();
+    if (value.IsObject() && value.As<Napi::Object>().Get("message").IsString()) {
+      msg = value.As<Napi::Object>().Get("message").As<Napi::String>().Utf8Value();
     } else {
       msg = value.ToString().Utf8Value();
     }
-    args.push_back(std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(msg)));
+    // Stage a structured error for object rejections so the original JS Error is
+    // reconstructed if the rejection surfaces uncaught (D1 through async).
+    StageJsError(value, msg);
+    if (runtime->HasPendingErrorValue()) {
+      args.push_back(runtime->TakePendingErrorValue());
+    } else {
+      args.push_back(std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(msg)));
+    }
   } else {
     args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
   }
@@ -1467,6 +1549,7 @@ void LuaContext::FinishAsync() {
   }
   async_deferred_.reset();
   async_pending_promise_.Reset();
+  js_error_registry_.clear();
   is_busy_ = false;
 }
 
@@ -1487,6 +1570,80 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
     auto deferred = *async_deferred_;
     FinishAsync();
     deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
+  }
+  return env.Undefined();
+}
+
+Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsFunction()) {
+    Napi::TypeError::New(env, "pcall(fn, ...args) requires a function as the first argument")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto fn = info[0].As<Napi::Function>();
+  std::vector<napi_value> args;
+  for (size_t i = 1; i < info.Length(); ++i) args.push_back(info[i]);
+
+  Napi::Object result = Napi::Object::New(env);
+  try {
+    Napi::Value r = fn.Call(args);
+    result.Set("ok", Napi::Boolean::New(env, true));
+    result.Set("value", r);
+  } catch (const Napi::Error& e) {
+    // The thrown value is preserved (reconstructed original JS Error when the
+    // failure came from a JS callback; otherwise a Lua-error Error object).
+    result.Set("ok", Napi::Boolean::New(env, false));
+    result.Set("error", e.Value());
+  }
+  return result;
+}
+
+void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
+  print_handler_ = Napi::Persistent(fn);
+  runtime->SetOutputHandler([this](const std::string& text) {
+    if (print_handler_.IsEmpty()) return;
+    print_handler_.Call({Napi::String::New(env, text)});
+  });
+}
+
+Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() >= 1 && info[0].IsFunction()) {
+    InstallPrintHandler(info[0].As<Napi::Function>());
+  } else {
+    // null/undefined clears redirection (print/io.write go to stdout).
+    print_handler_.Reset();
+    runtime->SetOutputHandler(nullptr);
+  }
+  return env.Undefined();
+}
+
+Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsFunction()) {
+    Napi::TypeError::New(env, "add_searcher(fn) requires a function")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const std::string name = "__searcher_" + std::to_string(next_searcher_id_++);
+  js_callbacks[name] = Napi::Persistent(info[0].As<Napi::Function>());
+  runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
+  try {
+    runtime->AddJsSearcher(name);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
   return env.Undefined();
 }
@@ -1869,9 +2026,10 @@ Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
 
   // Execute script and get function
   const std::string script = info[0].As<Napi::String>().Utf8Value();
+  CallScope _cs(this);
   const auto res = runtime->ExecuteScript(script);
   if (std::holds_alternative<std::string>(res)) {
-    Napi::Error::New(env, std::get<std::string>(res)).ThrowAsJavaScriptException();
+    ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
 

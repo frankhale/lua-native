@@ -841,6 +841,160 @@ pointing the user at `execute_async`.
 
 ---
 
+## Error Fidelity (July 2026)
+
+### Overview
+
+Three related improvements to how errors cross the Lua/JS boundary:
+
+- **D2 — Stack traces:** every Lua error now carries a `stack traceback`,
+  produced by a message handler installed on all protected calls.
+- **D1 — JS Error fidelity:** a JavaScript `Error` thrown by a host function is
+  preserved. Inside Lua it appears as a readable table
+  (`err.message`, `err.name`, `err.stack`); if it propagates uncaught back to
+  JS, the **original `Error` instance** is re-thrown — same type, message,
+  stack, and custom properties — not a flattened string.
+- **D3 — Protected calls from JS:** `pcall(fn, ...args)` calls a function and
+  returns `{ ok, value }` / `{ ok, error }` instead of throwing.
+
+### Architecture
+
+**Core layer (`lua-runtime.cpp`):**
+
+- `MessageHandler` is a `lua_pcall` message handler that appends a traceback via
+  `luaL_traceback` (which works even when the `debug` library is not loaded). It
+  deliberately leaves structured JS-error tables (identified by a `__jsErrorId`
+  field) untouched, so they are not flattened to strings.
+- `ProtectedCall` installs `MessageHandler` beneath the target function and runs
+  `lua_pcall`; it replaces the bare `lua_pcall` in `ExecuteScript`,
+  `ExecuteFile`, `CallFunction`, and `LoadBytecode`. The async path appends a
+  traceback to string errors via `luaL_traceback` on the coroutine thread.
+- `CaptureError` records the raw error **value** (`last_error_value_`) alongside
+  a display string, so the binding layer can inspect the structured error. It is
+  cleared at the entry of every execution method to avoid stale reads.
+- The host dispatchers (`LuaCallHostFunction`, `UserdataMethodCall`), when a
+  wrapper stages a structured error (`HasPendingErrorValue()`), raise that Lua
+  table instead of a formatted string.
+
+**Binding layer (`lua-native.cpp`):**
+
+- `StageJsError` handles a thrown `Napi::Value`: for object errors it stores the
+  original in `js_error_registry_` under an integer id and stages a plain Lua
+  table `{ message, name, stack, __jsErrorId }` (via `SetPendingErrorValue`);
+  non-object throws fall back to a string.
+- `LuaErrorToJsValue` inspects the captured error value: if it is a table with a
+  known `__jsErrorId`, it returns the original `Error` from the registry (and
+  erases it); otherwise it builds a plain `Error` from the (traceback-bearing)
+  string. `ThrowLuaError` throws the result. These run at every error-surfacing
+  point — `execute_script/file`, `load_bytecode`, returned-Lua-function calls,
+  and async rejection.
+- `CallScope` (RAII) clears the registry when the outermost Lua call begins,
+  bounding its lifetime to a single call tree; the async path clears it in
+  `execute_async`/`FinishAsync`.
+- `Pcall` calls the function inside a C++ try/catch and packages the outcome as
+  `{ ok, value }` or `{ ok, error }`, where `error` is whatever
+  `LuaFunctionCallbackStatic` threw (a reconstructed original error when
+  applicable).
+
+### Design Decisions
+
+**Plain table, not a marker string.** JS errors become a plain (metatable-free)
+Lua table, so: Lua code reads `err.message`/`err.name`/`err.stack` naturally; the
+value deep-copies cleanly for capture (no registry-ref leak); and no marker
+characters ever appear in a user-visible message. The message handler skips
+these tables so a traceback is not spliced into them.
+
+**Re-throw the original object.** Rather than reconstructing an Error from parsed
+fields, the exact `Error` instance is kept alive and re-thrown, giving 100%
+fidelity (subclass, `name`, `stack`, custom properties). This is a behavior
+change: object errors surface **unwrapped** (no "Host function 'x' threw…"
+prefix). Non-object throws (`throw "str"`, `throw 42`) still surface as a
+message string.
+
+**Tracebacks via `luaL_traceback`, not the `debug` library.** Using the C
+function directly means tracebacks work in sandboxed contexts that never load
+`debug`.
+
+**`pcall` is a thin, honest convenience.** It does not re-implement Lua's
+`pcall`; it calls the JS-facing function under try/catch. Its value is not
+throwing and surfacing the fidelity-preserved error as data.
+
+---
+
+## I/O, Output & Module Resolution (July 2026)
+
+### Overview
+
+Three capabilities for controlling how a Lua context talks to the outside world:
+
+- **E1 — Output redirection:** `set_print_handler(fn)` (and the `print` init
+  option) route `print()` and `io.write()` to a JS handler that receives the
+  formatted output text, rather than the process stdout.
+- **E2 — Dynamic `require`:** `add_searcher(fn)` installs a `package.searchers`
+  entry backed by JavaScript, so modules can be resolved lazily/virtually
+  (bundles, DB, in-memory) instead of only from the filesystem
+  (`add_search_path`) or a static preload (`register_module`).
+- **E3 — Bytecode guard:** the `allowBytecode: false` init option makes a context
+  refuse binary chunks — `load_bytecode()` throws and Lua's `load()` is forced
+  to text-only mode — for safely running untrusted scripts.
+
+### Architecture
+
+**Core layer (`lua-runtime.cpp`):**
+
+- `SetOutputHandler` stores a `std::function<void(const std::string&)>` and
+  installs `LuaPrint`/`LuaIoWrite` C functions over the `print` global and
+  `io.write` field. `LuaPrint` reproduces Lua's own `print` (each argument via
+  `luaL_tolstring`, tab-separated, trailing newline); `LuaIoWrite` writes
+  arguments verbatim. Both fall back to `stdout` when no handler is set, and
+  **skip the handler while `async_mode_` is active** (the worker-thread path)
+  since JS calls are only safe on the main thread.
+- `SetAllowBytecode(false)` records the flag (checked at the top of
+  `LoadBytecode`) and wraps the global `load` with `SafeLoad`, a closure over the
+  original `load` that forces the `mode` argument to `"t"` — so binary chunks
+  fail regardless of the caller's arguments.
+- `AddJsSearcher` appends `JsSearcher` (carrying the host function name as an
+  upvalue) to `package.searchers`. `JsSearcher` calls the host function with the
+  module name; a returned string is compiled with `luaL_loadbufferx(..., "t")`
+  (text-only, so a searcher can never inject bytecode) and returned as the
+  module loader; `nil` yields a "not found" message so the next searcher runs.
+  It rejects Promise results (searchers must be synchronous) and is disabled in
+  worker-thread async mode.
+
+**Binding layer (`lua-native.cpp`):**
+
+- `InstallPrintHandler` persists the JS function and sets a core output handler
+  that forwards each chunk as a `Napi::String`. `set_print_handler(null)` clears
+  it (output returns to stdout). The `print` option applies the same after
+  callbacks are registered, so it wins over a callback-provided `print`.
+- `add_searcher` registers the JS function as a host function (reusing
+  `CreateJsCallbackWrapper`) and calls `AddJsSearcher`.
+- The constructor reads `allowBytecode` and `print` from the options object
+  after libraries are loaded and callbacks registered.
+- The destructor clears the output handler alongside the GC/property handlers so
+  a `print` during teardown can't reach a half-destroyed context.
+
+### Design Decisions
+
+**Handlers receive formatted text, not raw arguments.** The point of E1 is
+"capture what would have gone to stdout," so `print` formatting (tabs,
+`__tostring`, newline) happens in C before the handler runs. This differs from
+the pre-existing trick of passing `print` in the callbacks object, which hands
+the callback the raw Lua values; the dedicated handler is faithful stdout
+capture and takes precedence.
+
+**Searchers return source, not values.** A searcher returns Lua *source*, which
+`require` compiles and runs — giving real modules with their own scope. Returning
+a JS value/object is what `register_module` already does; E2 complements it for
+the dynamic case.
+
+**Text-only enforcement is defense-in-depth.** E3 gates both the explicit
+`load_bytecode()` entry point and the in-Lua `load()` path (the vector an
+untrusted script would actually use). `loadfile`/`dofile` remain gated by simply
+not loading the `io`/`os` libraries (the `safe` preset excludes them).
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -862,3 +1016,5 @@ pointing the user at `execute_async`.
 | Type-system fidelity (built-in types + converter registry) | Moderate | July 2026 |
 | Class / usertype binding (constructor, methods, operators) | High | July 2026 |
 | Coroutine-driven async (await JS promises, callbacks, cancel) | High | July 2026 |
+| Error fidelity (stack traces, JS Error round-trip, pcall) | Moderate | July 2026 |
+| I/O redirection, JS require searcher, bytecode guard | Moderate | July 2026 |

@@ -329,9 +329,30 @@ public:
   void StoreHostFunction(const std::string& name, Function fn);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
 
+  // Error fidelity: a host wrapper stages a structured error value (a plain
+  // Lua table describing the JS error) that LuaCallHostFunction raises instead
+  // of a string. The last captured error value is exposed so the binding layer
+  // can reconstruct the original JS Error on the way out.
+  void SetPendingErrorValue(LuaPtr value) { pending_error_value_ = std::move(value); }
+  [[nodiscard]] bool HasPendingErrorValue() const { return static_cast<bool>(pending_error_value_); }
+  LuaPtr TakePendingErrorValue() { return std::move(pending_error_value_); }
+  LuaPtr TakeLastErrorValue() { return std::move(last_error_value_); }
+
   // Module / require support
   void AddSearchPath(const std::string& path) const;
   void RegisterModuleTable(const std::string& name, const std::vector<MetatableEntry>& entries) const;
+
+  // Output redirection (E1): route print()/io.write() to a JS handler.
+  using OutputHandler = std::function<void(const std::string&)>;
+  void SetOutputHandler(OutputHandler handler);
+
+  // Bytecode / untrusted-chunk guard (E3): when disabled, load_bytecode() is
+  // rejected and Lua's load() is forced to text-only mode (binary chunks fail).
+  void SetAllowBytecode(bool allow);
+
+  // Dynamic require (E2): append a package.searchers entry that resolves an
+  // unknown module by calling the named host function (returning Lua source).
+  void AddJsSearcher(const std::string& host_func_name);
 
   void CreateUserdataGlobal(const std::string& name, int ref_id);
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
@@ -402,6 +423,14 @@ private:
   PropertySetter property_setter_;
   bool async_mode_ = false;
 
+  // Error fidelity state (mutable: set while capturing errors in const methods)
+  mutable LuaPtr last_error_value_;     // structured value of the last error
+  LuaPtr pending_error_value_;          // staged by a host wrapper to be raised
+
+  // I/O and chunk-loading control
+  OutputHandler output_handler_;        // print()/io.write() sink (null = stdout)
+  bool allow_bytecode_ = true;          // false = reject binary chunks
+
   // Coroutine-driven async (main-thread promise awaiting) state
   bool await_driver_mode_ = false;  // true while execute_async is driving
   bool await_pending_ = false;      // set by a host call that returned a promise
@@ -423,6 +452,21 @@ private:
   static int UserdataMethodCall(lua_State* L);
   static int ClassIndex(lua_State* L);
   static int AsyncContinuation(lua_State* L, int status, lua_KContext ctx);
+
+  // Error handling: message handler that appends a Lua traceback (leaving
+  // structured JS-error tables untouched), a protected-call helper that installs
+  // it, and a capture helper that records the structured error value + a display
+  // string.
+  static int MessageHandler(lua_State* L);
+  int ProtectedCall(int nargs, int nresults) const;
+  std::string CaptureError(lua_State* L) const;
+
+  // I/O redirection and chunk-loading guards
+  void InstallOutputRedirection();
+  static int LuaPrint(lua_State* L);
+  static int LuaIoWrite(lua_State* L);
+  static int SafeLoad(lua_State* L);
+  static int JsSearcher(lua_State* L);
 };
 
 } // namespace lua_core

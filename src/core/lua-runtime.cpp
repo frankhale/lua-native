@@ -1,5 +1,7 @@
 #include "lua-runtime.h"
 
+#include <cstdio>
+
 namespace lua_core {
 
 namespace {
@@ -373,6 +375,11 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
   try {
     resultHolder = it->second(args);
   } catch (const std::exception& e) {
+    if (runtime->HasPendingErrorValue()) {
+      LuaPtr errVal = runtime->TakePendingErrorValue();
+      try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+      return lua_error(L);
+    }
     lua_pushfstring(L, "Method '%s' threw an exception: %s",
                     func_name ? func_name : "<unknown>", e.what());
     lua_error(L);
@@ -618,6 +625,177 @@ void LuaRuntime::RegisterModuleTable(const std::string& name,
   lua_setfield(L_, -2, name.c_str());
 }
 
+// --- Output redirection (E1) ---
+
+void LuaRuntime::SetOutputHandler(OutputHandler handler) {
+  output_handler_ = std::move(handler);
+  if (output_handler_) {
+    InstallOutputRedirection();
+  }
+}
+
+void LuaRuntime::InstallOutputRedirection() {
+  StackGuard guard(L_);
+  // Override the global print().
+  lua_pushcfunction(L_, LuaPrint);
+  lua_setglobal(L_, "print");
+  // Override io.write() when the io library is loaded.
+  lua_getglobal(L_, "io");
+  if (lua_istable(L_, -1)) {
+    lua_pushcfunction(L_, LuaIoWrite);
+    lua_setfield(L_, -2, "write");
+  }
+}
+
+int LuaRuntime::LuaPrint(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  const int n = lua_gettop(L);
+  std::string out;
+  for (int i = 1; i <= n; ++i) {
+    size_t len = 0;
+    const char* s = luaL_tolstring(L, i, &len);  // respects __tostring
+    if (i > 1) out += '\t';
+    out.append(s, len);
+    lua_pop(L, 1);  // pop the tolstring result
+  }
+  out += '\n';
+
+  if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
+    runtime->output_handler_(out);
+  } else {
+    fwrite(out.data(), 1, out.size(), stdout);
+  }
+  return 0;
+}
+
+int LuaRuntime::LuaIoWrite(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  const int n = lua_gettop(L);
+  std::string out;
+  for (int i = 1; i <= n; ++i) {
+    size_t len = 0;
+    const char* s = luaL_tolstring(L, i, &len);
+    out.append(s, len);
+    lua_pop(L, 1);
+  }
+
+  if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
+    runtime->output_handler_(out);
+  } else {
+    fwrite(out.data(), 1, out.size(), stdout);
+  }
+  return 0;
+}
+
+// --- Bytecode / untrusted-chunk guard (E3) ---
+
+void LuaRuntime::SetAllowBytecode(bool allow) {
+  allow_bytecode_ = allow;
+  if (!allow) {
+    // Wrap the global load() to force text-only mode (binary chunks rejected).
+    StackGuard guard(L_);
+    lua_getglobal(L_, "load");
+    if (lua_isfunction(L_, -1)) {
+      lua_pushcclosure(L_, SafeLoad, 1);  // upvalue 1 = original load
+      lua_setglobal(L_, "load");
+    }
+  }
+}
+
+int LuaRuntime::SafeLoad(lua_State* L) {
+  const int nargs = lua_gettop(L);
+  lua_pushvalue(L, lua_upvalueindex(1));                       // original load
+  lua_pushvalue(L, 1);                                         // chunk
+  if (nargs >= 2) lua_pushvalue(L, 2); else lua_pushnil(L);   // chunkname
+  lua_pushliteral(L, "t");                                    // force text mode
+  if (nargs >= 4) lua_pushvalue(L, 4); else lua_pushnil(L);   // env
+  lua_call(L, 4, LUA_MULTRET);
+  return lua_gettop(L) - nargs;
+}
+
+// --- Dynamic require via a JS searcher (E2) ---
+
+void LuaRuntime::AddJsSearcher(const std::string& host_func_name) {
+  StackGuard guard(L_);
+  if (!HasPackageLibrary()) {
+    throw std::runtime_error(
+      "Cannot add searcher: the 'package' library is not loaded.");
+  }
+  lua_getglobal(L_, "package");
+  lua_getfield(L_, -1, "searchers");
+  if (!lua_istable(L_, -1)) {
+    throw std::runtime_error("package.searchers is not available");
+  }
+  const int len = static_cast<int>(luaL_len(L_, -1));
+  lua_pushstring(L_, host_func_name.c_str());
+  lua_pushcclosure(L_, JsSearcher, 1);  // upvalue 1 = host function name
+  lua_seti(L_, -2, len + 1);            // append to package.searchers
+}
+
+int LuaRuntime::JsSearcher(lua_State* L) {
+  const char* modname = lua_tostring(L, 1);
+  if (!modname) { lua_pushstring(L, "\n\tinvalid module name"); return 1; }
+
+  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  const char* func_name = lua_tostring(L, lua_upvalueindex(1));
+  if (!runtime || !func_name) {
+    lua_pushstring(L, "\n\tsearcher unavailable");
+    return 1;
+  }
+  if (runtime->async_mode_) {
+    return luaL_error(L, "JS searchers are not available in async mode");
+  }
+
+  const auto it = runtime->host_functions_.find(func_name);
+  if (it == runtime->host_functions_.end()) {
+    lua_pushfstring(L, "\n\tno searcher '%s'", func_name);
+    return 1;
+  }
+
+  LuaPtr result;
+  try {
+    std::vector<LuaPtr> args{
+      std::make_shared<LuaValue>(LuaValue::from(std::string(modname)))};
+    result = it->second(args);
+  } catch (const std::exception& e) {
+    return luaL_error(L, "searcher for '%s' failed: %s", modname, e.what());
+  }
+
+  // Searchers must be synchronous — a Promise result is not supported.
+  if (runtime->await_pending_) {
+    runtime->await_pending_ = false;
+    return luaL_error(L, "JS searcher for '%s' must be synchronous", modname);
+  }
+
+  // nil/absent -> not found by this searcher (try the next one).
+  if (!result || std::holds_alternative<std::monostate>(result->value)) {
+    lua_pushfstring(L, "\n\tno JS module '%s'", modname);
+    return 1;
+  }
+  if (!std::holds_alternative<std::string>(result->value)) {
+    return luaL_error(L,
+      "JS searcher for '%s' must return a Lua source string or nil", modname);
+  }
+
+  const std::string& source = std::get<std::string>(result->value);
+  const std::string chunkname = "@" + std::string(modname);
+  // Force text mode so a searcher can never inject bytecode.
+  if (luaL_loadbufferx(L, source.c_str(), source.size(),
+                       chunkname.c_str(), "t") != LUA_OK) {
+    return luaL_error(L, "error loading JS module '%s': %s",
+                      modname, lua_tostring(L, -1));
+  }
+  return 1;  // the loader function
+}
+
 // --- Host function bridge ---
 
 int LuaRuntime::LuaCallHostFunction(lua_State* L) {
@@ -664,6 +842,13 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   try {
     resultHolder = it->second(args);
   } catch (const std::exception& e) {
+    // If the wrapper staged a structured error (a JS Error object), raise that
+    // table so the original error can be reconstructed on the way out.
+    if (runtime->HasPendingErrorValue()) {
+      LuaPtr errVal = runtime->TakePendingErrorValue();
+      try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+      return lua_error(L);
+    }
     lua_pushfstring(L, "Host function '%s' threw an exception: %s",
                     func_name ? func_name : "<unknown>", e.what());
     lua_error(L);
@@ -745,12 +930,67 @@ CompileResult LuaRuntime::CompileFile(const std::string& filepath,
   return bytecode;
 }
 
+// Message handler for lua_pcall: appends a Lua traceback to string errors and
+// leaves structured JS-error tables (identified by __jsErrorId) untouched.
+int LuaRuntime::MessageHandler(lua_State* L) {
+  if (lua_type(L, 1) == LUA_TTABLE) {
+    lua_getfield(L, 1, "__jsErrorId");
+    const bool is_js_error = !lua_isnil(L, -1);
+    lua_pop(L, 1);
+    if (is_js_error) return 1;  // preserve the structured error object as-is
+  }
+  const char* msg = lua_tostring(L, 1);
+  if (msg == nullptr) {
+    if (luaL_callmeta(L, 1, "__tostring") && lua_type(L, -1) == LUA_TSTRING) {
+      return 1;  // use the __tostring result
+    }
+    msg = lua_pushfstring(L, "(error object is a %s value)", luaL_typename(L, 1));
+  }
+  luaL_traceback(L, L, msg, 1);
+  return 1;
+}
+
+// Calls a function already on the stack (with nargs args above it) under the
+// traceback message handler.
+int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
+  const int base = lua_gettop(L_) - nargs;  // index of the function
+  lua_pushcfunction(L_, MessageHandler);
+  lua_insert(L_, base);  // move handler below the function
+  const int status = lua_pcall(L_, nargs, nresults, base);
+  lua_remove(L_, base);  // remove handler
+  return status;
+}
+
+// Captures the error object at the top of L's stack: records the structured
+// value (for JS-Error reconstruction) and returns a display string.
+std::string LuaRuntime::CaptureError(lua_State* L) const {
+  last_error_value_ = ToLuaValue(L, -1);
+  if (lua_type(L, -1) == LUA_TTABLE) {
+    lua_getfield(L, -1, "message");
+    if (lua_type(L, -1) == LUA_TSTRING) {
+      std::string m = lua_tostring(L, -1);
+      lua_pop(L, 1);
+      return m;
+    }
+    lua_pop(L, 1);
+  }
+  size_t len = 0;
+  const char* s = luaL_tolstring(L, -1, &len);
+  std::string msg(s ? s : "", s ? len : 0);
+  lua_pop(L, 1);  // pop the luaL_tolstring result
+  return msg;
+}
+
 ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
                                        const std::string& chunk_name) const {
   if (bytecode.empty()) {
     return std::string("Bytecode cannot be empty");
   }
+  if (!allow_bytecode_) {
+    return std::string("bytecode loading is disabled in this context");
+  }
 
+  last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
   struct ReaderData {
@@ -779,8 +1019,8 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
     return error;
   }
 
-  if (lua_pcall(L_, 0, LUA_MULTRET, 0) != LUA_OK) {
-    std::string error = lua_tostring(L_, -1);
+  if (ProtectedCall(0, LUA_MULTRET) != LUA_OK) {
+    std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
   }
@@ -801,10 +1041,16 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
 }
 
 ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
+  last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
-  if (luaL_loadstring(L_, script.c_str()) || lua_pcall(L_, 0, LUA_MULTRET, 0)) {
-    std::string error = lua_tostring(L_, -1);
+  if (luaL_loadstring(L_, script.c_str()) != LUA_OK) {
+    std::string error = CaptureError(L_);
+    lua_pop(L_, 1);
+    return error;
+  }
+  if (ProtectedCall(0, LUA_MULTRET) != LUA_OK) {
+    std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
   }
@@ -829,10 +1075,16 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
     return std::string("File path cannot be empty");
   }
 
+  last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
-  if (luaL_loadfile(L_, filepath.c_str()) || lua_pcall(L_, 0, LUA_MULTRET, 0)) {
-    std::string error = lua_tostring(L_, -1);
+  if (luaL_loadfile(L_, filepath.c_str()) != LUA_OK) {
+    std::string error = CaptureError(L_);
+    lua_pop(L_, 1);
+    return error;
+  }
+  if (ProtectedCall(0, LUA_MULTRET) != LUA_OK) {
+    std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
   }
@@ -872,6 +1124,7 @@ LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
 
 ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
                                       const std::vector<LuaPtr>& args) const {
+  last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
   lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
@@ -880,8 +1133,8 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
     PushLuaValue(L_, arg);
   }
 
-  if (lua_pcall(L_, static_cast<int>(args.size()), LUA_MULTRET, 0) != LUA_OK) {
-    std::string error = lua_tostring(L_, -1);
+  if (ProtectedCall(static_cast<int>(args.size()), LUA_MULTRET) != LUA_OK) {
+    std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
   }
@@ -1436,6 +1689,7 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     return result;
   }
 
+  last_error_value_.reset();
   await_is_error_ = arg_is_error;
 
   try {
@@ -1471,9 +1725,16 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     lua_settop(threadRef.thread, 0);
     result.state = AsyncStepResult::State::Finished;
   } else {
-    const char* msg = lua_tostring(threadRef.thread, -1);
-    result.error = msg ? msg : "unknown error";
-    lua_settop(threadRef.thread, 0);
+    lua_State* co = threadRef.thread;
+    // Append a traceback for string errors; structured JS-error tables pass
+    // through and are captured as-is.
+    if (lua_type(co, -1) == LUA_TSTRING) {
+      const char* m = lua_tostring(co, -1);
+      luaL_traceback(co, co, m, 1);
+      lua_remove(co, -2);  // drop the original string, keep the traceback'd one
+    }
+    result.error = CaptureError(co);
+    lua_settop(co, 0);
     result.state = AsyncStepResult::State::Error;
   }
 

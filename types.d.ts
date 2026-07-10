@@ -53,6 +53,17 @@ export interface LuaCoroutine {
 }
 
 /**
+ * Result of a protected call via `LuaContext.pcall`.
+ * On success, `value` holds the function's return value (an array when the Lua
+ * function returned multiple values). On failure, `error` holds the caught
+ * error — the original JS Error when the failure came from a JS callback,
+ * otherwise an Error carrying the Lua message and stack traceback.
+ */
+export type PcallResult =
+  | { ok: true; value: LuaValue | LuaValue[] }
+  | { ok: false; error: unknown };
+
+/**
  * Result of resuming a coroutine
  */
 export interface CoroutineResult {
@@ -558,6 +569,59 @@ export interface LuaContext {
    * `);
    */
   register_class(name: string, definition: ClassDefinition): void;
+
+  /**
+   * Calls a function in protected mode, returning a result object instead of
+   * throwing. Mirrors Lua's `pcall`: on success `{ ok: true, value }`; on
+   * failure `{ ok: false, error }`.
+   *
+   * Error fidelity is preserved — if the failure originated from a JS callback
+   * that threw an `Error`, `error` is that original `Error` instance; otherwise
+   * it is an `Error` whose message includes the Lua stack traceback.
+   *
+   * @param fn The function to call (typically a Lua function returned to JS)
+   * @param args Arguments to pass to the function
+   * @example
+   * const fn = lua.execute_script<LuaFunction>('return function(x) if x < 0 then error("neg") end return x end');
+   * const a = lua.pcall(fn, 5);   // { ok: true, value: 5 }
+   * const b = lua.pcall(fn, -1);  // { ok: false, error: Error("...neg...") }
+   */
+  pcall(fn: LuaFunction | ((...args: LuaValue[]) => unknown), ...args: LuaValue[]): PcallResult;
+
+  /**
+   * Redirects Lua `print()` and `io.write()` output to a JavaScript handler.
+   * The handler receives the fully-formatted output text — exactly what would
+   * have been written to stdout (`print` joins its arguments with tabs, applies
+   * `__tostring`, and appends a newline; `io.write` writes its arguments
+   * verbatim). Pass `null` to restore output to stdout.
+   *
+   * @param handler Called with each chunk of output text, or `null` to clear
+   * @example
+   * const lines: string[] = [];
+   * lua.set_print_handler((text) => lines.push(text));
+   * lua.execute_script('print("hello", 42)'); // lines: ["hello\t42\n"]
+   * lua.set_print_handler(null); // back to stdout
+   */
+  set_print_handler(handler: ((text: string) => void) | null): void;
+
+  /**
+   * Adds a module searcher backed by JavaScript, enabling dynamic/virtual
+   * `require()`. When Lua requires a module not already loaded or found by
+   * earlier searchers, `searcher(name)` is called; return the module's Lua
+   * source as a string to provide it, or `null`/`undefined` to let the next
+   * searcher try. Requires the `package` library.
+   *
+   * Unlike `register_module` (a static preload), this resolves modules lazily,
+   * so sources can come from a bundle, database, or in-memory map. Searchers
+   * must be synchronous. Requiring a module caches it as usual.
+   *
+   * @param searcher Maps a module name to its Lua source, or null if unknown
+   * @example
+   * const modules = { greet: 'return function(n) return "Hi " .. n end' };
+   * lua.add_searcher((name) => modules[name] ?? null);
+   * lua.execute_script('return require("greet")("Ada")'); // "Hi Ada"
+   */
+  add_searcher(searcher: (name: string) => string | null | undefined): void;
 }
 
 /**
@@ -619,6 +683,22 @@ export interface LuaInitOptions {
    * { maxMemory: 256 * 1024 }
    */
   maxMemory?: number;
+
+  /**
+   * Redirects Lua `print()` and `io.write()` to this handler (see
+   * `set_print_handler`). The handler receives the formatted output text.
+   * Equivalent to calling `set_print_handler` right after construction, and
+   * takes precedence over a `print` provided in the callbacks object.
+   */
+  print?: (text: string) => void;
+
+  /**
+   * When `false`, this context refuses to load Lua bytecode: `load_bytecode()`
+   * throws, and Lua's `load()` is forced to text-only mode so binary chunks are
+   * rejected. Loading untrusted bytecode is unsafe, so disable it when running
+   * untrusted scripts. Default: `true`.
+   */
+  allowBytecode?: boolean;
 }
 
 /**

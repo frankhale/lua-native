@@ -220,7 +220,12 @@ Sub-capabilities, roughly in dependency order:
 
 ---
 
-### D. Error fidelity
+### D. Error fidelity — ✅ D1–D3 implemented (July 2026)
+
+> **Status:** D1 (JS Error fidelity round-trip), D2 (stack traces + structured
+> surfacing), and D3 (protected calls from JS via `pcall()`) are implemented.
+> See the "Error Fidelity" section in [`FEATURES.md`](./FEATURES.md). The
+> original gap analysis is retained below.
 
 #### D1. JS `Error` objects lose all structure crossing into Lua
 
@@ -248,7 +253,13 @@ useful when the caller wants to branch on failure without try/catch.
 
 ---
 
-### E. I/O, output, and module resolution
+### E. I/O, output, and module resolution — ✅ E1–E3 implemented (July 2026)
+
+> **Status:** E1 (`print`/`io.write` redirection via `set_print_handler` and the
+> `print` option), E2 (dynamic `require` via `add_searcher`), and E3 (bytecode
+> guard via the `allowBytecode` option) are implemented. See the "I/O, Output &
+> Module Resolution" section in [`FEATURES.md`](./FEATURES.md). The original gap
+> analysis is retained below.
 
 #### E1. `print` / stdout redirection to a JS callback ⭐ (common, cheap, absent)
 
@@ -302,14 +313,14 @@ with no reasonable JS-side workaround and broad demand.
 | A2 | ✅ Callbacks during async — **done** | Medium | No | **1** |
 | A3 | ✅ Caller-initiated cancellation — **done** | Medium | No | **1** |
 | B1 | ✅ Built-in type fidelity (BigInt/Date/Map/Set/Buffer) — **done** | High (correctness) | Partial, error-prone | **1** |
-| E1 | ⭐ `print`/output redirection | High | No | **1** |
+| E1 | ✅ `print`/output redirection — **done** | High | No | **1** |
 | C1–C3 | ✅ Class/usertype + operator binding — **done** | High | Verbose Lua glue | **2** |
-| D1 | JS Error fidelity across boundary | Medium-high | No | **2** |
-| E3 | Bytecode text-only / untrusted-chunk guard | Medium (security) | No | **2** |
+| D1 | ✅ JS Error fidelity across boundary — **done** | Medium-high | No | **2** |
+| D2/D3 | ✅ Stack traces / structured errors / pcall — **done** | Medium | No | **2/3** |
+| E3 | ✅ Bytecode text-only / untrusted-chunk guard — **done** | Medium (security) | No | **2** |
 | B2 | ✅ Pluggable type-converter registry — **done** | Medium | No | **2** |
-| E2 | Dynamic `require` via JS searcher | Medium | `register_module` (static only) | **3** |
+| E2 | ✅ Dynamic `require` via JS searcher — **done** | Medium | `register_module` (static only) | **3** |
 | A4 | Coroutine as (async) iterator | Low-med | Manual `resume` loop | **3** |
-| D2/D3 | Structured errors / pcall surface | Low-med | try/catch + Lua `pcall` | **3** |
 | F1 | Metatables on non-global tables | Low-med | `execute_script` | **3** |
 | F2/F3 | call-by-name, per-call env | Low | `get_global`, `execute_script` | **4** |
 | A5 | Worker pool / true parallelism | Low | Multiple contexts | **4** |
