@@ -520,6 +520,10 @@ export interface LuaContext {
    * object, etc.). Converters do not see primitives, functions, BigInt, or
    * Symbol values.
    *
+   * Performance note: every registered `match` predicate runs for every
+   * object-typed value crossing JS→Lua, in registration order, until one
+   * matches. Keep `match` cheap and register only the converters you need.
+   *
    * @param match Predicate deciding whether this converter applies to a value
    * @param convert Maps a matched value to a Lua-convertible JS value
    * @example

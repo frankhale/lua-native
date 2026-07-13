@@ -16,11 +16,16 @@ public:
     std::shared_ptr<lua_core::LuaRuntime> runtime,
     std::string script,
     LuaContext* context,
+    Napi::ObjectReference contextRef,
     Napi::Promise::Deferred deferred)
     : Napi::AsyncWorker(deferred.Env()),
       runtime_(std::move(runtime)),
       script_(std::move(script)),
       context_(context),
+      // Persistent ref to the wrapping JS object keeps the LuaContext (an
+      // ObjectWrap) alive until this worker is destroyed, so OnOK/OnError can
+      // safely use context_ even if JS drops its last reference meanwhile.
+      contextRef_(std::move(contextRef)),
       deferred_(deferred) {}
 
   void Execute() override {
@@ -36,6 +41,7 @@ private:
   std::shared_ptr<lua_core::LuaRuntime> runtime_;
   std::string script_;
   LuaContext* context_;
+  Napi::ObjectReference contextRef_;
   Napi::Promise::Deferred deferred_;
   lua_core::ScriptResult result_;
 };
@@ -46,11 +52,13 @@ public:
     std::shared_ptr<lua_core::LuaRuntime> runtime,
     std::string filepath,
     LuaContext* context,
+    Napi::ObjectReference contextRef,
     Napi::Promise::Deferred deferred)
     : Napi::AsyncWorker(deferred.Env()),
       runtime_(std::move(runtime)),
       filepath_(std::move(filepath)),
       context_(context),
+      contextRef_(std::move(contextRef)),
       deferred_(deferred) {}
 
   void Execute() override {
@@ -66,6 +74,7 @@ private:
   std::shared_ptr<lua_core::LuaRuntime> runtime_;
   std::string filepath_;
   LuaContext* context_;
+  Napi::ObjectReference contextRef_;
   Napi::Promise::Deferred deferred_;
   lua_core::ScriptResult result_;
 };

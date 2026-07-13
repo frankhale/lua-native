@@ -1,6 +1,7 @@
 #pragma once
 
 #include <lua.hpp>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -18,91 +19,79 @@ using LuaPtr = std::shared_ptr<LuaValue>;
 using LuaArray = std::vector<LuaPtr>;
 using LuaTable = std::unordered_map<std::string, LuaPtr>;
 
+namespace detail {
+// Produces a shared owner whose deleter unrefs `ref` from the registry when the
+// last copy is destroyed. Returns null for the no-op refs (LUA_NOREF/LUA_REFNIL)
+// so those never touch the registry. The captured lua_State* must outlive every
+// copy of the owner; refs stored on the runtime itself must be dropped before
+// lua_close (see LuaRuntime's destructor).
+inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
+  if (!L || ref == LUA_NOREF || ref == LUA_REFNIL) return nullptr;
+  return std::shared_ptr<void>(nullptr, [L, ref](void*) {
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+  });
+}
+}  // namespace detail
+
 // Holds a reference to a Lua function in the registry.
-// Note: Copies share the same registry ref - only one should call release().
-// Prefer moving when transferring ownership.
+//
+// The registry slot is owned by a shared control block: copies share ownership
+// and the slot is unref'd exactly once, when the last copy is destroyed. This
+// makes the refs safe to copy freely (e.g. round-tripping through JS) without
+// leaking slots or double-unref'ing. `release()` drops this copy's share early.
 struct LuaFunctionRef {
   int ref;
   lua_State* L;
 
-  LuaFunctionRef(int r, lua_State* state) : ref(r), L(state) {}
+  LuaFunctionRef(int r, lua_State* state)
+      : ref(r), L(state), owner_(detail::MakeRegistryOwner(state, r)) {}
 
-  // Default copy (shares the same ref - be careful with release())
   LuaFunctionRef(const LuaFunctionRef&) = default;
   LuaFunctionRef& operator=(const LuaFunctionRef&) = default;
-
-  // Move transfers ownership (source becomes invalid)
-  LuaFunctionRef(LuaFunctionRef&& other) noexcept
-      : ref(other.ref), L(other.L) {
-    other.ref = LUA_NOREF;
-    other.L = nullptr;
-  }
-  LuaFunctionRef& operator=(LuaFunctionRef&& other) noexcept {
-    if (this != &other) {
-      release();
-      ref = other.ref;
-      L = other.L;
-      other.ref = LUA_NOREF;
-      other.L = nullptr;
-    }
-    return *this;
-  }
+  LuaFunctionRef(LuaFunctionRef&&) noexcept = default;
+  LuaFunctionRef& operator=(LuaFunctionRef&&) noexcept = default;
 
   void release() {
-    if (L && ref != LUA_NOREF) {
-      luaL_unref(L, LUA_REGISTRYINDEX, ref);
-      ref = LUA_NOREF;
-    }
+    owner_.reset();  // unrefs iff this was the last owner
+    ref = LUA_NOREF;
+    L = nullptr;
   }
+
+ private:
+  std::shared_ptr<void> owner_;
 };
 
-// Holds a reference to a Lua coroutine thread in the registry.
-// Note: Copies share the same registry ref - only one should call release().
-// Prefer moving when transferring ownership.
+// Holds a reference to a Lua coroutine thread in the registry. See LuaFunctionRef
+// for the shared-ownership semantics.
 struct LuaThreadRef {
   int ref;
   lua_State* L;        // Main state
   lua_State* thread;   // The coroutine thread
 
   LuaThreadRef(int r, lua_State* mainState, lua_State* threadState)
-    : ref(r), L(mainState), thread(threadState) {}
+      : ref(r), L(mainState), thread(threadState),
+        owner_(detail::MakeRegistryOwner(mainState, r)) {}
 
-  // Default copy (shares the same ref - be careful with release())
   LuaThreadRef(const LuaThreadRef&) = default;
   LuaThreadRef& operator=(const LuaThreadRef&) = default;
-
-  // Move transfers ownership (source becomes invalid)
-  LuaThreadRef(LuaThreadRef&& other) noexcept
-      : ref(other.ref), L(other.L), thread(other.thread) {
-    other.ref = LUA_NOREF;
-    other.L = nullptr;
-    other.thread = nullptr;
-  }
-  LuaThreadRef& operator=(LuaThreadRef&& other) noexcept {
-    if (this != &other) {
-      release();
-      ref = other.ref;
-      L = other.L;
-      thread = other.thread;
-      other.ref = LUA_NOREF;
-      other.L = nullptr;
-      other.thread = nullptr;
-    }
-    return *this;
-  }
+  LuaThreadRef(LuaThreadRef&&) noexcept = default;
+  LuaThreadRef& operator=(LuaThreadRef&&) noexcept = default;
 
   void release() {
-    if (L && ref != LUA_NOREF) {
-      luaL_unref(L, LUA_REGISTRYINDEX, ref);
-      ref = LUA_NOREF;
-      thread = nullptr;
-    }
+    owner_.reset();
+    ref = LUA_NOREF;
+    L = nullptr;
+    thread = nullptr;
   }
+
+ private:
+  std::shared_ptr<void> owner_;
 };
 
 // Holds a reference to userdata.
 // For JS-created userdata: ref_id maps to a JS object, registry_ref is LUA_NOREF.
-// For Lua-created userdata (opaque passthrough): ref_id is -1, registry_ref holds the Lua registry reference.
+// For Lua-created userdata (opaque passthrough): ref_id is -1, registry_ref holds
+// the Lua registry reference (owned via the shared control block below).
 struct LuaUserdataRef {
   int ref_id;           // JS object map key (-1 if opaque/Lua-created)
   int registry_ref;     // Lua registry ref (for opaque/Lua-created passthrough)
@@ -114,76 +103,49 @@ struct LuaUserdataRef {
   LuaUserdataRef(int id, lua_State* state, bool is_opaque = false,
                  int reg_ref = LUA_NOREF, bool is_proxy = false,
                  std::string cls = "")
-    : ref_id(id), registry_ref(reg_ref), L(state),
-      opaque(is_opaque), proxy(is_proxy), class_name(std::move(cls)) {}
+      : ref_id(id), registry_ref(reg_ref), L(state),
+        opaque(is_opaque), proxy(is_proxy), class_name(std::move(cls)),
+        // Only opaque (Lua-created) userdata owns a registry slot; JS-backed
+        // userdata is tracked by ref_id and freed via the __gc ref-count path.
+        owner_(is_opaque ? detail::MakeRegistryOwner(state, reg_ref) : nullptr) {}
 
   LuaUserdataRef(const LuaUserdataRef&) = default;
   LuaUserdataRef& operator=(const LuaUserdataRef&) = default;
-
-  LuaUserdataRef(LuaUserdataRef&& other) noexcept
-    : ref_id(other.ref_id), registry_ref(other.registry_ref),
-      L(other.L), opaque(other.opaque), proxy(other.proxy),
-      class_name(std::move(other.class_name)) {
-    other.registry_ref = LUA_NOREF;
-    other.L = nullptr;
-  }
-
-  LuaUserdataRef& operator=(LuaUserdataRef&& other) noexcept {
-    if (this != &other) {
-      release();
-      ref_id = other.ref_id;
-      registry_ref = other.registry_ref;
-      L = other.L;
-      opaque = other.opaque;
-      proxy = other.proxy;
-      class_name = std::move(other.class_name);
-      other.registry_ref = LUA_NOREF;
-      other.L = nullptr;
-    }
-    return *this;
-  }
+  LuaUserdataRef(LuaUserdataRef&&) noexcept = default;
+  LuaUserdataRef& operator=(LuaUserdataRef&&) noexcept = default;
 
   void release() {
-    if (opaque && L && registry_ref != LUA_NOREF) {
-      luaL_unref(L, LUA_REGISTRYINDEX, registry_ref);
-      registry_ref = LUA_NOREF;
-    }
+    owner_.reset();
+    registry_ref = LUA_NOREF;
+    L = nullptr;
   }
+
+ private:
+  std::shared_ptr<void> owner_;
 };
 
-// Holds a reference to a Lua table in the registry.
-// Used for metatabled tables to preserve metamethods across the JS boundary.
+// Holds a reference to a Lua table in the registry (metatabled tables preserved
+// as refs). See LuaFunctionRef for the shared-ownership semantics.
 struct LuaTableRef {
   int ref;
   lua_State* L;
 
-  LuaTableRef(int r, lua_State* state) : ref(r), L(state) {}
+  LuaTableRef(int r, lua_State* state)
+      : ref(r), L(state), owner_(detail::MakeRegistryOwner(state, r)) {}
 
   LuaTableRef(const LuaTableRef&) = default;
   LuaTableRef& operator=(const LuaTableRef&) = default;
-
-  LuaTableRef(LuaTableRef&& other) noexcept
-      : ref(other.ref), L(other.L) {
-    other.ref = LUA_NOREF;
-    other.L = nullptr;
-  }
-  LuaTableRef& operator=(LuaTableRef&& other) noexcept {
-    if (this != &other) {
-      release();
-      ref = other.ref;
-      L = other.L;
-      other.ref = LUA_NOREF;
-      other.L = nullptr;
-    }
-    return *this;
-  }
+  LuaTableRef(LuaTableRef&&) noexcept = default;
+  LuaTableRef& operator=(LuaTableRef&&) noexcept = default;
 
   void release() {
-    if (L && ref != LUA_NOREF) {
-      luaL_unref(L, LUA_REGISTRYINDEX, ref);
-      ref = LUA_NOREF;
-    }
+    owner_.reset();
+    ref = LUA_NOREF;
+    L = nullptr;
   }
+
+ private:
+  std::shared_ptr<void> owner_;
 };
 
 struct MemoryAllocator {
@@ -218,9 +180,16 @@ struct CoroutineResult {
 // Result of one step of the coroutine-driven async executor.
 struct AsyncStepResult {
   enum class State { Finished, Awaiting, Error };
-  State state = State::Error;
+  State state = State::Error;  // fail-safe default: treated as an error unless set
   std::vector<LuaPtr> values;  // return values when Finished
   std::string error;           // message when Error
+};
+
+// Names a registered host function so PushLuaValue can materialize it as a Lua
+// closure. Lets JS functions nested inside objects/arrays cross into Lua as real
+// callables (not as their internal registry-name string).
+struct HostFunctionName {
+  std::string name;
 };
 
 struct LuaValue {
@@ -235,7 +204,8 @@ struct LuaValue {
       LuaFunctionRef,
       LuaThreadRef,
       LuaUserdataRef,
-      LuaTableRef>;
+      LuaTableRef,
+      HostFunctionName>;
   Variant value;
 
   LuaValue() = default;
@@ -246,14 +216,14 @@ struct LuaValue {
   static LuaValue from(bool b) { return LuaValue{Variant{b}}; }
   static LuaValue from(int64_t i) { return LuaValue{Variant{i}}; }
   static LuaValue from(double d) { return LuaValue{Variant{d}}; }
-  static LuaValue from(const std::string& s) { return LuaValue{Variant{s}}; }
-  static LuaValue from(std::string&& s) { return LuaValue{Variant{std::move(s)}}; }
+  static LuaValue from(std::string s) { return LuaValue{Variant{std::move(s)}}; }
   static LuaValue from(LuaArray arr) { return LuaValue{Variant{std::move(arr)}}; }
   static LuaValue from(LuaTable tbl) { return LuaValue{Variant{std::move(tbl)}}; }
   static LuaValue from(LuaFunctionRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
   static LuaValue from(LuaThreadRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
   static LuaValue from(LuaUserdataRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
   static LuaValue from(LuaTableRef&& ref) { return LuaValue{Variant{std::move(ref)}}; }
+  static LuaValue from(HostFunctionName fn) { return LuaValue{Variant{std::move(fn)}}; }
 };
 
 using ScriptResult = std::variant<std::vector<LuaPtr>, std::string>;
@@ -408,9 +378,21 @@ public:
   static constexpr const char* kUserdataMetaName = "lua_native_userdata";
   static constexpr const char* kProxyUserdataMetaName = "lua_native_proxy_userdata";
 
+  // Registry keys / markers shared between the core and binding layers.
+  static constexpr const char* kRuntimeRegistryKey = "_lua_core_runtime";
+  static constexpr const char* kUserdataMethodsPrefix = "_ud_methods_";
+  static constexpr const char* kClassMetaPrefix = "_class_mt_";
+  static constexpr const char* kClassMethodsPrefix = "_class_methods_";
+  static constexpr const char* kClassMarkerField = "__lua_native_class";
+  static constexpr const char* kJsErrorIdField = "__jsErrorId";
+
 private:
   // allocator_ must be declared before L_ so it outlives the Lua state
-  // (C++ destroys members in reverse declaration order, and lua_close calls the allocator)
+  // (C++ destroys members in reverse declaration order, and lua_close calls the allocator).
+  // The destructor also runs an explicit teardown sequence — reset the
+  // registry-backed error values, run stored_function_data_ destructors, then
+  // lua_close — because lua_close fires __gc metamethods that can call back into
+  // host_functions_ and read these members while the state is still open.
   MemoryAllocator allocator_;
   lua_State* L_ { nullptr };
   std::unordered_map<std::string, Function> host_functions_;
@@ -421,7 +403,11 @@ private:
   std::unordered_map<int, int> userdata_ref_counts_;
   PropertyGetter property_getter_;
   PropertySetter property_setter_;
-  bool async_mode_ = false;
+  // True only while a worker thread (execute_script_async / execute_file_async)
+  // owns the Lua state. Read from the main thread (e.g. binding-layer guards) to
+  // reject concurrent access, so it must be atomic. Note: the main-thread
+  // coroutine driver (execute_async) uses await_driver_mode_, not this flag.
+  std::atomic<bool> async_mode_{false};
 
   // Error fidelity state (mutable: set while capturing errors in const methods)
   mutable LuaPtr last_error_value_;     // structured value of the last error
@@ -460,6 +446,12 @@ private:
   static int MessageHandler(lua_State* L);
   int ProtectedCall(int nargs, int nresults) const;
   std::string CaptureError(lua_State* L) const;
+
+  // Runs a pre-pushed C trampoline (function + nargs already on the stack) under
+  // lua_pcall so a raising metamethod becomes a std::runtime_error rather than a
+  // panic/abort. Used by the table-reference operations, whose refs preserve
+  // metatables and can therefore trigger __index/__newindex/__len.
+  void ProtectedTableCall(int nargs, int nresults) const;
 
   // I/O redirection and chunk-loading guards
   void InstallOutputRedirection();

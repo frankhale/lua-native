@@ -111,9 +111,23 @@ static std::optional<lua_core::LuaValue> ConvertBuiltinType(
 
 // --- Proxy trap functions for LuaTableRef ---
 
+// Throws a JS "busy" error and returns true if a worker thread currently owns
+// the Lua state (execute_script_async / execute_file_async). Table-ref traps and
+// handle methods touch the shared lua_State from the main thread, so they must
+// bail out rather than race the worker.
+static bool RejectIfWorkerBusy(Napi::Env env, LuaTableRefData* data) {
+  if (data && data->runtime && data->runtime->IsAsyncMode()) {
+    Napi::Error::New(env, "Lua context is busy with an async operation")
+      .ThrowAsJavaScriptException();
+    return true;
+  }
+  return false;
+}
+
 static Napi::Value TableRefGetTrap(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
 
   auto target = info[0].As<Napi::Object>();
   auto prop = info[1];
@@ -143,6 +157,7 @@ static Napi::Value TableRefGetTrap(const Napi::CallbackInfo& info) {
 static Napi::Value TableRefSetTrap(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
 
   auto prop = info[1];
   auto value = info[2];
@@ -164,6 +179,7 @@ static Napi::Value TableRefSetTrap(const Napi::CallbackInfo& info) {
 static Napi::Value TableRefHasTrap(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
 
   auto prop = info[1];
 
@@ -185,6 +201,7 @@ static Napi::Value TableRefHasTrap(const Napi::CallbackInfo& info) {
 static Napi::Value TableRefOwnKeysTrap(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
 
   try {
     auto keys = data->runtime->GetTableKeys(data->tableRef.ref);
@@ -202,6 +219,7 @@ static Napi::Value TableRefOwnKeysTrap(const Napi::CallbackInfo& info) {
 static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
 
   auto prop = info[1];
 
@@ -229,6 +247,7 @@ static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo
 static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -260,6 +279,7 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
 static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -292,6 +312,7 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
 static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -323,6 +344,7 @@ static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
 static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -340,6 +362,7 @@ static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
 static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -366,6 +389,7 @@ static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
 static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -392,13 +416,15 @@ static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
 static Napi::Value TableHandleRelease(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->tableRef.ref == LUA_NOREF) {
     // Already released — no-op
     return env.Undefined();
   }
 
-  data->runtime->ReleaseTableRef(data->tableRef.ref);
-  data->tableRef.ref = LUA_NOREF;
+  // Drop this handle's share of the registry slot (unref'd iff it was the last
+  // owner) and mark the handle released.
+  data->tableRef.release();
   return env.Undefined();
 }
 
@@ -408,6 +434,15 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaFunctionData*>(info.Data());
   if (!data || !data->runtime || !data->context) {
     Napi::Error::New(env, "Invalid Lua function reference").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // A worker thread (execute_script_async / execute_file_async) owns the Lua
+  // state during async_mode_; calling back into it from the main thread would be
+  // a concurrent access to the same lua_State.
+  if (data->runtime->IsAsyncMode()) {
+    Napi::Error::New(env, "Lua context is busy with an async operation")
+      .ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -434,21 +469,8 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  // Convert results back to JS
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(result);
-  if (values.empty()) return env.Undefined();
-
-  // For single return value, return it directly
-  if (values.size() == 1) {
-    return data->context->CoreToNapi(*values[0]);
-  }
-
-  // For multiple return values, return as array
-  Napi::Array arr = Napi::Array::New(env, values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    arr.Set(i, data->context->CoreToNapi(*values[i]));
-  }
-  return arr;
+  // Convert results back to JS (undefined / single value / array)
+  return data->context->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result));
 }
 
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
@@ -481,10 +503,10 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("add_searcher", &LuaContext::AddSearcher)
   });
 
-  auto* constructor = new Napi::FunctionReference();
-  *constructor = Napi::Persistent(func);
-
-  exports.Set(Napi::String::New(env, "init"), constructor->Value());
+  // The constructor is kept alive by the persistent reference InitModule stores
+  // as instance data (and by `exports` itself), so no separate leaked
+  // FunctionReference is needed here.
+  exports.Set(Napi::String::New(env, "init"), func);
 
   return exports;
 }
@@ -626,7 +648,7 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
     std::string key_str = key.ToString();
 
     if (val.IsFunction()) {
-      js_callbacks[key_str] = Napi::Persistent(val.As<Napi::Function>());
+      js_callbacks_[key_str] = Napi::Persistent(val.As<Napi::Function>());
       runtime->RegisterFunction(key_str, CreateJsCallbackWrapper(key_str));
     } else {
       try {
@@ -640,10 +662,7 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
 }
 
 Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string name as first argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -652,7 +671,7 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
   const std::string name = info[0].As<Napi::String>().Utf8Value();
 
   if (const Napi::Value value = info[1]; value.IsFunction()) {
-    js_callbacks[name] = Napi::Persistent(value.As<Napi::Function>());
+    js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
     runtime->RegisterFunction(name, CreateJsCallbackWrapper(name));
   } else {
     try {
@@ -667,10 +686,7 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string name as first argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -682,10 +698,7 @@ Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object[, options])").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -745,7 +758,7 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
       std::string func_name = "__ud_method_" + std::to_string(ref_id)
                             + "_" + methodName;
 
-      js_callbacks[func_name] = Napi::Persistent(methodFunc);
+      js_callbacks_[func_name] = Napi::Persistent(methodFunc);
       runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
       method_map[methodName] = func_name;
     }
@@ -757,10 +770,7 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env,
       "register_class(name, definition) requires a string name and an object")
@@ -792,7 +802,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
 
   // Constructor host function (special wrapper: builds + registers an instance).
   const std::string ctor_name = "__class_ctor_" + std::to_string(class_id);
-  js_callbacks[ctor_name] = Napi::Persistent(constructFn);
+  js_callbacks_[ctor_name] = Napi::Persistent(constructFn);
   runtime->StoreHostFunction(ctor_name,
     CreateConstructorWrapper(ctor_name, class_name, readable, writable));
 
@@ -806,7 +816,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
       Napi::Value val = methods.Get(name);
       if (val.IsFunction()) {
         std::string func_name = "__class_method_" + std::to_string(class_id) + "_" + name;
-        js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+        js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
         runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
         method_map[name] = func_name;
       }
@@ -823,7 +833,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
       Napi::Value val = mms.Get(key);
       if (val.IsFunction()) {
         std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
-        js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+        js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
         runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
         lua_core::MetatableEntry entry;
         entry.key = key;
@@ -839,10 +849,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -864,7 +871,7 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
 
     if (val.IsFunction()) {
       const std::string func_name = "__mt_" + std::to_string(mt_id) + "_" + key;
-      js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+      js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
       runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
       entry.is_function = true;
       entry.func_name = func_name;
@@ -892,10 +899,7 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -920,10 +924,7 @@ Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -945,7 +946,7 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 
     if (val.IsFunction()) {
       const std::string func_name = "__module_" + std::to_string(mod_id) + "_" + key;
-      js_callbacks[func_name] = Napi::Persistent(val.As<Napi::Function>());
+      js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
       runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
       entry.is_function = true;
       entry.func_name = func_name;
@@ -973,10 +974,7 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1008,10 +1006,7 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1039,10 +1034,7 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsBuffer()) {
     Napi::TypeError::New(env, "Expected Buffer argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1063,28 +1055,20 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
     ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
-
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
-  if (values.empty()) return env.Undefined();
-  if (values.size() == 1) return CoreToNapi(*values[0]);
-
-  const Napi::Array array = Napi::Array::New(env, values.size());
-  for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
-  return array;
+  return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(res));
 }
 
 Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
-  auto data = std::make_unique<LuaTableRefData>(
-    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()),
-    this
-  );
-  auto* dataPtr = data.get();
-  lua_table_ref_data_.push_back(std::move(data));
+  // The data is owned by the External's finalizer, freed when the handle is
+  // garbage-collected.
+  auto* dataPtr = new LuaTableRefData(
+    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this);
 
   Napi::Object handle = Napi::Object::New(env);
 
   // Store _tableRef as non-enumerable for round-trip detection (same pattern as Proxy)
-  auto external = Napi::External<LuaTableRefData>::New(env, dataPtr);
+  auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
+    [](Napi::Env, LuaTableRefData* d) { delete d; });
   auto Object = env.Global().Get("Object").As<Napi::Object>();
   auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
   Napi::Object descriptor = Napi::Object::New(env);
@@ -1106,10 +1090,7 @@ Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
 }
 
 Napi::Value LuaContext::CreateTableMethod(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
 
   int ref;
   if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
@@ -1147,10 +1128,7 @@ Napi::Value LuaContext::CreateTableMethod(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "get_global_ref() requires a string name").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1168,15 +1146,15 @@ Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
   return CreateTableHandle(env, ref);
 }
 
-Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& info) {
+Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& /*info*/) {
+  // A worker thread mutates the allocator counter during async execution;
+  // reading it concurrently would be a data race.
+  if (RejectIfBusy()) return env.Undefined();
   return Napi::Number::New(env, static_cast<double>(runtime->GetMemoryUsage()));
 }
 
 Napi::Value LuaContext::RegisterTypeConverter(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsFunction() || !info[1].IsFunction()) {
     Napi::TypeError::New(env,
       "register_type_converter(match, convert) requires two functions")
@@ -1212,7 +1190,7 @@ std::string LuaContext::StageJsError(const Napi::Value& value, const std::string
   lua_core::LuaTable t;
   t.emplace("message",
     std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(message)));
-  t.emplace("__jsErrorId",
+  t.emplace(lua_core::LuaRuntime::kJsErrorIdField,
     std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(static_cast<int64_t>(id))));
   if (obj.Get("name").IsString()) {
     t.emplace("name", std::make_shared<lua_core::LuaValue>(
@@ -1231,7 +1209,7 @@ Napi::Value LuaContext::LuaErrorToJsValue(const std::string& fallback) {
   lua_core::LuaPtr ev = runtime->TakeLastErrorValue();
   if (ev && std::holds_alternative<lua_core::LuaTable>(ev->value)) {
     const auto& t = std::get<lua_core::LuaTable>(ev->value);
-    auto it = t.find("__jsErrorId");
+    auto it = t.find(lua_core::LuaRuntime::kJsErrorIdField);
     if (it != t.end() && it->second &&
         std::holds_alternative<int64_t>(it->second->value)) {
       const int id = static_cast<int>(std::get<int64_t>(it->second->value));
@@ -1252,13 +1230,19 @@ void LuaContext::ThrowLuaError(const std::string& fallback) {
 
 lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::string& name) {
   return [this, name](const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    // Look the callback up explicitly: operator[] would default-construct an
+    // empty FunctionReference for a missing name, and calling that is UB.
+    auto cbIt = js_callbacks_.find(name);
+    if (cbIt == js_callbacks_.end()) {
+      throw std::runtime_error("JS callback '" + name + "' is no longer registered");
+    }
     std::vector<napi_value> jsArgs;
     jsArgs.reserve(args.size());
     for (const auto& a : args) {
       jsArgs.push_back(CoreToNapi(*a));
     }
     try {
-      const Napi::Value result = js_callbacks[name].Call(jsArgs);
+      const Napi::Value result = cbIt->second.Call(jsArgs);
       if (result.IsPromise()) {
         if (!runtime->IsAwaitDriverMode()) {
           throw std::runtime_error(
@@ -1281,6 +1265,11 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     bool readable, bool writable) {
   return [this, name, class_name, readable, writable](
       const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    auto cbIt = js_callbacks_.find(name);
+    if (cbIt == js_callbacks_.end()) {
+      throw std::runtime_error(
+        "Class '" + class_name + "' constructor is no longer registered");
+    }
     std::vector<napi_value> jsArgs;
     jsArgs.reserve(args.size());
     for (const auto& a : args) {
@@ -1289,7 +1278,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
 
     Napi::Value instance;
     try {
-      instance = js_callbacks[name].Call(jsArgs);
+      instance = cbIt->second.Call(jsArgs);
     } catch (const Napi::Error& e) {
       throw std::runtime_error(StageJsError(e.Value(), e.Message()));
     }
@@ -1323,10 +1312,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
 }
 
 Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1340,21 +1326,11 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
     ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
-
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
-  if (values.empty()) return env.Undefined();
-  if (values.size() == 1) return CoreToNapi(*values[0]);
-
-  const Napi::Array array = Napi::Array::New(env, values.size());
-  for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
-  return array;
+  return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(res));
 }
 
 Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1368,29 +1344,34 @@ Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
     ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
   }
-
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
-  if (values.empty()) return env.Undefined();
-  if (values.size() == 1) return CoreToNapi(*values[0]);
-
-  const Napi::Array array = Napi::Array::New(env, values.size());
-  for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
-  return array;
+  return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(res));
 }
 
 void LuaContext::ClearBusy() {
   is_busy_ = false;
 }
 
-Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& info) {
-  return Napi::Boolean::New(env, is_busy_);
+bool LuaContext::RejectIfBusy() {
+  if (is_busy_) {
+    Napi::Error::New(env, "Lua context is busy with an async operation")
+      .ThrowAsJavaScriptException();
+    return true;
+  }
+  return false;
 }
 
+Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& /*info*/) {
+  return Napi::Boolean::New(env, is_busy_.load());
+}
+
+// execute_script_async / execute_file_async run the script on a libuv worker
+// thread: use them for CPU-bound Lua that shouldn't block the event loop, but
+// note the script cannot call back into JS (host callbacks are disabled in
+// async_mode_) and print redirection is bypassed. For Lua that needs to await JS
+// Promises or invoke JS callbacks, use execute_async (coroutine-driven, stays on
+// the main thread) instead.
 Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1400,16 +1381,14 @@ Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
   is_busy_ = true;
 
   auto deferred = Napi::Promise::Deferred::New(env);
-  auto* worker = new LuaScriptAsyncWorker(runtime, script, this, deferred);
+  auto* worker = new LuaScriptAsyncWorker(
+    runtime, script, this, Napi::Persistent(info.This().As<Napi::Object>()), deferred);
   worker->Queue();
   return deferred.Promise();
 }
 
 Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1419,7 +1398,8 @@ Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
   is_busy_ = true;
 
   auto deferred = Napi::Promise::Deferred::New(env);
-  auto* worker = new LuaFileAsyncWorker(runtime, filepath, this, deferred);
+  auto* worker = new LuaFileAsyncWorker(
+    runtime, filepath, this, Napi::Persistent(info.This().As<Napi::Object>()), deferred);
   worker->Queue();
   return deferred.Promise();
 }
@@ -1427,10 +1407,7 @@ Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
 // --- Coroutine-driven async execution (execute_async / cancel) ---
 
 Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1447,6 +1424,7 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
   }
 
   is_busy_ = true;
+  ++async_generation_;  // invalidate any stale settlement from a prior run
   js_error_registry_.clear();
   runtime->ClearCancel();
   runtime->SetAwaitDriverMode(true);
@@ -1458,6 +1436,15 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
   DriveAsync({}, false);
   return promise;
 }
+
+// Data passed to the await-settlement callbacks: the context plus the generation
+// of the execute_async run that attached them (see async_generation_).
+namespace {
+struct AwaitCookie {
+  LuaContext* ctx;
+  uint64_t gen;
+};
+}  // namespace
 
 void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
   auto step = runtime->ResumeAsyncStep(*async_co_, args, is_error);
@@ -1473,12 +1460,15 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
         "only awaiting a host Promise suspends execution").Value());
       return;
     }
-    // Attach continuation callbacks to the pending promise.
+    // Attach continuation callbacks to the pending promise. The callbacks carry
+    // a heap cookie tagged with this run's generation; whichever of
+    // resolve/reject fires deletes it (a promise settles at most once).
     Napi::Object promise = async_pending_promise_.Value();
     async_pending_promise_.Reset();
     auto thenFn = promise.Get("then").As<Napi::Function>();
-    auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", this);
-    auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", this);
+    auto* cookie = new AwaitCookie{this, async_generation_};
+    auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", cookie);
+    auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", cookie);
     thenFn.Call(promise, {onResolve, onReject});
     return;
   }
@@ -1486,16 +1476,7 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
   // Finished or errored: settle the promise and tear down.
   auto deferred = *async_deferred_;
   if (step.state == lua_core::AsyncStepResult::State::Finished) {
-    Napi::Value resolved;
-    if (step.values.empty()) {
-      resolved = env.Undefined();
-    } else if (step.values.size() == 1) {
-      resolved = CoreToNapi(*step.values[0]);
-    } else {
-      Napi::Array arr = Napi::Array::New(env, step.values.size());
-      for (size_t i = 0; i < step.values.size(); ++i) arr.Set(i, CoreToNapi(*step.values[i]));
-      resolved = arr;
-    }
+    Napi::Value resolved = ResultsToJs(step.values);
     FinishAsync();
     deferred.Resolve(resolved);
   } else {
@@ -1506,9 +1487,12 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
   }
 }
 
-Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error) {
-  // The run may already be gone (e.g. cancelled while awaiting).
-  if (!async_co_ || !async_deferred_) return env.Undefined();
+Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen) {
+  // Ignore a settlement from a run that has already ended or been superseded
+  // (e.g. a promise from a cancelled run resolving after a new run has started).
+  if (!async_co_ || !async_deferred_ || gen != async_generation_) {
+    return env.Undefined();
+  }
 
   if (runtime->IsCancelRequested()) {
     auto deferred = *async_deferred_;
@@ -1554,13 +1538,19 @@ void LuaContext::FinishAsync() {
 }
 
 Napi::Value LuaContext::OnAwaitResolveStatic(const Napi::CallbackInfo& info) {
-  auto* ctx = static_cast<LuaContext*>(info.Data());
-  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), false);
+  auto* cookie = static_cast<AwaitCookie*>(info.Data());
+  LuaContext* ctx = cookie->ctx;
+  const uint64_t gen = cookie->gen;
+  delete cookie;  // one settlement per promise; the sibling callback never fires
+  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), false, gen);
 }
 
 Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
-  auto* ctx = static_cast<LuaContext*>(info.Data());
-  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), true);
+  auto* cookie = static_cast<AwaitCookie*>(info.Data());
+  LuaContext* ctx = cookie->ctx;
+  const uint64_t gen = cookie->gen;
+  delete cookie;
+  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), true, gen);
 }
 
 Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
@@ -1575,10 +1565,7 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsFunction()) {
     Napi::TypeError::New(env, "pcall(fn, ...args) requires a function as the first argument")
       .ThrowAsJavaScriptException();
@@ -1612,10 +1599,7 @@ void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
 }
 
 Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() >= 1 && info[0].IsFunction()) {
     InstallPrintHandler(info[0].As<Napi::Function>());
   } else {
@@ -1627,17 +1611,14 @@ Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsFunction()) {
     Napi::TypeError::New(env, "add_searcher(fn) requires a function")
       .ThrowAsJavaScriptException();
     return env.Undefined();
   }
   const std::string name = "__searcher_" + std::to_string(next_searcher_id_++);
-  js_callbacks[name] = Napi::Persistent(info[0].As<Napi::Function>());
+  js_callbacks_[name] = Napi::Persistent(info[0].As<Napi::Function>());
   runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
   try {
     runtime->AddJsSearcher(name);
@@ -1658,19 +1639,7 @@ void LuaScriptAsyncWorker::OnOK() {
     deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
     return;
   }
-
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(result_);
-  if (values.empty()) {
-    deferred_.Resolve(env.Undefined());
-  } else if (values.size() == 1) {
-    deferred_.Resolve(context_->CoreToNapi(*values[0]));
-  } else {
-    Napi::Array array = Napi::Array::New(env, values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-      array.Set(i, context_->CoreToNapi(*values[i]));
-    }
-    deferred_.Resolve(array);
-  }
+  deferred_.Resolve(context_->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result_)));
 }
 
 void LuaScriptAsyncWorker::OnError(const Napi::Error& error) {
@@ -1686,19 +1655,7 @@ void LuaFileAsyncWorker::OnOK() {
     deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
     return;
   }
-
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(result_);
-  if (values.empty()) {
-    deferred_.Resolve(env.Undefined());
-  } else if (values.size() == 1) {
-    deferred_.Resolve(context_->CoreToNapi(*values[0]));
-  } else {
-    Napi::Array array = Napi::Array::New(env, values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-      array.Set(i, context_->CoreToNapi(*values[i]));
-    }
-    deferred_.Resolve(array);
-  }
+  deferred_.Resolve(context_->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result_)));
 }
 
 void LuaFileAsyncWorker::OnError(const Napi::Error& error) {
@@ -1722,11 +1679,13 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   }
 
   if (value.IsFunction()) {
-    const std::string name = "__js_callback_" + std::to_string(js_callbacks.size());
-    js_callbacks[name] = Napi::Persistent(value.As<Napi::Function>());
-    runtime->RegisterFunction(name, CreateJsCallbackWrapper(name));
-    // For JS functions passed to Lua, they become globals and we return their name
-    return lua_core::LuaValue::from(name);
+    // Register the callback (without creating a global) and return a
+    // HostFunctionName so PushLuaValue materializes it as a real Lua closure —
+    // even when the function is nested inside a table or array.
+    const std::string name = "__js_callback_" + std::to_string(next_js_callback_id_++);
+    js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
+    runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
+    return lua_core::LuaValue::from(lua_core::HostFunctionName{name});
   }
 
   const napi_valuetype type = value.Type();
@@ -1767,12 +1726,13 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
     if (value.IsObject()) {
       auto obj = value.As<Napi::Object>();
 
-      // Check if it's a LuaTableRef Proxy (metatabled table round-tripping through JS)
+      // Check if it's a LuaTableRef Proxy (metatabled table round-tripping through JS).
+      // Copy the existing ref so it shares registry ownership rather than minting a
+      // second owner for the same slot (which would double-unref).
       if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
         auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
         if (data) {
-          return lua_core::LuaValue::from(
-            lua_core::LuaTableRef(data->tableRef.ref, data->tableRef.L));
+          return lua_core::LuaValue::from(lua_core::LuaTableRef(data->tableRef));
         }
       }
 
@@ -1780,10 +1740,7 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
       if (obj.Has("_userdata") && obj.Get("_userdata").IsExternal()) {
         auto* data = obj.Get("_userdata").As<Napi::External<LuaUserdataData>>().Data();
         if (data) {
-          return lua_core::LuaValue::from(lua_core::LuaUserdataRef(
-            data->userdataRef.ref_id, data->userdataRef.L,
-            data->userdataRef.opaque, data->userdataRef.registry_ref,
-            data->userdataRef.proxy));
+          return lua_core::LuaValue::from(lua_core::LuaUserdataRef(data->userdataRef));
         }
       }
 
@@ -1910,6 +1867,14 @@ lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
   return lua_core::LuaValue::nil();
 }
 
+Napi::Value LuaContext::ResultsToJs(const std::vector<lua_core::LuaPtr>& values) {
+  if (values.empty()) return env.Undefined();
+  if (values.size() == 1) return CoreToNapi(*values[0]);
+  Napi::Array array = Napi::Array::New(env, values.size());
+  for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
+  return array;
+}
+
 Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
   return std::visit(
       [&](const auto& v) -> Napi::Value {
@@ -1943,17 +1908,22 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           }
           return obj;
         } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
-          auto data = std::make_unique<LuaFunctionData>(runtime, v, this);
-          auto* dataPtr = data.get();
-          lua_function_data_.push_back(std::move(data));
-          return Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
+          // The data is owned by a finalizer tied to the JS function, so it (and
+          // its registry ref) is freed when the function is garbage-collected.
+          auto* dataPtr = new LuaFunctionData(runtime, v, this);
+          Napi::Function fn =
+            Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
+          DefineHiddenProp(env, fn, "__luaFnOwner",
+            Napi::External<LuaFunctionData>::New(env, dataPtr,
+              [](Napi::Env, LuaFunctionData* d) { delete d; }));
+          return fn;
         } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
-          // Return a coroutine object with the thread reference
-          auto data = std::make_unique<LuaThreadData>(runtime, v);
-          auto* dataPtr = data.get();
-          lua_thread_data_.push_back(std::move(data));
+          // Return a coroutine object with the thread reference (data owned by the
+          // External's finalizer).
+          auto* dataPtr = new LuaThreadData(runtime, v);
           Napi::Object coro = Napi::Object::New(env);
-          coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr));
+          coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr,
+            [](Napi::Env, LuaThreadData* d) { delete d; }));
           lua_core::CoroutineStatus status = runtime->GetCoroutineStatus(v);
           coro.Set("status", Napi::String::New(env,
             status == lua_core::CoroutineStatus::Suspended ? "suspended" :
@@ -1968,25 +1938,24 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
             }
             return env.Null();
           } else {
-            // Lua-created userdata - wrap as opaque handle for round-trip
-            auto data = std::make_unique<LuaUserdataData>(runtime, v);
-            auto* dataPtr = data.get();
-            lua_userdata_data_.push_back(std::move(data));
+            // Lua-created userdata - wrap as opaque handle for round-trip (data
+            // owned by the External's finalizer).
+            auto* dataPtr = new LuaUserdataData(runtime, v);
             Napi::Object handle = Napi::Object::New(env);
-            handle.Set("_userdata", Napi::External<LuaUserdataData>::New(env, dataPtr));
+            handle.Set("_userdata", Napi::External<LuaUserdataData>::New(env, dataPtr,
+              [](Napi::Env, LuaUserdataData* d) { delete d; }));
             return handle;
           }
         } else if constexpr (std::is_same_v<T, lua_core::LuaTableRef>) {
-          // Create a JS Proxy that preserves Lua metamethods
+          // Create a JS Proxy that preserves Lua metamethods. The trap data is
+          // owned by the External's finalizer, tied to the proxy target's life.
           Napi::Object target = Napi::Object::New(env);
 
-          // Store data for traps
-          auto data = std::make_unique<LuaTableRefData>(runtime, v, this);
-          auto* dataPtr = data.get();
-          lua_table_ref_data_.push_back(std::move(data));
+          auto* dataPtr = new LuaTableRefData(runtime, v, this);
 
           // Store _tableRef as non-enumerable on target for round-trip detection
-          auto external = Napi::External<LuaTableRefData>::New(env, dataPtr);
+          auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
+            [](Napi::Env, LuaTableRefData* d) { delete d; });
           auto Object = env.Global().Get("Object").As<Napi::Object>();
           auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
           Napi::Object descriptor = Napi::Object::New(env);
@@ -2008,6 +1977,12 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           // Create Proxy
           auto ProxyCtor = env.Global().Get("Proxy").As<Napi::Function>();
           return ProxyCtor.New({target, handler});
+        } else if constexpr (std::is_same_v<T, lua_core::HostFunctionName>) {
+          // A JS function that crossed into Lua and came back: return the
+          // original JS function if it's still registered.
+          auto it = js_callbacks_.find(v.name);
+          if (it != js_callbacks_.end()) return it->second.Value();
+          return env.Undefined();
         }
         return env.Undefined();
       },
@@ -2015,10 +1990,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
 }
 
 Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -2047,21 +2019,19 @@ Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
   }
 
   const auto& threadRef = std::get<lua_core::LuaThreadRef>(result);
-  auto threadData = std::make_unique<LuaThreadData>(runtime, threadRef);
-  auto* threadDataPtr = threadData.get();
-  lua_thread_data_.push_back(std::move(threadData));
+  // Data owned by the External's finalizer, freed when the coroutine object is
+  // garbage-collected.
+  auto* threadDataPtr = new LuaThreadData(runtime, threadRef);
 
   Napi::Object coro = Napi::Object::New(env);
-  coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, threadDataPtr));
+  coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, threadDataPtr,
+    [](Napi::Env, LuaThreadData* d) { delete d; }));
   coro.Set("status", Napi::String::New(env, "suspended"));
   return coro;
 }
 
 Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+  if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsObject()) {
     Napi::TypeError::New(env, "Expected a coroutine object as first argument").ThrowAsJavaScriptException();
     return env.Undefined();

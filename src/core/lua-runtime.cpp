@@ -1,6 +1,8 @@
 #include "lua-runtime.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 
 namespace lua_core {
 
@@ -12,37 +14,98 @@ struct StackGuard {
   ~StackGuard() { lua_settop(L, top); }
 };
 
+// Outcome of a host-function bridge body, decided while C++ objects are still
+// alive and acted on only after they have been destroyed. lua_error/lua_yieldk
+// longjmp (skipping C++ destructors), so any error value must be staged on the
+// Lua stack inside the scope and the jump performed from a scope with no
+// non-trivial locals.
+enum class HostCallOutcome { Return1, Raise, Yield };
+
+// True if a table is a dense 1..n integer-keyed sequence. Order-independent:
+// counts integer keys in [1, rawlen] and requires every slot to be present, so
+// it does not depend on lua_next iteration order (which only tracks insertion
+// order for the array part).
 bool isSequentialArray(lua_State* L, int index) {
   const int abs_index = lua_absindex(L, index);
-  lua_Integer expected = 1;
+  const lua_Integer len = static_cast<lua_Integer>(lua_rawlen(L, abs_index));
+  lua_Integer int_keys = 0;
   lua_pushnil(L);
   while (lua_next(L, abs_index) != 0) {
-    if (!lua_isinteger(L, -2) || lua_tointeger(L, -2) != expected) {
+    if (!lua_isinteger(L, -2)) {
       lua_pop(L, 2);
       return false;
     }
-    expected++;
+    const lua_Integer k = lua_tointeger(L, -2);
+    if (k < 1 || k > len) {
+      lua_pop(L, 2);
+      return false;  // an integer key outside [1, #t] means it's not a sequence
+    }
+    ++int_keys;
     lua_pop(L, 1);
   }
-  return true;
+  return int_keys == len;  // every slot 1..len present and nothing else
+}
+
+// Pushes a table key as an integer when the whole string parses cleanly as one
+// (without overflow), otherwise as a string. Note: this means a key that looks
+// like an integer is always addressed as an integer key — a genuine string key
+// such as "123" is not reachable through this string-based API. A value that
+// overflows int64 (e.g. "99999999999999999999") stays a string key rather than
+// being silently clamped.
+void PushTableKey(lua_State* L, const std::string& key) {
+  errno = 0;
+  char* end = nullptr;
+  const long long int_key = strtoll(key.c_str(), &end, 10);
+  if (end != key.c_str() && *end == '\0' && errno != ERANGE) {
+    lua_pushinteger(L, static_cast<lua_Integer>(int_key));
+  } else {
+    lua_pushlstring(L, key.data(), key.size());
+  }
+}
+
+// Protected trampolines for metamethod-triggering table-ref operations. Each is
+// run under lua_pcall (see LuaRuntime::ProtectedTableCall) so a raising
+// __index/__newindex/__len is caught instead of aborting the process. They hold
+// no C++ locals, so the longjmp on raise has nothing to skip.
+int ProtectedTableGet(lua_State* L) {   // [t, key] -> [value]
+  lua_gettable(L, 1);
+  return 1;
+}
+int ProtectedTableSet(lua_State* L) {   // [t, key, value] -> []
+  lua_settable(L, 1);
+  return 0;
+}
+int ProtectedTableLen(lua_State* L) {   // [t] -> [len]
+  lua_pushinteger(L, luaL_len(L, 1));
+  return 1;
+}
+int ProtectedTableICollect(lua_State* L) {  // [t] -> [dense array of values]
+  lua_newtable(L);
+  for (lua_Integer i = 1; ; ++i) {
+    lua_geti(L, 1, i);  // respects __index
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
+    lua_rawseti(L, 2, i);
+  }
+  return 1;
 }
 } // namespace
 
-// Map from user-facing library name to the Lua 5.5 bitmask constant
-static const std::unordered_map<std::string, int> kLibFlags = {
-  {"base",      LUA_GLIBK},
-  {"package",   LUA_LOADLIBK},
-  {"coroutine", LUA_COLIBK},
-  {"debug",     LUA_DBLIBK},
-  {"io",        LUA_IOLIBK},
-  {"math",      LUA_MATHLIBK},
-  {"os",        LUA_OSLIBK},
-  {"string",    LUA_STRLIBK},
-  {"table",     LUA_TABLIBK},
-  {"utf8",      LUA_UTF8LIBK},
-};
-
 int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
+  // Map from user-facing library name to the Lua 5.5 bitmask constant. Kept as a
+  // function-local static to avoid a globally-constructed map.
+  static const std::unordered_map<std::string, int> kLibFlags = {
+    {"base",      LUA_GLIBK},
+    {"package",   LUA_LOADLIBK},
+    {"coroutine", LUA_COLIBK},
+    {"debug",     LUA_DBLIBK},
+    {"io",        LUA_IOLIBK},
+    {"math",      LUA_MATHLIBK},
+    {"os",        LUA_OSLIBK},
+    {"string",    LUA_STRLIBK},
+    {"table",     LUA_TABLIBK},
+    {"utf8",      LUA_UTF8LIBK},
+  };
+
   int mask = 0;
   for (const auto& lib : libraries) {
     const auto it = kLibFlags.find(lib);
@@ -66,7 +129,9 @@ void* LuaRuntime::LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize) 
     return nullptr;
   }
 
-  // For new allocations (ptr == NULL), osize is the Lua type tag, not a size
+  // For new allocations (ptr == NULL), osize is the Lua type tag, not a size.
+  // For reallocations, Lua guarantees osize is the true old block size, so
+  // alloc->current >= old_size always holds and the subtraction never wraps.
   size_t old_size = ptr ? osize : 0;
 
   // Check limit (0 means unlimited)
@@ -84,7 +149,7 @@ void* LuaRuntime::LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize) 
 void LuaRuntime::InitState() {
   // Store the runtime in registry for callbacks
   lua_pushlightuserdata(L_, this);
-  lua_setfield(L_, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_setfield(L_, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
 
   // Register userdata metatables
   RegisterUserdataMetatable();
@@ -99,24 +164,12 @@ std::vector<std::string> LuaRuntime::SafeLibraries() {
   return {"base", "package", "coroutine", "table", "string", "math", "utf8"};
 }
 
-LuaRuntime::LuaRuntime() {
-  L_ = lua_newstate(LuaAllocator, &allocator_, 0);
-  if (!L_) {
-    throw std::runtime_error("Failed to create Lua state");
-  }
-  InitState();
-}
+// Delegating constructors funnel into the RuntimeConfig overload so state
+// creation, the null check, library loading, and InitState() live in one place.
+LuaRuntime::LuaRuntime() : LuaRuntime(RuntimeConfig{}) {}
 
-LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries) {
-  L_ = lua_newstate(LuaAllocator, &allocator_, 0);
-  if (!L_) {
-    throw std::runtime_error("Failed to create Lua state");
-  }
-  if (!libraries.empty()) {
-    luaL_openselectedlibs(L_, LibraryMask(libraries), 0);
-  }
-  InitState();
-}
+LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries)
+    : LuaRuntime(RuntimeConfig{libraries, 0}) {}
 
 LuaRuntime::LuaRuntime(const RuntimeConfig& config) {
   allocator_.limit = config.max_memory;
@@ -131,6 +184,11 @@ LuaRuntime::LuaRuntime(const RuntimeConfig& config) {
 }
 
 LuaRuntime::~LuaRuntime() {
+  // Drop any registry-backed error values while the Lua state is still open;
+  // their RAII owners call luaL_unref, which must run before lua_close.
+  last_error_value_.reset();
+  pending_error_value_.reset();
+
   // Clean up stored function data
   for (auto& [data, destructor] : stored_function_data_) {
     if (destructor) destructor(data);
@@ -169,7 +227,7 @@ int LuaRuntime::UserdataGC(lua_State* L) {
   auto* block = static_cast<int*>(lua_touserdata(L, 1));
   if (!block) return 0;
 
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
@@ -186,7 +244,7 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
   const char* key = lua_tostring(L, 2);
   if (!key) return 0;
 
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
@@ -195,42 +253,62 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
     return 1;
   }
 
-  // 1. Check for a registered method
-  bool has_method_table = false;
-  std::string registry_key = "_ud_methods_" + std::to_string(*block);
-  lua_getfield(L, LUA_REGISTRYINDEX, registry_key.c_str());
-  if (lua_istable(L, -1)) {
-    has_method_table = true;
-    lua_getfield(L, -1, key);
-    if (lua_isstring(L, -1)) {
-      // Found a method. The value is the host function name.
-      // Push a closure that calls the host function with self prepended.
-      // upvalue 1: host function name
-      lua_pushcclosure(L, UserdataMethodCall, 1);
-      lua_remove(L, -2);  // remove method table
-      return 1;
-    }
-    lua_pop(L, 1);  // pop nil (key not found in method table)
-  }
-  lua_pop(L, 1);  // pop method table (or nil if no table)
-
-  // 2. Fall through to property access
-  if (runtime->property_getter_) {
-    try {
-      auto result = runtime->property_getter_(*block, key);
-      PushLuaValue(L, result);
-      return 1;
-    } catch (const std::exception& e) {
-      // If this userdata has methods but isn't readable, return nil
-      // instead of erroring (methods work independently of readable)
-      if (has_method_table) {
-        lua_pushnil(L);
-        return 1;
+  // Stage any error on the Lua stack while the std::string / caught exception
+  // are alive, then longjmp (lua_error) only after they are destroyed.
+  bool raise = false;
+  bool have_result = false;
+  {
+    // 1. Check for a registered method
+    bool has_method_table = false;
+    std::string registry_key =
+        std::string(kUserdataMethodsPrefix) + std::to_string(*block);
+    lua_getfield(L, LUA_REGISTRYINDEX, registry_key.c_str());
+    if (lua_istable(L, -1)) {
+      has_method_table = true;
+      lua_getfield(L, -1, key);
+      if (lua_isfunction(L, -1)) {
+        // Cached closure from a previous access: return it (so obj.m == obj.m).
+        lua_remove(L, -2);  // remove method table
+        have_result = true;
+      } else if (lua_isstring(L, -1)) {
+        // First access: the value is the host function name. Build a closure
+        // (upvalue 1: name), cache it back into the method table, and return it.
+        lua_pushcclosure(L, UserdataMethodCall, 1);  // consumes the name string
+        lua_pushvalue(L, -1);       // dup the closure
+        lua_setfield(L, -3, key);   // method_table[key] = closure
+        lua_remove(L, -2);          // remove method table
+        have_result = true;
+      } else {
+        lua_pop(L, 1);  // pop nil (key not found in method table)
       }
-      lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
-      lua_error(L);
     }
-  }
+
+    if (!have_result) {
+      lua_pop(L, 1);  // pop method table (or nil if no table)
+
+      // 2. Fall through to property access
+      if (runtime->property_getter_) {
+        try {
+          auto result = runtime->property_getter_(*block, key);
+          PushLuaValue(L, result);
+          have_result = true;
+        } catch (const std::exception& e) {
+          // If this userdata has methods but isn't readable, return nil instead
+          // of erroring (methods work independently of readable).
+          if (has_method_table) {
+            lua_pushnil(L);
+            have_result = true;
+          } else {
+            lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
+            raise = true;
+          }
+        }
+      }
+    }
+  }  // registry_key destroyed here, before any longjmp
+
+  if (raise) return lua_error(L);
+  if (have_result) return 1;
   lua_pushnil(L);
   return 1;
 }
@@ -242,19 +320,21 @@ int LuaRuntime::UserdataNewIndex(lua_State* L) {
   const char* key = lua_tostring(L, 2);
   if (!key) return 0;
 
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
+  bool raise = false;
   if (runtime && runtime->property_setter_) {
     try {
       auto value = ToLuaValue(L, 3);
       runtime->property_setter_(*block, key, value);
     } catch (const std::exception& e) {
       lua_pushfstring(L, "Error writing property '%s': %s", key, e.what());
-      lua_error(L);
+      raise = true;
     }
   }
+  if (raise) return lua_error(L);  // after the exception object is destroyed
   return 0;
 }
 
@@ -299,7 +379,7 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
       userdata_ref_counts_.erase(it);
 
       // Clean up method table if one exists
-      std::string registry_key = "_ud_methods_" + std::to_string(ref_id);
+      std::string registry_key = std::string(kUserdataMethodsPrefix) + std::to_string(ref_id);
       lua_pushnil(L_);
       lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
 
@@ -323,7 +403,7 @@ void LuaRuntime::SetUserdataMethodTable(
   }
 
   // Store in registry: _ud_methods_<ref_id> = table
-  std::string registry_key = "_ud_methods_" + std::to_string(ref_id);
+  std::string registry_key = std::string(kUserdataMethodsPrefix) + std::to_string(ref_id);
   lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
 }
 
@@ -332,21 +412,19 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
   // When called as obj:method(a, b), the stack has: obj, a, b
   const char* func_name = lua_tostring(L, lua_upvalueindex(1));
 
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
   if (!runtime) {
     lua_pushstring(L, "LuaRuntime not found in registry");
-    lua_error(L);
-    return 0;
+    return lua_error(L);
   }
 
   const auto it = runtime->host_functions_.find(func_name ? func_name : "");
   if (it == runtime->host_functions_.end()) {
     lua_pushfstring(L, "Method '%s' not found", func_name ? func_name : "");
-    lua_error(L);
-    return 0;
+    return lua_error(L);
   }
 
   if (runtime->async_mode_) {
@@ -355,58 +433,74 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
       func_name ? func_name : "<unknown>");
   }
 
-  // Convert all arguments (including self at position 1)
-  const int argc = lua_gettop(L);
-  std::vector<LuaPtr> args;
-  args.reserve(argc);
-  try {
-    for (int i = 1; i <= argc; ++i) {
-      args.push_back(ToLuaValue(L, i));
+  // See HostCallOutcome / LuaCallHostFunction: stage any error on the Lua stack
+  // inside the scope, then longjmp only after C++ locals are destroyed.
+  HostCallOutcome outcome = HostCallOutcome::Return1;
+  {
+    // Convert all arguments (including self at position 1)
+    const int argc = lua_gettop(L);
+    std::vector<LuaPtr> args;
+    args.reserve(argc);
+    bool converted = true;
+    try {
+      for (int i = 1; i <= argc; ++i) args.push_back(ToLuaValue(L, i));
+    } catch (const std::exception& e) {
+      lua_pushfstring(L, "Error converting arguments for method '%s': %s",
+                      func_name ? func_name : "<unknown>", e.what());
+      outcome = HostCallOutcome::Raise;
+      converted = false;
     }
-  } catch (const std::exception& e) {
-    lua_pushfstring(L, "Error converting arguments for method '%s': %s",
-                    func_name ? func_name : "<unknown>", e.what());
-    lua_error(L);
-    return 0;
-  }
 
-  // Call the host function
-  LuaPtr resultHolder;
-  try {
-    resultHolder = it->second(args);
-  } catch (const std::exception& e) {
-    if (runtime->HasPendingErrorValue()) {
-      LuaPtr errVal = runtime->TakePendingErrorValue();
-      try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+    if (converted) {
+      LuaPtr resultHolder;
+      bool called = true;
+      try {
+        resultHolder = it->second(args);
+      } catch (const std::exception& e) {
+        if (runtime->HasPendingErrorValue()) {
+          LuaPtr errVal = runtime->TakePendingErrorValue();
+          try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+        } else {
+          lua_pushfstring(L, "Method '%s' threw an exception: %s",
+                          func_name ? func_name : "<unknown>", e.what());
+        }
+        outcome = HostCallOutcome::Raise;
+        called = false;
+      } catch (...) {
+        lua_pushfstring(L, "Method '%s' threw an unknown exception",
+                        func_name ? func_name : "<unknown>");
+        outcome = HostCallOutcome::Raise;
+        called = false;
+      }
+
+      if (called) {
+        if (runtime->await_pending_) {
+          // A method that returned a JS Promise while in the async driver
+          // suspends the coroutine until it settles (see LuaCallHostFunction).
+          runtime->await_pending_ = false;
+          outcome = HostCallOutcome::Yield;
+        } else {
+          try {
+            PushLuaValue(L, resultHolder);
+          } catch (const std::exception& e) {
+            lua_pushfstring(L, "Error converting return value from method '%s': %s",
+                            func_name ? func_name : "<unknown>", e.what());
+            outcome = HostCallOutcome::Raise;
+          }
+        }
+      }
+    }
+  }  // all C++ locals destroyed here, before any longjmp below
+
+  switch (outcome) {
+    case HostCallOutcome::Raise:
       return lua_error(L);
-    }
-    lua_pushfstring(L, "Method '%s' threw an exception: %s",
-                    func_name ? func_name : "<unknown>", e.what());
-    lua_error(L);
-    return 0;
-  } catch (...) {
-    lua_pushfstring(L, "Method '%s' threw an unknown exception",
-                    func_name ? func_name : "<unknown>");
-    lua_error(L);
-    return 0;
+    case HostCallOutcome::Yield:
+      return lua_yieldk(L, 0, 0, AsyncContinuation);
+    case HostCallOutcome::Return1:
+      return 1;
   }
-
-  // A method that returned a JS Promise while in the async driver suspends the
-  // coroutine until it settles (see LuaCallHostFunction).
-  if (runtime->await_pending_) {
-    runtime->await_pending_ = false;
-    return lua_yieldk(L, 0, static_cast<lua_KContext>(0), AsyncContinuation);
-  }
-
-  try {
-    PushLuaValue(L, resultHolder);
-  } catch (const std::exception& e) {
-    lua_pushfstring(L, "Error converting return value from method '%s': %s",
-                    func_name ? func_name : "<unknown>", e.what());
-    lua_error(L);
-    return 0;
-  }
-  return 1;
+  return 0;  // unreachable
 }
 
 // --- Class / usertype support ---
@@ -419,7 +513,7 @@ void LuaRuntime::RegisterClass(
   StackGuard guard(L_);
 
   // 1. Create the shared per-class instance metatable.
-  const std::string mt_name = "_class_mt_" + class_name;
+  const std::string mt_name = std::string(kClassMetaPrefix) + class_name;
   luaL_newmetatable(L_, mt_name.c_str());
 
   lua_pushcfunction(L_, UserdataGC);
@@ -442,7 +536,7 @@ void LuaRuntime::RegisterClass(
   // Marker so ToLuaValue recognizes instances as JS-backed class userdata
   // (and recovers the class name) rather than treating them as opaque.
   lua_pushstring(L_, class_name.c_str());
-  lua_setfield(L_, -2, "__lua_native_class");
+  lua_setfield(L_, -2, kClassMarkerField);
 
   // Operator overloads / other metamethods dispatch through the host bridge.
   for (const auto& mm : metamethods) {
@@ -458,7 +552,7 @@ void LuaRuntime::RegisterClass(
     lua_pushstring(L_, func_name.c_str());
     lua_setfield(L_, -2, name.c_str());
   }
-  const std::string methods_key = "_class_methods_" + class_name;
+  const std::string methods_key = std::string(kClassMethodsPrefix) + class_name;
   lua_setfield(L_, LUA_REGISTRYINDEX, methods_key.c_str());
 
   // 3. Create the class global table with a `new` constructor function.
@@ -478,42 +572,70 @@ int LuaRuntime::ClassIndex(lua_State* L) {
 
   const char* class_name = lua_tostring(L, lua_upvalueindex(1));
 
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
   if (!runtime) { lua_pushnil(L); return 1; }
 
-  // 1. Look up the key in the shared class method table.
-  bool has_methods = false;
-  const std::string methods_key =
-      "_class_methods_" + std::string(class_name ? class_name : "");
-  lua_getfield(L, LUA_REGISTRYINDEX, methods_key.c_str());
-  if (lua_istable(L, -1)) {
-    has_methods = true;
-    lua_getfield(L, -1, key);
-    if (lua_isstring(L, -1)) {
-      // Found: value is the host function name. Return a bound method closure.
-      lua_pushcclosure(L, UserdataMethodCall, 1);  // consumes name as upvalue 1
-      lua_remove(L, -2);  // remove method table
-      return 1;
+  // Stage any error on the Lua stack while the std::string / caught exception
+  // are alive, then longjmp (lua_error) only after they are destroyed.
+  bool raise = false;
+  bool have_result = false;
+  {
+    // 1. Look up the key in the shared class method table.
+    bool has_methods = false;
+    const std::string methods_key =
+        std::string(kClassMethodsPrefix) + std::string(class_name ? class_name : "");
+    lua_getfield(L, LUA_REGISTRYINDEX, methods_key.c_str());
+    if (lua_istable(L, -1)) {
+      has_methods = true;
+      lua_getfield(L, -1, key);
+      if (lua_isfunction(L, -1)) {
+        // Cached closure (shared across instances of this class): return it.
+        lua_remove(L, -2);  // remove method table
+        have_result = true;
+      } else if (lua_isstring(L, -1)) {
+        // First access: value is the host function name. Build a bound method
+        // closure, cache it back into the shared method table, and return it.
+        lua_pushcclosure(L, UserdataMethodCall, 1);  // consumes name as upvalue 1
+        lua_pushvalue(L, -1);       // dup the closure
+        lua_setfield(L, -3, key);   // method_table[key] = closure
+        lua_remove(L, -2);          // remove method table
+        have_result = true;
+      } else {
+        lua_pop(L, 1);  // pop nil (key not a method)
+      }
     }
-    lua_pop(L, 1);  // pop nil (key not a method)
-  }
-  lua_pop(L, 1);  // pop method table (or nil)
 
-  // 2. Fall through to property access.
-  if (runtime->property_getter_) {
-    try {
-      auto result = runtime->property_getter_(*block, key);
-      PushLuaValue(L, result);
-      return 1;
-    } catch (const std::exception& e) {
-      // Class with methods but not readable: return nil rather than erroring
-      // (methods work independently of readable, matching userdata behavior).
-      if (has_methods) { lua_pushnil(L); return 1; }
-      return luaL_error(L, "Error reading property '%s': %s", key, e.what());
+    if (!have_result) {
+      lua_pop(L, 1);  // pop method table (or nil)
+
+      // 2. Fall through to property access.
+      if (runtime->property_getter_) {
+        try {
+          auto result = runtime->property_getter_(*block, key);
+          PushLuaValue(L, result);
+          have_result = true;
+        } catch (const std::exception& e) {
+          // Class with methods but not readable: return nil rather than erroring
+          // (methods work independently of readable, matching userdata behavior).
+          if (has_methods) {
+            lua_pushnil(L);
+            have_result = true;
+          } else {
+            // Reproduce luaL_error's "chunk:line: " location prefix.
+            luaL_where(L, 1);
+            lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
+            lua_concat(L, 2);
+            raise = true;
+          }
+        }
+      }
     }
-  }
+  }  // methods_key destroyed here, before any longjmp
+
+  if (raise) return lua_error(L);
+  if (have_result) return 1;
   lua_pushnil(L);
   return 1;
 }
@@ -558,8 +680,7 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
 bool LuaRuntime::HasPackageLibrary() const {
   StackGuard guard(L_);
   lua_getglobal(L_, "package");
-  bool has = !lua_isnil(L_, -1) && lua_istable(L_, -1);
-  return has;
+  return lua_istable(L_, -1);  // lua_istable already implies non-nil
 }
 
 void LuaRuntime::AddSearchPath(const std::string& path) const {
@@ -648,7 +769,7 @@ void LuaRuntime::InstallOutputRedirection() {
 }
 
 int LuaRuntime::LuaPrint(lua_State* L) {
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
@@ -671,8 +792,12 @@ int LuaRuntime::LuaPrint(lua_State* L) {
   return 0;
 }
 
+// Redirects io.write() to the output handler. Intentionally simplified versus
+// stock io.write: it does not return the file handle (so `io.write(x):write(y)`
+// chaining is unavailable), ignores io.output() redirection, and stringifies its
+// arguments via __tostring rather than erroring on non-string/number values.
 int LuaRuntime::LuaIoWrite(lua_State* L) {
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
@@ -742,7 +867,7 @@ int LuaRuntime::JsSearcher(lua_State* L) {
   const char* modname = lua_tostring(L, 1);
   if (!modname) { lua_pushstring(L, "\n\tinvalid module name"); return 1; }
 
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
   const char* func_name = lua_tostring(L, lua_upvalueindex(1));
@@ -760,40 +885,70 @@ int LuaRuntime::JsSearcher(lua_State* L) {
     return 1;
   }
 
-  LuaPtr result;
-  try {
-    std::vector<LuaPtr> args{
-      std::make_shared<LuaValue>(LuaValue::from(std::string(modname)))};
-    result = it->second(args);
-  } catch (const std::exception& e) {
-    return luaL_error(L, "searcher for '%s' failed: %s", modname, e.what());
-  }
+  // Stage any raised error on the Lua stack while the LuaPtr / std::string locals
+  // are alive, then longjmp (lua_error) only after they are destroyed. On the
+  // non-raising paths, `nresults` values are already on the stack.
+  bool raise = false;
+  int nresults = 1;
+  {
+    LuaPtr result;
+    bool ok = true;
+    try {
+      std::vector<LuaPtr> args{
+        std::make_shared<LuaValue>(LuaValue::from(std::string(modname)))};
+      result = it->second(args);
+    } catch (const std::exception& e) {
+      luaL_where(L, 1);
+      lua_pushfstring(L, "searcher for '%s' failed: %s", modname, e.what());
+      lua_concat(L, 2);
+      raise = true;
+      ok = false;
+    }
 
-  // Searchers must be synchronous — a Promise result is not supported.
-  if (runtime->await_pending_) {
-    runtime->await_pending_ = false;
-    return luaL_error(L, "JS searcher for '%s' must be synchronous", modname);
-  }
+    // Searchers must be synchronous — a Promise result is not supported.
+    if (ok && runtime->await_pending_) {
+      runtime->await_pending_ = false;
+      luaL_where(L, 1);
+      lua_pushfstring(L, "JS searcher for '%s' must be synchronous", modname);
+      lua_concat(L, 2);
+      raise = true;
+      ok = false;
+    }
 
-  // nil/absent -> not found by this searcher (try the next one).
-  if (!result || std::holds_alternative<std::monostate>(result->value)) {
-    lua_pushfstring(L, "\n\tno JS module '%s'", modname);
-    return 1;
-  }
-  if (!std::holds_alternative<std::string>(result->value)) {
-    return luaL_error(L,
-      "JS searcher for '%s' must return a Lua source string or nil", modname);
-  }
+    if (ok) {
+      if (!result || std::holds_alternative<std::monostate>(result->value)) {
+        // nil/absent -> not found by this searcher (try the next one).
+        lua_pushfstring(L, "\n\tno JS module '%s'", modname);
+      } else if (!std::holds_alternative<std::string>(result->value)) {
+        luaL_where(L, 1);
+        lua_pushfstring(L,
+          "JS searcher for '%s' must return a Lua source string or nil", modname);
+        lua_concat(L, 2);
+        raise = true;
+      } else {
+        const std::string& source = std::get<std::string>(result->value);
+        const std::string chunkname = "@" + std::string(modname);
+        // Force text mode so a searcher can never inject bytecode.
+        if (luaL_loadbufferx(L, source.c_str(), source.size(),
+                             chunkname.c_str(), "t") != LUA_OK) {
+          const char* loaderr = lua_tostring(L, -1);
+          luaL_where(L, 1);
+          lua_pushfstring(L, "error loading JS module '%s': %s",
+                          modname, loaderr ? loaderr : "?");
+          lua_concat(L, 2);
+          lua_remove(L, -2);  // drop the raw loader error beneath the staged one
+          raise = true;
+        } else {
+          // Return loader + modname (searcher data), per Lua's convention.
+          lua_pushstring(L, modname);
+          nresults = 2;
+        }
+      }
+    }
+  }  // result, args, source, chunkname destroyed here, before any longjmp
 
-  const std::string& source = std::get<std::string>(result->value);
-  const std::string chunkname = "@" + std::string(modname);
-  // Force text mode so a searcher can never inject bytecode.
-  if (luaL_loadbufferx(L, source.c_str(), source.size(),
-                       chunkname.c_str(), "t") != LUA_OK) {
-    return luaL_error(L, "error loading JS module '%s': %s",
-                      modname, lua_tostring(L, -1));
-  }
-  return 1;  // the loader function
+  if (raise) return lua_error(L);
+  return nresults;
 }
 
 // --- Host function bridge ---
@@ -802,20 +957,18 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   const char* func_name = lua_tostring(L, lua_upvalueindex(1));
 
   // Get runtime
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
   if (!runtime) {
     lua_pushstring(L, "LuaRuntime not found in registry");
-    lua_error(L);
-    return 0;
+    return lua_error(L);
   }
 
   const auto it = runtime->host_functions_.find(func_name ? func_name : "");
   if (it == runtime->host_functions_.end()) {
     lua_pushfstring(L, "Host function '%s' not found", func_name ? func_name : "");
-    lua_error(L);
-    return 0;
+    return lua_error(L);
   }
 
   if (runtime->async_mode_) {
@@ -824,58 +977,74 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
       func_name ? func_name : "<unknown>");
   }
 
-  const int argc = lua_gettop(L);
-  std::vector<LuaPtr> args;
-  args.reserve(argc);
-  try {
-    for (int i = 1; i <= argc; ++i) {
-      args.push_back(ToLuaValue(L, i));
+  HostCallOutcome outcome = HostCallOutcome::Return1;
+  {
+    const int argc = lua_gettop(L);
+    std::vector<LuaPtr> args;
+    args.reserve(argc);
+    bool converted = true;
+    try {
+      for (int i = 1; i <= argc; ++i) args.push_back(ToLuaValue(L, i));
+    } catch (const std::exception& e) {
+      lua_pushfstring(L, "Error converting arguments for '%s': %s",
+                      func_name ? func_name : "<unknown>", e.what());
+      outcome = HostCallOutcome::Raise;
+      converted = false;
     }
-  } catch (const std::exception& e) {
-    lua_pushfstring(L, "Error converting arguments for '%s': %s",
-                    func_name ? func_name : "<unknown>", e.what());
-    lua_error(L);
-    return 0;
-  }
 
-  LuaPtr resultHolder;
-  try {
-    resultHolder = it->second(args);
-  } catch (const std::exception& e) {
-    // If the wrapper staged a structured error (a JS Error object), raise that
-    // table so the original error can be reconstructed on the way out.
-    if (runtime->HasPendingErrorValue()) {
-      LuaPtr errVal = runtime->TakePendingErrorValue();
-      try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+    if (converted) {
+      LuaPtr resultHolder;
+      bool called = true;
+      try {
+        resultHolder = it->second(args);
+      } catch (const std::exception& e) {
+        // If the wrapper staged a structured error (a JS Error object), raise
+        // that table so the original error can be reconstructed on the way out.
+        if (runtime->HasPendingErrorValue()) {
+          LuaPtr errVal = runtime->TakePendingErrorValue();
+          try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+        } else {
+          lua_pushfstring(L, "Host function '%s' threw an exception: %s",
+                          func_name ? func_name : "<unknown>", e.what());
+        }
+        outcome = HostCallOutcome::Raise;
+        called = false;
+      } catch (...) {
+        lua_pushfstring(L, "Host function '%s' threw an unknown exception",
+                        func_name ? func_name : "<unknown>");
+        outcome = HostCallOutcome::Raise;
+        called = false;
+      }
+
+      if (called) {
+        if (runtime->await_pending_) {
+          // The host call returned a JS Promise while in the async driver:
+          // suspend the coroutine until it settles (AsyncContinuation delivers
+          // the resolved value).
+          runtime->await_pending_ = false;
+          outcome = HostCallOutcome::Yield;
+        } else {
+          try {
+            PushLuaValue(L, resultHolder);
+          } catch (const std::exception& e) {
+            lua_pushfstring(L, "Error converting return value from '%s': %s",
+                            func_name ? func_name : "<unknown>", e.what());
+            outcome = HostCallOutcome::Raise;
+          }
+        }
+      }
+    }
+  }  // all C++ locals destroyed here, before any longjmp below
+
+  switch (outcome) {
+    case HostCallOutcome::Raise:
       return lua_error(L);
-    }
-    lua_pushfstring(L, "Host function '%s' threw an exception: %s",
-                    func_name ? func_name : "<unknown>", e.what());
-    lua_error(L);
-    return 0;
-  } catch (...) {
-    lua_pushfstring(L, "Host function '%s' threw an unknown exception",
-                    func_name ? func_name : "<unknown>");
-    lua_error(L);
-    return 0;
+    case HostCallOutcome::Yield:
+      return lua_yieldk(L, 0, 0, AsyncContinuation);
+    case HostCallOutcome::Return1:
+      return 1;
   }
-
-  // The host call returned a JS Promise while in the async driver: suspend the
-  // coroutine until it settles. AsyncContinuation delivers the resolved value.
-  if (runtime->await_pending_) {
-    runtime->await_pending_ = false;
-    return lua_yieldk(L, 0, static_cast<lua_KContext>(0), AsyncContinuation);
-  }
-
-  try {
-    PushLuaValue(L, resultHolder);
-  } catch (const std::exception& e) {
-    lua_pushfstring(L, "Error converting return value from '%s': %s",
-                    func_name ? func_name : "<unknown>", e.what());
-    lua_error(L);
-    return 0;
-  }
-  return 1;
+  return 0;  // unreachable
 }
 
 CompileResult LuaRuntime::CompileScript(const std::string& script,
@@ -883,12 +1052,12 @@ CompileResult LuaRuntime::CompileScript(const std::string& script,
                                          const std::string& chunk_name) const {
   StackGuard guard(L_);
 
-  int status;
-  if (!chunk_name.empty()) {
-    status = luaL_loadbuffer(L_, script.c_str(), script.size(), chunk_name.c_str());
-  } else {
-    status = luaL_loadstring(L_, script.c_str());
-  }
+  // Always load size-aware (luaL_loadstring stops at the first embedded NUL).
+  // With no explicit chunk name, mirror luaL_loadstring by using the source
+  // (up to its first NUL) as the display name.
+  const int status = luaL_loadbuffer(
+      L_, script.data(), script.size(),
+      chunk_name.empty() ? script.c_str() : chunk_name.c_str());
 
   if (status != LUA_OK) {
     std::string err = lua_tostring(L_, -1);
@@ -934,7 +1103,7 @@ CompileResult LuaRuntime::CompileFile(const std::string& filepath,
 // leaves structured JS-error tables (identified by __jsErrorId) untouched.
 int LuaRuntime::MessageHandler(lua_State* L) {
   if (lua_type(L, 1) == LUA_TTABLE) {
-    lua_getfield(L, 1, "__jsErrorId");
+    lua_getfield(L, 1, kJsErrorIdField);
     const bool is_js_error = !lua_isnil(L, -1);
     lua_pop(L, 1);
     if (is_js_error) return 1;  // preserve the structured error object as-is
@@ -959,6 +1128,18 @@ int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
   const int status = lua_pcall(L_, nargs, nresults, base);
   lua_remove(L_, base);  // remove handler
   return status;
+}
+
+// Runs the pre-pushed trampoline + nargs under lua_pcall; on failure pops the
+// error and throws std::runtime_error so the binding layer surfaces it as a JS
+// exception (rather than the Lua panic handler aborting the process).
+void LuaRuntime::ProtectedTableCall(int nargs, int nresults) const {
+  if (lua_pcall(L_, nargs, nresults, 0) != LUA_OK) {
+    const char* msg = lua_tostring(L_, -1);
+    std::string err = msg ? msg : "table access error";
+    lua_pop(L_, 1);
+    throw std::runtime_error(err);
+  }
 }
 
 // Captures the error object at the top of L's stack: records the structured
@@ -1044,7 +1225,8 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
-  if (luaL_loadstring(L_, script.c_str()) != LUA_OK) {
+  // Size-aware load so scripts with embedded NULs aren't silently truncated.
+  if (luaL_loadbuffer(L_, script.data(), script.size(), script.c_str()) != LUA_OK) {
     std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
@@ -1105,11 +1287,16 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
 }
 
 void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
+  // Guard so a PushLuaValue that throws mid-table doesn't strand a partial value
+  // on the stack. On success the setglobal balances the push, so the guard is a
+  // no-op.
+  StackGuard guard(L_);
   PushLuaValue(L_, value);
   lua_setglobal(L_, name.c_str());
 }
 
 void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
+  StackGuard guard(L_);
   host_functions_[name] = std::move(fn);
   lua_pushstring(L_, name.c_str());
   lua_pushcclosure(L_, LuaCallHostFunction, 1);
@@ -1250,7 +1437,7 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
       // Check if it's a registered class instance (per-class metatable carries
       // a __lua_native_class marker). Treat as JS-backed userdata.
       if (lua_getmetatable(L, abs_index)) {
-        lua_getfield(L, -1, "__lua_native_class");
+        lua_getfield(L, -1, kClassMarkerField);
         if (lua_isstring(L, -1)) {
           std::string class_name = lua_tostring(L, -1);
           lua_pop(L, 2);  // marker + metatable
@@ -1323,19 +1510,24 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             *block = v.ref_id;
             if (!v.class_name.empty()) {
               // Class instance - use the per-class metatable
-              std::string mt_name = "_class_mt_" + v.class_name;
+              std::string mt_name = std::string(kClassMetaPrefix) + v.class_name;
               luaL_setmetatable(L, mt_name.c_str());
             } else {
               luaL_setmetatable(L, v.proxy ? kProxyUserdataMetaName : kUserdataMetaName);
             }
             // Increment ref count so __gc balances correctly
-            lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+            lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
             auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
             lua_pop(L, 1);
             if (runtime) runtime->IncrementUserdataRefCount(v.ref_id);
           }
         } else if constexpr (std::is_same_v<T, LuaTableRef>) {
           lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
+        } else if constexpr (std::is_same_v<T, HostFunctionName>) {
+          // Materialize a registered host function as a Lua closure (upvalue 1 =
+          // the host function name), the same shape RegisterFunction installs.
+          lua_pushlstring(L, v.name.c_str(), v.name.size());
+          lua_pushcclosure(L, LuaCallHostFunction, 1);
         }
       },
       value->value);
@@ -1345,48 +1537,29 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
 
 LuaPtr LuaRuntime::GetTableField(int registry_ref, const std::string& key) const {
   StackGuard guard(L_);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
-
-  // Try integer key
-  char* end = nullptr;
-  long long int_key = strtoll(key.c_str(), &end, 10);
-  if (end != key.c_str() && *end == '\0') {
-    lua_geti(L_, -1, static_cast<lua_Integer>(int_key));
-  } else {
-    lua_getfield(L_, -1, key.c_str());
-  }
-
+  lua_pushcfunction(L_, ProtectedTableGet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  PushTableKey(L_, key);                             // key
+  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
   return ToLuaValue(L_, -1);
 }
 
 void LuaRuntime::SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const {
   StackGuard guard(L_);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
-  PushLuaValue(L_, value);
-
-  char* end = nullptr;
-  long long int_key = strtoll(key.c_str(), &end, 10);
-  if (end != key.c_str() && *end == '\0') {
-    lua_seti(L_, -2, static_cast<lua_Integer>(int_key));
-  } else {
-    lua_setfield(L_, -2, key.c_str());
-  }
+  lua_pushcfunction(L_, ProtectedTableSet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  PushTableKey(L_, key);                             // key
+  PushLuaValue(L_, value);                           // value
+  ProtectedTableCall(3, 0);                          // may trigger __newindex
 }
 
 bool LuaRuntime::HasTableField(int registry_ref, const std::string& key) const {
   StackGuard guard(L_);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
-
-  char* end = nullptr;
-  long long int_key = strtoll(key.c_str(), &end, 10);
-  if (end != key.c_str() && *end == '\0') {
-    lua_geti(L_, -1, static_cast<lua_Integer>(int_key));
-  } else {
-    lua_getfield(L_, -1, key.c_str());
-  }
-
-  bool has = !lua_isnil(L_, -1);
-  return has;
+  lua_pushcfunction(L_, ProtectedTableGet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  PushTableKey(L_, key);                             // key
+  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
+  return !lua_isnil(L_, -1);
 }
 
 std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
@@ -1410,8 +1583,10 @@ std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
 
 int LuaRuntime::GetTableLength(int registry_ref) const {
   StackGuard guard(L_);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
-  return static_cast<int>(luaL_len(L_, -1));
+  lua_pushcfunction(L_, ProtectedTableLen);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  ProtectedTableCall(1, 1);                          // -> len (may trigger __len)
+  return static_cast<int>(lua_tointeger(L_, -1));
 }
 
 // --- Table reference API ---
@@ -1422,6 +1597,9 @@ int LuaRuntime::CreateTable() {
 }
 
 int LuaRuntime::CreateTableFrom(const LuaTable& initial) {
+  // On success luaL_ref pops the table, so the guard is a no-op; if PushLuaValue
+  // throws mid-build it drops the partially-filled table from the stack.
+  StackGuard guard(L_);
   lua_newtable(L_);
   for (const auto& [key, value] : initial) {
     PushLuaValue(L_, value);
@@ -1431,6 +1609,7 @@ int LuaRuntime::CreateTableFrom(const LuaTable& initial) {
 }
 
 int LuaRuntime::CreateTableFrom(const LuaArray& initial) {
+  StackGuard guard(L_);
   lua_createtable(L_, static_cast<int>(initial.size()), 0);
   for (size_t i = 0; i < initial.size(); ++i) {
     PushLuaValue(L_, initial[i]);
@@ -1458,12 +1637,13 @@ std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) 
     return result;
   }
 
+  // lua_next performs a raw traversal (no metamethods), so this loop needs no
+  // protected call. Determine the key type first and skip unsupported keys
+  // before converting the value, so nothing is converted needlessly.
   lua_pushnil(L_);
   while (lua_next(L_, -2) != 0) {
-    LuaPtr value = ToLuaValue(L_, lua_absindex(L_, -1));
-    // Convert key: read without consuming (lua_next needs the key on stack)
     LuaPtr key;
-    int key_type = lua_type(L_, -2);
+    const int key_type = lua_type(L_, -2);
     if (key_type == LUA_TSTRING) {
       size_t len;
       const char* str = lua_tolstring(L_, -2, &len);
@@ -1479,6 +1659,7 @@ std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) 
       lua_pop(L_, 1);
       continue;
     }
+    LuaPtr value = ToLuaValue(L_, lua_absindex(L_, -1));
     result.emplace_back(std::move(key), std::move(value));
     lua_pop(L_, 1);  // pop value, keep key for next iteration
   }
@@ -1490,21 +1671,23 @@ std::vector<std::pair<int64_t, LuaPtr>> LuaRuntime::TableIPairs(int registry_ref
   StackGuard guard(L_);
   std::vector<std::pair<int64_t, LuaPtr>> result;
 
+  // Collect the dense-sequence values into a plain Lua array under protection
+  // (lua_geti can trigger __index), then convert that array to C++ afterwards so
+  // no C++ locals are live across a potential metamethod raise.
+  lua_pushcfunction(L_, ProtectedTableICollect);
   lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
   if (!lua_istable(L_, -1)) {
-    return result;
+    return result;  // StackGuard drops the function + non-table value
   }
+  ProtectedTableCall(1, 1);  // -> array of values
 
-  for (int64_t i = 1; ; ++i) {
-    lua_geti(L_, -1, static_cast<lua_Integer>(i));
-    if (lua_isnil(L_, -1)) {
-      lua_pop(L_, 1);
-      break;
-    }
-    result.emplace_back(i, ToLuaValue(L_, lua_absindex(L_, -1)));
+  const int n = static_cast<int>(lua_rawlen(L_, -1));
+  result.reserve(n);
+  for (int i = 1; i <= n; ++i) {
+    lua_rawgeti(L_, -1, i);
+    result.emplace_back(i, ToLuaValue(L_, -1));
     lua_pop(L_, 1);
   }
-
   return result;
 }
 
@@ -1606,13 +1789,20 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     lua_pop(threadRef.thread, nresults);
   } else {
     result.status = CoroutineStatus::Dead;
-    result.error = lua_tostring(threadRef.thread, -1);
+    // Use CaptureError: the error object may be a table (e.g. error({code=1}) or
+    // a structured JS-error) for which lua_tostring returns NULL — constructing a
+    // std::string from NULL is undefined behavior. This also records the
+    // structured value for JS-error reconstruction, matching the other paths.
+    result.error = CaptureError(threadRef.thread);
     lua_pop(threadRef.thread, 1);
   }
 
   return result;
 }
 
+// Reports Suspended or Dead only. CoroutineStatus::Running is never returned:
+// with the single-threaded driver a coroutine is never observed mid-execution
+// from here (a resume runs to its next yield or completion before returning).
 CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) const {
   if (!threadRef.thread) {
     return CoroutineStatus::Dead;
@@ -1644,8 +1834,9 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
     const std::string& script) const {
   StackGuard guard(L_);
 
-  // Load the script chunk as a function on the main stack.
-  if (luaL_loadstring(L_, script.c_str()) != LUA_OK) {
+  // Load the script chunk as a function on the main stack (size-aware so
+  // embedded NULs aren't truncated).
+  if (luaL_loadbuffer(L_, script.data(), script.size(), script.c_str()) != LUA_OK) {
     const char* msg = lua_tostring(L_, -1);
     return std::string(msg ? msg : "failed to load script");
   }
@@ -1667,7 +1858,7 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
 int LuaRuntime::AsyncContinuation(lua_State* L, int status, lua_KContext ctx) {
   (void)status;
   (void)ctx;
-  lua_getfield(L, LUA_REGISTRYINDEX, "_lua_core_runtime");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
@@ -1686,6 +1877,16 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   if (!threadRef.thread) {
     result.state = AsyncStepResult::State::Error;
     result.error = "invalid coroutine thread";
+    return result;
+  }
+
+  // Don't resume a coroutine that has already finished or errored; resuming a
+  // dead thread corrupts it. (The binding state machine should never do this,
+  // but the core API must not depend on its caller for validity.)
+  const int thread_status = lua_status(threadRef.thread);
+  if (thread_status != LUA_OK && thread_status != LUA_YIELD) {
+    result.state = AsyncStepResult::State::Error;
+    result.error = "cannot resume a dead coroutine";
     return result;
   }
 
