@@ -161,6 +161,26 @@ const result = lua.execute_script("return add(2, 3)");
 console.log(result); // 5
 ```
 
+JavaScript functions are callable from Lua even when nested inside an object or
+array — they cross the boundary as real Lua functions, not placeholders:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init();
+
+// Functions nested inside a table/array remain callable in Lua
+lua.set_global("math_ops", {
+  double: (n) => n * 2,
+  ops: [(a, b) => a + b],
+});
+
+const [d, sum] = lua.execute_script(`
+  return math_ops.double(21), math_ops.ops[1](3, 4)
+`);
+console.log(d, sum); // 42 7
+```
+
 ### Working with Global Variables
 
 ```javascript
@@ -1832,6 +1852,9 @@ Returns the current memory usage of the Lua state in bytes.
 
 **Returns:** `number` — bytes currently allocated by the Lua state
 
+**Throws:** Error if the context is busy with an async operation (the allocator
+counter is being updated on another thread).
+
 ### `LuaContext.add_search_path(path)`
 
 Appends a search path to Lua's `package.path` for module resolution.
@@ -2125,7 +2148,7 @@ and vice versa. Call `release()` when done to free the registry slot.
 | `table` (array-like)  | `Array`         | Sequential numeric indices starting from 1 (no metatable)                                                     |
 | `table` (object-like) | `Object`        | String or mixed keys (no metatable)                                                                           |
 | `table` (metatabled)  | `Proxy`         | Wrapped as JS Proxy — metamethods preserved                                                                   |
-| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS                                                                              |
+| `function`            | `Function`      | Bidirectional: JS→Lua and Lua→JS, including functions nested inside objects/arrays                            |
 | `thread`              | `LuaCoroutine`  | Created via `create_coroutine()`                                                                              |
 | `userdata`            | `Object`        | JS-created via `set_userdata()`, returned by reference. Lua-created userdata passes through as opaque handles |
 
