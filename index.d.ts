@@ -1,5 +1,7 @@
 import type { LuaNative } from './types';
 export type {
+  ClassDefinition,
+  CompileOptions,
   CoroutineResult,
   LuaCallback,
   LuaCallbacks,
@@ -11,8 +13,13 @@ export type {
   LuaLibraryPreset,
   LuaNative,
   LuaTable,
+  LuaTableHandle,
   LuaTableRef,
   LuaValue,
+  MetatableDefinition,
+  PcallResult,
+  UserdataMethod,
+  UserdataOptions,
 } from './types';
 
 declare const lua_module: LuaNative;

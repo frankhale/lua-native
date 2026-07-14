@@ -2990,6 +2990,49 @@ describe('lua-native Node adapter', () => {
         t.release();
       });
 
+      it('distinguishes a string key "123" from integer key 123', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        // A numeric string key and the matching integer key are two distinct
+        // slots in Lua; the handle API must reach each independently.
+        t.set('123', 'string-key');
+        t.set(123, 'integer-key');
+        expect(t.get('123')).toBe('string-key');
+        expect(t.get(123)).toBe('integer-key');
+        expect(t.has('123')).toBe(true);
+        expect(t.has(123)).toBe(true);
+
+        // Verify against Lua's own view: t["123"] vs t[123].
+        lua.set_global('t', t);
+        expect(lua.execute_script('return t["123"]')).toBe('string-key');
+        expect(lua.execute_script('return t[123]')).toBe('integer-key');
+        t.release();
+      });
+
+      it('does not coerce a large numeric string key to an integer', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        t.set('99999999999999999999', 'big-string-key');
+        expect(t.get('99999999999999999999')).toBe('big-string-key');
+        lua.set_global('t', t);
+        expect(lua.execute_script('return t["99999999999999999999"]')).toBe('big-string-key');
+        t.release();
+      });
+
+      it('preserves a fractional numeric key instead of truncating it', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        // 1.5 used to be truncated to integer key 1 via Int64Value().
+        t.set(1.5, 'half');
+        t.set(1, 'whole');
+        expect(t.get(1.5)).toBe('half');
+        expect(t.get(1)).toBe('whole');
+        lua.set_global('t', t);
+        expect(lua.execute_script('return t[1.5]')).toBe('half');
+        expect(lua.execute_script('return t[1]')).toBe('whole');
+        t.release();
+      });
+
       it('overwrites existing values', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         const t = lua.create_table({ x: 1 });
@@ -4354,6 +4397,108 @@ describe('lua-native Node adapter', () => {
         const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
         expect(lua.execute_script('return load("return 7")()')).toBe(7);
       });
+    });
+  });
+
+  // ============================================
+  // CODE-REVIEW-2 REGRESSIONS
+  // ============================================
+  describe('code-review-2 regressions', () => {
+    it('H1: cancel() from inside a host callback during execute_async settles cleanly', async () => {
+      const lua: any = new lua_native.init(
+        { trigger: () => { lua.cancel(); return 1; } },
+        { libraries: 'safe' }
+      );
+      await expect(lua.execute_async('trigger(); return 42')).rejects.toThrow(/cancelled/);
+      // The context must remain usable (no wedged busy state, no corruption).
+      expect(lua.execute_script('return 5')).toBe(5);
+      expect(lua.is_busy()).toBe(false);
+    });
+
+    it('H7: a resolved value that cannot convert rejects instead of wedging the context', async () => {
+      const lua: any = new lua_native.init(
+        { getBad: () => Promise.resolve(Symbol('nope')) },
+        { libraries: 'safe' }
+      );
+      await expect(lua.execute_async('local v = getBad(); return v')).rejects.toThrow();
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1')).toBe(1);
+    });
+
+    it('H8: a throwing print handler does not crash the process', () => {
+      const lua = new lua_native.init({}, {
+        libraries: 'safe',
+        print: () => { throw new Error('boom'); },
+      });
+      // Must not abort; the throw is contained.
+      expect(() => lua.execute_script('print("x")')).not.toThrow();
+      expect(lua.execute_script('return 1')).toBe(1);
+    });
+
+    it('M2: resuming a finished async coroutine is impossible (state stays consistent)', async () => {
+      const lua = new lua_native.init({}, { libraries: 'safe' });
+      const r = await lua.execute_async('return 1 + 1');
+      expect(r).toBe(2);
+      expect(lua.is_busy()).toBe(false);
+      // A fresh run works after completion.
+      expect(await lua.execute_async('return 3')).toBe(3);
+    });
+
+    it('M4: a raising __index on the _G metatable surfaces as a JS error, not a crash', () => {
+      const lua = new lua_native.init({}, { libraries: 'all' });
+      lua.execute_script('setmetatable(_G, { __index = function() error("trap") end })');
+      expect(() => lua.get_global('definitely_missing')).toThrow();
+      // A metatable on _G with __newindex likewise routes through protection.
+      const lua2 = new lua_native.init({}, { libraries: 'all' });
+      lua2.execute_script('setmetatable(_G, { __newindex = function() error("no writes") end })');
+      expect(() => lua2.set_global('x', 1)).toThrow();
+    });
+
+    it('M7: register_class rejects reserved metamethods but allows operator overloads', () => {
+      const lua = new lua_native.init({}, { libraries: 'safe' });
+      for (const reserved of ['__gc', '__index', '__newindex', '__name']) {
+        expect(() =>
+          lua.register_class('Bad', {
+            construct: () => ({}),
+            metamethods: { [reserved]: () => {} },
+          })
+        ).toThrow(/reserved/);
+      }
+      // A non-reserved metamethod is accepted and dispatches to JS.
+      lua.register_class('Vec', {
+        construct: (x: number) => ({ x }),
+        readable: true,
+        metamethods: { __tostring: (self: any) => `vec(${self.x})` },
+      });
+      expect(lua.execute_script('return tostring(Vec.new(3))')).toBe('vec(3)');
+    });
+
+    it('M9: 2^63 no longer wraps to a negative 64-bit integer', () => {
+      const lua = new lua_native.init({}, { libraries: 'safe' });
+      lua.set_global('x', Math.pow(2, 63)); // exactly 2^63
+      expect(lua.execute_script('return x > 0')).toBe(true);
+    });
+
+    it('L1: re-enabling bytecode unwraps the text-only load() shim', () => {
+      const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+      const bc = lua.compile('return 21');
+      // Disabled: in-script load of a binary chunk fails.
+      lua.set_global('bc', bc.toString('latin1'));
+      expect(lua.execute_script('return load(bc) == nil')).toBe(true);
+      // (Text load still works while disabled.)
+      expect(lua.execute_script('return load("return 7")()')).toBe(7);
+    });
+
+    it('L2: numeric-looking keys with whitespace or sign stay distinct string keys', () => {
+      const lua = new lua_native.init({}, { libraries: 'all' });
+      const t = lua.create_table();
+      t.set(12, 'integer-12');   // integer key 12
+      t.set(' 12', 'string-12'); // must NOT alias integer key 12
+      t.set('+12', 'plus-12');   // must NOT alias integer key 12 either
+      expect(t.get(12)).toBe('integer-12');
+      expect(t.get(' 12')).toBe('string-12');
+      expect(t.get('+12')).toBe('plus-12');
+      t.release();
     });
   });
 });

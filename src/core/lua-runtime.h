@@ -19,16 +19,36 @@ using LuaPtr = std::shared_ptr<LuaValue>;
 using LuaArray = std::vector<LuaPtr>;
 using LuaTable = std::unordered_map<std::string, LuaPtr>;
 
+// A table key whose Lua type is carried explicitly, so a caller that knows the
+// intended type (e.g. the JS `LuaTableHandle` methods, which see whether the
+// argument was a JS number or string) can reach an integer key and a genuine
+// string key with the same textual form independently — `t[123]` vs `t["123"]`.
+// Contrast the plain std::string key overloads, which coerce a numeric-looking
+// string to an integer key (used by the Proxy path, where JS property keys are
+// always strings and `obj[1]` must address the array part).
+using TableKey = std::variant<std::string, int64_t, double>;
+
 namespace detail {
 // Produces a shared owner whose deleter unrefs `ref` from the registry when the
 // last copy is destroyed. Returns null for the no-op refs (LUA_NOREF/LUA_REFNIL)
-// so those never touch the registry. The captured lua_State* must outlive every
-// copy of the owner; refs stored on the runtime itself must be dropped before
-// lua_close (see LuaRuntime's destructor).
+// so those never touch the registry.
+//
+// The registry is shared by every thread of a global Lua state, so any thread
+// can perform the unref — but the captured state must still be alive when the
+// deleter runs. A value can be converted on a *coroutine thread* (e.g. a value
+// yielded or errored out of a coroutine), and that thread may be garbage
+// collected while a ref taken on it is still held by JS. Capturing it directly
+// would leave the deleter dereferencing a freed lua_State. Resolve and capture
+// the main thread instead: it stays valid until lua_close. Refs stored on the
+// runtime itself must still be dropped before lua_close (see the destructor).
 inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   if (!L || ref == LUA_NOREF || ref == LUA_REFNIL) return nullptr;
-  return std::shared_ptr<void>(nullptr, [L, ref](void*) {
-    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+  lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+  lua_State* mainL = lua_tothread(L, -1);
+  lua_pop(L, 1);
+  if (!mainL) mainL = L;  // defensive: LUA_RIDX_MAINTHREAD is always populated
+  return std::shared_ptr<void>(nullptr, [mainL, ref](void*) {
+    luaL_unref(mainL, LUA_REGISTRYINDEX, ref);
   });
 }
 }  // namespace detail
@@ -346,10 +366,17 @@ public:
       const std::unordered_map<std::string, std::string>& method_map,
       const std::vector<MetatableEntry>& metamethods);
 
-  // Table reference operations (for metatabled tables preserved as refs)
+  // Table reference operations (for metatabled tables preserved as refs).
+  // The plain-string variants coerce a numeric-looking key to an integer key
+  // (Proxy path, where JS property keys are always strings); the *Keyed variants
+  // honor the caller's explicit key type so a genuine string key like "123" is
+  // distinct from integer key 123.
   [[nodiscard]] LuaPtr GetTableField(int registry_ref, const std::string& key) const;
   void SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const;
   [[nodiscard]] bool HasTableField(int registry_ref, const std::string& key) const;
+  [[nodiscard]] LuaPtr GetTableFieldKeyed(int registry_ref, const TableKey& key) const;
+  void SetTableFieldKeyed(int registry_ref, const TableKey& key, const LuaPtr& value) const;
+  [[nodiscard]] bool HasTableFieldKeyed(int registry_ref, const TableKey& key) const;
   [[nodiscard]] std::vector<std::string> GetTableKeys(int registry_ref) const;
   [[nodiscard]] int GetTableLength(int registry_ref) const;
 

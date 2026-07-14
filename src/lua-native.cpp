@@ -111,12 +111,20 @@ static std::optional<lua_core::LuaValue> ConvertBuiltinType(
 
 // --- Proxy trap functions for LuaTableRef ---
 
-// Throws a JS "busy" error and returns true if a worker thread currently owns
-// the Lua state (execute_script_async / execute_file_async). Table-ref traps and
-// handle methods touch the shared lua_State from the main thread, so they must
-// bail out rather than race the worker.
+// Guards every table-ref trap and handle method. Throws (and returns true) if
+// the handle can't be safely used right now, for either reason:
+//  - the backing LuaContext has been destroyed (a retained handle outliving it);
+//  - any async op is in flight. Checking the context's is_busy_ (set
+//    synchronously before a worker Queue() or an execute_async begins) closes
+//    the Queue()-to-async_mode_ window and also blocks reentry during a
+//    suspended execute_async, which a runtime->IsAsyncMode() check would miss.
 static bool RejectIfWorkerBusy(Napi::Env env, LuaTableRefData* data) {
-  if (data && data->runtime && data->runtime->IsAsyncMode()) {
+  if (!data || !data->ContextLive() || !data->context) {
+    Napi::Error::New(env, "Lua table handle's context has been destroyed")
+      .ThrowAsJavaScriptException();
+    return true;
+  }
+  if (data->context->IsBusy()) {
     Napi::Error::New(env, "Lua context is busy with an async operation")
       .ThrowAsJavaScriptException();
     return true;
@@ -244,6 +252,31 @@ static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo
 
 // --- Table handle method functions ---
 
+// Builds an explicitly-typed Lua table key from a LuaTableHandle argument. A JS
+// number becomes an integer key when its value is integral and in int64 range
+// (so `handle.get(1)` reaches the array part) and a float key otherwise (so
+// `handle.get(1.5)` is no longer truncated to key 1). A JS string becomes a
+// string key verbatim — never coerced to an integer — so a genuine string key
+// like "123" is reachable and distinct from integer key 123. Returns false for
+// any other JS type so the caller can raise its own TypeError.
+static bool NapiToTableKey(const Napi::Value& value, lua_core::TableKey& out) {
+  if (value.IsNumber()) {
+    const double d = value.As<Napi::Number>().DoubleValue();
+    if (std::isfinite(d) && d == std::trunc(d) &&
+        d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
+      out = static_cast<int64_t>(d);
+    } else {
+      out = d;
+    }
+    return true;
+  }
+  if (value.IsString()) {
+    out = value.As<Napi::String>().Utf8Value();
+    return true;
+  }
+  return false;
+}
+
 static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
@@ -257,18 +290,14 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  std::string key;
-  if (info[0].IsNumber()) {
-    key = std::to_string(info[0].As<Napi::Number>().Int64Value());
-  } else if (info[0].IsString()) {
-    key = info[0].As<Napi::String>().Utf8Value();
-  } else {
+  lua_core::TableKey key;
+  if (!NapiToTableKey(info[0], key)) {
     Napi::TypeError::New(env, "get() key must be a string or number").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
   try {
-    auto result = data->runtime->GetTableField(data->tableRef.ref, key);
+    auto result = data->runtime->GetTableFieldKeyed(data->tableRef.ref, key);
     return data->context->CoreToNapi(*result);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -289,12 +318,8 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  std::string key;
-  if (info[0].IsNumber()) {
-    key = std::to_string(info[0].As<Napi::Number>().Int64Value());
-  } else if (info[0].IsString()) {
-    key = info[0].As<Napi::String>().Utf8Value();
-  } else {
+  lua_core::TableKey key;
+  if (!NapiToTableKey(info[0], key)) {
     Napi::TypeError::New(env, "set() key must be a string or number").ThrowAsJavaScriptException();
     return env.Undefined();
   }
@@ -302,7 +327,7 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
   try {
     auto value = std::make_shared<lua_core::LuaValue>(
       data->context->NapiToCoreInstance(info[1]));
-    data->runtime->SetTableField(data->tableRef.ref, key, value);
+    data->runtime->SetTableFieldKeyed(data->tableRef.ref, key, value);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
   }
@@ -322,18 +347,14 @@ static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  std::string key;
-  if (info[0].IsNumber()) {
-    key = std::to_string(info[0].As<Napi::Number>().Int64Value());
-  } else if (info[0].IsString()) {
-    key = info[0].As<Napi::String>().Utf8Value();
-  } else {
+  lua_core::TableKey key;
+  if (!NapiToTableKey(info[0], key)) {
     Napi::TypeError::New(env, "has() key must be a string or number").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
   try {
-    bool exists = data->runtime->HasTableField(data->tableRef.ref, key);
+    bool exists = data->runtime->HasTableFieldKeyed(data->tableRef.ref, key);
     return Napi::Boolean::New(env, exists);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -432,15 +453,18 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
 
   auto* data = static_cast<LuaFunctionData*>(info.Data());
-  if (!data || !data->runtime || !data->context) {
-    Napi::Error::New(env, "Invalid Lua function reference").ThrowAsJavaScriptException();
+  if (!data || !data->runtime || !data->context || !data->ContextLive()) {
+    Napi::Error::New(env, "Lua function's context has been destroyed")
+      .ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
-  // A worker thread (execute_script_async / execute_file_async) owns the Lua
-  // state during async_mode_; calling back into it from the main thread would be
-  // a concurrent access to the same lua_State.
-  if (data->runtime->IsAsyncMode()) {
+  // Reject reentry while any async op is in flight. Checking the context's
+  // is_busy_ (set synchronously before either a worker Queue() or an
+  // execute_async begins) closes two gaps that a runtime->IsAsyncMode() check
+  // misses: the window between Queue() and the worker setting async_mode_, and a
+  // suspended execute_async (which never sets async_mode_ at all).
+  if (data->context->IsBusy()) {
     Napi::Error::New(env, "Lua context is busy with an async operation")
       .ThrowAsJavaScriptException();
     return env.Undefined();
@@ -596,10 +620,13 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     js_userdata_.erase(ref_id);
   });
 
-  // Set up property handlers for proxy userdata
+  // Set up property handlers for proxy userdata. Each runs inside a Lua C frame
+  // during __index/__newindex; a HandleScope keeps per-access N-API handles from
+  // accumulating across a hot property-access loop.
   runtime->SetPropertyHandlers(
     // Getter (__index)
     [this](int ref_id, const std::string& key) -> lua_core::LuaPtr {
+      Napi::HandleScope scope(env);
       auto it = js_userdata_.find(ref_id);
       if (it == js_userdata_.end()) {
         return std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::nil());
@@ -612,6 +639,7 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     },
     // Setter (__newindex)
     [this](int ref_id, const std::string& key, const lua_core::LuaPtr& value) {
+      Napi::HandleScope scope(env);
       auto it = js_userdata_.find(ref_id);
       if (it == js_userdata_.end()) return;
       if (!it->second.writable) {
@@ -693,8 +721,16 @@ Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
   }
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
-  auto result = runtime->GetGlobal(name);
-  return CoreToNapi(*result);
+  // GetGlobal can throw (an over-deep table, or a raising __index on a _G
+  // metatable via the protected-get path). Surface it as a JS exception rather
+  // than letting a std::runtime_error unwind through the N-API boundary.
+  try {
+    auto result = runtime->GetGlobal(name);
+    return CoreToNapi(*result);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 }
 
 Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
@@ -830,6 +866,17 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     Napi::Array keys = mms.GetPropertyNames();
     for (uint32_t i = 0; i < keys.Length(); ++i) {
       std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
+      // These metamethods implement the class machinery itself (lifecycle,
+      // method/property dispatch, type marker). Allowing a user override would
+      // silently break instance cleanup (leaking JS references), method lookup,
+      // or round-tripping — and a user __gc would call into JS during GC/teardown.
+      if (key == "__gc" || key == "__index" || key == "__newindex" ||
+          key == "__name" || key == lua_core::LuaRuntime::kClassMarkerField) {
+        Napi::TypeError::New(env,
+          "register_class(): metamethod '" + key + "' is reserved and cannot be overridden")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
       Napi::Value val = mms.Get(key);
       if (val.IsFunction()) {
         std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
@@ -1062,7 +1109,7 @@ Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
   // The data is owned by the External's finalizer, freed when the handle is
   // garbage-collected.
   auto* dataPtr = new LuaTableRefData(
-    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this);
+    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this, alive_);
 
   Napi::Object handle = Napi::Object::New(env);
 
@@ -1168,6 +1215,10 @@ Napi::Value LuaContext::RegisterTypeConverter(const Napi::CallbackInfo& info) {
 }
 
 LuaContext::~LuaContext() {
+  // Signal any outstanding function/table handles that their context is gone, so
+  // a call after destruction fails cleanly instead of dereferencing freed memory.
+  if (alive_) alive_->store(false);
+
   // Clear callbacks to prevent accessing member state during lua_close()
   if (runtime) {
     runtime->SetUserdataGCCallback(nullptr);
@@ -1230,6 +1281,11 @@ void LuaContext::ThrowLuaError(const std::string& fallback) {
 
 lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::string& name) {
   return [this, name](const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    // Runs inside a Lua C frame; scope the per-call handles (args + result) so a
+    // tight Lua loop calling this host function doesn't accumulate millions of
+    // live handles until the enclosing script returns. The stashed
+    // async_pending_promise_ is a Persistent (strong) ref and survives the scope.
+    Napi::HandleScope scope(env);
     // Look the callback up explicitly: operator[] would default-construct an
     // empty FunctionReference for a missing name, and calling that is UB.
     auto cbIt = js_callbacks_.find(name);
@@ -1430,6 +1486,10 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
   runtime->SetAwaitDriverMode(true);
   async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
   async_deferred_.emplace(Napi::Promise::Deferred::New(env));
+  // Root the wrapping JS object for the run's duration: while the coroutine is
+  // suspended awaiting a promise, the settlement callbacks hold only a raw
+  // pointer to this context, so the ObjectWrap must not be collectible.
+  async_self_ref_ = Napi::Persistent(info.This().As<Napi::Object>());
 
   Napi::Promise promise = async_deferred_->Promise();
   // Initial resume (no arguments) — runs until the script finishes or awaits.
@@ -1447,7 +1507,22 @@ struct AwaitCookie {
 }  // namespace
 
 void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
+  // Mark the resume window so a cancel() arriving re-entrantly from a host
+  // callback defers its teardown until after the coroutine leaves the C stack
+  // (see Cancel()). Tearing down here would free the running coroutine.
+  async_resuming_ = true;
   auto step = runtime->ResumeAsyncStep(*async_co_, args, is_error);
+  async_resuming_ = false;
+
+  // Honor a cancel() that arrived during the resume, now that the coroutine has
+  // returned. Also covers a cancel requested before an about-to-be-attached
+  // continuation.
+  if (runtime->IsCancelRequested()) {
+    auto deferred = *async_deferred_;
+    FinishAsync();
+    deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
+    return;
+  }
 
   if (step.state == lua_core::AsyncStepResult::State::Awaiting) {
     if (async_pending_promise_.IsEmpty()) {
@@ -1473,12 +1548,27 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
     return;
   }
 
-  // Finished or errored: settle the promise and tear down.
+  // Finished or errored: settle the promise and tear down. Marshalling can throw
+  // (e.g. a result value that fails to cross to JS); catch it so the deferred is
+  // always settled and the context is never left permanently busy.
   auto deferred = *async_deferred_;
   if (step.state == lua_core::AsyncStepResult::State::Finished) {
-    Napi::Value resolved = ResultsToJs(step.values);
+    Napi::Value resolved;
+    bool ok = true;
+    std::string convErr;
+    try {
+      resolved = ResultsToJs(step.values);
+    } catch (const std::exception& e) {
+      ok = false;
+      convErr = e.what();
+    }
     FinishAsync();
-    deferred.Resolve(resolved);
+    if (ok) {
+      deferred.Resolve(resolved);
+    } else {
+      deferred.Reject(Napi::Error::New(env,
+        std::string("failed to convert async result: ") + convErr).Value());
+    }
   } else {
     // Reconstruct the original JS Error if this was a raised JS callback error.
     Napi::Value errValue = LuaErrorToJsValue(step.error);
@@ -1518,7 +1608,18 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
       args.push_back(std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::from(msg)));
     }
   } else {
-    args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
+    // Converting the resolved value can throw (Symbol, out-of-range BigInt, an
+    // over-deep object). Don't let it escape this N-API callback: settle the
+    // deferred with the error and tear down instead of leaving the run wedged.
+    try {
+      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
+    } catch (const std::exception& e) {
+      auto deferred = *async_deferred_;
+      FinishAsync();
+      deferred.Reject(Napi::Error::New(env,
+        std::string("failed to convert awaited value: ") + e.what()).Value());
+      return env.Undefined();
+    }
   }
   DriveAsync(std::move(args), is_error);
   return env.Undefined();
@@ -1533,6 +1634,7 @@ void LuaContext::FinishAsync() {
   }
   async_deferred_.reset();
   async_pending_promise_.Reset();
+  async_self_ref_.Reset();  // release the wrapper root taken in ExecuteAsync
   js_error_registry_.clear();
   is_busy_ = false;
 }
@@ -1555,6 +1657,15 @@ Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
 
 Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
   if (async_co_ && async_deferred_) {
+    if (async_resuming_) {
+      // Called re-entrantly from a host callback while the coroutine is still
+      // executing on the C stack. Tearing down now would free the running
+      // coroutine (use-after-free) and disengage async_deferred_ out from under
+      // DriveAsync. Defer: DriveAsync observes the request once the resume
+      // returns and finishes the run then.
+      runtime->RequestCancel();
+      return env.Undefined();
+    }
     // Abandon the suspended coroutine and reject immediately. Any pending
     // promise settlement becomes a no-op (async_co_ is cleared).
     auto deferred = *async_deferred_;
@@ -1594,7 +1705,15 @@ void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
   print_handler_ = Napi::Persistent(fn);
   runtime->SetOutputHandler([this](const std::string& text) {
     if (print_handler_.IsEmpty()) return;
-    print_handler_.Call({Napi::String::New(env, text)});
+    // This runs inside Lua's C call frame (print/io.write). Lua is built as C,
+    // so a C++ exception must not unwind through it. Contain a throwing handler,
+    // and scope the per-call handles so a hot print loop doesn't accumulate them.
+    Napi::HandleScope scope(env);
+    try {
+      print_handler_.Call({Napi::String::New(env, text)});
+    } catch (const Napi::Error&) {
+      // A throwing print handler is swallowed rather than corrupting the VM.
+    }
   });
 }
 
@@ -1706,8 +1825,11 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   }
   if (type == napi_number) {
     const double num = value.As<Napi::Number>().DoubleValue();
+    // Upper bound is strictly < 2^63: static_cast<double>(INT64_MAX) rounds up
+    // to exactly 2^63, and casting a double == 2^63 back to int64_t is UB.
+    constexpr double kInt64UpperExclusive = 9223372036854775808.0;  // 2^63
     if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-        num <= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        num < kInt64UpperExclusive) {
       double intpart;
       if (std::modf(num, &intpart) == 0.0) {
         return lua_core::LuaValue::from(static_cast<int64_t>(num));
@@ -1728,18 +1850,21 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
 
       // Check if it's a LuaTableRef Proxy (metatabled table round-tripping through JS).
       // Copy the existing ref so it shares registry ownership rather than minting a
-      // second owner for the same slot (which would double-unref).
+      // second owner for the same slot (which would double-unref). Only trust the
+      // marker if it belongs to THIS context's runtime — a ref index from another
+      // context would address an unrelated slot in this registry.
       if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
         auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
-        if (data) {
+        if (data && data->runtime.get() == runtime.get()) {
           return lua_core::LuaValue::from(lua_core::LuaTableRef(data->tableRef));
         }
+        // Foreign or invalid marker: fall through to a plain deep copy.
       }
 
       // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
       if (obj.Has("_userdata") && obj.Get("_userdata").IsExternal()) {
         auto* data = obj.Get("_userdata").As<Napi::External<LuaUserdataData>>().Data();
-        if (data) {
+        if (data && data->runtime.get() == runtime.get()) {
           return lua_core::LuaValue::from(lua_core::LuaUserdataRef(data->userdataRef));
         }
       }
@@ -1761,10 +1886,15 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
 
     // B2: user-registered converters get first look at objects (after internal
     // round-trip markers, before built-in type handling). A converter returns a
-    // JS value that is then converted normally.
-    for (auto& conv : type_converters_) {
-      if (conv.first.Value().Call({value}).ToBoolean().Value()) {
-        return NapiToCoreInstance(conv.second.Value().Call({value}), depth + 1);
+    // JS value that is then converted normally. Index the vector and pull both
+    // function handles out BEFORE calling match(): a match/convert callback may
+    // re-enter and register another converter, reallocating the vector and
+    // invalidating any reference held across the call.
+    for (size_t i = 0; i < type_converters_.size(); ++i) {
+      Napi::Function match = type_converters_[i].first.Value();
+      Napi::Function convert = type_converters_[i].second.Value();
+      if (match.Call({value}).ToBoolean().Value()) {
+        return NapiToCoreInstance(convert.Call({value}), depth + 1);
       }
     }
 
@@ -1821,8 +1951,10 @@ lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
   }
   if (type == napi_number) {
     const double num = value.As<Napi::Number>().DoubleValue();
+    // Upper bound is strictly < 2^63 (casting a double == 2^63 to int64_t is UB).
+    constexpr double kInt64UpperExclusive = 9223372036854775808.0;  // 2^63
     if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-        num <= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        num < kInt64UpperExclusive) {
       double intpart;
       if (std::modf(num, &intpart) == 0.0) {
         return lua_core::LuaValue::from(static_cast<int64_t>(num));
@@ -1910,7 +2042,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
         } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
           // The data is owned by a finalizer tied to the JS function, so it (and
           // its registry ref) is freed when the function is garbage-collected.
-          auto* dataPtr = new LuaFunctionData(runtime, v, this);
+          auto* dataPtr = new LuaFunctionData(runtime, v, this, alive_);
           Napi::Function fn =
             Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
           DefineHiddenProp(env, fn, "__luaFnOwner",
@@ -1951,7 +2083,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           // owned by the External's finalizer, tied to the proxy target's life.
           Napi::Object target = Napi::Object::New(env);
 
-          auto* dataPtr = new LuaTableRefData(runtime, v, this);
+          auto* dataPtr = new LuaTableRefData(runtime, v, this, alive_);
 
           // Store _tableRef as non-enumerable on target for round-trip detection
           auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,

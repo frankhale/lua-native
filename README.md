@@ -1461,6 +1461,27 @@ console.log(t.has("missing")); // false
 console.log(t.length()); // 1 (sequence length — the # operator)
 ```
 
+The key's JavaScript type selects the Lua key type: a `number` addresses an
+integer key when integral (`1`) or a float key otherwise (`1.5`), while a
+`string` always addresses a string key — never coerced to a number. This lets a
+genuine string key like `"123"` stay distinct from integer key `123`:
+
+```javascript
+const t = lua.create_table();
+
+t.set("123", "string key");
+t.set(123, "integer key");
+t.set(1.5, "float key"); // preserved, not truncated to key 1
+
+console.log(t.get("123")); // 'string key'
+console.log(t.get(123)); //  'integer key'
+console.log(t.get(1.5)); //  'float key'
+```
+
+(Proxy-based access — reading a table returned into JS as a plain object — can
+only use string keys, since JavaScript property keys are always strings. Use a
+table handle's `get`/`set`/`has` when you need to distinguish the two.)
+
 #### Iterating Tables
 
 ```javascript

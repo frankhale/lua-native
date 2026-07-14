@@ -190,13 +190,22 @@ export interface ClassDefinition {
  * registry slot.
  */
 export interface LuaTableHandle {
-  /** Get a field by key. Triggers __index if the table has a metatable. */
+  /**
+   * Get a field by key. Triggers __index if the table has a metatable.
+   *
+   * The key's JS type selects the Lua key type: a `number` addresses an
+   * integer key when integral (e.g. `1`) or a float key otherwise (e.g. `1.5`),
+   * while a `string` always addresses a string key — never coerced. This makes
+   * a genuine string key like `"123"` distinct from integer key `123`
+   * (`t.get("123")` vs `t.get(123)`), unlike Proxy-based access where JS
+   * property keys are always strings.
+   */
   get(key: string | number): LuaValue;
 
-  /** Set a field by key. Triggers __newindex if the table has a metatable. */
+  /** Set a field by key. Triggers __newindex if the table has a metatable. See {@link get} for how the key's JS type maps to the Lua key type. */
   set(key: string | number, value: LuaValue): void;
 
-  /** Check if a key exists in the table. */
+  /** Check if a key exists in the table. See {@link get} for how the key's JS type maps to the Lua key type. */
   has(key: string | number): boolean;
 
   /** Get the table length (# operator). Triggers __len metamethod. */

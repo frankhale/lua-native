@@ -1,6 +1,5 @@
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import fs from 'node:fs';
 import url from 'node:url';
 import os from 'node:os';
 
@@ -29,38 +28,37 @@ function loadModule() {
     platformDir = 'unknown';
   }
   
-  // List of possible relative paths where the module might be found
+  // Candidate locations, in priority order. Local build outputs come FIRST so
+  // that during development a freshly compiled binary (e.g. from
+  // `npm run build-debug`) always wins over a checked-in or packaged prebuild.
+  // Consumers who install from the registry have no build/ directory, so these
+  // entries simply don't exist and resolution falls through to prebuilds.
   const relativePaths = [
-    ['prebuilds', platformDir, baseName],
-    // CMake output paths with platform-specific directories
-    ['build', 'Debug', platformDir, baseName],
-    ['build', 'Release', platformDir, baseName],
-    
-    // Standard node-gyp paths (fallback)
+    // node-gyp output (npm run build-debug / build-release)
     ['build', 'Debug', baseName],
     ['build', 'Release', baseName],
-    
-    // Some systems might place output directly in build
+
+    // CMake output (see OUTPUT_DIR in CMakeLists.txt: build/<Config>/<os>)
+    ['build', 'Debug', 'macos', baseName],
+    ['build', 'Release', 'macos', baseName],
+    ['build', 'Debug', 'windows', baseName],
+    ['build', 'Release', 'windows', baseName],
+
+    // Prebuilt binaries shipped in the published package
+    ['prebuilds', platformDir, baseName],
+
+    // Misc fallback layouts
     ['build', baseName],
-    
-    // node-gyp might sometimes output to these locations
-    ['build', 'Debug', `${baseName}.node`],
-    ['build', 'Release', `${baseName}.node`],
-    
-    // For non-Windows platforms with different layout
-    ['build', `${baseName}.node`],
-    
-    // For backwards compatibility or unusual configurations
-    [baseName]
+    [baseName],
   ];
-  
+
   // Convert relative paths to absolute paths
-  const paths = relativePaths.map(segments => 
+  const paths = relativePaths.map(segments =>
     path.join(currentDir, ...segments)
   );
 
   let lastError = null;
-  
+
   // Try each path
   for (const modulePath of paths) {
     try {
@@ -69,29 +67,35 @@ function loadModule() {
       return require(cleanPath);
     } catch (error) {
       lastError = error;
-      // Only continue if it's a module not found error
-      if (error.code !== 'MODULE_NOT_FOUND') {
+      // Keep trying on "not found" (this path simply doesn't exist) and on
+      // "dlopen failed" (a prebuild built for a different arch/OS/ABI) — a
+      // later candidate may still yield a working binary. Any other error is a
+      // genuine failure and should surface immediately.
+      if (error.code !== 'MODULE_NOT_FOUND' && error.code !== 'ERR_DLOPEN_FAILED') {
         throw error;
       }
     }
   }
-  
-  // Check if the build directory exists
-  const buildDir = path.join(currentDir, 'build');
-  if (!fs.existsSync(buildDir)) {
-    throw new Error(`Build directory not found. Please run 'npm run build-debug' first.`);
+
+  // Last resort: let node-gyp-build resolve a prebuild using its own naming
+  // convention (this is what `prebuildify` output follows).
+  try {
+    const prebuild = require('node-gyp-build')(currentDir);
+    if (prebuild) {
+      return prebuild;
+    }
+  } catch (error) {
+    lastError = error;
   }
 
-  const prebuild = require('node-gyp-build')(currentDir);
-  if(prebuild) {
-    return prebuild;
-  }
-
-  // If we get here, the module was not found in any expected location
+  // Nothing worked — report every location we tried plus the last error.
   throw new Error(
-    `Could not find ${baseName} module in any expected location. ` +
-    `Expected paths included: ${paths.slice(0, 4).join(', ')}... ` +
-    `Did you build the project? Try running 'npm run build-debug' first.`
+    `Could not load the ${baseName} native binary.\n` +
+    `Tried the following locations:\n` +
+    paths.map(p => `  - ${p}`).join('\n') + '\n' +
+    `and node-gyp-build resolution in ${currentDir}.\n` +
+    `If you are developing locally, run 'npm run build-debug' first.` +
+    (lastError ? `\nLast error: ${lastError.message}` : '')
   );
 }
 

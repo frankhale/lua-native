@@ -13,19 +13,30 @@
 
 class LuaContext;
 
+// A returned Lua-function/table handle keeps its LuaRuntime alive (via the
+// shared_ptr) but the LuaContext wrapper is an independent GC root that can be
+// collected first. `contextAlive` is a liveness flag shared with the context:
+// it flips to false in ~LuaContext, letting a handle used afterwards fail
+// cleanly instead of dereferencing a freed `context`.
 struct LuaFunctionData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
   lua_core::LuaFunctionRef funcRef;
   LuaContext* context;
+  std::shared_ptr<std::atomic<bool>> contextAlive;
 
   LuaFunctionData(std::shared_ptr<lua_core::LuaRuntime> rt,
                   lua_core::LuaFunctionRef ref,
-                  LuaContext* ctx)
-    : runtime(std::move(rt)), funcRef(std::move(ref)), context(ctx) {}
+                  LuaContext* ctx,
+                  std::shared_ptr<std::atomic<bool>> alive)
+    : runtime(std::move(rt)), funcRef(std::move(ref)), context(ctx),
+      contextAlive(std::move(alive)) {}
 
   ~LuaFunctionData() {
     funcRef.release();
   }
+
+  // True while the backing LuaContext is still alive and usable.
+  bool ContextLive() const { return contextAlive && contextAlive->load(); }
 };
 
 struct LuaThreadData {
@@ -57,15 +68,21 @@ struct LuaTableRefData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
   lua_core::LuaTableRef tableRef;
   LuaContext* context;
+  std::shared_ptr<std::atomic<bool>> contextAlive;
 
   LuaTableRefData(std::shared_ptr<lua_core::LuaRuntime> rt,
                   lua_core::LuaTableRef ref,
-                  LuaContext* ctx)
-    : runtime(std::move(rt)), tableRef(std::move(ref)), context(ctx) {}
+                  LuaContext* ctx,
+                  std::shared_ptr<std::atomic<bool>> alive)
+    : runtime(std::move(rt)), tableRef(std::move(ref)), context(ctx),
+      contextAlive(std::move(alive)) {}
 
   ~LuaTableRefData() {
     tableRef.release();
   }
+
+  // True while the backing LuaContext is still alive and usable.
+  bool ContextLive() const { return contextAlive && contextAlive->load(); }
 };
 
 struct UserdataEntry {
@@ -108,6 +125,12 @@ public:
     Napi::Value AddSearcher(const Napi::CallbackInfo& info);
 
     void ClearBusy();
+
+    // True while any async op (worker-thread or coroutine-driven) is in flight.
+    // Lua-side entry points (the function trampoline, table traps) consult this
+    // to reject reentry into the shared state during a suspension. Public so
+    // those free functions can reach it.
+    bool IsBusy() const { return is_busy_.load(); }
 
     // Public so LuaFunctionCallbackStatic can use it
     Napi::Value CoreToNapi(const lua_core::LuaValue& value);
@@ -152,11 +175,25 @@ private:
     // safety even though it is only touched on the main thread.
     std::atomic<bool> is_busy_{false};
 
+    // Flipped to false in ~LuaContext. Shared (by shared_ptr) with every
+    // returned function/table handle so a handle used after the context is
+    // destroyed fails cleanly instead of dereferencing freed memory.
+    std::shared_ptr<std::atomic<bool>> alive_ =
+        std::make_shared<std::atomic<bool>>(true);
+
     // In-flight coroutine-driven async execution state (execute_async).
     // Only one runs at a time (guarded by is_busy_).
     std::optional<lua_core::LuaThreadRef> async_co_;
     std::optional<Napi::Promise::Deferred> async_deferred_;
     Napi::ObjectReference async_pending_promise_;
+    // Roots the wrapping JS object for the lifetime of an execute_async run so
+    // the ObjectWrap can't be garbage-collected while the coroutine is suspended
+    // awaiting a promise (the settlement callbacks hold only a raw pointer).
+    Napi::ObjectReference async_self_ref_;
+    // True only while a resume is executing on the C stack (inside DriveAsync).
+    // cancel() called re-entrantly from a host callback during that window must
+    // defer teardown — see Cancel()/DriveAsync().
+    bool async_resuming_ = false;
     // Bumped when each execute_async run starts. The await-settlement callbacks
     // capture the generation they were created for; a settlement whose generation
     // no longer matches (e.g. a promise from a cancelled run) is ignored so it

@@ -1,5 +1,6 @@
 #include "lua-runtime.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -53,14 +54,41 @@ bool isSequentialArray(lua_State* L, int index) {
 // overflows int64 (e.g. "99999999999999999999") stays a string key rather than
 // being silently clamped.
 void PushTableKey(lua_State* L, const std::string& key) {
-  errno = 0;
-  char* end = nullptr;
-  const long long int_key = strtoll(key.c_str(), &end, 10);
-  if (end != key.c_str() && *end == '\0' && errno != ERANGE) {
-    lua_pushinteger(L, static_cast<lua_Integer>(int_key));
-  } else {
-    lua_pushlstring(L, key.data(), key.size());
+  // strtoll accepts leading whitespace and a '+' sign, which would silently
+  // alias e.g. " 12" or "+12" onto integer key 12. Only treat a key as integer
+  // when it's a bare optional-'-' digit string, so those stay string keys.
+  const bool looks_numeric =
+      !key.empty() &&
+      (key[0] == '-' ? key.size() > 1 && std::isdigit(static_cast<unsigned char>(key[1]))
+                     : std::isdigit(static_cast<unsigned char>(key[0])));
+  if (looks_numeric) {
+    errno = 0;
+    char* end = nullptr;
+    const long long int_key = strtoll(key.c_str(), &end, 10);
+    if (end != key.c_str() && *end == '\0' && errno != ERANGE) {
+      lua_pushinteger(L, static_cast<lua_Integer>(int_key));
+      return;
+    }
   }
+  lua_pushlstring(L, key.data(), key.size());
+}
+
+// Pushes an explicitly-typed table key. Unlike the string overload above, a
+// string alternative is always pushed as a Lua string — no numeric coercion —
+// so a genuine string key like "123" is reachable and distinct from integer
+// key 123. (Lua itself normalizes a float key with an exact integer value to an
+// integer key, so `1.0` and `1` address the same slot, matching Lua semantics.)
+void PushTableKey(lua_State* L, const lua_core::TableKey& key) {
+  std::visit([L](const auto& k) {
+    using T = std::decay_t<decltype(k)>;
+    if constexpr (std::is_same_v<T, std::string>) {
+      lua_pushlstring(L, k.data(), k.size());
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+      lua_pushinteger(L, static_cast<lua_Integer>(k));
+    } else {  // double
+      lua_pushnumber(L, static_cast<lua_Number>(k));
+    }
+  }, key);
 }
 
 // Protected trampolines for metamethod-triggering table-ref operations. Each is
@@ -86,6 +114,14 @@ int ProtectedTableICollect(lua_State* L) {  // [t] -> [dense array of values]
     if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
     lua_rawseti(L, 2, i);
   }
+  return 1;
+}
+
+// Protected __tostring trampoline: [value] -> [string]. Run under lua_pcall so a
+// raising __tostring metamethod (on an error object surfaced from an unprotected
+// coroutine path) becomes a caught failure rather than a panic/abort.
+int ProtectedToString(lua_State* L) {  // [value] -> [string]
+  luaL_tolstring(L, 1, nullptr);
   return 1;
 }
 } // namespace
@@ -189,6 +225,13 @@ LuaRuntime::~LuaRuntime() {
   last_error_value_.reset();
   pending_error_value_.reset();
 
+  // lua_close() below runs __gc metamethods, which can reach the userdata GC
+  // and output callbacks. Clear them first so teardown never calls back into a
+  // (possibly already torn-down) host handler. The binding layer also clears
+  // these, but the core must not depend on it.
+  userdata_gc_callback_ = nullptr;
+  output_handler_ = nullptr;
+
   // Clean up stored function data
   for (auto& [data, destructor] : stored_function_data_) {
     if (destructor) destructor(data);
@@ -288,6 +331,13 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
 
       // 2. Fall through to property access
       if (runtime->property_getter_) {
+        if (runtime->async_mode_) {
+          // A worker thread owns the state; the getter would call into JS
+          // off the main thread. Reject like the host-function path does.
+          lua_pushfstring(L,
+            "property access is not available in async mode (reading '%s')", key);
+          raise = true;
+        } else {
         try {
           auto result = runtime->property_getter_(*block, key);
           PushLuaValue(L, result);
@@ -302,6 +352,7 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
             lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
             raise = true;
           }
+        }
         }
       }
     }
@@ -326,12 +377,20 @@ int LuaRuntime::UserdataNewIndex(lua_State* L) {
 
   bool raise = false;
   if (runtime && runtime->property_setter_) {
-    try {
-      auto value = ToLuaValue(L, 3);
-      runtime->property_setter_(*block, key, value);
-    } catch (const std::exception& e) {
-      lua_pushfstring(L, "Error writing property '%s': %s", key, e.what());
+    if (runtime->async_mode_) {
+      // A worker thread owns the state; the setter would call into JS off the
+      // main thread. Reject like the host-function path does.
+      lua_pushfstring(L,
+        "property access is not available in async mode (writing '%s')", key);
       raise = true;
+    } else {
+      try {
+        auto value = ToLuaValue(L, 3);
+        runtime->property_setter_(*block, key, value);
+      } catch (const std::exception& e) {
+        lua_pushfstring(L, "Error writing property '%s': %s", key, e.what());
+        raise = true;
+      }
     }
   }
   if (raise) return lua_error(L);  // after the exception object is destroyed
@@ -383,7 +442,11 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
       lua_pushnil(L_);
       lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
 
-      if (userdata_gc_callback_) {
+      // The GC callback reaches into the binding layer's N-API state (it frees a
+      // Napi::ObjectReference). During worker-thread async that would be an
+      // off-thread N-API call, so skip it. The binding entry is reclaimed when
+      // the context is destroyed; leaking it for the run is better than a crash.
+      if (userdata_gc_callback_ && !async_mode_) {
         userdata_gc_callback_(ref_id);
       }
     }
@@ -612,6 +675,15 @@ int LuaRuntime::ClassIndex(lua_State* L) {
 
       // 2. Fall through to property access.
       if (runtime->property_getter_) {
+        if (runtime->async_mode_) {
+          // A worker thread owns the state; the getter would call into JS off
+          // the main thread. Reject like the host-function path does.
+          luaL_where(L, 1);
+          lua_pushfstring(L,
+            "property access is not available in async mode (reading '%s')", key);
+          lua_concat(L, 2);
+          raise = true;
+        } else {
         try {
           auto result = runtime->property_getter_(*block, key);
           PushLuaValue(L, result);
@@ -629,6 +701,7 @@ int LuaRuntime::ClassIndex(lua_State* L) {
             lua_concat(L, 2);
             raise = true;
           }
+        }
         }
       }
     }
@@ -821,14 +894,25 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
 // --- Bytecode / untrusted-chunk guard (E3) ---
 
 void LuaRuntime::SetAllowBytecode(bool allow) {
+  if (allow == allow_bytecode_) return;  // no transition: don't stack/unwrap wrappers
   allow_bytecode_ = allow;
+  StackGuard guard(L_);
   if (!allow) {
     // Wrap the global load() to force text-only mode (binary chunks rejected).
-    StackGuard guard(L_);
     lua_getglobal(L_, "load");
     if (lua_isfunction(L_, -1)) {
       lua_pushcclosure(L_, SafeLoad, 1);  // upvalue 1 = original load
       lua_setglobal(L_, "load");
+    }
+  } else {
+    // Re-enable: unwrap by restoring the original load() saved as SafeLoad's
+    // upvalue 1. Only touch load() if it is still our wrapper (a user may have
+    // replaced it in the meantime).
+    lua_getglobal(L_, "load");
+    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == SafeLoad) {
+      if (lua_getupvalue(L_, -1, 1)) {  // push the original load
+        lua_setglobal(L_, "load");      // restore it as the global load
+      }
     }
   }
 }
@@ -1144,10 +1228,16 @@ void LuaRuntime::ProtectedTableCall(int nargs, int nresults) const {
 
 // Captures the error object at the top of L's stack: records the structured
 // value (for JS-Error reconstruction) and returns a display string.
+//
+// This runs on unprotected paths (coroutine resume / async step have no message
+// handler), so it must never invoke a user metamethod without a protected frame:
+// ToLuaValue does only raw traversal, the "message" lookup uses lua_rawget (no
+// __index), and stringification goes through a protected __tostring trampoline.
 std::string LuaRuntime::CaptureError(lua_State* L) const {
   last_error_value_ = ToLuaValue(L, -1);
   if (lua_type(L, -1) == LUA_TTABLE) {
-    lua_getfield(L, -1, "message");
+    lua_pushstring(L, "message");
+    lua_rawget(L, -2);  // raw: won't fire __index on a user error object
     if (lua_type(L, -1) == LUA_TSTRING) {
       std::string m = lua_tostring(L, -1);
       lua_pop(L, 1);
@@ -1155,11 +1245,19 @@ std::string LuaRuntime::CaptureError(lua_State* L) const {
     }
     lua_pop(L, 1);
   }
-  size_t len = 0;
-  const char* s = luaL_tolstring(L, -1, &len);
-  std::string msg(s ? s : "", s ? len : 0);
-  lua_pop(L, 1);  // pop the luaL_tolstring result
-  return msg;
+  // Stringify under protection so a raising __tostring can't panic here.
+  lua_pushcfunction(L, ProtectedToString);
+  lua_pushvalue(L, -2);  // the error value
+  if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_type(L, -1) == LUA_TSTRING) {
+    size_t len = 0;
+    const char* s = lua_tolstring(L, -1, &len);
+    std::string msg(s ? s : "", s ? len : 0);
+    lua_pop(L, 1);
+    return msg;
+  }
+  lua_pop(L, 1);  // pop the failed pcall result / non-string
+  // Fallback that never runs user code (the error value is still at -1).
+  return std::string("(error object is a ") + luaL_typename(L, -1) + " value)";
 }
 
 ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
@@ -1287,12 +1385,16 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
 }
 
 void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
-  // Guard so a PushLuaValue that throws mid-table doesn't strand a partial value
-  // on the stack. On success the setglobal balances the push, so the guard is a
-  // no-op.
+  // Assign through a protected _G[name] = value so a __newindex metamethod on
+  // the globals table (rare, but reachable via setmetatable(_G, ...)) surfaces
+  // as a std::runtime_error instead of an unprotected panic. StackGuard also
+  // clears a partially-built value if PushLuaValue throws.
   StackGuard guard(L_);
-  PushLuaValue(L_, value);
-  lua_setglobal(L_, name.c_str());
+  lua_pushcfunction(L_, ProtectedTableSet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+  lua_pushlstring(L_, name.data(), name.size());          // key
+  PushLuaValue(L_, value);                                // value
+  ProtectedTableCall(3, 0);
 }
 
 void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
@@ -1304,8 +1406,13 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
 }
 
 LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
+  // Read through a protected _G[name] so a __index metamethod on the globals
+  // table surfaces as a std::runtime_error instead of an unprotected panic.
   StackGuard guard(L_);
-  lua_getglobal(L_, name.c_str());
+  lua_pushcfunction(L_, ProtectedTableGet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+  lua_pushlstring(L_, name.data(), name.size());          // key
+  ProtectedTableCall(2, 1);
   return ToLuaValue(L_, -1);
 }
 
@@ -1314,6 +1421,9 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
   last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
+  if (!lua_checkstack(L_, static_cast<int>(args.size()) + LUA_MINSTACK)) {
+    return std::string("stack overflow: too many arguments to Lua function");
+  }
   lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
 
   for (const auto& arg : args) {
@@ -1346,6 +1456,12 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
   if (depth > kMaxDepth) {
     throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
+  }
+  // Reserve headroom for this level's working set (metatable probe, key/value
+  // during traversal). Lua only guarantees LUA_MINSTACK free slots and the raw
+  // push APIs do not grow the stack, so deep/wide tables would otherwise overrun.
+  if (!lua_checkstack(L, 4)) {
+    throw std::runtime_error("Lua stack overflow while reading a value");
   }
   switch (const int abs_index = lua_absindex(L, index); lua_type(L, abs_index)) {
     case LUA_TNIL:
@@ -1469,6 +1585,12 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
   if (depth > kMaxDepth) {
     throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
   }
+  // Reserve headroom before pushing (raw push APIs don't grow the stack). Each
+  // recursion level ensures its own additional slots, so nested containers
+  // accumulate the space they need instead of overrunning a full stack.
+  if (!lua_checkstack(L, 4)) {
+    throw std::runtime_error("Lua stack overflow while pushing a value");
+  }
   std::visit(
       [&](const auto& v) {
         using T = std::decay_t<decltype(v)>;
@@ -1562,18 +1684,56 @@ bool LuaRuntime::HasTableField(int registry_ref, const std::string& key) const {
   return !lua_isnil(L_, -1);
 }
 
+LuaPtr LuaRuntime::GetTableFieldKeyed(int registry_ref, const TableKey& key) const {
+  StackGuard guard(L_);
+  lua_pushcfunction(L_, ProtectedTableGet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  PushTableKey(L_, key);                             // key
+  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
+  return ToLuaValue(L_, -1);
+}
+
+void LuaRuntime::SetTableFieldKeyed(int registry_ref, const TableKey& key, const LuaPtr& value) const {
+  StackGuard guard(L_);
+  lua_pushcfunction(L_, ProtectedTableSet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  PushTableKey(L_, key);                             // key
+  PushLuaValue(L_, value);                           // value
+  ProtectedTableCall(3, 0);                          // may trigger __newindex
+}
+
+bool LuaRuntime::HasTableFieldKeyed(int registry_ref, const TableKey& key) const {
+  StackGuard guard(L_);
+  lua_pushcfunction(L_, ProtectedTableGet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+  PushTableKey(L_, key);                             // key
+  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
+  return !lua_isnil(L_, -1);
+}
+
 std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
   StackGuard guard(L_);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
 
   std::vector<std::string> keys;
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  // A stale/released ref (or a non-table slot) must not reach lua_next: raw
+  // traversal of a non-table is an API violation. Bail out with no keys.
+  if (!lua_istable(L_, -1)) {
+    return keys;
+  }
+
   lua_pushnil(L_);
   while (lua_next(L_, -2) != 0) {
     if (lua_type(L_, -2) == LUA_TSTRING) {
-      keys.emplace_back(lua_tostring(L_, -2));
+      // Length-aware so keys containing embedded NULs aren't truncated.
+      size_t len = 0;
+      const char* str = lua_tolstring(L_, -2, &len);
+      keys.emplace_back(str, len);
     } else if (lua_type(L_, -2) == LUA_TNUMBER) {
-      lua_pushvalue(L_, -2);
-      keys.emplace_back(lua_tostring(L_, -1));
+      lua_pushvalue(L_, -2);  // stringify a copy (never mutate the live key)
+      size_t len = 0;
+      const char* str = lua_tolstring(L_, -1, &len);
+      keys.emplace_back(str, len);
       lua_pop(L_, 1);
     }
     lua_pop(L_, 1);  // pop value, keep key
@@ -1744,6 +1904,11 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
   }
 
   // Push arguments onto the coroutine's stack
+  if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
+    result.status = CoroutineStatus::Dead;
+    result.error = "stack overflow: too many coroutine arguments";
+    return result;
+  }
   try {
     for (const auto& arg : args) {
       PushLuaValue(threadRef.thread, arg);
@@ -1889,10 +2054,23 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     result.error = "cannot resume a dead coroutine";
     return result;
   }
+  // A finished coroutine has status LUA_OK with an empty stack (exactly the
+  // state this function leaves behind via lua_settop(co, 0)). Resuming it would
+  // call below the stack base — reject it like ResumeCoroutine does.
+  if (thread_status == LUA_OK && lua_gettop(threadRef.thread) == 0) {
+    result.state = AsyncStepResult::State::Error;
+    result.error = "cannot resume a finished coroutine";
+    return result;
+  }
 
   last_error_value_.reset();
   await_is_error_ = arg_is_error;
 
+  if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
+    result.state = AsyncStepResult::State::Error;
+    result.error = "stack overflow: too many resume values";
+    return result;
+  }
   try {
     for (const auto& arg : args) {
       PushLuaValue(threadRef.thread, arg);

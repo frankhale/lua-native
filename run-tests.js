@@ -7,9 +7,14 @@ const isWin = os.platform() === "win32";
 const exeName = isWin ? "lua-native-test.exe" : "lua-native-test";
 
 const buildDirs = [
-  path.join("build", "Debug", "windows"),
+  // node-gyp output
   path.join("build", "Debug"),
   path.join("build", "Release"),
+  // CMake output (see OUTPUT_DIR in CMakeLists.txt: build/<Config>/<os>)
+  path.join("build", "Debug", "macos"),
+  path.join("build", "Release", "macos"),
+  path.join("build", "Debug", "windows"),
+  path.join("build", "Release", "windows"),
   path.join("build", "test", "Debug"),
   path.join("build", "test", "Release"),
   "cmake-build-debug",

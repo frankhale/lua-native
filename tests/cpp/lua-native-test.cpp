@@ -2546,6 +2546,37 @@ TEST(LuaRuntimeTableAPI, CreateTableFromTablePopulatesFields) {
   rt.ReleaseTableRef(ref);
 }
 
+TEST(LuaRuntimeTableAPI, KeyedFieldsDistinguishStringFromIntegerKeys) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int ref = rt.CreateTable();
+
+  // A string key "123" and an integer key 123 are distinct Lua slots. The
+  // *Keyed API honors the caller's explicit type; the string overload coerces.
+  rt.SetTableFieldKeyed(ref, TableKey{std::string("123")},
+      std::make_shared<LuaValue>(LuaValue::from(std::string("string-key"))));
+  rt.SetTableFieldKeyed(ref, TableKey{static_cast<int64_t>(123)},
+      std::make_shared<LuaValue>(LuaValue::from(std::string("integer-key"))));
+
+  auto s = rt.GetTableFieldKeyed(ref, TableKey{std::string("123")});
+  EXPECT_EQ(std::get<std::string>(s->value), "string-key");
+  auto i = rt.GetTableFieldKeyed(ref, TableKey{static_cast<int64_t>(123)});
+  EXPECT_EQ(std::get<std::string>(i->value), "integer-key");
+  EXPECT_TRUE(rt.HasTableFieldKeyed(ref, TableKey{std::string("123")}));
+  EXPECT_TRUE(rt.HasTableFieldKeyed(ref, TableKey{static_cast<int64_t>(123)}));
+
+  // The coercing string overload reaches only the integer slot for "123".
+  auto coerced = rt.GetTableField(ref, "123");
+  EXPECT_EQ(std::get<std::string>(coerced->value), "integer-key");
+
+  // A fractional key stays a float key (Int64Value truncation regression).
+  rt.SetTableFieldKeyed(ref, TableKey{1.5},
+      std::make_shared<LuaValue>(LuaValue::from(std::string("half"))));
+  auto half = rt.GetTableFieldKeyed(ref, TableKey{1.5});
+  EXPECT_EQ(std::get<std::string>(half->value), "half");
+
+  rt.ReleaseTableRef(ref);
+}
+
 TEST(LuaRuntimeTableAPI, CreateTableFromArrayCreatesSequence) {
   LuaRuntime rt(LuaRuntime::AllLibraries());
   LuaArray initial;

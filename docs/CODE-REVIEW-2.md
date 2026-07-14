@@ -15,9 +15,77 @@ synthesis) or **[Reported]** (verified by the originating pass; scenario
 reproduced from code reading, not re-checked a second time).
 
 **Baseline:** All 402 TypeScript tests and 162 C++ tests pass on the current
-tree. **Caveat:** because of finding P2, the TypeScript suite currently loads
-`prebuilds/darwin-arm64/lua-native.node`, *not* `build/Debug` — the passing
-run does not necessarily exercise the debug build.
+tree. **Caveat (at review time):** because of finding P2, the TypeScript suite
+loaded `prebuilds/darwin-arm64/lua-native.node`, *not* `build/Debug` — the
+passing run did not necessarily exercise the debug build.
+
+---
+
+## Resolution status (July 14, 2026)
+
+All findings triaged and, except for the documented residuals below, fixed.
+After the fixes: **411 TypeScript tests** (402 + 9 new CODE-REVIEW-2 regressions)
+and **162 C++ tests** pass, now verified against the freshly built `build/Debug`
+binary (P2 is fixed, so the suite exercises the real debug build). A standalone
+behavioral harness additionally confirmed the reentrant-cancel, throwing-print,
+reserved-metamethod, `2^63`, `_G`-metatable, and bytecode-re-enable paths.
+
+| # | Status | Resolution |
+|---|--------|------------|
+| P1 | ✅ Fixed | `install` script no longer uses `cross-env`; a `skip_test%` gyp default removes the need for `GYP_DEFINES`, so consumer installs no longer depend on a devDependency. `cross-env` dropped entirely. |
+| P2 | ✅ Fixed | Loader searches `build/Debug`/`build/Release` **before** `prebuilds/`; `ERR_DLOPEN_FAILED` is now non-fatal (tries the next candidate); `node-gyp-build` fallback always runs. |
+| P3 | ✅ Fixed | `get_vcpkg_path.js` added to `files` (verified in `npm pack`); `prebuildify` added to devDependencies; the "build dir not found" early-throw that shadowed `node-gyp-build` is gone; prebuild script uses `--napi`. |
+| H1 | ✅ Fixed | `async_resuming_` flag: a `cancel()` re-entered from a host callback during a resume defers to `RequestCancel()`, and `DriveAsync` honors it after the resume returns — no UAF, no empty-optional deref, no cross-run settle. |
+| H2 | ✅ Fixed | `async_self_ref_` roots the wrapper JS object for the run's duration; `~LuaContext` also flips the liveness flag. |
+| H3 | ✅ Fixed | `LuaFunctionData`/`LuaTableRefData` carry a shared `contextAlive` flag flipped in `~LuaContext`; the function trampoline and all table traps/handles check it and fail cleanly. |
+| H4 | ✅ Fixed | `lua_checkstack` guards added to `ToLuaValue`, `PushLuaValue` (per level), `CallFunction`, `ResumeCoroutine`, and `ResumeAsyncStep`. |
+| H5 | ✅ Fixed | `MakeRegistryOwner` resolves and captures the main thread (`LUA_RIDX_MAINTHREAD`) so the unref never targets a collected coroutine thread. |
+| H6 | ✅ Fixed | `CaptureError` uses `lua_rawget` for `message` and a protected `__tostring` trampoline; a raising metamethod on a coroutine error path can no longer panic. |
+| H7 | ✅ Fixed | `GetGlobal` binding wraps conversion in try/catch; `DriveAsync` and `OnAwaitSettled` catch marshalling exceptions, settle the deferred, and tear down. |
+| H8 | ✅ Fixed | The print-handler invocation catches `Napi::Error` (and runs in a `HandleScope`) so a throwing handler can't unwind through Lua's C frames. |
+| H9 | ✅ Fixed (a,b); ⚠️ residual (c) | (a) Lua-side guards now check `is_busy_`, closing the `Queue()`→`async_mode_` window. (b) Userdata/class property paths raise in async mode; the GC callback is skipped in async mode to avoid an off-thread N-API call. (c) Finalizer `luaL_unref` racing a worker still needs a deferred-unref queue — see residuals. |
+| H10 | ✅ Fixed | Same `is_busy_` guard blocks reentry into a suspended `execute_async` from the function trampoline and table traps. |
+| M2 | ✅ Fixed | `ResumeAsyncStep` rejects a finished coroutine (`LUA_OK` + empty stack), matching `ResumeCoroutine`. |
+| M3 | ✅ Fixed | `GetTableKeys` checks `lua_istable` before `lua_next`. |
+| M4 | ✅ Fixed (GetGlobal/SetGlobal); ⚠️ partial | `GetGlobal`/`SetGlobal` route through the protected-call path. `RegisterFunction`/`GetGlobalRef`/`SetGlobalMetatable`/`AddSearchPath` still use raw global access (rarer triggers) — noted as residual. |
+| M6 | ✅ Fixed (`_tableRef`/`_userdata`); ⚠️ partial | Round-trip markers are honored only when `data->runtime` matches this context; foreign handles fall through to a deep copy. `__luaClassRef` (no runtime pointer) is a documented residual. |
+| M7 | ✅ Fixed | `register_class` rejects `__gc`/`__index`/`__newindex`/`__name`/class-marker metamethods with a clear error. |
+| M8 | ✅ Fixed | The converter loop indexes the vector and extracts both function handles before calling `match`, surviving a reentrant `register_type_converter`. |
+| M9 | ✅ Fixed | Upper bound is now `num < 2^63` (both `NapiToCore` and `NapiToCoreInstance`); `2^63` no longer wraps to `INT64_MIN`. |
+| M10 | ✅ Fixed | `HandleScope` added to the host-callback wrapper, property getter/setter, and print handler. |
+| M13 | ✅ Fixed | `index.d.ts` re-exports `ClassDefinition`, `CompileOptions`, `MetatableDefinition`, `UserdataMethod`, `UserdataOptions`, `PcallResult`, `LuaTableHandle`. |
+| M14 | ✅ Fixed | Loader and `run-tests.js` search the real CMake output dirs (`build/<Config>/macos`, `.../windows`). |
+| M15 | ✅ Fixed | `MACOSX_DEPLOYMENT_TARGET` lowered from `26.0` to `11.0` (both blocks). |
+| L1 | ✅ Fixed | `SetAllowBytecode` is idempotent and unwraps the `load()` shim on re-enable. |
+| L2 | ✅ Fixed | `PushTableKey` treats only bare optional-`-` digit strings as integers; `" 12"`/`"+12"` stay string keys. |
+| L3 | ✅ Fixed | `GetTableKeys` reads keys length-aware (embedded NULs preserved). |
+| L4 | ✅ Fixed | `~LuaRuntime` clears `userdata_gc_callback_`/`output_handler_` before `lua_close`. |
+| L9 | ✅ Fixed | Removed the stray `-fno-exceptions` from the MSVC-only blocks, the misleading `binary.napi_versions` metadata, and the ignored `-Dskip_test` args on the CMake scripts. |
+| M5 | ⚠️ Partial | The most reachable OOM-in-unprotected-path sites (`GetGlobal`/`SetGlobal`) are now protected via M4; other allocating core methods (`CreateTableFrom`, `RegisterFunction`) remain unprotected. |
+| M1, M11, M12, L5, L6, L7, L8, H9c | ⚠️ Documented residual | See below. |
+
+**Deliberately deferred (documented, not changed):**
+
+- **H9c — finalizer `luaL_unref` racing a worker run.** A correct fix needs a
+  deferred-unref queue drained on the main thread after the worker completes;
+  the trigger (V8 GC collecting a wrapper *during* a multi-second
+  `execute_script_async`) is narrow. The worker-thread async model is already
+  the lower-capability path (no JS callbacks); `execute_async` is preferred.
+- **M1 — awaiting a JS promise from inside a *user* coroutine** yields to the
+  wrong resumer. Needs a core guard that refuses to yield when the yielding
+  state isn't the driver thread; deferred as a correctness-of-a-niche-usage item.
+- **M5 (remainder), M4 (remainder)** — remaining unprotected allocating/global
+  API sites; same protected-trampoline treatment applies when prioritized.
+- **L5 — hostile `Promise` subclass double-firing** the await callbacks
+  (spec-violating input) can double-free the cookie. Low-risk; a settled flag or
+  finalizer-owned cookie would close it.
+- **L6, L7, L8, M11/M12** — configurable owner props, `js_error_registry_`
+  accumulation on non-`CallScope` paths, `cancel()` being a no-op for
+  worker-thread async (this is the `lua_sethook` instruction-limit work tracked
+  in `FUTURE.md`/`BRIDGE-GAP-ANALYSIS.md` A3b), and the stored-`env` documentation
+  items — left as-is per their low severity.
+
+The original findings follow unchanged for reference.
 
 ---
 

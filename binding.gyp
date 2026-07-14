@@ -1,4 +1,10 @@
 {
+  "variables": {
+    # Default to skipping the C++ test target so that source installs on
+    # consumer machines (which run the `install` script) build only the addon.
+    # Overridden to 0 by the build-debug script (`-Dskip_test=0`).
+    "skip_test%": 1
+  },
   "targets": [
     {
       "target_name": "lua-native",
@@ -32,9 +38,6 @@
           "defines": [
             "WIN32_LEAN_AND_MEAN",
             "NOMINMAX"
-          ],
-          "cflags_cc": [
-            "-fno-exceptions"
           ],
           "configurations": {
             "Debug": {
@@ -174,9 +177,6 @@
               "defines": [
                 "WIN32_LEAN_AND_MEAN",
                 "NOMINMAX"
-              ],
-              "cflags_cc": [
-                "-fno-exceptions"
               ],
               "configurations": {
                 "Debug": {
