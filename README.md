@@ -31,6 +31,7 @@ data structures.
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
+- Execution limits — cap Lua VM instructions with `maxInstructions` option so infinite loops abort instead of hanging
 - Coroutine support with yield/resume semantics
 - Error fidelity — Lua errors carry stack tracebacks, thrown JS `Error` objects round-trip with full fidelity (type, message, stack, custom props), and `pcall()` runs a function protected, returning `{ ok, value/error }`
 - Cross-platform support (Windows, macOS)
@@ -548,6 +549,52 @@ console.log(lua.get_memory_usage()); // increased after allocation
 
 Memory tracking works even without `maxMemory` — every Lua context tracks its
 memory usage automatically.
+
+### Execution Time Limits
+
+Cap the number of Lua VM instructions a single execution may run, so an infinite
+loop aborts instead of hanging the host process. This is the second half of
+sandboxing alongside `maxMemory`:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, {
+  libraries: "safe",
+  maxInstructions: 1_000_000,
+});
+
+// Normal scripts complete well within the budget
+lua.execute_script("local s = 0; for i = 1, 100 do s = s + i end; return s"); // 5050
+
+// A runaway loop is aborted instead of hanging
+try {
+  lua.execute_script("while true do end");
+} catch (error) {
+  console.error(error.message); // "instruction limit exceeded"
+}
+
+// The context remains usable afterward
+lua.execute_script("return 1 + 1"); // 2
+```
+
+The budget applies **per execution call** — each `execute_script`,
+`execute_file`, `load_bytecode`, Lua-function call from JS, and each coroutine
+`resume` gets a fresh budget, so the limit catches a single runaway execution
+without accumulating across unrelated calls. Coroutines created inside a script
+(including via `coroutine.create`) inherit the limit. Enforcement is approximate
+to within ~1000 instructions (the sampling granularity of the hook). Set to `0`
+or omit for unlimited execution.
+
+For a tight sandbox, combine both limits:
+
+```javascript
+const sandbox = new lua_native.init({}, {
+  libraries: "safe",
+  maxMemory: 256 * 1024,
+  maxInstructions: 1_000_000,
+});
+```
 
 ### Module / Require Integration
 
@@ -1763,6 +1810,12 @@ creates a bare Lua state with no callbacks and no standard libraries.
   - `maxMemory` (optional): Maximum memory in bytes that the Lua state can
     allocate. When exceeded, Lua raises an out-of-memory error. `0` or omitted
     means unlimited. Memory usage is tracked even without a limit.
+  - `maxInstructions` (optional): Maximum number of Lua VM instructions a single
+    execution may run before it is aborted with an `"instruction limit
+    exceeded"` error, preventing infinite loops from hanging the process. The
+    budget applies per execution call (each `execute_script`/`execute_file`/
+    `load_bytecode`, Lua-function call, and coroutine `resume`). `0` or omitted
+    means unlimited. Enforcement is approximate to within ~1000 instructions.
   - `print` (optional): Handler receiving `print()`/`io.write()` output as
     formatted text (see `set_print_handler`). Takes precedence over a `print`
     in the callbacks object.

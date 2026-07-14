@@ -190,6 +190,52 @@ void LuaRuntime::InitState() {
   // Register userdata metatables
   RegisterUserdataMetatable();
   RegisterProxyUserdataMetatable();
+
+  // Install the instruction/cancel count-hook if a limit was configured. Must
+  // run after the runtime pointer is in the registry (the hook reads it back).
+  InstallExecutionHook();
+}
+
+// Retrieves the LuaRuntime from the registry, tallies instructions, and raises
+// "instruction limit exceeded" (or "execution cancelled") when appropriate.
+// Holds no non-trivial C++ locals, so the luaL_error longjmp skips nothing (see
+// the H1 discussion in CODE-REVIEW-1). Always fires inside a lua_pcall /
+// lua_resume frame, so the raise is protected rather than a panic.
+void LuaRuntime::InstructionCountHook(lua_State* L, lua_Debug* /*ar*/) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (!runtime) return;
+
+  // Cooperative cancellation of a compute-bound loop.
+  if (runtime->cancel_requested_.load(std::memory_order_relaxed)) {
+    luaL_error(L, "execution cancelled");
+    return;  // unreachable: luaL_error longjmps
+  }
+
+  if (runtime->max_instructions_ == 0) return;  // limit removed since install
+  runtime->instruction_count_ +=
+      static_cast<size_t>(runtime->instruction_hook_interval_);
+  if (runtime->instruction_count_ >= runtime->max_instructions_) {
+    luaL_error(L, "instruction limit exceeded");
+  }
+}
+
+void LuaRuntime::InstallExecutionHook() {
+  if (max_instructions_ > 0) {
+    // Fire at least as often as the limit so a small limit is still enforced,
+    // capped at 1000 to keep per-instruction overhead negligible for large ones.
+    instruction_hook_interval_ =
+        max_instructions_ < 1000 ? static_cast<int>(max_instructions_) : 1000;
+    lua_sethook(L_, InstructionCountHook, LUA_MASKCOUNT, instruction_hook_interval_);
+  } else {
+    lua_sethook(L_, nullptr, 0, 0);
+  }
+}
+
+void LuaRuntime::SetMaxInstructions(size_t limit) {
+  max_instructions_ = limit;
+  InstallExecutionHook();
 }
 
 std::vector<std::string> LuaRuntime::AllLibraries() {
@@ -209,6 +255,7 @@ LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries)
 
 LuaRuntime::LuaRuntime(const RuntimeConfig& config) {
   allocator_.limit = config.max_memory;
+  max_instructions_ = config.max_instructions;  // installed by InitState()
   L_ = lua_newstate(LuaAllocator, &allocator_, 0);
   if (!L_) {
     throw std::runtime_error("Failed to create Lua state");
@@ -231,6 +278,10 @@ LuaRuntime::~LuaRuntime() {
   // these, but the core must not depend on it.
   userdata_gc_callback_ = nullptr;
   output_handler_ = nullptr;
+
+  // Remove the count-hook before lua_close so a __gc finalizer running during
+  // teardown can't trip the instruction limit / cancel raise.
+  if (L_) lua_sethook(L_, nullptr, 0, 0);
 
   // Clean up stored function data
   for (auto& [data, destructor] : stored_function_data_) {
@@ -1206,6 +1257,11 @@ int LuaRuntime::MessageHandler(lua_State* L) {
 // Calls a function already on the stack (with nargs args above it) under the
 // traceback message handler.
 int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
+  // Fresh instruction budget per top-level execution (execute_script/file,
+  // load_bytecode, a Lua function call). Nested Lua→host→Lua calls re-enter
+  // here and legitimately get their own budget; a plain Lua loop that never
+  // re-enters keeps accumulating and is caught. No-op when unlimited.
+  instruction_count_ = 0;
   const int base = lua_gettop(L_) - nargs;  // index of the function
   lua_pushcfunction(L_, MessageHandler);
   lua_insert(L_, base);  // move handler below the function
@@ -1919,7 +1975,8 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     return result;
   }
 
-  // Resume the coroutine
+  // Resume the coroutine (fresh instruction budget for this resume step).
+  instruction_count_ = 0;
   int nresults = 0;
   int resumeStatus = lua_resume(threadRef.thread, L_, static_cast<int>(args.size()), &nresults);
 
@@ -2064,6 +2121,7 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   }
 
   last_error_value_.reset();
+  instruction_count_ = 0;  // fresh instruction budget for this resume step
   await_is_error_ = arg_is_error;
 
   if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {

@@ -131,13 +131,18 @@ deliberately documented rather than changed:
   an unrelated guarded call runs.
 - **Reason deferred:** low severity.
 
-#### L8 — `cancel()` is a no-op for worker-thread async *(low)*
+#### L8 — `cancel()` is a no-op for worker-thread async *(low)* — ⚠️ PARTIALLY RESOLVED
 - Nothing ever calls `RequestCancel()`; worker-thread runs
   (`execute_script_async` / `execute_file_async`) cannot be interrupted at all,
   and the `IsCancelRequested` branch in `OnAwaitSettled` is dead code.
-- **Reason deferred:** tracked separately as the `lua_sethook` instruction-limit
-  work — gap **A3b** in `FUTURE.md` / `BRIDGE-GAP-ANALYSIS.md` (hook-based
-  cancellation).
+- **Progress:** the `lua_sethook` count-hook this item depended on (gap **A3b**)
+  now exists — see the **Execution Time Limits** entry below. The hook polls
+  `IsCancelRequested()`, so a compute-bound loop is now cooperatively
+  interruptible *once a cancel is signalled*.
+- **Still open:** the worker-thread `cancel()` path does not yet call
+  `RequestCancel()`, so worker runs still can't actually be cancelled. Wiring
+  that single call (plus removing the dead `OnAwaitSettled` branch, or making it
+  live) completes A3b.
 
 #### M11 — no `HandleScope` in Lua→JS reentrant callbacks *(medium)*
 - Every `CoreToNapi` result / `Call` return created during a long script run
@@ -178,5 +183,17 @@ deliberately documented rather than changed:
    steering users to `execute_async`).
 5. **M11** — `HandleScope` coverage on the remaining reentrant callback sites.
 6. **L5–L8, L6, stored-env docs, M9/M10/L1 cleanups** — polish, done
-   opportunistically. L8 in particular is subsumed by the A3b hook-based
-   cancellation work.
+   opportunistically. L8's A3b hook now exists (see below); only the
+   worker-`cancel()` → `RequestCancel()` wiring remains.
+
+---
+
+## Feature work completed since these reviews
+
+- **Execution Time Limits (`maxInstructions`)** — the tier-1 `lua_sethook` /
+  `LUA_MASKCOUNT` count-hook from `FUTURE.md` (gap **A3b**) is implemented. A
+  per-execution VM-instruction budget aborts runaway scripts with
+  `"instruction limit exceeded"`, and the hook also polls `IsCancelRequested()`
+  so compute-bound loops become cooperatively cancellable. This delivers the
+  infrastructure half of L8 / A3b (see the L8 entry above for the remaining
+  worker-`cancel()` wiring).

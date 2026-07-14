@@ -2900,6 +2900,94 @@ TEST(LuaRuntimeMemory, RecoveryAfterOOM) {
   EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res2)[0]->value), 3);
 }
 
+// ---- Execution time limits (maxInstructions) ----
+
+TEST(LuaRuntimeInstructions, UnlimitedByDefault) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetMaxInstructions(), 0u);
+  // A long but finite loop completes when unlimited.
+  const auto res = rt.ExecuteScript("local s=0; for i=1,2000000 do s=s+1 end; return s");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2000000);
+}
+
+TEST(LuaRuntimeInstructions, ConfigConstructorSetsLimit) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 1000000;
+  LuaRuntime rt(config);
+  EXPECT_EQ(rt.GetMaxInstructions(), 1000000u);
+}
+
+TEST(LuaRuntimeInstructions, InfiniteLoopAborts) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 1000000;
+  LuaRuntime rt(config);
+
+  const auto res = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"), std::string::npos)
+      << "got: " << std::get<std::string>(res);
+}
+
+TEST(LuaRuntimeInstructions, NormalScriptCompletes) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 1000000;
+  LuaRuntime rt(config);
+
+  const auto res = rt.ExecuteScript("local s=0; for i=1,100 do s=s+i end; return s");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 5050);
+}
+
+TEST(LuaRuntimeInstructions, BudgetResetsBetweenExecutions) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 200000;
+  LuaRuntime rt(config);
+
+  // Each call runs well under the limit; the counter must not carry over.
+  for (int i = 0; i < 20; ++i) {
+    const auto res = rt.ExecuteScript("local s=0; for j=1,1000 do s=s+j end; return s");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res))
+        << "iteration " << i << " failed: " << std::get<std::string>(res);
+    EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 500500);
+  }
+}
+
+TEST(LuaRuntimeInstructions, ContextRecoversAfterAbort) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 1000000;
+  LuaRuntime rt(config);
+
+  const auto res1 = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res1));
+
+  const auto res2 = rt.ExecuteScript("return 1 + 2");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res2)[0]->value), 3);
+}
+
+TEST(LuaRuntimeInstructions, SetMaxInstructionsPostConstruction) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetMaxInstructions(), 0u);
+
+  rt.SetMaxInstructions(500000);
+  EXPECT_EQ(rt.GetMaxInstructions(), 500000u);
+  const auto res = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"), std::string::npos);
+
+  // Removing the limit lets a finite loop complete again.
+  rt.SetMaxInstructions(0);
+  EXPECT_EQ(rt.GetMaxInstructions(), 0u);
+  const auto res2 = rt.ExecuteScript("local s=0; for i=1,2000000 do s=s+1 end; return s");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

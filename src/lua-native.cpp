@@ -561,6 +561,25 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
       }
     }
 
+    // Check for maxInstructions option (VM instruction execution limit)
+    size_t max_instructions = 0;
+    bool has_max_instructions = false;
+    if (options.Has("maxInstructions")) {
+      auto insVal = options.Get("maxInstructions");
+      if (insVal.IsNumber()) {
+        double insNum = insVal.As<Napi::Number>().DoubleValue();
+        if (insNum < 0) {
+          Napi::RangeError::New(env, "maxInstructions must be a non-negative number").ThrowAsJavaScriptException();
+          return;
+        }
+        max_instructions = static_cast<size_t>(insNum);
+        has_max_instructions = true;
+      } else if (!insVal.IsUndefined() && !insVal.IsNull()) {
+        Napi::TypeError::New(env, "maxInstructions must be a number").ThrowAsJavaScriptException();
+        return;
+      }
+    }
+
     // Parse libraries
     std::vector<std::string> libraries;
     bool has_libraries = false;
@@ -596,10 +615,11 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
 
     // Create runtime with appropriate constructor
     try {
-      if (has_max_memory) {
+      if (has_max_memory || has_max_instructions) {
         lua_core::RuntimeConfig config;
         config.libraries = std::move(libraries);
         config.max_memory = max_memory;
+        config.max_instructions = max_instructions;
         runtime = std::make_shared<lua_core::LuaRuntime>(config);
       } else if (has_libraries) {
         runtime = std::make_shared<lua_core::LuaRuntime>(libraries);

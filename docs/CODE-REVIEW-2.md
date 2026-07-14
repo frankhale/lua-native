@@ -81,9 +81,13 @@ reserved-metamethod, `2^63`, `_G`-metatable, and bytecode-re-enable paths.
   finalizer-owned cookie would close it.
 - **L6, L7, L8, M11/M12** — configurable owner props, `js_error_registry_`
   accumulation on non-`CallScope` paths, `cancel()` being a no-op for
-  worker-thread async (this is the `lua_sethook` instruction-limit work tracked
-  in `FUTURE.md`/`BRIDGE-GAP-ANALYSIS.md` A3b), and the stored-`env` documentation
-  items — left as-is per their low severity.
+  worker-thread async, and the stored-`env` documentation items — left as-is
+  per their low severity. **Update (Execution Time Limits landed):** the
+  `lua_sethook` count-hook this L8 note referred to (`FUTURE.md` /
+  `BRIDGE-GAP-ANALYSIS.md` A3b) now exists — see `maxInstructions`. The hook
+  polls `IsCancelRequested()`, so compute-bound loops are now cooperatively
+  interruptible *once a cancel is signalled*; the remaining L8 piece is wiring
+  the worker-thread `cancel()` path to call `RequestCancel()`.
 
 The original findings follow unchanged for reference.
 
@@ -587,6 +591,11 @@ cleared until an unrelated guarded call runs.
 `src/lua-native.cpp:1497-1502, 1556-1565`. Nothing ever calls
 `RequestCancel()`; worker runs cannot be interrupted at all. (Tracked as gap
 A3b in `BRIDGE-GAP-ANALYSIS.md` — hook-based cancellation.)
+
+> **Partially addressed** (Execution Time Limits): the A3b count-hook now
+> exists (`maxInstructions`) and polls `IsCancelRequested()`, so a compute-bound
+> loop *is* interruptible when a cancel is signalled. The still-open half is
+> that the worker-thread `cancel()` path does not yet call `RequestCancel()`.
 
 ### L9. `binding.gyp` misc  [Reported]
 `-fno-exceptions` (a GCC flag) inside the MSVC-only `OS=='win'` blocks

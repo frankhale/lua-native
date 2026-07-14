@@ -3429,6 +3429,98 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // Execution time limits (maxInstructions)
+  // ============================================
+  describe('execution limits', () => {
+    describe('maxInstructions enforcement', () => {
+      it('aborts an infinite loop instead of hanging', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 1_000_000 });
+        expect(() => {
+          lua.execute_script('while true do end');
+        }).toThrow(/instruction limit exceeded/i);
+      });
+
+      it('lets a normal script complete within the limit', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 1_000_000 });
+        const result = lua.execute_script('local s = 0; for i = 1, 100 do s = s + i end; return s');
+        expect(result).toBe(5050);
+      });
+
+      it('resets the instruction budget between execute_script calls', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 200_000 });
+        // Each call does a moderate amount of work well under the limit; run
+        // several in a row to prove the counter does not carry over.
+        for (let i = 0; i < 20; i++) {
+          const r = lua.execute_script('local s = 0; for j = 1, 1000 do s = s + j end; return s');
+          expect(r).toBe(500500);
+        }
+      });
+
+      it('aborts an infinite loop inside a coroutine', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 500_000 });
+        lua.execute_script('co = coroutine.create(function() while true do end end)');
+        const result = lua.execute_script<string>(
+          'local ok, err = coroutine.resume(co); return tostring(ok) .. ": " .. tostring(err)'
+        );
+        expect(result).toMatch(/^false: .*instruction limit exceeded/i);
+      });
+
+      it('the context still works after an instruction-limit abort', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 1_000_000 });
+        expect(() => lua.execute_script('while true do end')).toThrow(/instruction limit/i);
+        expect(lua.execute_script('return 42')).toBe(42);
+      });
+
+      it('enforces a small limit tightly', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 500 });
+        expect(() => {
+          lua.execute_script('local s = 0; for i = 1, 1e9 do s = s + i end; return s');
+        }).toThrow(/instruction limit exceeded/i);
+      });
+    });
+
+    describe('maxInstructions: 0 / omitted means unlimited', () => {
+      it('runs a long (but finite) loop with maxInstructions: 0', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all', maxInstructions: 0 });
+        const result = lua.execute_script('local s = 0; for i = 1, 5000000 do s = s + 1 end; return s');
+        expect(result).toBe(5_000_000);
+      });
+
+      it('runs a long loop when maxInstructions is omitted', () => {
+        const lua = new lua_native.init(undefined, { libraries: 'all' });
+        const result = lua.execute_script('local s = 0; for i = 1, 5000000 do s = s + 1 end; return s');
+        expect(result).toBe(5_000_000);
+      });
+    });
+
+    describe('invalid maxInstructions rejected', () => {
+      it('throws RangeError for a negative value', () => {
+        expect(() => {
+          new lua_native.init(undefined, { libraries: 'all', maxInstructions: -1 } as any);
+        }).toThrow(/non-negative/);
+      });
+
+      it('throws TypeError for a non-number value', () => {
+        expect(() => {
+          new lua_native.init(undefined, { libraries: 'all', maxInstructions: 'lots' } as any);
+        }).toThrow(/must be a number/);
+      });
+    });
+
+    describe('maxInstructions combines with maxMemory', () => {
+      it('both limits are active together', () => {
+        const lua = new lua_native.init(undefined, {
+          libraries: 'safe',
+          maxMemory: 1024 * 1024,
+          maxInstructions: 1_000_000,
+        });
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+        expect(() => lua.execute_script('while true do end')).toThrow(/instruction limit/i);
+      });
+    });
+  });
+
+  // ============================================
   // TYPE-SYSTEM FIDELITY (B1 + B2)
   // ============================================
   describe('type-system fidelity', () => {

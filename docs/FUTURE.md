@@ -12,7 +12,7 @@ workarounds rank lowest.
 | Tier | Feature | Status | Rationale |
 |---|---|---|---|
 | 1 | ~~Memory Limits~~ | Completed | No workaround — a script can OOM the process |
-| 1 | Execution Time Limits | Not started | No workaround — an infinite loop hangs the process. Also required for hook-based `cancel()` of compute-bound loops (see `BRIDGE-GAP-ANALYSIS.md` A3b) |
+| 1 | ~~Execution Time Limits~~ | Completed | No workaround — an infinite loop hangs the process. See `maxInstructions` in `LuaInitOptions`. The count-hook also polls `IsCancelRequested()`, delivering the infrastructure half of hook-based `cancel()` (see `BRIDGE-GAP-ANALYSIS.md` A3b) |
 | 2 | ~~Error Stack Traces~~ | Completed | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
 | 2 | GC Control | Not started | Small scope, complements sandboxing |
@@ -51,15 +51,36 @@ Implemented. See `maxMemory` option in `LuaInitOptions` and `get_memory_usage()`
 
 ---
 
-### Execution Time Limits
+### ~~Execution Time Limits~~ (Completed)
 
-Use `lua_sethook` with `LUA_MASKCOUNT` to limit the number of instructions a script can execute:
+Implemented. Use `lua_sethook` with `LUA_MASKCOUNT` to limit the number of VM
+instructions a single execution can run:
 
 ```typescript
 const lua = new lua_native.init({}, {
   maxInstructions: 1_000_000
 });
 ```
+
+**As built:**
+- `maxInstructions` in `LuaInitOptions` (and `RuntimeConfig::max_instructions` /
+  `LuaRuntime::SetMaxInstructions` in the core). 0 = unlimited.
+- The count-hook (`InstructionCountHook`) is installed once on the main state;
+  coroutine threads inherit it (`lua_newthread` copies the parent hook), so the
+  limit also covers `coroutine.create` bodies. Removed again when the limit is
+  set back to 0.
+- The budget is **per execution call** — reset at the top of `ProtectedCall`
+  (covers `execute_script`/`execute_file`/`load_bytecode`/Lua-function calls)
+  and before each `lua_resume` (coroutine / async step). A runaway loop aborts
+  with `"instruction limit exceeded"`; the context stays usable afterward.
+- Granularity is the hook's sampling interval (`min(limit, 1000)` instructions).
+- **Cancel synergy delivered:** the hook also polls `IsCancelRequested()` and
+  raises `"execution cancelled"`, so a compute-bound loop is cooperatively
+  interruptible once a cancel is signalled. `cancel_requested_` was made
+  `std::atomic<bool>` for the worker-thread read. The remaining A3b piece is
+  wiring the worker-thread `cancel()` path to call `RequestCancel()`.
+
+The original design notes follow for reference.
 
 Prevents infinite loops from hanging the process. The hook function checks the instruction count and calls `luaL_error` to abort execution when the limit is reached. Could also support a timeout-based approach using wall clock time in the hook.
 

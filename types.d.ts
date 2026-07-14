@@ -698,6 +698,29 @@ export interface LuaInitOptions {
   maxMemory?: number;
 
   /**
+   * Maximum number of Lua VM instructions a single execution may run before it
+   * is aborted with an `"instruction limit exceeded"` error. This prevents an
+   * infinite loop (`while true do end`) from hanging the process — the second
+   * half of sandboxing alongside `maxMemory`. Set to 0 or omit for unlimited.
+   *
+   * The limit applies **per execution call**: each `execute_script`,
+   * `execute_file`, `load_bytecode`, Lua-function call from JS, and each
+   * coroutine `resume` gets a fresh budget. Enforcement is approximate to within
+   * ~1000 instructions (the hook's sampling granularity).
+   *
+   * Best set at construction so every coroutine created afterward inherits the
+   * limit.
+   *
+   * @example
+   * // Abort runaway scripts after ~10 million instructions
+   * { maxInstructions: 10_000_000 }
+   *
+   * // Tight sandbox for untrusted code
+   * { libraries: 'safe', maxMemory: 256 * 1024, maxInstructions: 1_000_000 }
+   */
+  maxInstructions?: number;
+
+  /**
    * Redirects Lua `print()` and `io.write()` to this handler (see
    * `set_print_handler`). The handler receives the formatted output text.
    * Equivalent to calling `set_print_handler` right after construction, and

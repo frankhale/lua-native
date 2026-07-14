@@ -175,7 +175,8 @@ struct MemoryAllocator {
 
 struct RuntimeConfig {
   std::vector<std::string> libraries;
-  size_t max_memory = 0;  // 0 = unlimited
+  size_t max_memory = 0;        // 0 = unlimited
+  size_t max_instructions = 0;  // 0 = unlimited (VM instructions per execution)
 };
 
 struct MetatableEntry {
@@ -392,6 +393,15 @@ public:
   [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
   [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
 
+  // Execution time limits: cap the number of VM instructions a single execution
+  // (execute_script/file, a Lua function call, or one coroutine resume) may run
+  // before it is aborted with "instruction limit exceeded". 0 = unlimited. The
+  // count-hook that enforces this also honors a pending cancel() request, so a
+  // compute-bound loop can be interrupted cooperatively. Best set at
+  // construction; a post-construction change applies to threads created after.
+  void SetMaxInstructions(size_t limit);
+  [[nodiscard]] size_t GetMaxInstructions() const { return max_instructions_; }
+
   [[nodiscard]] lua_State* RawState() const { return L_; }
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
@@ -448,9 +458,25 @@ private:
   bool await_driver_mode_ = false;  // true while execute_async is driving
   bool await_pending_ = false;      // set by a host call that returned a promise
   bool await_is_error_ = false;     // next resume delivers a rejection to raise
-  bool cancel_requested_ = false;   // execute_async was cancelled
+  // execute_async was cancelled; also polled by the instruction count-hook so a
+  // compute-bound loop can be aborted. Atomic because a worker-thread run reads
+  // it (in the hook) while the JS thread may set it via cancel().
+  std::atomic<bool> cancel_requested_{false};
+
+  // Execution time limits (see SetMaxInstructions). instruction_count_ tallies
+  // the VM instructions run in the current execution and resets at each entry
+  // point; the hook increments it by instruction_hook_interval_ each time it
+  // fires (LUA_MASKCOUNT granularity) and raises once max_instructions_ is hit.
+  size_t max_instructions_ = 0;             // 0 = unlimited
+  mutable size_t instruction_count_ = 0;    // instructions run this execution
+  int instruction_hook_interval_ = 1000;    // count-hook firing granularity
 
   void InitState();
+  // Installs or removes the count-hook on L_ to reflect max_instructions_.
+  // Newly created coroutine threads inherit the hook from L_ (lua_newthread
+  // copies the parent's hook), so a single install covers all threads.
+  void InstallExecutionHook();
+  static void InstructionCountHook(lua_State* L, lua_Debug* ar);
   static int LibraryMask(const std::vector<std::string>& libraries);
   bool HasPackageLibrary() const;
   static void* LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize);
