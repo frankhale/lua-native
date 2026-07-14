@@ -2,6 +2,8 @@
 
 **Status:** Assessment / planning document
 **Date:** July 2026
+**Last source audit:** July 14, 2026 — every "implemented" claim below was
+re-verified against `src/` (see [Verification audit](#verification-audit-july-14-2026))
 **Purpose:** Identify the features that mature Lua bridges provide but `lua-native`
 does not yet cover — including gaps *not* already tracked in [`FUTURE.md`](./FUTURE.md).
 
@@ -69,13 +71,20 @@ from **full** parity.
 These real gaps are already tracked and should not be duplicated. Cross-referenced
 so this document stands alone:
 
-- Execution time / instruction limits + wall-clock timeout (Tier 1/3)
-- Error **stack traces** via `debug.traceback` (Tier 2)
-- GC control, context reset, state introspection (Tier 2/3)
-- Debug hooks (`lua_sethook`) (Tier 3)
-- Environment tables / per-script `_ENV` sandboxing (Tier 3)
-- Reference lifecycle management / explicit `release()` (Tier 3)
-- Dotted-path globals, shared state between contexts (Tier 4)
+- Execution time / instruction limits + wall-clock timeout (Tier 1/3) — **still
+  open**, and now more urgent: `cancel()` is only observed at host-call/await
+  boundaries, so a compute-bound Lua loop cannot be cancelled until the
+  `lua_sethook` infrastructure lands (see audit note under A3)
+- ~~Error **stack traces** via `debug.traceback` (Tier 2)~~ — **done** (July
+  2026, shipped with D2 via a `luaL_traceback` message handler in
+  `lua-runtime.cpp`)
+- GC control, context reset, state introspection (Tier 2/3) — still open
+- Debug hooks (`lua_sethook`) (Tier 3) — still open
+- Environment tables / per-script `_ENV` sandboxing (Tier 3) — still open
+- Reference lifecycle management / explicit `release()` (Tier 3) — **partially
+  done**: `LuaTableHandle.release()` exists; function and coroutine refs still
+  have no explicit release
+- Dotted-path globals, shared state between contexts (Tier 4) — still open
 
 The remainder of this document covers **gaps that are NOT in `FUTURE.md`** — the
 net-new findings.
@@ -128,11 +137,22 @@ No way to abort a runaway or no-longer-needed async run from JS
 infrastructure as instruction limits — set a "cancel requested" flag the hook
 checks.
 
+> **Audit note (July 14, 2026):** the shipped `cancel()` sets a
+> `cancel_requested_` flag that is checked at host-call and await boundaries
+> only — there is no `lua_sethook` component. A script that calls host
+> functions or awaits Promises cancels promptly; a pure-Lua compute loop
+> (`while true do end`) does not. Full cancellation coverage is blocked on the
+> Tier 1 instruction-limit hook in `FUTURE.md` (tracked below as **A3b**).
+
 #### A4. Coroutine ↔ JS async iterator ergonomics
 
 Bridges commonly expose a Lua coroutine as a JS `Iterator`/`AsyncIterator` so
 `for (const v of coro)` / `for await` works. Today the consumer must hand-loop
 `resume()` and inspect `status`. Thin wrapper over the existing coroutine API.
+
+Related ergonomic gap to fold into the same work: `create_coroutine()` accepts
+only a script **string** — a `LuaFunction` ref already held on the JS side
+cannot be turned into a coroutine without re-sourcing it as text.
 
 #### A5. True parallelism / worker pool
 
@@ -148,6 +168,12 @@ no pooling/scheduling abstraction. (Lower priority — userland can build it.)
 > section in [`FEATURES.md`](./FEATURES.md) for the architecture and
 > `register_type_converter()` in the API. The original gap analysis is retained
 > below for context.
+>
+> **Audit note (July 14, 2026):** the shipped converter registry is
+> **JS→Lua only** — `register_type_converter(match, convert)` has no `fromLua`
+> counterpart, so app-specific reconstruction of Lua values into JS types
+> (the second half of wasmoon's `TypeExtension` design) is not possible.
+> Tracked below as **B3**.
 
 Verified against `NapiToCoreInstance` (`src/lua-native.cpp:1157`): only
 `function`, `undefined/null`, `boolean`, `number`, `string`, `Array`, and plain
@@ -302,48 +328,91 @@ exists despite the sandboxing emphasis.
 
 ---
 
+## Verification audit (July 14, 2026)
+
+A full pass over `src/lua-native.cpp`, `src/core/lua-runtime.cpp`, and
+`types.d.ts` confirmed every "implemented" banner above is real:
+
+| Claim | Evidence |
+|---|---|
+| A1–A3 async driver | `execute_async`/`cancel`/`is_busy` exposed; Promise detection + `RequestAwaitYield` in the host-call wrapper; sync execution rejects Promise-returning callbacks with a clear error pointing to `execute_async()` |
+| B1 type fidelity | `BigInt` ↔ 64-bit integer both directions (with lossless-range checks and `> 2^53` → `BigInt` on the way out); integral JS numbers become Lua integers; `Date`/`Map`/`Set`/`Buffer`/`TypedArray`/`RegExp` branches present; `Symbol` throws a documented rejection |
+| B2 converter registry | `register_type_converter(match, convert)` consulted before built-in object conversion |
+| C1–C3 class binding | `register_class` with constructor wrapper, shared metatable, methods, properties, metamethods |
+| D1–D3 error fidelity | Structured JS-error tables cross the boundary; `luaL_traceback` message handler on `lua_pcall` and coroutine resume; `pcall()` exposed to JS |
+| E1–E3 I/O | `set_print_handler`, `add_searcher`, `allowBytecode` option all present |
+
+The audit also surfaced **three previously untracked findings**, folded into the
+matrix below:
+
+- **A3b — cancellation is boundary-only.** `cancel()` sets a flag checked at
+  host-call/await boundaries; there is no `lua_sethook` interrupt, so a
+  compute-bound Lua loop is uncancellable. Fixing this is the same work as
+  `FUTURE.md`'s Tier 1 instruction limits — implement them together.
+- **B3 — no Lua→JS custom conversion.** The converter registry only covers
+  JS→Lua. wasmoon's `TypeExtension` is bidirectional.
+- **A4 (extended) — coroutines only from source strings.** `create_coroutine()`
+  cannot take an existing `LuaFunction` ref.
+
+Also noted while auditing (already tracked in `FUTURE.md`, status updated
+there): stack traces are done; reference lifecycle is partially done
+(`LuaTableHandle.release()` exists, function/coroutine refs have none).
+
+---
+
 ## Priority matrix
 
 Ranked by *impact × (absence of workaround)*, highest first. ⭐ marks the items
 with no reasonable JS-side workaround and broad demand.
 
+### Completed (verified July 14, 2026)
+
+| # | Gap | Impact |
+|---|---|---|
+| A1 | ✅ Await JS Promises from Lua | Very high |
+| A2 | ✅ Callbacks during async | Medium |
+| A3 | ✅ Caller-initiated cancellation (boundary-granularity; see A3b) | Medium |
+| B1 | ✅ Built-in type fidelity (BigInt/Date/Map/Set/Buffer) | High |
+| E1 | ✅ `print`/output redirection | High |
+| C1–C3 | ✅ Class/usertype + operator binding | High |
+| D1–D3 | ✅ JS Error fidelity, stack traces, structured errors, `pcall` | Medium-high |
+| E3 | ✅ Bytecode text-only guard (`allowBytecode`) | Medium (security) |
+| B2 | ✅ Pluggable type-converter registry (JS→Lua; see B3) | Medium |
+| E2 | ✅ Dynamic `require` via JS searcher | Medium |
+
+### Remaining
+
 | # | Gap | Impact | Workaround exists? | Rec. tier |
 |---|---|---|---|---|
-| A1 | ✅ Await JS Promises from Lua — **done** | Very high | No | **1** |
-| A2 | ✅ Callbacks during async — **done** | Medium | No | **1** |
-| A3 | ✅ Caller-initiated cancellation — **done** | Medium | No | **1** |
-| B1 | ✅ Built-in type fidelity (BigInt/Date/Map/Set/Buffer) — **done** | High (correctness) | Partial, error-prone | **1** |
-| E1 | ✅ `print`/output redirection — **done** | High | No | **1** |
-| C1–C3 | ✅ Class/usertype + operator binding — **done** | High | Verbose Lua glue | **2** |
-| D1 | ✅ JS Error fidelity across boundary — **done** | Medium-high | No | **2** |
-| D2/D3 | ✅ Stack traces / structured errors / pcall — **done** | Medium | No | **2/3** |
-| E3 | ✅ Bytecode text-only / untrusted-chunk guard — **done** | Medium (security) | No | **2** |
-| B2 | ✅ Pluggable type-converter registry — **done** | Medium | No | **2** |
-| E2 | ✅ Dynamic `require` via JS searcher — **done** | Medium | `register_module` (static only) | **3** |
-| A4 | Coroutine as (async) iterator | Low-med | Manual `resume` loop | **3** |
-| F1 | Metatables on non-global tables | Low-med | `execute_script` | **3** |
+| A3b ⭐ | Hook-based cancellation of compute-bound loops (= `FUTURE.md` Tier 1 instruction limits) | High (sandboxing) | No | **1** |
+| B3 | Lua→JS direction of the type-converter registry | Medium | Manual post-processing of results | **3** |
+| A4 | Coroutine as (async) iterator + coroutine-from-`LuaFunction` | Low-med | Manual `resume` loop | **3** |
+| F1 | Metatables on non-global tables (table handles / `create_table`) | Low-med | `execute_script` | **3** |
+| C4 | Class inheritance / `__index` chaining | Low-med | Flatten methods in JS | **4** |
 | F2/F3 | call-by-name, per-call env | Low | `get_global`, `execute_script` | **4** |
-| A5 | Worker pool / true parallelism | Low | Multiple contexts | **4** |
+| A5 | Worker pool / true parallelism | Low | Multiple contexts | **4** (by design) |
 
 ---
 
-## Recommended sequencing
+## Recommended sequencing (updated July 14, 2026)
 
-1. **Correctness first (quick wins):** B1 (type fidelity) and E1 (output
-   redirect). Both are small, self-contained, and fix silent data loss / a
-   universally expected feature. E3 (bytecode guard) rides along with the
-   sandboxing theme.
-2. **The async overhaul:** A1 is the flagship feature and unblocks A2, A3, A4. It
-   is the largest single project here (a coroutine-driven async execution model)
-   and the biggest differentiator versus the current implementation. Best done as
-   a focused effort after the quick wins.
-3. **Class binding:** C1→C2→C3 as one arc, reusing the userdata/metatable
-   infrastructure that already exists. Defer C4 (inheritance) until requested.
-4. **Extensibility & polish:** B2, D1–D3, E2, and the F-series as demand dictates.
+The original three phases (correctness quick-wins → async overhaul → class
+binding) are **complete**. What remains, in order:
 
-This sequence front-loads correctness and the two features (async Promise interop,
-output capture) that users most immediately notice are missing, then tackles the
-larger architectural items.
+1. **Sandboxing completion (A3b + `FUTURE.md` Tier 1):** instruction limits,
+   wall-clock timeout, and hook-based cancellation are one body of work sharing
+   `lua_sethook`. This is the only remaining item with *no* workaround and it
+   closes the last hole in the untrusted-code story (`safe` preset + memory
+   limits + `allowBytecode: false` are already in place).
+2. **Operational control (`FUTURE.md` Tier 2):** GC control, context reset.
+   Small, low-risk, natural follow-ons to the sandboxing theme. Extend
+   `release()` from table handles to function/coroutine refs while in the area
+   (Tier 3 ref lifecycle).
+3. **Interop polish, by demand:** B3 (Lua→JS converters), A4 (iterators +
+   coroutine-from-function), F1 (metatables on handles). Each is small and
+   independent.
+4. **Defer until requested:** C4 (inheritance), F2/F3, A5, environment tables,
+   debug hooks, and the `FUTURE.md` Tier 4 items.
 
 ---
 

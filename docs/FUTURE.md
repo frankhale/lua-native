@@ -12,8 +12,8 @@ workarounds rank lowest.
 | Tier | Feature | Status | Rationale |
 |---|---|---|---|
 | 1 | ~~Memory Limits~~ | Completed | No workaround — a script can OOM the process |
-| 1 | Execution Time Limits | Not started | No workaround — an infinite loop hangs the process |
-| 2 | Error Stack Traces | Not started | Universal in bridges (6/7); no workaround for useful errors |
+| 1 | Execution Time Limits | Not started | No workaround — an infinite loop hangs the process. Also required for hook-based `cancel()` of compute-bound loops (see `BRIDGE-GAP-ANALYSIS.md` A3b) |
+| 2 | ~~Error Stack Traces~~ | Completed | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
 | 2 | GC Control | Not started | Small scope, complements sandboxing |
 | 2 | Context Reset | Not started | No workaround without re-registering everything |
@@ -22,7 +22,7 @@ workarounds rank lowest.
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
 | 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
-| 3 | Reference Lifecycle Management | Not started | Prevents memory leaks in long-lived contexts |
+| 3 | Reference Lifecycle Management | Partially done | `LuaTableHandle.release()` exists (July 2026); function and coroutine refs still lack explicit release |
 | 4 | Dotted Path Globals | Not started | Workaround: `execute_script` |
 | 4 | Shared State Between Contexts | Not started | Workaround: `set_global` on each context |
 | — | ~~File Execution~~ | Completed | |
@@ -64,6 +64,12 @@ const lua = new lua_native.init({}, {
 Prevents infinite loops from hanging the process. The hook function checks the instruction count and calls `luaL_error` to abort execution when the limit is reached. Could also support a timeout-based approach using wall clock time in the hook.
 
 **Why tier 1:** There is no workaround from JavaScript. `while true do end` will hang the process (or permanently block a worker thread in async mode). This is the second half of sandboxing — memory limits prevent resource exhaustion, instruction limits prevent runaway execution.
+
+**Synergy with `cancel()`:** the July 2026 async driver's `cancel()` only takes
+effect at host-call/await boundaries. The same `lua_sethook` hook that enforces
+instruction limits should also check `IsCancelRequested()` so compute-bound
+loops become cancellable (see `BRIDGE-GAP-ANALYSIS.md` A3b). Implement both in
+one pass.
 
 #### Implementation Plan
 
@@ -191,7 +197,13 @@ with no easy workaround.
 
 ---
 
-### Error Stack Traces
+### ~~Error Stack Traces~~ (Completed — July 2026)
+
+Implemented as part of the error-fidelity work (see `BRIDGE-GAP-ANALYSIS.md`
+D2 and the "Error Fidelity" section in `FEATURES.md`). A `luaL_traceback`
+message handler is installed for `lua_pcall` in `lua-runtime.cpp`, and
+coroutine resume errors get tracebacks as well. The original plan is retained
+below.
 
 Automatically include Lua stack traces in error messages by pushing
 `debug.traceback` as the message handler for `lua_pcall`:
@@ -439,7 +451,12 @@ separate contexts as a workaround. The implementation is moderately complex —
 
 ---
 
-### Reference Lifecycle Management
+### Reference Lifecycle Management (Partially done — July 2026)
+
+`LuaTableHandle.release()` is implemented (double-release is a safe no-op, and
+use-after-release throws a clear error). Still missing: explicit release for
+`LuaFunction` and `LuaCoroutine` refs, which accumulate in the registry the
+same way.
 
 Provide explicit control over registry references to prevent memory leaks in
 long-lived contexts. When Lua functions, coroutines, or metatabled tables are
