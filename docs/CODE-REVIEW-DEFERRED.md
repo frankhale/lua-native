@@ -70,9 +70,10 @@ deliberately documented rather than changed:
   (`src/core/lua-runtime.cpp`) that reads `_G[name]` through the existing
   `ProtectedTableGet` trampoline under `lua_pcall`, and refactored `GetGlobal`,
   `GetGlobalRef`, `SetGlobalMetatable`, and `HasPackageLibrary` / `AddSearchPath`
-  onto it. `RegisterFunction` now installs its closure through the
-  `ProtectedTableSet` trampoline (same shape as `SetGlobal`). A raising `_G`
-  metamethod therefore surfaces as a caught `std::runtime_error`. The binding
+  onto it. `RegisterFunction` installs its closure inside a protected frame (see
+  M5 — it now uses `RunProtected`, which subsumes the earlier `ProtectedTableSet`
+  approach). A raising `_G` metamethod therefore surfaces as a caught
+  `std::runtime_error`. The binding
   layer was hardened to match: `set_global` (both the function and value
   branches), `RegisterCallbacks`, and `get_global_ref` now wrap the core calls in
   try/catch so the exception becomes a JS error instead of unwinding past N-API
@@ -80,15 +81,35 @@ deliberately documented rather than changed:
   added at the core C++ level (`LuaRuntimeProtectedGlobals.*`) and the TS level
   (`lua-native.spec.ts`, "M4 remainder").
 
-#### M5 (partial) — allocation failure in unprotected API paths aborts *(medium)*
-- **Fixed (via M4):** the most reachable OOM sites (`GetGlobal` / `SetGlobal`)
-  are now protected.
-- **Still open:** other allocating core methods remain unprotected —
-  `CreateTableFrom` (`lua_newtable`), `RegisterFunction` (`lua_pushstring`),
-  `luaL_ref` sites. With `maxMemory` set, hitting the limit raises `LUA_ERRMEM`
-  on these paths → unprotected panic → process abort. The memory-limit feature
-  thus converts "operation fails" into "process aborts" on some paths.
-- **Fix shape:** run these mutations through protected shims too.
+#### M5 — allocation failure in unprotected API paths aborts *(medium)* — ✅ RESOLVED
+- **Original gap:** `GetGlobal` / `SetGlobal` were protected via M4, but other
+  allocating core methods stayed unprotected — `CreateTable`, `CreateTableFrom`
+  (`lua_newtable`), `RegisterFunction` (`lua_pushstring` / `lua_pushcclosure`),
+  and the `luaL_ref` sites in `GetGlobalRef` / `CreateCoroutineFromScript`. With
+  `maxMemory` set, hitting the limit on one of these direct API calls (no
+  surrounding script `pcall`) raised `LUA_ERRMEM` → unprotected panic → process
+  abort, converting "operation fails" into "process aborts."
+- **Resolution:** added a general `LuaRuntime::RunProtected(op)` helper
+  (`src/core/lua-runtime.cpp`) that runs an operation inside a `lua_pcall` frame
+  via a **light C-function trampoline** (0 upvalues → its push never allocates, so
+  the protected frame is established before any allocation can fail). A Lua
+  `LUA_ERRMEM` longjmps to the pcall and is rethrown as a `std::runtime_error`; a
+  C++ exception from `op` (e.g. `PushLuaValue` depth/stack) is captured in the
+  trampoline and rethrown after the frame unwinds, so it never crosses the pcall C
+  frame (the linked Lua is a C/longjmp build). `CreateTable`, both
+  `CreateTableFrom` overloads, `RegisterFunction`, `GetGlobalRef`, and
+  `CreateCoroutineFromScript` now build-and-ref entirely inside `RunProtected`;
+  `RegisterFunction` folds its M4 `__newindex` protection into the same frame. The
+  binding layer catches the new throws (`create_table`, `execute_async`;
+  `set_global` / `get_global_ref` were already guarded). Tests:
+  `LuaRuntimeProtectedAlloc.*` (C++, an over-limit `CreateTableFrom` throws
+  instead of aborting) and the two `M5:` TS cases.
+- **Documented residual:** the `luaL_ref` calls buried in the value-conversion
+  path (`ToLuaValue` materializing a function/thread/metatable *result*) are not
+  individually wrapped. In the common case they run inside the execution `pcall`
+  (script results are converted right after `ProtectedCall`); a bare-API result
+  conversion under an exhausted `maxMemory` remains a narrower unprotected site,
+  orthogonal to the direct-allocation-API class this finding targeted.
 
 #### M6 — cross-context round-trip marker identity check *(medium)* — ✅ RESOLVED
 - **Original gap:** `_tableRef` / `_userdata` markers were already honored only
@@ -219,24 +240,26 @@ deliberately documented rather than changed:
 
 ## Suggested order for a future hardening pass
 
-Every finding from CODE-REVIEW-1 and CODE-REVIEW-2 is now resolved except the
-**M5 remainder** below.
-
-1. **M5 remainder** — the trapped-`_G` half (M4) is resolved; what remains is the
-   OOM half: route the still-unprotected *allocating* sites through protected
-   shims — `CreateTableFrom` (`lua_newtable`), the `luaL_ref` sites, and the
-   closure/string allocations in `RegisterFunction` (`lua_pushstring` /
-   `lua_pushcclosure`) that still run outside the protected frame. Closes the last
-   panic/abort surface from ordinary API usage under `maxMemory`.
+**Every finding from CODE-REVIEW-1 and CODE-REVIEW-2 is now resolved.** The only
+remaining item is the narrow, documented M5 residual (result-conversion
+`luaL_ref` sites — see the M5 entry above), which is orthogonal to the
+direct-allocation-API panic class the review targeted and normally runs inside
+the execution `pcall` anyway.
 
 ---
 
 ## Feature work completed since these reviews
 
-- **Execution Time Limits (`maxInstructions`)** — the tier-1 `lua_sethook` /
-  `LUA_MASKCOUNT` count-hook from `FUTURE.md` (gap **A3b**) is implemented. A
+- **Execution Time Limits (`maxInstructions`)** — ✅ **fully complete (A3b
+  closed).** The tier-1 `lua_sethook` / `LUA_MASKCOUNT` count-hook from
+  `FUTURE.md` (gap **A3b**) is implemented. A
   per-execution VM-instruction budget aborts runaway scripts with
-  `"instruction limit exceeded"`, and the hook also polls `IsCancelRequested()`
-  so compute-bound loops become cooperatively cancellable. This delivers the
-  infrastructure half of L8 / A3b (see the L8 entry above for the remaining
-  worker-`cancel()` wiring).
+  `"instruction limit exceeded"`; the budget is reset per execution call at every
+  entry point (`ProtectedCall`, `ResumeCoroutine`, `ResumeAsyncStep`), the hook
+  is installed once on the main state and inherited by coroutine threads
+  (`lua_newthread` copies it), and it is removed when the limit is set back to 0.
+  The hook also polls `IsCancelRequested()` so compute-bound loops become
+  cooperatively cancellable. With the L8 worker-`cancel()` → `RequestCancel()`
+  wiring now in place (see the L8 entry above), **A3b is fully closed** — both the
+  instruction-limit and hook-based-`cancel()` halves are done. Covered by
+  `LuaRuntimeInstructions.*` (C++) and the `maxInstructions` / `L8:` TS suites.

@@ -3,6 +3,7 @@
 #include <lua.hpp>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -543,6 +544,23 @@ private:
   // panic/abort. Used by the table-reference operations, whose refs preserve
   // metatables and can therefore trigger __index/__newindex/__len.
   void ProtectedTableCall(int nargs, int nresults) const;
+
+  // Runs `op` inside a lua_pcall frame so a Lua memory error (LUA_ERRMEM under
+  // maxMemory) — or a metamethod raise — becomes a caught std::runtime_error
+  // instead of an unprotected panic/abort (M5). `op` may perform Lua allocations
+  // and may throw a C++ exception (captured and rethrown after the frame
+  // unwinds). It must be self-contained on the Lua stack: a pcall frame can't see
+  // the caller's stack slots, so any value `op` needs must be created inside it.
+  // The light C-function trampoline is pushed without allocating, so the setup
+  // itself can never OOM.
+  void RunProtected(const std::function<void()>& op) const;
+  // The operation + captured C++ exception for the active RunProtected call.
+  struct ProtectedThunk {
+    const std::function<void()>* op;
+    std::exception_ptr error;
+  };
+  mutable ProtectedThunk* active_thunk_ = nullptr;
+  static int ProtectedThunkRunner(lua_State* L);
 
   // Reads _G[name] through the protected table-get trampoline (so an __index
   // metamethod installed via setmetatable(_G, ...) surfaces as a

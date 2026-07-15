@@ -1362,6 +1362,51 @@ void LuaRuntime::ProtectedTableCall(int nargs, int nresults) const {
   }
 }
 
+// Trampoline for RunProtected (M5). A light C function (0 upvalues), so pushing
+// it never allocates. It resolves the runtime from the registry, runs the active
+// thunk's operation, and captures any C++ exception so it can't unwind across the
+// lua_pcall C frame — a Lua OOM instead longjmps straight to the pcall and is
+// reported via its status code.
+int LuaRuntime::ProtectedThunkRunner(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (!runtime || !runtime->active_thunk_) return 0;
+  ProtectedThunk* thunk = runtime->active_thunk_;
+  try {
+    (*thunk->op)();
+  } catch (...) {
+    thunk->error = std::current_exception();
+  }
+  return 0;
+}
+
+// Runs `op` inside a lua_pcall frame so a Lua memory error (or a metamethod
+// raise) becomes a caught std::runtime_error rather than an unprotected panic
+// (M5). See the header for the stack-self-containment contract.
+void LuaRuntime::RunProtected(const std::function<void()>& op) const {
+  ProtectedThunk thunk{&op, nullptr};
+  ProtectedThunk* prev = active_thunk_;
+  active_thunk_ = &thunk;
+  // Light C function (0 upvalues) — Lua guarantees this push never raises a
+  // memory error, so the protected frame is established before any allocation.
+  lua_pushcfunction(L_, ProtectedThunkRunner);
+  const int status = lua_pcall(L_, 0, 0, 0);
+  active_thunk_ = prev;
+
+  // A C++ exception thrown by `op` was caught in the trampoline: rethrow it here,
+  // in normal C++ control flow, now that the pcall frame has been left.
+  if (thunk.error) std::rethrow_exception(thunk.error);
+  if (status != LUA_OK) {
+    // A Lua error (typically LUA_ERRMEM under maxMemory). pcall left the message
+    // on top and unwound the stack; surface it as a catchable C++ exception.
+    const char* msg = lua_tostring(L_, -1);
+    std::string err = msg ? msg : "protected operation failed (out of memory?)";
+    lua_pop(L_, 1);
+    throw std::runtime_error(err);
+  }
+}
+
 // Captures the error object at the top of L's stack: records the structured
 // value (for JS-Error reconstruction) and returns a display string.
 //
@@ -1534,17 +1579,18 @@ void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
 }
 
 void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
-  // Install through a protected _G[name] = <closure> so a __newindex metamethod
-  // on the globals table surfaces as a std::runtime_error instead of an
-  // unprotected panic (same reasoning as SetGlobal).
-  StackGuard guard(L_);
+  // Install _G[name] = <closure> inside a protected frame so BOTH a __newindex
+  // metamethod on the globals table (M4) AND an OOM allocating the key string /
+  // closure (M5) surface as a std::runtime_error instead of an unprotected panic.
   host_functions_[name] = std::move(fn);
-  lua_pushcfunction(L_, ProtectedTableSet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
-  lua_pushlstring(L_, name.data(), name.size());          // key
-  lua_pushstring(L_, name.c_str());                       // closure upvalue
-  lua_pushcclosure(L_, LuaCallHostFunction, 1);           // value = closure
-  ProtectedTableCall(3, 0);
+  RunProtected([&]() {
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+    lua_pushlstring(L_, name.data(), name.size());          // key (size-aware)
+    lua_pushstring(L_, name.c_str());                       // closure upvalue
+    lua_pushcclosure(L_, LuaCallHostFunction, 1);           // value = closure
+    lua_settable(L_, -3);                                   // _G[key]=closure (may __newindex)
+    lua_pop(L_, 1);                                         // pop globals table
+  });
 }
 
 // Reads _G[name] through the protected table-get trampoline, leaving the value
@@ -1900,42 +1946,70 @@ int LuaRuntime::GetTableLength(int registry_ref) const {
 // --- Table reference API ---
 
 int LuaRuntime::CreateTable() {
-  lua_newtable(L_);
-  return luaL_ref(L_, LUA_REGISTRYINDEX);
+  // Protected so an OOM (under maxMemory) in lua_newtable/luaL_ref throws instead
+  // of aborting (M5). The table is created and ref'd entirely inside the frame.
+  int ref = LUA_NOREF;
+  RunProtected([&]() {
+    lua_newtable(L_);
+    ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+  });
+  return ref;
 }
 
 int LuaRuntime::CreateTableFrom(const LuaTable& initial) {
-  // On success luaL_ref pops the table, so the guard is a no-op; if PushLuaValue
-  // throws mid-build it drops the partially-filled table from the stack.
-  StackGuard guard(L_);
-  lua_newtable(L_);
-  for (const auto& [key, value] : initial) {
-    PushLuaValue(L_, value);
-    lua_setfield(L_, -2, key.c_str());
-  }
-  return luaL_ref(L_, LUA_REGISTRYINDEX);
+  // Build and ref the whole table inside a protected frame so an OOM anywhere in
+  // the build throws rather than aborting (M5). PushLuaValue may also throw a C++
+  // exception (depth/stack); RunProtected captures and rethrows it. On any error
+  // the pcall unwinds the partially-built table, so no StackGuard is needed.
+  int ref = LUA_NOREF;
+  RunProtected([&]() {
+    lua_newtable(L_);
+    for (const auto& [key, value] : initial) {
+      PushLuaValue(L_, value);
+      lua_setfield(L_, -2, key.c_str());
+    }
+    ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+  });
+  return ref;
 }
 
 int LuaRuntime::CreateTableFrom(const LuaArray& initial) {
-  StackGuard guard(L_);
-  lua_createtable(L_, static_cast<int>(initial.size()), 0);
-  for (size_t i = 0; i < initial.size(); ++i) {
-    PushLuaValue(L_, initial[i]);
-    lua_seti(L_, -2, static_cast<lua_Integer>(i + 1));
-  }
-  return luaL_ref(L_, LUA_REGISTRYINDEX);
+  int ref = LUA_NOREF;
+  RunProtected([&]() {
+    lua_createtable(L_, static_cast<int>(initial.size()), 0);
+    for (size_t i = 0; i < initial.size(); ++i) {
+      PushLuaValue(L_, initial[i]);
+      lua_seti(L_, -2, static_cast<lua_Integer>(i + 1));
+    }
+    ref = luaL_ref(L_, LUA_REGISTRYINDEX);
+  });
+  return ref;
 }
 
 std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name) {
-  // Read through the protected _G[name] path so a raising __index metamethod on
-  // the globals table can't panic (luaL_ref below pops the value it leaves).
-  PushProtectedGlobal(name);
-  if (!lua_istable(L_, -1)) {
-    std::string type_name = lua_typename(L_, lua_type(L_, -1));
-    lua_pop(L_, 1);
-    return "global '" + name + "' is not a table (got " + type_name + ")";
+  // Read _G[name] and ref it inside one protected frame so both a raising
+  // __index metamethod (M4) and an OOM in the lua_gettable/luaL_ref allocation
+  // (M5) surface as a caught error instead of a panic. The value must be fetched
+  // inside the frame (a pcall frame can't reach a value left by the caller).
+  int ref = LUA_NOREF;
+  int got_type = LUA_TNIL;
+  RunProtected([&]() {
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+    lua_pushlstring(L_, name.data(), name.size());          // key
+    lua_gettable(L_, -2);                                   // _G[name] (may __index)
+    lua_remove(L_, -2);                                     // drop globals table
+    got_type = lua_type(L_, -1);
+    if (got_type == LUA_TTABLE) {
+      ref = luaL_ref(L_, LUA_REGISTRYINDEX);                // pops the value
+    } else {
+      lua_pop(L_, 1);
+    }
+  });
+  if (got_type != LUA_TTABLE) {
+    return "global '" + name + "' is not a table (got " +
+           lua_typename(L_, got_type) + ")";
   }
-  return luaL_ref(L_, LUA_REGISTRYINDEX);
+  return ref;
 }
 
 std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) const {
@@ -2157,14 +2231,19 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
     const char* msg = lua_tostring(L_, -1);
     return std::string(msg ? msg : "failed to load script");
   }
-  // Stack: [chunk]. Create the thread (pushed on top).
-  lua_State* thread = lua_newthread(L_);
+  // Stack: [chunk]. Create + anchor the thread inside a protected frame so an OOM
+  // in lua_newthread / luaL_ref throws instead of aborting (M5). These run in the
+  // pcall frame (above the chunk), so they don't touch the chunk left below.
+  lua_State* thread = nullptr;
+  int threadRef = LUA_NOREF;
+  RunProtected([&]() {
+    thread = lua_newthread(L_);
+    threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);  // pops the thread, anchors it
+  });
   if (!thread) {
     return std::string("Failed to create coroutine thread");
   }
-  // Stack: [chunk, thread]. Anchor the thread (pops it).
-  const int threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);
-  // Stack: [chunk]. Move the chunk onto the thread as its body.
+  // Stack: [chunk] again (pcall restored it). Move the chunk onto the thread.
   lua_xmove(L_, thread, 1);
 
   return LuaThreadRef(threadRef, L_, thread);

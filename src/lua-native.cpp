@@ -1207,7 +1207,12 @@ Napi::Value LuaContext::CreateTableMethod(const Napi::CallbackInfo& info) {
       return env.Undefined();
     }
   } else {
-    ref = runtime->CreateTable();
+    try {
+      ref = runtime->CreateTable();
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
   }
 
   return CreateTableHandle(env, ref);
@@ -1535,7 +1540,17 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
 
   const std::string script = info[0].As<Napi::String>().Utf8Value();
 
-  auto co = runtime->CreateCoroutineFromScript(script);
+  // CreateCoroutineFromScript can now throw a std::runtime_error if creating the
+  // coroutine thread OOMs under maxMemory (M5); reject rather than let it unwind
+  // past N-API.
+  std::variant<lua_core::LuaThreadRef, std::string> co = std::string();
+  try {
+    co = runtime->CreateCoroutineFromScript(script);
+  } catch (const std::exception& e) {
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Reject(Napi::Error::New(env, e.what()).Value());
+    return deferred.Promise();
+  }
   if (std::holds_alternative<std::string>(co)) {
     // Reject (rather than throw) so `.catch` and `await` both see the error.
     auto deferred = Napi::Promise::Deferred::New(env);

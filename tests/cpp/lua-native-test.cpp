@@ -3036,6 +3036,47 @@ TEST(LuaRuntimeInstructions, SetMaxInstructionsPostConstruction) {
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
 }
 
+// M5: allocating API methods run under a protected frame, so hitting maxMemory
+// throws a catchable std::runtime_error instead of an unprotected panic/abort.
+TEST(LuaRuntimeProtectedAlloc, CreateTableFromOverLimitThrowsInsteadOfAborting) {
+  RuntimeConfig config;
+  config.max_memory = 512 * 1024;  // small budget; bare state fits easily
+  LuaRuntime rt(config);
+
+  // A large array initializer forces lua_createtable to pre-size an array part
+  // far bigger than the remaining budget → LUA_ERRMEM inside the protected frame.
+  LuaArray big;
+  big.reserve(300000);
+  for (int i = 0; i < 300000; ++i) {
+    big.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(i))));
+  }
+  EXPECT_THROW({ (void)rt.CreateTableFrom(big); }, std::runtime_error);
+
+  // The runtime is not corrupted: a small table still builds fine afterward.
+  const int ref = rt.CreateTable();
+  EXPECT_NE(ref, LUA_NOREF);
+  EXPECT_NE(ref, LUA_REFNIL);
+}
+
+TEST(LuaRuntimeProtectedAlloc, RegisterFunctionAndCreateTableStillWorkUnderLimit) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 4 * 1024 * 1024;  // ample
+  LuaRuntime rt(config);
+
+  // Normal (within-budget) protected operations succeed unchanged.
+  rt.RegisterFunction("answer", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42)));
+  });
+  const auto res = rt.ExecuteScript("return answer()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 42);
+
+  const int ref = rt.CreateTableFrom(LuaArray{
+    std::make_shared<LuaValue>(LuaValue::from(std::string("ok")))});
+  EXPECT_NE(ref, LUA_NOREF);
+}
+
 // H9c: registry unrefs are deferred while a worker run is bracketed and drained
 // by EndWorkerUnrefDeferral, and are immediate otherwise. (The thread-safety is
 // exercised by the async TS suite; this pins the queue-or-drain logic.)

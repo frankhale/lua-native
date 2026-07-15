@@ -12,7 +12,7 @@ workarounds rank lowest.
 | Tier | Feature | Status | Rationale |
 |---|---|---|---|
 | 1 | ~~Memory Limits~~ | Completed | No workaround — a script can OOM the process |
-| 1 | ~~Execution Time Limits~~ | Completed | No workaround — an infinite loop hangs the process. See `maxInstructions` in `LuaInitOptions`. The count-hook also polls `IsCancelRequested()`, delivering the infrastructure half of hook-based `cancel()` (see `BRIDGE-GAP-ANALYSIS.md` A3b) |
+| 1 | ~~Execution Time Limits~~ | Completed | No workaround — an infinite loop hangs the process. See `maxInstructions` in `LuaInitOptions`. The count-hook also polls `IsCancelRequested()`; with the worker-`cancel()` wiring now in place, hook-based `cancel()` (`BRIDGE-GAP-ANALYSIS.md` A3b) is fully complete |
 | 2 | ~~Error Stack Traces~~ | Completed | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
 | 2 | GC Control | Not started | Small scope, complements sandboxing |
@@ -74,11 +74,14 @@ const lua = new lua_native.init({}, {
   and before each `lua_resume` (coroutine / async step). A runaway loop aborts
   with `"instruction limit exceeded"`; the context stays usable afterward.
 - Granularity is the hook's sampling interval (`min(limit, 1000)` instructions).
-- **Cancel synergy delivered:** the hook also polls `IsCancelRequested()` and
-  raises `"execution cancelled"`, so a compute-bound loop is cooperatively
-  interruptible once a cancel is signalled. `cancel_requested_` was made
-  `std::atomic<bool>` for the worker-thread read. The remaining A3b piece is
-  wiring the worker-thread `cancel()` path to call `RequestCancel()`.
+- **Cancel synergy delivered (A3b fully closed):** the hook also polls
+  `IsCancelRequested()` and raises `"execution cancelled"`, so a compute-bound
+  loop is cooperatively interruptible once a cancel is signalled.
+  `cancel_requested_` was made `std::atomic<bool>` for the worker-thread read.
+  The worker-thread `cancel()` path now calls `RequestCancel()` (and `ClearBusy`
+  resets the flag on worker teardown), so `execute_script_async` /
+  `execute_file_async` runs are cooperatively cancellable when `maxInstructions`
+  is set — completing A3b.
 
 The original design notes follow for reference.
 

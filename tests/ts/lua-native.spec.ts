@@ -4767,5 +4767,35 @@ describe('lua-native Node adapter', () => {
       expect(await lua.execute_script_async('return 1 + 1')).toBe(2);
       expect(lua.is_busy()).toBe(false);
     });
+
+    it('M5: create_table exceeding maxMemory throws instead of aborting the process', () => {
+      const lua = new lua_native.init({}, { maxMemory: 512 * 1024 });
+      // A direct API call (no surrounding script pcall) that allocates past the
+      // limit. Before the fix this panicked → process abort; now it throws.
+      const big = new Array(300000).fill(0).map((_, i) => i);
+      expect(() => lua.create_table(big)).toThrow(/memory/i);
+      // Context is not corrupted — small direct-API operations still work.
+      const t = lua.create_table({ ok: true });
+      expect(t.get('ok')).toBe(true);
+      t.release();
+    });
+
+    it('M5: registering a JS function past the limit throws instead of aborting', () => {
+      // Fill most of the budget, then register a function (RegisterFunction) via
+      // the direct set_global API — the allocation is now protected.
+      const lua: any = new lua_native.init({}, { libraries: 'all', maxMemory: 900 * 1024 });
+      lua.execute_script("blob = string.rep('x', 400 * 1024)");
+      let threw = false;
+      try {
+        // Register many functions to push allocation over the remaining budget.
+        for (let i = 0; i < 100000; i++) lua.set_global('f' + i, () => i);
+      } catch (e: any) {
+        threw = true;
+        expect(String(e.message)).toMatch(/memory/i);
+      }
+      expect(threw).toBe(true);
+      // Still usable (no abort, no wedged state).
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
   });
 });
