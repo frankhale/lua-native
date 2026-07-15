@@ -856,6 +856,54 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForBoolGlobal) {
   }, std::runtime_error);
 }
 
+// M4 remainder: a raising __index/__newindex on the _G metatable reached
+// through RegisterFunction / GetGlobalRef / SetGlobalMetatable / AddSearchPath
+// must surface as a caught std::runtime_error, not an unprotected panic/abort.
+TEST(LuaRuntimeProtectedGlobals, RegisterFunctionSurvivesRaisingNewindexOnG) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript(
+    "setmetatable(_G, { __newindex = function() error('no writes') end })");
+  EXPECT_THROW({
+    rt.RegisterFunction("f", [](const std::vector<LuaPtr>&) -> LuaPtr {
+      return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+    });
+  }, std::runtime_error);
+  // The runtime is still usable afterwards (stack was restored, no abort).
+  (void)rt.ExecuteScript("setmetatable(_G, nil)");
+  rt.RegisterFunction("g", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(2)));
+  });
+  const auto res = rt.ExecuteScript("return g()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+}
+
+TEST(LuaRuntimeProtectedGlobals, GetGlobalRefSurvivesRaisingIndexOnG) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript(
+    "setmetatable(_G, { __index = function() error('trap') end })");
+  EXPECT_THROW({ (void)rt.GetGlobalRef("definitely_missing"); },
+              std::runtime_error);
+}
+
+TEST(LuaRuntimeProtectedGlobals, SetGlobalMetatableSurvivesRaisingIndexOnG) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript(
+    "setmetatable(_G, { __index = function() error('trap') end })");
+  std::vector<MetatableEntry> entries;
+  EXPECT_THROW({ rt.SetGlobalMetatable("definitely_missing", entries); },
+              std::runtime_error);
+}
+
+TEST(LuaRuntimeProtectedGlobals, AddSearchPathSurvivesRaisingIndexOnG) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  // Remove package so the protected _G["package"] lookup hits __index.
+  (void)rt.ExecuteScript(
+    "package = nil "
+    "setmetatable(_G, { __index = function() error('trap') end })");
+  EXPECT_THROW({ rt.AddSearchPath("/tmp/?.lua"); }, std::runtime_error);
+}
+
 TEST(LuaRuntimeMetatable, ToStringMetamethod) {
   LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.StoreHostFunction("__mt_tostring", [](const std::vector<LuaPtr>&) -> LuaPtr {

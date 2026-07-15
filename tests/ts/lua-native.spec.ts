@@ -3924,6 +3924,40 @@ describe('lua-native Node adapter', () => {
         expect(len).toBe(5);
         expect(str).toBe('(3, 4)');
       });
+
+      it('M6: a class instance from another context is deep-copied, not aliased to a local slot', () => {
+        // Both contexts mint class-ref id 1 for their first instance. Passing
+        // context A's instance into context B must NOT be mistaken for B's own
+        // userdata slot 1 (a cross-context identity collision) — the foreign
+        // marker is ignored and the object falls through to a plain deep copy.
+        const a = makeVecContext();
+        const b = makeVecContext();
+
+        // Give B its own instance first, so B's js_userdata_ slot 1 is occupied
+        // by a DIFFERENT object than A's slot 1.
+        b.execute_script('B_LOCAL = Vec.new(100, 200)');
+
+        const foreign = a.execute_script('return Vec.new(3, 4)'); // A's ref id 1
+        b.set_global('foreign', foreign);
+
+        // In B, the foreign value is a plain table (deep copy), not B's Vec #1:
+        // its fields survive, but it carries no class metatable/methods and is
+        // not identical to B_LOCAL.
+        expect(b.execute_script('return foreign.x, foreign.y')).toEqual([3, 4]);
+        expect(b.execute_script('return getmetatable(foreign) == getmetatable(B_LOCAL)')).toBe(false);
+        expect(b.execute_script('local ok = pcall(function() return foreign:length() end); return ok')).toBe(false);
+        // B's own instance is untouched by the collision.
+        expect(b.execute_script('return B_LOCAL:length()')).toBeCloseTo(Math.hypot(100, 200));
+      });
+
+      it('M6: a class instance still round-trips within its OWN context', () => {
+        // The identity check must not break the normal same-context round-trip.
+        const lua = makeVecContext();
+        const v = lua.execute_script('return Vec.new(6, 8)');
+        lua.set_global('back', v);
+        expect(lua.execute_script('return back:length()')).toBe(10);
+        expect(lua.execute_script('return tostring(back)')).toBe('(6, 8)');
+      });
     });
 
     describe('multiple classes coexist', () => {
@@ -4544,6 +4578,20 @@ describe('lua-native Node adapter', () => {
       const lua2 = new lua_native.init({}, { libraries: 'all' });
       lua2.execute_script('setmetatable(_G, { __newindex = function() error("no writes") end })');
       expect(() => lua2.set_global('x', 1)).toThrow();
+    });
+
+    it('M4 remainder: register_function / get_global_ref / set_metatable route _G access through protection', () => {
+      // set_global(name, fn) reaches RegisterFunction; a raising __newindex on
+      // _G must surface as a caught error, not a process abort.
+      const lua = new lua_native.init({}, { libraries: 'all' });
+      lua.execute_script('setmetatable(_G, { __newindex = function() error("no writes") end })');
+      expect(() => lua.set_global('fn', () => 1)).toThrow();
+
+      // get_global_ref and set_metatable read _G through the protected path.
+      const lua2 = new lua_native.init({}, { libraries: 'all' });
+      lua2.execute_script('setmetatable(_G, { __index = function() error("trap") end })');
+      expect(() => lua2.get_global_ref('definitely_missing')).toThrow();
+      expect(() => lua2.set_metatable('definitely_missing', { __index: () => 0 })).toThrow();
     });
 
     it('M7: register_class rejects reserved metamethods but allows operator overloads', () => {

@@ -59,14 +59,26 @@ deliberately documented rather than changed:
 
 ### Partially resolved
 
-#### M4 (partial) — unprotected global access vs. a metatable on `_G` *(medium)*
-- **Fixed:** `GetGlobal` / `SetGlobal` now route through the protected-call path.
-- **Still open:** `RegisterFunction`, `GetGlobalRef`, `SetGlobalMetatable`, and
-  `AddSearchPath` still use raw global access (`lua_getglobal` /
-  `lua_setglobal`) outside any protected frame. A metatable on `_G` with a
-  raising `__index` / `__newindex` reached through these paths can still panic →
-  process abort. Rarer triggers than `GetGlobal`/`SetGlobal`, hence deferred.
-- **Fix shape:** route through the existing protected-call shim.
+#### M4 — unprotected global access vs. a metatable on `_G` *(medium)* — ✅ RESOLVED
+- **Original gap:** `GetGlobal` / `SetGlobal` routed through the protected-call
+  path, but `RegisterFunction`, `GetGlobalRef`, `SetGlobalMetatable`, and
+  `AddSearchPath` / `HasPackageLibrary` still used raw global access
+  (`lua_getglobal` / `lua_setglobal`) outside any protected frame. A metatable on
+  `_G` with a raising `__index` / `__newindex` reached through these paths could
+  panic → process abort.
+- **Resolution:** added a `LuaRuntime::PushProtectedGlobal(name)` helper
+  (`src/core/lua-runtime.cpp`) that reads `_G[name]` through the existing
+  `ProtectedTableGet` trampoline under `lua_pcall`, and refactored `GetGlobal`,
+  `GetGlobalRef`, `SetGlobalMetatable`, and `HasPackageLibrary` / `AddSearchPath`
+  onto it. `RegisterFunction` now installs its closure through the
+  `ProtectedTableSet` trampoline (same shape as `SetGlobal`). A raising `_G`
+  metamethod therefore surfaces as a caught `std::runtime_error`. The binding
+  layer was hardened to match: `set_global` (both the function and value
+  branches), `RegisterCallbacks`, and `get_global_ref` now wrap the core calls in
+  try/catch so the exception becomes a JS error instead of unwinding past N-API
+  (`set_metatable` / `add_search_path` were already guarded). Regression tests
+  added at the core C++ level (`LuaRuntimeProtectedGlobals.*`) and the TS level
+  (`lua-native.spec.ts`, "M4 remainder").
 
 #### M5 (partial) — allocation failure in unprotected API paths aborts *(medium)*
 - **Fixed (via M4):** the most reachable OOM sites (`GetGlobal` / `SetGlobal`)
@@ -78,13 +90,22 @@ deliberately documented rather than changed:
   thus converts "operation fails" into "process aborts" on some paths.
 - **Fix shape:** run these mutations through protected shims too.
 
-#### M6 (partial) — cross-context round-trip marker identity check *(medium)*
-- **Fixed:** `_tableRef` / `_userdata` markers are honored only when
-  `data->runtime` matches this context; foreign handles fall through to a deep
-  copy.
-- **Still open:** `__luaClassRef` (which carries no runtime pointer) is a
-  documented residual — it partially mitigates via its `js_userdata_` lookup but
-  is not fully identity-checked.
+#### M6 — cross-context round-trip marker identity check *(medium)* — ✅ RESOLVED
+- **Original gap:** `_tableRef` / `_userdata` markers were already honored only
+  when `data->runtime` matched this context, but `__luaClassRef` carried no
+  runtime pointer — it was a bare integer validated only by a `js_userdata_`
+  lookup. A class instance from context A (ref id `N`) passed into context B
+  could alias B's own userdata slot `N`, a cross-context identity collision.
+- **Resolution:** class instances now also carry a `__luaClassOwner` hidden
+  property — an `Napi::External<lua_core::LuaRuntime>` wrapping this context's
+  runtime pointer (identity comparison only; no ownership, no finalizer). The
+  round-trip check in `NapiToCoreInstance` (`src/lua-native.cpp`) honors
+  `__luaClassRef` only when `__luaClassOwner` matches `runtime.get()`, mirroring
+  the `_tableRef` / `_userdata` identity checks; a foreign or missing owner falls
+  through to a plain deep copy. Regression tests added at the TS level
+  (`lua-native.spec.ts`, "round-trip identity" → the two `M6:` cases: a foreign
+  instance is deep-copied rather than aliased, and same-context round-trip still
+  works).
 
 ### Deliberately deferred (documented, not changed)
 
@@ -171,14 +192,15 @@ deliberately documented rather than changed:
 
 ## Suggested order for a future hardening pass
 
-1. **M4 / M5 remainder** — route the remaining unprotected allocating/global API
-   sites (`RegisterFunction`, `GetGlobalRef`, `SetGlobalMetatable`,
-   `AddSearchPath`, `CreateTableFrom`) through protected shims. Closes the last
-   panic/abort surface from ordinary API usage under `maxMemory` or a trapped
-   `_G`.
+1. **M5 remainder** — the trapped-`_G` half (M4) is now resolved; what remains is
+   the OOM half: route the still-unprotected *allocating* sites through protected
+   shims — `CreateTableFrom` (`lua_newtable`), the `luaL_ref` sites, and the
+   closure/string allocations in `RegisterFunction` (`lua_pushstring` /
+   `lua_pushcclosure`) that still run outside the protected frame. Closes the last
+   panic/abort surface from ordinary API usage under `maxMemory`.
 2. **M12** — consume/clear the staged searcher error (one-site correctness fix).
-3. **M6 remainder / M1** — `__luaClassRef` identity check; user-coroutine await
-   guard.
+3. **M1** — user-coroutine await guard. *(M6's `__luaClassRef` identity check is
+   now resolved — see above.)*
 4. **H9c** — deferred-unref queue for the worker-thread async path (or continue
    steering users to `execute_async`).
 5. **M11** — `HandleScope` coverage on the remaining reentrant callback sites.

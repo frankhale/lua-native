@@ -506,6 +506,12 @@ private:
   // metatables and can therefore trigger __index/__newindex/__len.
   void ProtectedTableCall(int nargs, int nresults) const;
 
+  // Reads _G[name] through the protected table-get trampoline (so an __index
+  // metamethod installed via setmetatable(_G, ...) surfaces as a
+  // std::runtime_error instead of an unprotected panic) and leaves the resulting
+  // value on top of the stack.
+  void PushProtectedGlobal(const std::string& name) const;
+
   // I/O redirection and chunk-loading guards
   void InstallOutputRedirection();
   static int LuaPrint(lua_State* L);

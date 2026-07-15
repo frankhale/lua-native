@@ -695,16 +695,16 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
     Napi::Value val = callbacks.Get(key);
     std::string key_str = key.ToString();
 
-    if (val.IsFunction()) {
-      js_callbacks_[key_str] = Napi::Persistent(val.As<Napi::Function>());
-      runtime->RegisterFunction(key_str, CreateJsCallbackWrapper(key_str));
-    } else {
-      try {
+    try {
+      if (val.IsFunction()) {
+        js_callbacks_[key_str] = Napi::Persistent(val.As<Napi::Function>());
+        runtime->RegisterFunction(key_str, CreateJsCallbackWrapper(key_str));
+      } else {
         runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
-      } catch (const std::exception& e) {
-        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-        return;
       }
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return;
     }
   }
 }
@@ -718,16 +718,19 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
 
-  if (const Napi::Value value = info[1]; value.IsFunction()) {
-    js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
-    runtime->RegisterFunction(name, CreateJsCallbackWrapper(name));
-  } else {
-    try {
+  // Both branches can throw a std::runtime_error (a raising __index/__newindex
+  // on a _G metatable now routes through the protected global path), so guard
+  // the whole body rather than letting the exception unwind past N-API.
+  try {
+    if (const Napi::Value value = info[1]; value.IsFunction()) {
+      js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
+      runtime->RegisterFunction(name, CreateJsCallbackWrapper(name));
+    } else {
       runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
-    } catch (const std::exception& e) {
-      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-      return env.Undefined();
     }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
   return env.Undefined();
@@ -1202,7 +1205,16 @@ Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
   }
 
   std::string name = info[0].As<Napi::String>().Utf8Value();
-  auto result = runtime->GetGlobalRef(name);
+  // GetGlobalRef reads _G[name] through the protected-get path, which throws a
+  // std::runtime_error if a __index metamethod on the globals table raises;
+  // surface it as a JS exception rather than letting it unwind past N-API.
+  std::variant<int, std::string> result;
+  try {
+    result = runtime->GetGlobalRef(name);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
   if (auto* error = std::get_if<std::string>(&result)) {
     Napi::Error::New(env, *error).ThrowAsJavaScriptException();
@@ -1368,9 +1380,16 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     const int ref_id = next_userdata_id_++;
     auto instObj = instance.As<Napi::Object>();
     // Tag the instance so that passing the JS object back into Lua re-materializes
-    // it as the same class userdata instead of deep-copying it to a table.
+    // it as the same class userdata instead of deep-copying it to a table. The
+    // owner marker carries this context's runtime pointer so a ref_id from a
+    // foreign context isn't mistaken for one of our js_userdata_ slots (the ref_id
+    // alone is just an integer and would collide across contexts). The External
+    // wraps the raw pointer for identity comparison only — it never owns or
+    // dereferences the runtime, so no finalizer is needed.
     DefineHiddenProp(env, instObj, "__luaClassRef", Napi::Number::New(env, ref_id));
     DefineHiddenProp(env, instObj, "__luaClassName", Napi::String::New(env, class_name));
+    DefineHiddenProp(env, instObj, "__luaClassOwner",
+      Napi::External<lua_core::LuaRuntime>::New(env, runtime.get()));
 
     UserdataEntry entry;
     entry.object = Napi::Persistent(instObj);
@@ -1890,10 +1909,18 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
       }
 
       // Check if it's a registered class instance round-tripping back to Lua.
+      // Only honor the marker if it was minted by THIS context's runtime — the
+      // ref_id is a bare integer, so an instance from another context could
+      // otherwise alias an unrelated slot in this js_userdata_. Foreign or
+      // invalid markers fall through to a plain deep copy (same policy as the
+      // _tableRef / _userdata markers above).
       if (obj.Has("__luaClassRef")) {
         Napi::Value r = obj.Get("__luaClassRef");
         Napi::Value cn = obj.Get("__luaClassName");
-        if (r.IsNumber() && cn.IsString()) {
+        Napi::Value owner = obj.Get("__luaClassOwner");
+        const bool owned = owner.IsExternal() &&
+          owner.As<Napi::External<lua_core::LuaRuntime>>().Data() == runtime.get();
+        if (owned && r.IsNumber() && cn.IsString()) {
           const int ref_id = r.As<Napi::Number>().Int32Value();
           if (js_userdata_.find(ref_id) != js_userdata_.end()) {
             return lua_core::LuaValue::from(lua_core::LuaUserdataRef(

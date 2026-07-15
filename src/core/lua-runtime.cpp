@@ -773,7 +773,9 @@ void LuaRuntime::StoreHostFunction(const std::string& name, Function fn) {
 void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries) {
   StackGuard guard(L_);
 
-  lua_getglobal(L_, name.c_str());
+  // Read through the protected _G[name] path so a raising __index metamethod on
+  // the globals table can't panic.
+  PushProtectedGlobal(name);
   if (lua_isnil(L_, -1)) {
     throw std::runtime_error("Global '" + name + "' does not exist");
   }
@@ -803,7 +805,7 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
 
 bool LuaRuntime::HasPackageLibrary() const {
   StackGuard guard(L_);
-  lua_getglobal(L_, "package");
+  PushProtectedGlobal("package");
   return lua_istable(L_, -1);  // lua_istable already implies non-nil
 }
 
@@ -816,7 +818,7 @@ void LuaRuntime::AddSearchPath(const std::string& path) const {
       "Include 'package' in the libraries option.");
   }
 
-  lua_getglobal(L_, "package");
+  PushProtectedGlobal("package");
 
   // Get current package.path
   lua_getfield(L_, -1, "path");
@@ -1454,21 +1456,33 @@ void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
 }
 
 void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
+  // Install through a protected _G[name] = <closure> so a __newindex metamethod
+  // on the globals table surfaces as a std::runtime_error instead of an
+  // unprotected panic (same reasoning as SetGlobal).
   StackGuard guard(L_);
   host_functions_[name] = std::move(fn);
-  lua_pushstring(L_, name.c_str());
-  lua_pushcclosure(L_, LuaCallHostFunction, 1);
-  lua_setglobal(L_, name.c_str());
+  lua_pushcfunction(L_, ProtectedTableSet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+  lua_pushlstring(L_, name.data(), name.size());          // key
+  lua_pushstring(L_, name.c_str());                       // closure upvalue
+  lua_pushcclosure(L_, LuaCallHostFunction, 1);           // value = closure
+  ProtectedTableCall(3, 0);
+}
+
+// Reads _G[name] through the protected table-get trampoline, leaving the value
+// on top of the stack. Callers manage stack cleanup (typically via StackGuard).
+void LuaRuntime::PushProtectedGlobal(const std::string& name) const {
+  lua_pushcfunction(L_, ProtectedTableGet);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+  lua_pushlstring(L_, name.data(), name.size());          // key
+  ProtectedTableCall(2, 1);                               // -> value (may __index)
 }
 
 LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
   // Read through a protected _G[name] so a __index metamethod on the globals
   // table surfaces as a std::runtime_error instead of an unprotected panic.
   StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableGet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
-  lua_pushlstring(L_, name.data(), name.size());          // key
-  ProtectedTableCall(2, 1);
+  PushProtectedGlobal(name);
   return ToLuaValue(L_, -1);
 }
 
@@ -1835,7 +1849,9 @@ int LuaRuntime::CreateTableFrom(const LuaArray& initial) {
 }
 
 std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name) {
-  lua_getglobal(L_, name.c_str());
+  // Read through the protected _G[name] path so a raising __index metamethod on
+  // the globals table can't panic (luaL_ref below pops the value it leaves).
+  PushProtectedGlobal(name);
   if (!lua_istable(L_, -1)) {
     std::string type_name = lua_typename(L_, lua_type(L_, -1));
     lua_pop(L_, 1);
