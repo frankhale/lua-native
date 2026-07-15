@@ -708,6 +708,12 @@ export interface LuaInitOptions {
    * coroutine `resume` gets a fresh budget. Enforcement is approximate to within
    * ~1000 instructions (the hook's sampling granularity).
    *
+   * Because the budget resets on every entry, it bounds **pure-Lua** compute
+   * only: a Lua loop whose body calls a JS callback that re-enters Lua (via a
+   * returned function handle or another execution) restarts the counter each
+   * re-entry. `maxInstructions` is not a wall-clock or total-work ceiling once
+   * host callbacks re-enter the VM.
+   *
    * Best set at construction so every coroutine created afterward inherits the
    * limit.
    *

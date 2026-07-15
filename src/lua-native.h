@@ -4,6 +4,7 @@
 #include <atomic>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -232,6 +233,11 @@ private:
     int next_js_error_id_ = 1;
     int call_depth_ = 0;  // clears the registry when the outermost call starts
 
+    // Names of classes already registered on this context. luaL_newmetatable
+    // silently returns the existing metatable for a repeated name, so a second
+    // register_class(sameName) would half-merge definitions; reject it (L7).
+    std::unordered_set<std::string> registered_classes_;
+
     // Stages a structured error table for a thrown JS value (object errors only)
     // and returns the display message.
     std::string StageJsError(const Napi::Value& value, const std::string& message);
@@ -247,7 +253,4 @@ private:
         const std::string& name, const std::string& class_name,
         bool readable, bool writable);
     Napi::Object CreateTableHandle(Napi::Env env, int registry_ref);
-
-public:
-    static lua_core::LuaValue NapiToCore(const Napi::Value& value, int depth = 0);
 };

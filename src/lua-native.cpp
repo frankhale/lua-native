@@ -214,6 +214,9 @@ static Napi::Value TableRefHasTrap(const Napi::CallbackInfo& info) {
   if (key == "_tableRef") return Napi::Boolean::New(env, true);
 
   try {
+    // Clear the JS-error registry at the outermost access so a staged entry from
+    // a raising __index host callback can't accumulate (L3, mirrors get/set).
+    LuaContext::CallScope scope(data->context);
     bool has = data->runtime->HasTableField(data->tableRef.ref, key);
     return Napi::Boolean::New(env, has);
   } catch (const std::exception& e) {
@@ -228,6 +231,7 @@ static Napi::Value TableRefOwnKeysTrap(const Napi::CallbackInfo& info) {
   if (RejectIfWorkerBusy(env, data)) return env.Undefined();
 
   try {
+    LuaContext::CallScope scope(data->context);
     auto keys = data->runtime->GetTableKeys(data->tableRef.ref);
     Napi::Array arr = Napi::Array::New(env, keys.size());
     for (size_t i = 0; i < keys.size(); i++) {
@@ -252,6 +256,7 @@ static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo
   std::string key = prop.As<Napi::String>().Utf8Value();
 
   try {
+    LuaContext::CallScope scope(data->context);
     if (data->runtime->HasTableField(data->tableRef.ref, key)) {
       auto value = data->runtime->GetTableField(data->tableRef.ref, key);
       Napi::Object desc = Napi::Object::New(env);
@@ -388,8 +393,8 @@ static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
   }
 
   try {
-    int len = data->runtime->GetTableLength(data->tableRef.ref);
-    return Napi::Number::New(env, len);
+    int64_t len = data->runtime->GetTableLength(data->tableRef.ref);
+    return Napi::Number::New(env, static_cast<double>(len));
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
@@ -656,6 +661,12 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     js_userdata_.erase(ref_id);
   });
 
+  // Drop the paired JS reference when an anonymous nested callback's Lua closure
+  // is collected, so callback-heavy patterns don't leak js_callbacks_ (M2).
+  runtime->SetHostFunctionGCCallback([this](const std::string& name) {
+    js_callbacks_.erase(name);
+  });
+
   // Set up property handlers for proxy userdata. Each runs inside a Lua C frame
   // during __index/__newindex; a HandleScope keeps per-access N-API handles from
   // accumulating across a hot property-access loop.
@@ -864,6 +875,32 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   }
   auto constructFn = def.Get("construct").As<Napi::Function>();
 
+  // Reject a duplicate class name before any callback is registered (L7).
+  if (registered_classes_.count(class_name)) {
+    Napi::Error::New(env,
+      "class '" + class_name + "' is already registered on this context")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Validate reserved metamethods up front, before anything is registered, so a
+  // rejected definition doesn't strand the constructor/method callbacks in
+  // js_callbacks_/host_functions_ (L4).
+  if (def.Has("metamethods") && def.Get("metamethods").IsObject()) {
+    auto mms = def.Get("metamethods").As<Napi::Object>();
+    Napi::Array mmKeys = mms.GetPropertyNames();
+    for (uint32_t i = 0; i < mmKeys.Length(); ++i) {
+      std::string key = mmKeys.Get(i).As<Napi::String>().Utf8Value();
+      if (key == "__gc" || key == "__index" || key == "__newindex" ||
+          key == "__name" || key == lua_core::LuaRuntime::kClassMarkerField) {
+        Napi::TypeError::New(env,
+          "register_class(): metamethod '" + key + "' is reserved and cannot be overridden")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+    }
+  }
+
   bool readable = false;
   bool writable = false;
   if (def.Has("readable") && def.Get("readable").IsBoolean()) {
@@ -873,7 +910,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     writable = def.Get("writable").As<Napi::Boolean>().Value();
   }
 
-  const int class_id = next_class_id_++;
+  const uint64_t class_id = next_class_id_++;
 
   // Constructor host function (special wrapper: builds + registers an instance).
   const std::string ctor_name = "__class_ctor_" + std::to_string(class_id);
@@ -905,17 +942,8 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     Napi::Array keys = mms.GetPropertyNames();
     for (uint32_t i = 0; i < keys.Length(); ++i) {
       std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
-      // These metamethods implement the class machinery itself (lifecycle,
-      // method/property dispatch, type marker). Allowing a user override would
-      // silently break instance cleanup (leaking JS references), method lookup,
-      // or round-tripping — and a user __gc would call into JS during GC/teardown.
-      if (key == "__gc" || key == "__index" || key == "__newindex" ||
-          key == "__name" || key == lua_core::LuaRuntime::kClassMarkerField) {
-        Napi::TypeError::New(env,
-          "register_class(): metamethod '" + key + "' is reserved and cannot be overridden")
-          .ThrowAsJavaScriptException();
-        return env.Undefined();
-      }
+      // Reserved metamethods were already rejected up front (L4), so any key
+      // reaching here is a permitted operator/overload metamethod.
       Napi::Value val = mms.Get(key);
       if (val.IsFunction()) {
         std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
@@ -931,6 +959,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   }
 
   runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
+  registered_classes_.insert(class_name);
   return env.Undefined();
 }
 
@@ -945,7 +974,7 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   const auto mt = info[1].As<Napi::Object>();
   const Napi::Array keys = mt.GetPropertyNames();
 
-  int mt_id = next_metatable_id_++;
+  uint64_t mt_id = next_metatable_id_++;
   std::vector<lua_core::MetatableEntry> entries;
 
   for (uint32_t i = 0; i < keys.Length(); i++) {
@@ -1020,7 +1049,7 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   const auto moduleObj = info[1].As<Napi::Object>();
   const Napi::Array keys = moduleObj.GetPropertyNames();
 
-  int mod_id = next_module_id_++;
+  uint64_t mod_id = next_module_id_++;
   std::vector<lua_core::MetatableEntry> entries;
 
   for (uint32_t i = 0; i < keys.Length(); i++) {
@@ -1145,32 +1174,34 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
 }
 
 Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
-  // The data is owned by the External's finalizer, freed when the handle is
-  // garbage-collected.
   auto* dataPtr = new LuaTableRefData(
     runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this, alive_);
 
   Napi::Object handle = Napi::Object::New(env);
 
-  // Store _tableRef as non-enumerable for round-trip detection (same pattern as Proxy)
+  // The External's finalizer is the sole owner of dataPtr. Root it on _tableRef
+  // AND on every method function below, so a method destructured off the handle
+  // (`const { get } = handle; get(...)`) keeps the data alive instead of reading
+  // freed memory once the handle object is collected. Non-configurable so it
+  // can't be deleted to free the data out from under the still-bound methods —
+  // the same ownership discipline used for __luaFnOwner (H3 / L6).
   auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
     [](Napi::Env, LuaTableRefData* d) { delete d; });
-  auto Object = env.Global().Get("Object").As<Napi::Object>();
-  auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
-  Napi::Object descriptor = Napi::Object::New(env);
-  descriptor.Set("value", external);
-  descriptor.Set("enumerable", Napi::Boolean::New(env, false));
-  descriptor.Set("configurable", Napi::Boolean::New(env, true));
-  defineProperty.Call({handle, Napi::String::New(env, "_tableRef"), descriptor});
+  DefineHiddenProp(env, handle, "_tableRef", external, /*writable=*/false);
 
-  // Attach methods
-  handle.Set("get", Napi::Function::New(env, TableHandleGet, "get", dataPtr));
-  handle.Set("set", Napi::Function::New(env, TableHandleSet, "set", dataPtr));
-  handle.Set("has", Napi::Function::New(env, TableHandleHas, "has", dataPtr));
-  handle.Set("length", Napi::Function::New(env, TableHandleLength, "length", dataPtr));
-  handle.Set("pairs", Napi::Function::New(env, TableHandlePairs, "pairs", dataPtr));
-  handle.Set("ipairs", Napi::Function::New(env, TableHandleIPairs, "ipairs", dataPtr));
-  handle.Set("release", Napi::Function::New(env, TableHandleRelease, "release", dataPtr));
+  auto addMethod = [&](const char* name,
+                       Napi::Value (*cb)(const Napi::CallbackInfo&)) {
+    Napi::Function fn = Napi::Function::New(env, cb, name, dataPtr);
+    DefineHiddenProp(env, fn, "_tableOwner", external, /*writable=*/false);
+    handle.Set(name, fn);
+  };
+  addMethod("get", TableHandleGet);
+  addMethod("set", TableHandleSet);
+  addMethod("has", TableHandleHas);
+  addMethod("length", TableHandleLength);
+  addMethod("pairs", TableHandlePairs);
+  addMethod("ipairs", TableHandleIPairs);
+  addMethod("release", TableHandleRelease);
 
   return handle;
 }
@@ -1275,6 +1306,7 @@ LuaContext::~LuaContext() {
   // Clear callbacks to prevent accessing member state during lua_close()
   if (runtime) {
     runtime->SetUserdataGCCallback(nullptr);
+    runtime->SetHostFunctionGCCallback(nullptr);
     runtime->SetPropertyHandlers(nullptr, nullptr);
     runtime->SetOutputHandler(nullptr);
   }
@@ -1598,10 +1630,18 @@ struct AwaitCookie {
 void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
   // Mark the resume window so a cancel() arriving re-entrantly from a host
   // callback defers its teardown until after the coroutine leaves the C stack
-  // (see Cancel()). Tearing down here would free the running coroutine.
-  async_resuming_ = true;
-  auto step = runtime->ResumeAsyncStep(*async_co_, args, is_error);
-  async_resuming_ = false;
+  // (see Cancel()). Tearing down here would free the running coroutine. RAII so
+  // the flag is cleared even if the resume unexpectedly throws (H1).
+  struct ResumeFlag {
+    bool& f;
+    explicit ResumeFlag(bool& b) : f(b) { f = true; }
+    ~ResumeFlag() { f = false; }
+  };
+  lua_core::AsyncStepResult step;
+  {
+    ResumeFlag resuming(async_resuming_);
+    step = runtime->ResumeAsyncStep(*async_co_, args, is_error);
+  }
 
   // Honor a cancel() that arrived during the resume, now that the coroutine has
   // returned. Also covers a cancel requested before an about-to-be-attached
@@ -1712,6 +1752,15 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
         std::string("failed to convert awaited value: ") + e.what()).Value());
       return env.Undefined();
     }
+  }
+  // Marshalling the settled value above (type converters, object getters, the
+  // reject path's message/name/stack reads) can run user JS that calls cancel()
+  // — which, since we are not inside a resume, takes the full-teardown branch
+  // and disengages async_co_/async_deferred_ — or even starts a new run. Re-check
+  // the liveness+generation guard before driving so we neither dereference a
+  // disengaged optional nor inject this settlement into a newer run (H2).
+  if (!async_co_ || !async_deferred_ || gen != async_generation_) {
+    return env.Undefined();
   }
   DriveAsync(std::move(args), is_error);
   return env.Undefined();
@@ -1907,7 +1956,10 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
     // even when the function is nested inside a table or array.
     const std::string name = "__js_callback_" + std::to_string(next_js_callback_id_++);
     js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
-    runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
+    // Reclaimable: the entry (and the js_callbacks_ reference above) is dropped
+    // when the materialized Lua closure is garbage-collected, so anonymous
+    // callbacks don't accumulate for the life of the context (M2).
+    runtime->RegisterReclaimableHostFunction(name, CreateJsCallbackWrapper(name));
     return lua_core::LuaValue::from(lua_core::HostFunctionName{name});
   }
 
@@ -1960,6 +2012,11 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
       if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
         auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
         if (data && data->runtime.get() == runtime.get()) {
+          // A released handle would push registry slot LUA_NOREF (nil) silently;
+          // surface it as an error instead, matching the handle methods (L2).
+          if (data->tableRef.ref == LUA_NOREF) {
+            throw std::runtime_error("table handle has been released");
+          }
           return lua_core::LuaValue::from(lua_core::LuaTableRef(data->tableRef));
         }
         // Foreign or invalid marker: fall through to a plain deep copy.
@@ -2032,78 +2089,6 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
       Napi::Value key = keys[i];
       std::string keyStr = key.ToString().Utf8Value();
       tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(obj.Get(key), depth + 1)));
-    }
-    return lua_core::LuaValue::from(std::move(tbl));
-  }
-
-  return lua_core::LuaValue::nil();
-}
-
-lua_core::LuaValue LuaContext::NapiToCore(const Napi::Value& value, int depth) {
-  if (depth > lua_core::LuaRuntime::kMaxDepth) {
-    throw std::runtime_error("Value nesting depth exceeds the maximum of "
-      + std::to_string(lua_core::LuaRuntime::kMaxDepth) + " levels");
-  }
-
-  const napi_valuetype type = value.Type();
-  if (type == napi_undefined || type == napi_null) {
-    return lua_core::LuaValue::nil();
-  }
-  if (type == napi_boolean) {
-    return lua_core::LuaValue::from(value.As<Napi::Boolean>().Value());
-  }
-  if (type == napi_bigint) {
-    bool lossless = false;
-    const int64_t i = value.As<Napi::BigInt>().Int64Value(&lossless);
-    if (!lossless) {
-      throw std::runtime_error(
-        "BigInt value is out of range for a 64-bit Lua integer");
-    }
-    return lua_core::LuaValue::from(i);
-  }
-  if (type == napi_number) {
-    const double num = value.As<Napi::Number>().DoubleValue();
-    // Upper bound is strictly < 2^63 (casting a double == 2^63 to int64_t is UB).
-    constexpr double kInt64UpperExclusive = 9223372036854775808.0;  // 2^63
-    if (std::isfinite(num) && num >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-        num < kInt64UpperExclusive) {
-      double intpart;
-      if (std::modf(num, &intpart) == 0.0) {
-        return lua_core::LuaValue::from(static_cast<int64_t>(num));
-      }
-    }
-    return lua_core::LuaValue::from(num);
-  }
-  if (type == napi_string) {
-    return lua_core::LuaValue::from(value.As<Napi::String>().Utf8Value());
-  }
-  if (type == napi_symbol) {
-    throw std::runtime_error("Cannot convert a JavaScript Symbol to a Lua value");
-  }
-
-  if (type == napi_object) {
-    // Common built-in JS types (binary data, Date, Map, Set, RegExp)
-    if (auto builtin = ConvertBuiltinType(value, depth,
-          [](const Napi::Value& v, int d) { return NapiToCore(v, d); })) {
-      return std::move(*builtin);
-    }
-
-    if (value.IsArray()) {
-      const auto arr = value.As<Napi::Array>();
-      lua_core::LuaArray coreArr;
-      coreArr.reserve(arr.Length());
-      for (uint32_t i = 0; i < arr.Length(); ++i) {
-        coreArr.push_back(std::make_shared<lua_core::LuaValue>(NapiToCore(arr.Get(i), depth + 1)));
-      }
-      return lua_core::LuaValue::from(std::move(coreArr));
-    }
-    const auto obj = value.As<Napi::Object>();
-    Napi::Array keys = obj.GetPropertyNames();
-    lua_core::LuaTable tbl;
-    for (uint32_t i = 0; i < keys.Length(); i++) {
-      Napi::Value key = keys[i];
-      std::string keyStr = key.ToString().Utf8Value();
-      tbl.emplace(std::move(keyStr), std::make_shared<lua_core::LuaValue>(NapiToCore(obj.Get(key), depth + 1)));
     }
     return lua_core::LuaValue::from(std::move(tbl));
   }
@@ -2212,15 +2197,23 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           descriptor.Set("configurable", Napi::Boolean::New(env, true));
           defineProperty.Call({target, Napi::String::New(env, "_tableRef"), descriptor});
 
-          // Create handler with traps
+          // Create handler with traps. Root the owner External on each trap so
+          // `delete proxy._tableRef` (which forwards to the target, removing only
+          // that reference) can't free dataPtr while the traps still point at it
+          // (H3). The target's _tableRef stays configurable so the Proxy ownKeys
+          // invariant — ownKeys omits _tableRef — is not violated.
           Napi::Object handler = Napi::Object::New(env);
-          handler.Set("get", Napi::Function::New(env, TableRefGetTrap, "get", dataPtr));
-          handler.Set("set", Napi::Function::New(env, TableRefSetTrap, "set", dataPtr));
-          handler.Set("has", Napi::Function::New(env, TableRefHasTrap, "has", dataPtr));
-          handler.Set("ownKeys", Napi::Function::New(env, TableRefOwnKeysTrap, "ownKeys", dataPtr));
-          handler.Set("getOwnPropertyDescriptor",
-            Napi::Function::New(env, TableRefGetOwnPropertyDescriptorTrap,
-                                "getOwnPropertyDescriptor", dataPtr));
+          auto addTrap = [&](const char* name,
+                             Napi::Value (*cb)(const Napi::CallbackInfo&)) {
+            Napi::Function fn = Napi::Function::New(env, cb, name, dataPtr);
+            DefineHiddenProp(env, fn, "_tableOwner", external, /*writable=*/false);
+            handler.Set(name, fn);
+          };
+          addTrap("get", TableRefGetTrap);
+          addTrap("set", TableRefSetTrap);
+          addTrap("has", TableRefHasTrap);
+          addTrap("ownKeys", TableRefOwnKeysTrap);
+          addTrap("getOwnPropertyDescriptor", TableRefGetOwnPropertyDescriptorTrap);
 
           // Create Proxy
           auto ProxyCtor = env.Global().Get("Proxy").As<Napi::Function>();
@@ -2304,6 +2297,15 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
   auto* threadData = externalVal.As<Napi::External<LuaThreadData>>().Data();
   if (!threadData || !threadData->runtime) {
     Napi::Error::New(env, "Invalid coroutine reference").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  // Resuming a coroutine created by another context would run lua_resume with
+  // this context's main state driving that context's thread — two unrelated Lua
+  // states in one call (UB). Reject it, mirroring the round-trip identity checks
+  // on table/userdata/class markers (M1).
+  if (threadData->runtime.get() != runtime.get()) {
+    Napi::Error::New(env, "coroutine belongs to a different Lua context")
+      .ThrowAsJavaScriptException();
     return env.Undefined();
   }
 

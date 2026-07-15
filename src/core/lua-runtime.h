@@ -342,6 +342,18 @@ public:
   void UnrefOrDefer(int ref);
   // Metatable support
   void StoreHostFunction(const std::string& name, Function fn);
+  // Like StoreHostFunction, but the registry entry (and the binding's paired JS
+  // reference, via the host-function GC callback) is reclaimed once every Lua
+  // closure materialized from this name is garbage-collected. Used for the
+  // anonymous JS callbacks nested inside values crossing JS→Lua, which would
+  // otherwise accumulate for the life of the context (M2).
+  void RegisterReclaimableHostFunction(const std::string& name, Function fn);
+  // Invoked when a reclaimable host function's last live closure is collected,
+  // so the binding layer can drop its paired js_callbacks_ reference. Runs on
+  // the thread the GC fires on; skipped during worker-thread async (off-thread
+  // N-API is illegal), same as the userdata GC callback.
+  using HostFunctionGCCallback = std::function<void(const std::string&)>;
+  void SetHostFunctionGCCallback(HostFunctionGCCallback cb);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
 
   // Error fidelity: a host wrapper stages a structured error value (a plain
@@ -403,7 +415,7 @@ public:
   void SetTableFieldKeyed(int registry_ref, const TableKey& key, const LuaPtr& value) const;
   [[nodiscard]] bool HasTableFieldKeyed(int registry_ref, const TableKey& key) const;
   [[nodiscard]] std::vector<std::string> GetTableKeys(int registry_ref) const;
-  [[nodiscard]] int GetTableLength(int registry_ref) const;
+  [[nodiscard]] int64_t GetTableLength(int registry_ref) const;
 
   // Table reference API — create and manage live table references
   [[nodiscard]] int CreateTable();
@@ -438,6 +450,7 @@ public:
   static constexpr int kMaxDepth = 100;
   static constexpr const char* kUserdataMetaName = "lua_native_userdata";
   static constexpr const char* kProxyUserdataMetaName = "lua_native_proxy_userdata";
+  static constexpr const char* kHostFnSentinelMeta = "lua_native_hostfn_sentinel";
 
   // Registry keys / markers shared between the core and binding layers.
   static constexpr const char* kRuntimeRegistryKey = "_lua_core_runtime";
@@ -464,6 +477,13 @@ private:
   std::unordered_map<int, int> userdata_ref_counts_;
   PropertyGetter property_getter_;
   PropertySetter property_setter_;
+
+  // Reclaimable host functions (M2). reclaimable_host_fns_ maps a name to the
+  // number of live Lua closures materialized from it; each closure carries a
+  // sentinel userdata whose __gc decrements the count and, at zero, drops the
+  // host_functions_ entry and notifies the binding via host_fn_gc_callback_.
+  std::unordered_map<std::string, int> reclaimable_host_fns_;
+  HostFunctionGCCallback host_fn_gc_callback_;
   // True only while a worker thread (execute_script_async / execute_file_async)
   // owns the Lua state. Read from the main thread (e.g. binding-layer guards) to
   // reject concurrent access, so it must be atomic. Note: the main-thread
@@ -522,6 +542,11 @@ private:
 
   void RegisterUserdataMetatable();
   void RegisterProxyUserdataMetatable();
+  void RegisterHostFnSentinelMetatable();
+
+  // Reclaims a reclaimable host function's entries once its last closure dies.
+  void OnHostFnClosureCollected(const std::string& name);
+  static int HostFnSentinelGC(lua_State* L);
 
   static int LuaCallHostFunction(lua_State* L);
   static int UserdataGC(lua_State* L);

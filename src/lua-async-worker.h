@@ -30,12 +30,18 @@ public:
 
   void Execute() override {
     // Defer main-thread registry unrefs (GC finalizers) for the duration of the
-    // off-thread run so they can't mutate the registry concurrently (H9c).
+    // off-thread run so they can't mutate the registry concurrently (H9c). The
+    // teardown runs through an RAII guard so that even if ExecuteScript throws
+    // (an unexpected C++ exception the AsyncWorker base catches), async_mode_ is
+    // cleared and the deferral queue is drained — otherwise the context would be
+    // left permanently degraded (H1).
     runtime_->BeginWorkerUnrefDeferral();
     runtime_->SetAsyncMode(true);
+    struct Teardown {
+      lua_core::LuaRuntime* rt;
+      ~Teardown() { rt->SetAsyncMode(false); rt->EndWorkerUnrefDeferral(); }
+    } teardown{runtime_.get()};
     result_ = runtime_->ExecuteScript(script_);
-    runtime_->SetAsyncMode(false);
-    runtime_->EndWorkerUnrefDeferral();
   }
 
   void OnOK() override;
@@ -67,12 +73,15 @@ public:
 
   void Execute() override {
     // See LuaScriptAsyncWorker::Execute — defer main-thread registry unrefs for
-    // the off-thread run (H9c).
+    // the off-thread run (H9c), with RAII teardown so a throw can't leave the
+    // context degraded (H1).
     runtime_->BeginWorkerUnrefDeferral();
     runtime_->SetAsyncMode(true);
+    struct Teardown {
+      lua_core::LuaRuntime* rt;
+      ~Teardown() { rt->SetAsyncMode(false); rt->EndWorkerUnrefDeferral(); }
+    } teardown{runtime_.get()};
     result_ = runtime_->ExecuteFile(filepath_);
-    runtime_->SetAsyncMode(false);
-    runtime_->EndWorkerUnrefDeferral();
   }
 
   void OnOK() override;

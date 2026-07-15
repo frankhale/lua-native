@@ -196,6 +196,7 @@ void LuaRuntime::InitState() {
   // Register userdata metatables
   RegisterUserdataMetatable();
   RegisterProxyUserdataMetatable();
+  RegisterHostFnSentinelMetatable();
 
   // Install the instruction/cancel count-hook if a limit was configured. Must
   // run after the runtime pointer is in the registry (the hook reads it back).
@@ -284,6 +285,9 @@ LuaRuntime::~LuaRuntime() {
   // these, but the core must not depend on it.
   userdata_gc_callback_ = nullptr;
   output_handler_ = nullptr;
+  // lua_close also fires the host-fn sentinel __gc metamethods; clear the
+  // callback so teardown never calls back into a torn-down binding handler (M2).
+  host_fn_gc_callback_ = nullptr;
 
   // Remove the count-hook before lua_close so a __gc finalizer running during
   // teardown can't trip the instruction limit / cancel raise.
@@ -513,18 +517,31 @@ void detail::UnrefRegistrySlot(lua_State* mainL, int ref) {
 }
 
 void LuaRuntime::CreateUserdataGlobal(const std::string& name, int ref_id) {
-  auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
-  *block = ref_id;
-  luaL_setmetatable(L_, kUserdataMetaName);
-  lua_setglobal(L_, name.c_str());
+  // Protected so an OOM (under maxMemory) allocating the userdata, or a raising
+  // __newindex on a _G metatable, throws instead of aborting (M3). The build is
+  // self-contained; the pcall frame discards the stack on the way out.
+  RunProtected([&]() {
+    auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
+    *block = ref_id;
+    luaL_setmetatable(L_, kUserdataMetaName);          // [ud]
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // [ud, _G]
+    lua_pushlstring(L_, name.data(), name.size());     // [ud, _G, key]
+    lua_pushvalue(L_, -3);                             // [ud, _G, key, ud]
+    lua_settable(L_, -3);                             // _G[key] = ud (may __newindex)
+  });
   IncrementUserdataRefCount(ref_id);
 }
 
 void LuaRuntime::CreateProxyUserdataGlobal(const std::string& name, int ref_id) {
-  auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
-  *block = ref_id;
-  luaL_setmetatable(L_, kProxyUserdataMetaName);
-  lua_setglobal(L_, name.c_str());
+  RunProtected([&]() {
+    auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
+    *block = ref_id;
+    luaL_setmetatable(L_, kProxyUserdataMetaName);     // [ud]
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // [ud, _G]
+    lua_pushlstring(L_, name.data(), name.size());     // [ud, _G, key]
+    lua_pushvalue(L_, -3);                             // [ud, _G, key, ud]
+    lua_settable(L_, -3);                             // _G[key] = ud (may __newindex)
+  });
   IncrementUserdataRefCount(ref_id);
 }
 
@@ -557,18 +574,19 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
 void LuaRuntime::SetUserdataMethodTable(
     int ref_id,
     const std::unordered_map<std::string, std::string>& method_map) {
-  StackGuard guard(L_);
-
-  // Create a table: { method_name = "host_func_name", ... }
-  lua_newtable(L_);
-  for (const auto& [name, func_name] : method_map) {
-    lua_pushstring(L_, func_name.c_str());
-    lua_setfield(L_, -2, name.c_str());
-  }
-
-  // Store in registry: _ud_methods_<ref_id> = table
-  std::string registry_key = std::string(kUserdataMethodsPrefix) + std::to_string(ref_id);
-  lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
+  const std::string registry_key =
+      std::string(kUserdataMethodsPrefix) + std::to_string(ref_id);
+  // Protected so an OOM building the method table throws instead of aborting (M3).
+  RunProtected([&]() {
+    // Create a table: { method_name = "host_func_name", ... }
+    lua_newtable(L_);
+    for (const auto& [name, func_name] : method_map) {
+      lua_pushstring(L_, func_name.c_str());
+      lua_setfield(L_, -2, name.c_str());
+    }
+    // Store in registry: _ud_methods_<ref_id> = table (consumes the table)
+    lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
+  });
 }
 
 int LuaRuntime::UserdataMethodCall(lua_State* L) {
@@ -684,8 +702,11 @@ void LuaRuntime::RegisterClass(
     const std::string& constructor_func_name,
     const std::unordered_map<std::string, std::string>& method_map,
     const std::vector<MetatableEntry>& metamethods) {
-  StackGuard guard(L_);
-
+  // The whole build (metatable, method table, class global) runs in one
+  // protected frame so an OOM under maxMemory, or a raising __newindex on a _G
+  // metatable at the final lua_setglobal, throws instead of aborting (M3). Every
+  // allocation and _G write below is therefore protected.
+  RunProtected([&]() {
   // 1. Create the shared per-class instance metatable.
   const std::string mt_name = std::string(kClassMetaPrefix) + class_name;
   luaL_newmetatable(L_, mt_name.c_str());
@@ -735,6 +756,7 @@ void LuaRuntime::RegisterClass(
   lua_pushcclosure(L_, LuaCallHostFunction, 1);
   lua_setfield(L_, -2, "new");
   lua_setglobal(L_, class_name.c_str());
+  });
 }
 
 int LuaRuntime::ClassIndex(lua_State* L) {
@@ -830,35 +852,85 @@ void LuaRuntime::StoreHostFunction(const std::string& name, Function fn) {
   host_functions_[name] = std::move(fn);
 }
 
+void LuaRuntime::RegisterReclaimableHostFunction(const std::string& name, Function fn) {
+  host_functions_[name] = std::move(fn);
+  reclaimable_host_fns_[name] = 0;  // live-closure count, incremented on each push
+}
+
+void LuaRuntime::SetHostFunctionGCCallback(HostFunctionGCCallback cb) {
+  host_fn_gc_callback_ = std::move(cb);
+}
+
+void LuaRuntime::RegisterHostFnSentinelMetatable() {
+  luaL_newmetatable(L_, kHostFnSentinelMeta);
+  lua_pushcfunction(L_, HostFnSentinelGC);
+  lua_setfield(L_, -2, "__gc");
+  lua_pop(L_, 1);
+}
+
+// __gc for the sentinel userdata carried as a reclaimable closure's upvalue.
+// Fires when that closure is collected. Holds no non-trivial C++ locals across
+// a raise, so it is safe on any GC path.
+int LuaRuntime::HostFnSentinelGC(lua_State* L) {
+  auto** slot = static_cast<std::string**>(lua_touserdata(L, 1));
+  if (!slot || !*slot) return 0;
+  std::string* namep = *slot;
+  *slot = nullptr;  // guard against a double __gc
+
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (runtime) runtime->OnHostFnClosureCollected(*namep);
+
+  delete namep;
+  return 0;
+}
+
+void LuaRuntime::OnHostFnClosureCollected(const std::string& name) {
+  auto it = reclaimable_host_fns_.find(name);
+  if (it == reclaimable_host_fns_.end()) return;
+  if (--it->second <= 0) {
+    reclaimable_host_fns_.erase(it);
+    host_functions_.erase(name);
+    // Drop the binding's paired JS reference. Skip during a worker run — that
+    // would be an off-thread N-API call; the entry is then reclaimed with the
+    // context instead, matching the userdata GC callback's tradeoff.
+    if (host_fn_gc_callback_ && !async_mode_) host_fn_gc_callback_(name);
+  }
+}
+
 void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries) {
-  StackGuard guard(L_);
-
-  // Read through the protected _G[name] path so a raising __index metamethod on
-  // the globals table can't panic.
-  PushProtectedGlobal(name);
-  if (lua_isnil(L_, -1)) {
-    throw std::runtime_error("Global '" + name + "' does not exist");
-  }
-  if (!lua_istable(L_, -1)) {
-    throw std::runtime_error("Global '" + name + "' is not a table");
-  }
-
-  // Create the metatable
-  lua_newtable(L_);
-
-  for (const auto& entry : entries) {
-    if (entry.is_function) {
-      // Push function name as upvalue, then create closure
-      lua_pushstring(L_, entry.func_name.c_str());
-      lua_pushcclosure(L_, LuaCallHostFunction, 1);
-    } else {
-      PushLuaValue(L_, entry.value);
+  // One protected frame covers the read (already protected on its own), the
+  // metatable allocation (M3), and lua_setmetatable. Validation throws and
+  // PushLuaValue depth throws propagate out of RunProtected unchanged.
+  RunProtected([&]() {
+    // Read through the protected _G[name] path so a raising __index metamethod
+    // on the globals table can't panic.
+    PushProtectedGlobal(name);
+    if (lua_isnil(L_, -1)) {
+      throw std::runtime_error("Global '" + name + "' does not exist");
     }
-    lua_setfield(L_, -2, entry.key.c_str());
-  }
+    if (!lua_istable(L_, -1)) {
+      throw std::runtime_error("Global '" + name + "' is not a table");
+    }
 
-  // Set the metatable on the target table (pops metatable)
-  lua_setmetatable(L_, -2);
+    // Create the metatable
+    lua_newtable(L_);
+
+    for (const auto& entry : entries) {
+      if (entry.is_function) {
+        // Push function name as upvalue, then create closure
+        lua_pushstring(L_, entry.func_name.c_str());
+        lua_pushcclosure(L_, LuaCallHostFunction, 1);
+      } else {
+        PushLuaValue(L_, entry.value);
+      }
+      lua_setfield(L_, -2, entry.key.c_str());
+    }
+
+    // Set the metatable on the target table (pops metatable)
+    lua_setmetatable(L_, -2);
+  });
 }
 
 // --- Module / require support ---
@@ -870,66 +942,70 @@ bool LuaRuntime::HasPackageLibrary() const {
 }
 
 void LuaRuntime::AddSearchPath(const std::string& path) const {
-  StackGuard guard(L_);
-
   if (!HasPackageLibrary()) {
     throw std::runtime_error(
       "Cannot add search path: the 'package' library is not loaded. "
       "Include 'package' in the libraries option.");
   }
 
-  PushProtectedGlobal("package");
+  // Protected so the pushstring/setfield allocation (M3) — and a __newindex on
+  // a metatabled package table — throw rather than abort.
+  RunProtected([&]() {
+    PushProtectedGlobal("package");
 
-  // Get current package.path
-  lua_getfield(L_, -1, "path");
-  const char* current_raw = lua_tostring(L_, -1);
-  std::string current = current_raw ? current_raw : "";
-  lua_pop(L_, 1);  // pop path string
+    // Get current package.path
+    lua_getfield(L_, -1, "path");
+    const char* current_raw = lua_tostring(L_, -1);
+    std::string current = current_raw ? current_raw : "";
+    lua_pop(L_, 1);  // pop path string
 
-  // Append the new path
-  if (!current.empty()) {
-    current += ";";
-  }
-  current += path;
+    // Append the new path
+    if (!current.empty()) {
+      current += ";";
+    }
+    current += path;
 
-  // Set the updated package.path
-  lua_pushstring(L_, current.c_str());
-  lua_setfield(L_, -2, "path");
+    // Set the updated package.path
+    lua_pushstring(L_, current.c_str());
+    lua_setfield(L_, -2, "path");
+  });
 }
 
 void LuaRuntime::RegisterModuleTable(const std::string& name,
                                       const std::vector<MetatableEntry>& entries) const {
-  StackGuard guard(L_);
-
   if (!HasPackageLibrary()) {
     throw std::runtime_error(
       "Cannot register module: the 'package' library is not loaded. "
       "Include 'package' in the libraries option.");
   }
 
-  lua_getglobal(L_, "package");
-  lua_getfield(L_, -1, "loaded");
-  if (lua_isnil(L_, -1)) {
-    throw std::runtime_error(
-      "Cannot register module: package.loaded is not available.");
-  }
-
-  // Create the module table
-  lua_newtable(L_);
-
-  for (const auto& entry : entries) {
-    if (entry.is_function) {
-      // Push function name as upvalue, then create closure
-      lua_pushstring(L_, entry.func_name.c_str());
-      lua_pushcclosure(L_, LuaCallHostFunction, 1);
-    } else {
-      PushLuaValue(L_, entry.value);
+  // Protected so the table build (M3) and the reads/writes on package.loaded
+  // can't abort; validation throws propagate out of RunProtected unchanged.
+  RunProtected([&]() {
+    PushProtectedGlobal("package");
+    lua_getfield(L_, -1, "loaded");
+    if (lua_isnil(L_, -1)) {
+      throw std::runtime_error(
+        "Cannot register module: package.loaded is not available.");
     }
-    lua_setfield(L_, -2, entry.key.c_str());
-  }
 
-  // package.loaded[name] = module_table
-  lua_setfield(L_, -2, name.c_str());
+    // Create the module table
+    lua_newtable(L_);
+
+    for (const auto& entry : entries) {
+      if (entry.is_function) {
+        // Push function name as upvalue, then create closure
+        lua_pushstring(L_, entry.func_name.c_str());
+        lua_pushcclosure(L_, LuaCallHostFunction, 1);
+      } else {
+        PushLuaValue(L_, entry.value);
+      }
+      lua_setfield(L_, -2, entry.key.c_str());
+    }
+
+    // package.loaded[name] = module_table
+    lua_setfield(L_, -2, name.c_str());
+  });
 }
 
 // --- Output redirection (E1) ---
@@ -942,16 +1018,19 @@ void LuaRuntime::SetOutputHandler(OutputHandler handler) {
 }
 
 void LuaRuntime::InstallOutputRedirection() {
-  StackGuard guard(L_);
-  // Override the global print().
-  lua_pushcfunction(L_, LuaPrint);
-  lua_setglobal(L_, "print");
-  // Override io.write() when the io library is loaded.
-  lua_getglobal(L_, "io");
-  if (lua_istable(L_, -1)) {
-    lua_pushcfunction(L_, LuaIoWrite);
-    lua_setfield(L_, -2, "write");
-  }
+  // Protected so a __newindex on a _G metatable at the print override can't
+  // panic (M3). Light C-function pushes don't allocate, so there's no OOM here.
+  RunProtected([&]() {
+    // Override the global print().
+    lua_pushcfunction(L_, LuaPrint);
+    lua_setglobal(L_, "print");
+    // Override io.write() when the io library is loaded.
+    lua_getglobal(L_, "io");
+    if (lua_istable(L_, -1)) {
+      lua_pushcfunction(L_, LuaIoWrite);
+      lua_setfield(L_, -2, "write");
+    }
+  });
 }
 
 int LuaRuntime::LuaPrint(lua_State* L) {
@@ -959,16 +1038,24 @@ int LuaRuntime::LuaPrint(lua_State* L) {
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
+  // Assemble the line with a Lua-side buffer so that if luaL_tolstring fires a
+  // raising __tostring, the longjmp skips no live C++ object (the std::string is
+  // only built afterward, from the finished Lua string) (M4).
   const int n = lua_gettop(L);
-  std::string out;
+  luaL_Buffer b;
+  luaL_buffinit(L, &b);
   for (int i = 1; i <= n; ++i) {
-    size_t len = 0;
-    const char* s = luaL_tolstring(L, i, &len);  // respects __tostring
-    if (i > 1) out += '\t';
-    out.append(s, len);
-    lua_pop(L, 1);  // pop the tolstring result
+    if (i > 1) luaL_addchar(&b, '\t');
+    luaL_tolstring(L, i, nullptr);  // respects __tostring; pushes the string
+    luaL_addvalue(&b);              // moves it into the buffer
   }
-  out += '\n';
+  luaL_addchar(&b, '\n');
+  luaL_pushresult(&b);              // finished line on top of the stack
+
+  size_t len = 0;
+  const char* s = lua_tolstring(L, -1, &len);
+  std::string out(s ? s : "", s ? len : 0);
+  lua_pop(L, 1);
 
   if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
     runtime->output_handler_(out);
@@ -987,14 +1074,21 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
+  // See LuaPrint: build the output through a Lua buffer so a raising __tostring
+  // can't longjmp over a live std::string (M4).
   const int n = lua_gettop(L);
-  std::string out;
+  luaL_Buffer b;
+  luaL_buffinit(L, &b);
   for (int i = 1; i <= n; ++i) {
-    size_t len = 0;
-    const char* s = luaL_tolstring(L, i, &len);
-    out.append(s, len);
-    lua_pop(L, 1);
+    luaL_tolstring(L, i, nullptr);
+    luaL_addvalue(&b);
   }
+  luaL_pushresult(&b);
+
+  size_t len = 0;
+  const char* s = lua_tolstring(L, -1, &len);
+  std::string out(s ? s : "", s ? len : 0);
+  lua_pop(L, 1);
 
   if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
     runtime->output_handler_(out);
@@ -1009,25 +1103,28 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
 void LuaRuntime::SetAllowBytecode(bool allow) {
   if (allow == allow_bytecode_) return;  // no transition: don't stack/unwrap wrappers
   allow_bytecode_ = allow;
-  StackGuard guard(L_);
-  if (!allow) {
-    // Wrap the global load() to force text-only mode (binary chunks rejected).
-    lua_getglobal(L_, "load");
-    if (lua_isfunction(L_, -1)) {
-      lua_pushcclosure(L_, SafeLoad, 1);  // upvalue 1 = original load
-      lua_setglobal(L_, "load");
-    }
-  } else {
-    // Re-enable: unwrap by restoring the original load() saved as SafeLoad's
-    // upvalue 1. Only touch load() if it is still our wrapper (a user may have
-    // replaced it in the meantime).
-    lua_getglobal(L_, "load");
-    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == SafeLoad) {
-      if (lua_getupvalue(L_, -1, 1)) {  // push the original load
-        lua_setglobal(L_, "load");      // restore it as the global load
+  // Protected so the closure allocation (M3) and a __newindex on a _G metatable
+  // at the load() reassignment throw rather than abort.
+  RunProtected([&]() {
+    if (!allow) {
+      // Wrap the global load() to force text-only mode (binary chunks rejected).
+      lua_getglobal(L_, "load");
+      if (lua_isfunction(L_, -1)) {
+        lua_pushcclosure(L_, SafeLoad, 1);  // upvalue 1 = original load
+        lua_setglobal(L_, "load");
+      }
+    } else {
+      // Re-enable: unwrap by restoring the original load() saved as SafeLoad's
+      // upvalue 1. Only touch load() if it is still our wrapper (a user may have
+      // replaced it in the meantime).
+      lua_getglobal(L_, "load");
+      if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == SafeLoad) {
+        if (lua_getupvalue(L_, -1, 1)) {  // push the original load
+          lua_setglobal(L_, "load");      // restore it as the global load
+        }
       }
     }
-  }
+  });
 }
 
 int LuaRuntime::SafeLoad(lua_State* L) {
@@ -1044,20 +1141,23 @@ int LuaRuntime::SafeLoad(lua_State* L) {
 // --- Dynamic require via a JS searcher (E2) ---
 
 void LuaRuntime::AddJsSearcher(const std::string& host_func_name) {
-  StackGuard guard(L_);
   if (!HasPackageLibrary()) {
     throw std::runtime_error(
       "Cannot add searcher: the 'package' library is not loaded.");
   }
-  lua_getglobal(L_, "package");
-  lua_getfield(L_, -1, "searchers");
-  if (!lua_istable(L_, -1)) {
-    throw std::runtime_error("package.searchers is not available");
-  }
-  const int len = static_cast<int>(luaL_len(L_, -1));
-  lua_pushstring(L_, host_func_name.c_str());
-  lua_pushcclosure(L_, JsSearcher, 1);  // upvalue 1 = host function name
-  lua_seti(L_, -2, len + 1);            // append to package.searchers
+  // Protected so the closure allocation (M3), the __len on package.searchers,
+  // and the append (__newindex) throw rather than abort.
+  RunProtected([&]() {
+    PushProtectedGlobal("package");
+    lua_getfield(L_, -1, "searchers");
+    if (!lua_istable(L_, -1)) {
+      throw std::runtime_error("package.searchers is not available");
+    }
+    const lua_Integer len = luaL_len(L_, -1);
+    lua_pushstring(L_, host_func_name.c_str());
+    lua_pushcclosure(L_, JsSearcher, 1);  // upvalue 1 = host function name
+    lua_seti(L_, -2, len + 1);            // append to package.searchers
+  });
 }
 
 int LuaRuntime::JsSearcher(lua_State* L) {
@@ -1280,12 +1380,21 @@ CompileResult LuaRuntime::CompileScript(const std::string& script,
   }
 
   std::vector<uint8_t> bytecode;
-  lua_dump(L_, [](lua_State*, const void* p, size_t sz, void* ud) -> int {
+  const int dump_status = lua_dump(L_, [](lua_State*, const void* p, size_t sz, void* ud) -> int {
     auto* bc = static_cast<std::vector<uint8_t>*>(ud);
     auto* bytes = static_cast<const uint8_t*>(p);
-    bc->insert(bc->end(), bytes, bytes + sz);
+    // A std::bad_alloc here must not unwind across lua_dump's C frame; trap it
+    // and report failure through the writer's status instead (M4).
+    try {
+      bc->insert(bc->end(), bytes, bytes + sz);
+    } catch (...) {
+      return 1;
+    }
     return 0;
   }, &bytecode, strip_debug ? 1 : 0);
+  if (dump_status != 0) {
+    return std::string("failed to serialize bytecode (out of memory?)");
+  }
 
   return bytecode;
 }
@@ -1304,12 +1413,19 @@ CompileResult LuaRuntime::CompileFile(const std::string& filepath,
   }
 
   std::vector<uint8_t> bytecode;
-  lua_dump(L_, [](lua_State*, const void* p, size_t sz, void* ud) -> int {
+  const int dump_status = lua_dump(L_, [](lua_State*, const void* p, size_t sz, void* ud) -> int {
     auto* bc = static_cast<std::vector<uint8_t>*>(ud);
     auto* bytes = static_cast<const uint8_t*>(p);
-    bc->insert(bc->end(), bytes, bytes + sz);
+    try {
+      bc->insert(bc->end(), bytes, bytes + sz);
+    } catch (...) {
+      return 1;
+    }
     return 0;
   }, &bytecode, strip_debug ? 1 : 0);
+  if (dump_status != 0) {
+    return std::string("failed to serialize bytecode (out of memory?)");
+  }
 
   return bytecode;
 }
@@ -1318,7 +1434,10 @@ CompileResult LuaRuntime::CompileFile(const std::string& filepath,
 // leaves structured JS-error tables (identified by __jsErrorId) untouched.
 int LuaRuntime::MessageHandler(lua_State* L) {
   if (lua_type(L, 1) == LUA_TTABLE) {
-    lua_getfield(L, 1, kJsErrorIdField);
+    // Raw probe (no __index): a metatabled error object with a raising __index
+    // must not turn this message handler into a nested error (LUA_ERRERR) (L1).
+    lua_pushstring(L, kJsErrorIdField);
+    lua_rawget(L, 1);
     const bool is_js_error = !lua_isnil(L, -1);
     lua_pop(L, 1);
     if (is_js_error) return 1;  // preserve the structured error object as-is
@@ -1415,7 +1534,16 @@ void LuaRuntime::RunProtected(const std::function<void()>& op) const {
 // ToLuaValue does only raw traversal, the "message" lookup uses lua_rawget (no
 // __index), and stringification goes through a protected __tostring trampoline.
 std::string LuaRuntime::CaptureError(lua_State* L) const {
-  last_error_value_ = ToLuaValue(L, -1);
+  try {
+    last_error_value_ = ToLuaValue(L, -1);
+  } catch (const std::exception&) {
+    // A pathological error object (nested past kMaxDepth, or a stack overflow
+    // while reading it) must not throw out of the error path — every execution
+    // path funnels its failures through here, and a throw would unwind across
+    // the N-API boundary and terminate the process (H1). Leave the structured
+    // value absent; LuaErrorToJsValue already falls back to the display string.
+    last_error_value_.reset();
+  }
   if (lua_type(L, -1) == LUA_TTABLE) {
     lua_pushstring(L, "message");
     lua_rawget(L, -2);  // raw: won't fire __index on a user error object
@@ -1620,8 +1748,16 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
   }
   lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
 
-  for (const auto& arg : args) {
-    PushLuaValue(L_, arg);
+  // PushLuaValue throws on depth/stack overflow; if it does, restore the stack
+  // and return a string error rather than letting the exception unwind out of
+  // this method (and, via the function-handle trampoline, past N-API) (H1).
+  try {
+    for (const auto& arg : args) {
+      PushLuaValue(L_, arg);
+    }
+  } catch (const std::exception& e) {
+    lua_settop(L_, stackBefore);
+    return std::string("Error converting argument to Lua function: ") + e.what();
   }
 
   if (ProtectedCall(static_cast<int>(args.size()), LUA_MULTRET) != LUA_OK) {
@@ -1843,7 +1979,28 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
           // Materialize a registered host function as a Lua closure (upvalue 1 =
           // the host function name), the same shape RegisterFunction installs.
           lua_pushlstring(L, v.name.c_str(), v.name.size());
-          lua_pushcclosure(L, LuaCallHostFunction, 1);
+          // If the name is reclaimable (an anonymous nested callback), attach a
+          // sentinel userdata as upvalue 2 whose __gc reclaims the registry
+          // entry once this closure is collected, and bump the live-closure
+          // count. LuaCallHostFunction only reads upvalue 1, so the extra
+          // upvalue is inert to the call path (M2).
+          bool reclaimable = false;
+          lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+          if (auto* rt = static_cast<LuaRuntime*>(lua_touserdata(L, -1))) {
+            lua_pop(L, 1);
+            auto it = rt->reclaimable_host_fns_.find(v.name);
+            if (it != rt->reclaimable_host_fns_.end()) {
+              reclaimable = true;
+              ++it->second;
+              auto** slot = static_cast<std::string**>(
+                  lua_newuserdatauv(L, sizeof(std::string*), 0));
+              *slot = new std::string(v.name);
+              luaL_setmetatable(L, kHostFnSentinelMeta);
+            }
+          } else {
+            lua_pop(L, 1);
+          }
+          lua_pushcclosure(L, LuaCallHostFunction, reclaimable ? 2 : 1);
         }
       },
       value->value);
@@ -1935,12 +2092,12 @@ std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
   return keys;
 }
 
-int LuaRuntime::GetTableLength(int registry_ref) const {
+int64_t LuaRuntime::GetTableLength(int registry_ref) const {
   StackGuard guard(L_);
   lua_pushcfunction(L_, ProtectedTableLen);
   lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
   ProtectedTableCall(1, 1);                          // -> len (may trigger __len)
-  return static_cast<int>(lua_tointeger(L_, -1));
+  return static_cast<int64_t>(lua_tointeger(L_, -1));
 }
 
 // --- Table reference API ---
@@ -2077,27 +2234,32 @@ std::vector<std::pair<int64_t, LuaPtr>> LuaRuntime::TableIPairs(int registry_ref
 
 void LuaRuntime::ReleaseTableRef(int registry_ref) {
   if (registry_ref != LUA_NOREF && registry_ref != LUA_REFNIL) {
-    luaL_unref(L_, LUA_REGISTRYINDEX, registry_ref);
+    // Route through the deferral queue so a caller invoking this while a worker
+    // owns the state doesn't mutate the registry concurrently (H9c) (L5).
+    UnrefOrDefer(registry_ref);
   }
 }
 
 // --- Coroutine support ---
 
 std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFunctionRef& funcRef) const {
-  StackGuard guard(L_);
-
-  // Create a new Lua thread (coroutine)
-  lua_State* thread = lua_newthread(L_);
+  // Build and anchor the thread inside a protected frame so an OOM under
+  // maxMemory in lua_newthread/luaL_ref throws instead of aborting (M3).
+  lua_State* thread = nullptr;
+  int threadRef = LUA_NOREF;
+  try {
+    RunProtected([&]() {
+      thread = lua_newthread(L_);                     // [thread]
+      threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);    // anchors it (pops thread)
+      lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);  // push the function
+      lua_xmove(L_, thread, 1);                        // move it onto the thread
+    });
+  } catch (const std::exception& e) {
+    return std::string(e.what());
+  }
   if (!thread) {
     return std::string("Failed to create coroutine thread");
   }
-
-  // Store the thread in the registry to prevent GC (pops thread from stack)
-  const int threadRef = luaL_ref(L_, LUA_REGISTRYINDEX);
-
-  // Push the function onto the new thread's stack
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
-  lua_xmove(L_, thread, 1);
 
   return LuaThreadRef(threadRef, L_, thread);
 }
