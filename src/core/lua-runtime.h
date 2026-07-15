@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,14 @@ using LuaTable = std::unordered_map<std::string, LuaPtr>;
 using TableKey = std::variant<std::string, int64_t, double>;
 
 namespace detail {
+// Unrefs `ref` from mainL's registry, unless a worker thread is mid-run on that
+// state — in which case it defers the unref to a queue drained after the worker
+// finishes (H9c). Defined in lua-runtime.cpp, where LuaRuntime is complete; the
+// runtime is resolved from mainL's extra space (set in InitState), so this reads
+// no registry and takes no Lua lock. Always runs on the main (JS) thread at GC /
+// value-destruction time.
+void UnrefRegistrySlot(lua_State* mainL, int ref);
+
 // Produces a shared owner whose deleter unrefs `ref` from the registry when the
 // last copy is destroyed. Returns null for the no-op refs (LUA_NOREF/LUA_REFNIL)
 // so those never touch the registry.
@@ -48,7 +57,7 @@ inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   lua_pop(L, 1);
   if (!mainL) mainL = L;  // defensive: LUA_RIDX_MAINTHREAD is always populated
   return std::shared_ptr<void>(nullptr, [mainL, ref](void*) {
-    luaL_unref(mainL, LUA_REGISTRYINDEX, ref);
+    UnrefRegistrySlot(mainL, ref);
   });
 }
 }  // namespace detail
@@ -305,6 +314,10 @@ public:
       const std::vector<LuaPtr>& args, bool arg_is_error);
   void SetAwaitDriverMode(bool enabled);
   [[nodiscard]] bool IsAwaitDriverMode() const;
+  // Records (or clears, with nullptr) the coroutine thread execute_async drives,
+  // so the host-call bridge can tell a top-level await from one attempted inside
+  // a user coroutine (M1).
+  void SetAwaitDriverThread(lua_State* thread);
   void RequestAwaitYield();
   void RequestCancel();
   [[nodiscard]] bool IsCancelRequested() const;
@@ -316,6 +329,16 @@ public:
 
   void SetAsyncMode(bool enabled);
   bool IsAsyncMode() const;
+
+  // Worker-thread registry-unref deferral (H9c). A worker (execute_script_async
+  // / execute_file_async) runs Lua off-thread; a GC finalizer freeing a registry
+  // slot on the main thread meanwhile would mutate the registry concurrently.
+  // Begin/End bracket the worker run; between them, main-thread unrefs are queued
+  // and drained (on the main state) by End. UnrefOrDefer is the queue-or-unref
+  // entry point the registry-owner deleter routes through.
+  void BeginWorkerUnrefDeferral();
+  void EndWorkerUnrefDeferral();
+  void UnrefOrDefer(int ref);
   // Metatable support
   void StoreHostFunction(const std::string& name, Function fn);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
@@ -446,6 +469,16 @@ private:
   // coroutine driver (execute_async) uses await_driver_mode_, not this flag.
   std::atomic<bool> async_mode_{false};
 
+  // H9c: guards the registry-unref deferral queue. worker_active_ is true only
+  // between BeginWorkerUnrefDeferral / EndWorkerUnrefDeferral (a worker run).
+  // Every registry unref (finalizer path and the End drain) and every flag flip
+  // happens under this mutex, so no two luaL_unref calls — and no unref and the
+  // worker's own registry mutation — race. Accessed from the main thread
+  // (finalizers) and the worker thread (Begin/End).
+  std::mutex deferred_unref_mutex_;
+  bool worker_active_ = false;
+  std::vector<int> deferred_unrefs_;
+
   // Error fidelity state (mutable: set while capturing errors in const methods)
   mutable LuaPtr last_error_value_;     // structured value of the last error
   LuaPtr pending_error_value_;          // staged by a host wrapper to be raised
@@ -458,6 +491,11 @@ private:
   bool await_driver_mode_ = false;  // true while execute_async is driving
   bool await_pending_ = false;      // set by a host call that returned a promise
   bool await_is_error_ = false;     // next resume delivers a rejection to raise
+  // The specific coroutine thread execute_async drives. A host call that returns
+  // a Promise may only suspend when it runs on THIS thread; awaiting from inside
+  // a user-created coroutine would yield the wrong state, so the bridge raises
+  // instead (M1). nullptr when not driving.
+  lua_State* await_driver_thread_ = nullptr;
   // execute_async was cancelled; also polled by the instruction count-hook so a
   // compute-bound loop can be aborted. Atomic because a worker-thread run reads
   // it (in the hook) while the JS thread may set it via cancel().

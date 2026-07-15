@@ -8,17 +8,24 @@
 
 // --- Built-in JS type conversion helpers (JS -> Lua) ---
 
-// Defines a non-enumerable, non-writable-safe marker property on an object
-// (used to tag class instances so they round-trip back to Lua userdata).
+// Defines a non-enumerable, non-configurable marker property on an object.
+// `configurable: false` blocks `delete obj[key]`, which for a lifetime-owner
+// property (an External whose finalizer frees a *Data still referenced by a
+// bound C function) would otherwise let JS free the data out from under the
+// binding — `delete fn.__luaFnOwner; gc(); fn()` (L6). When `writable` is false
+// the value also can't be reassigned (closing the `fn.__luaFnOwner = null`
+// vector); pass `writable = true` for identity markers that may be re-tagged
+// (e.g. a construct() that returns a pooled object gets a fresh __luaClassRef).
 static void DefineHiddenProp(Napi::Env env, Napi::Object obj,
-                             const char* key, Napi::Value value) {
+                             const char* key, Napi::Value value,
+                             bool writable = true) {
   auto Object = env.Global().Get("Object").As<Napi::Object>();
   auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
   Napi::Object desc = Napi::Object::New(env);
   desc.Set("value", value);
   desc.Set("enumerable", Napi::Boolean::New(env, false));
-  desc.Set("configurable", Napi::Boolean::New(env, true));
-  desc.Set("writable", Napi::Boolean::New(env, true));
+  desc.Set("configurable", Napi::Boolean::New(env, false));
+  desc.Set("writable", Napi::Boolean::New(env, writable));
   defineProperty.Call({obj, Napi::String::New(env, key), desc});
 }
 
@@ -154,6 +161,12 @@ static Napi::Value TableRefGetTrap(const Napi::CallbackInfo& info) {
   if (key == "then") return env.Undefined();
 
   try {
+    // A __index metamethod reached here can call a JS host function that throws,
+    // which stages a js_error_registry_ entry. This trap raises a plain string
+    // (the structured value is stringified by ProtectedTableCall), so nothing
+    // consumes that entry by id. The CallScope clears the registry at the
+    // outermost access so such entries can't accumulate across trap calls (L7).
+    LuaContext::CallScope scope(data->context);
     auto result = data->runtime->GetTableField(data->tableRef.ref, key);
     return data->context->CoreToNapi(*result);
   } catch (const std::exception& e) {
@@ -175,6 +188,9 @@ static Napi::Value TableRefSetTrap(const Napi::CallbackInfo& info) {
   std::string key = prop.As<Napi::String>().Utf8Value();
 
   try {
+    // See TableRefGetTrap: clear the registry at the outermost access so a
+    // staged entry from a raising __newindex host callback can't accumulate (L7).
+    LuaContext::CallScope scope(data->context);
     auto coreValue = std::make_shared<lua_core::LuaValue>(
       data->context->NapiToCoreInstance(value));
     data->runtime->SetTableField(data->tableRef.ref, key, coreValue);
@@ -1353,6 +1369,12 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     bool readable, bool writable) {
   return [this, name, class_name, readable, writable](
       const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    // Bound the N-API handles created below (arg conversions, the constructed
+    // instance, the hidden-prop temporaries) to this call. Without a scope,
+    // `for i=1,1e6 do MyClass() end` would pile every iteration's handles into
+    // the outer entry scope until the whole Lua execution returns (M11). Nothing
+    // needs to escape: the instance survives via the Napi::Persistent below.
+    Napi::HandleScope scope(env);
     auto cbIt = js_callbacks_.find(name);
     if (cbIt == js_callbacks_.end()) {
       throw std::runtime_error(
@@ -1443,6 +1465,9 @@ Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
 }
 
 void LuaContext::ClearBusy() {
+  // Worker teardown (OnOK/OnError). Clear any cancel signalled during the run so
+  // a cancelled worker doesn't leave the flag set to abort the next run (L8).
+  runtime->ClearCancel();
   is_busy_ = false;
 }
 
@@ -1524,6 +1549,9 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
   runtime->ClearCancel();
   runtime->SetAwaitDriverMode(true);
   async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
+  // Tell the core which thread is the driver so a promise awaited from inside a
+  // user coroutine is rejected rather than yielding the wrong state (M1).
+  runtime->SetAwaitDriverThread(async_co_->thread);
   async_deferred_.emplace(Napi::Promise::Deferred::New(env));
   // Root the wrapping JS object for the run's duration: while the coroutine is
   // suspended awaiting a promise, the settlement callbacks hold only a raw
@@ -1537,11 +1565,18 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
 }
 
 // Data passed to the await-settlement callbacks: the context plus the generation
-// of the execute_async run that attached them (see async_generation_).
+// of the execute_async run that attached them (see async_generation_). `settled`
+// makes a second invocation a no-op — a spec-violating Promise whose `then`
+// fires both callbacks, or the same one twice, must not re-enter the resume
+// logic (L5). The cookie is never freed by the callbacks; its lifetime is owned
+// by an Napi::External finalizer rooted on both callback functions, so it stays
+// valid for any late/duplicate settlement and is reclaimed only when the promise
+// (and thus the callbacks) is collected.
 namespace {
 struct AwaitCookie {
   LuaContext* ctx;
   uint64_t gen;
+  bool settled;
 };
 }  // namespace
 
@@ -1575,14 +1610,21 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
       return;
     }
     // Attach continuation callbacks to the pending promise. The callbacks carry
-    // a heap cookie tagged with this run's generation; whichever of
-    // resolve/reject fires deletes it (a promise settles at most once).
+    // a heap cookie tagged with this run's generation. The cookie's lifetime is
+    // owned by an External finalizer (not by the callbacks), and that External is
+    // rooted as a hidden prop on BOTH callbacks — so the cookie outlives any
+    // duplicate/late settlement from a misbehaving promise and is freed only when
+    // the promise and its callbacks are garbage-collected (L5).
     Napi::Object promise = async_pending_promise_.Value();
     async_pending_promise_.Reset();
     auto thenFn = promise.Get("then").As<Napi::Function>();
-    auto* cookie = new AwaitCookie{this, async_generation_};
+    auto* cookie = new AwaitCookie{this, async_generation_, false};
     auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", cookie);
     auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", cookie);
+    auto cookieOwner = Napi::External<AwaitCookie>::New(env, cookie,
+      [](Napi::Env, AwaitCookie* c) { delete c; });
+    DefineHiddenProp(env, onResolve, "__cookie", cookieOwner);
+    DefineHiddenProp(env, onReject, "__cookie", cookieOwner);
     thenFn.Call(promise, {onResolve, onReject});
     return;
   }
@@ -1619,14 +1661,10 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
 Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen) {
   // Ignore a settlement from a run that has already ended or been superseded
   // (e.g. a promise from a cancelled run resolving after a new run has started).
+  // A cancel() while suspended awaiting a promise tears the run down immediately
+  // in Cancel() (clearing async_co_), so a pending cancel is never observed here
+  // — the generation/liveness guard above already discards the late settlement.
   if (!async_co_ || !async_deferred_ || gen != async_generation_) {
-    return env.Undefined();
-  }
-
-  if (runtime->IsCancelRequested()) {
-    auto deferred = *async_deferred_;
-    FinishAsync();
-    deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
     return env.Undefined();
   }
 
@@ -1666,6 +1704,7 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
 
 void LuaContext::FinishAsync() {
   runtime->SetAwaitDriverMode(false);
+  runtime->SetAwaitDriverThread(nullptr);
   runtime->ClearCancel();
   if (async_co_) {
     async_co_->release();
@@ -1680,18 +1719,21 @@ void LuaContext::FinishAsync() {
 
 Napi::Value LuaContext::OnAwaitResolveStatic(const Napi::CallbackInfo& info) {
   auto* cookie = static_cast<AwaitCookie*>(info.Data());
-  LuaContext* ctx = cookie->ctx;
-  const uint64_t gen = cookie->gen;
-  delete cookie;  // one settlement per promise; the sibling callback never fires
-  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), false, gen);
+  // Ignore a duplicate settlement (hostile/broken promise firing twice). The
+  // cookie is owned by the External finalizer, never freed here, so reading the
+  // flag is always safe (L5).
+  if (cookie->settled) return info.Env().Undefined();
+  cookie->settled = true;
+  return cookie->ctx->OnAwaitSettled(
+    info.Length() > 0 ? info[0] : info.Env().Undefined(), false, cookie->gen);
 }
 
 Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
   auto* cookie = static_cast<AwaitCookie*>(info.Data());
-  LuaContext* ctx = cookie->ctx;
-  const uint64_t gen = cookie->gen;
-  delete cookie;
-  return ctx->OnAwaitSettled(info.Length() > 0 ? info[0] : info.Env().Undefined(), true, gen);
+  if (cookie->settled) return info.Env().Undefined();
+  cookie->settled = true;
+  return cookie->ctx->OnAwaitSettled(
+    info.Length() > 0 ? info[0] : info.Env().Undefined(), true, cookie->gen);
 }
 
 Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
@@ -1710,6 +1752,14 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
     auto deferred = *async_deferred_;
     FinishAsync();
     deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
+  } else if (is_busy_) {
+    // A worker-thread run (execute_script_async / execute_file_async) is in
+    // flight. It executes Lua synchronously off-thread, so it can only be
+    // interrupted cooperatively: signal the runtime and let the instruction
+    // count-hook (polls IsCancelRequested) abort the VM at the next check. This
+    // therefore only takes effect when maxInstructions is set — the hook exists
+    // only then. The worker's OnOK/OnError clears the flag via ClearBusy (L8).
+    runtime->RequestCancel();
   }
   return env.Undefined();
 }
@@ -2092,9 +2142,13 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           auto* dataPtr = new LuaFunctionData(runtime, v, this, alive_);
           Napi::Function fn =
             Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
+          // Non-writable + non-configurable: this External's finalizer owns the
+          // LuaFunctionData that `fn` still calls through, so it must not be
+          // deletable or reassignable from JS (L6).
           DefineHiddenProp(env, fn, "__luaFnOwner",
             Napi::External<LuaFunctionData>::New(env, dataPtr,
-              [](Napi::Env, LuaFunctionData* d) { delete d; }));
+              [](Napi::Env, LuaFunctionData* d) { delete d; }),
+            /*writable=*/false);
           return fn;
         } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
           // Return a coroutine object with the thread reference (data owned by the
@@ -2211,6 +2265,10 @@ Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
 
 Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  // Clear the JS-error registry at the outermost entry so a staged error from a
+  // prior resume (whose JS callback threw) can't accumulate — resume otherwise
+  // has no CallScope and never consumes by id (L7).
+  CallScope scope(this);
   if (info.Length() < 1 || !info[0].IsObject()) {
     Napi::TypeError::New(env, "Expected a coroutine object as first argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -2278,6 +2336,11 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
 
   // Set error if present
   if (result.error.has_value()) {
+    // Consume any staged fidelity state (the js_error_registry_ entry and
+    // last_error_value_) so it doesn't linger after this resume (L7). The
+    // coroutine API surfaces the error as a string, so the reconstructed Error
+    // object LuaErrorToJsValue returns is intentionally discarded.
+    (void)LuaErrorToJsValue(result.error.value());
     resultObj.Set("error", Napi::String::New(env, result.error.value()));
   }
 

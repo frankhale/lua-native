@@ -29,9 +29,13 @@ public:
       deferred_(deferred) {}
 
   void Execute() override {
+    // Defer main-thread registry unrefs (GC finalizers) for the duration of the
+    // off-thread run so they can't mutate the registry concurrently (H9c).
+    runtime_->BeginWorkerUnrefDeferral();
     runtime_->SetAsyncMode(true);
     result_ = runtime_->ExecuteScript(script_);
     runtime_->SetAsyncMode(false);
+    runtime_->EndWorkerUnrefDeferral();
   }
 
   void OnOK() override;
@@ -62,9 +66,13 @@ public:
       deferred_(deferred) {}
 
   void Execute() override {
+    // See LuaScriptAsyncWorker::Execute — defer main-thread registry unrefs for
+    // the off-thread run (H9c).
+    runtime_->BeginWorkerUnrefDeferral();
     runtime_->SetAsyncMode(true);
     result_ = runtime_->ExecuteFile(filepath_);
     runtime_->SetAsyncMode(false);
+    runtime_->EndWorkerUnrefDeferral();
   }
 
   void OnOK() override;

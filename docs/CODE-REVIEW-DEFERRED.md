@@ -107,106 +107,127 @@ deliberately documented rather than changed:
   instance is deep-copied rather than aliased, and same-context round-trip still
   works).
 
-### Deliberately deferred (documented, not changed)
+### Formerly deferred — now resolved
 
-#### H9c — finalizer `luaL_unref` racing a worker run *(high)*
-- An N-API finalizer running `luaL_unref` on the main thread at GC time can
-  mutate the Lua registry **concurrently** with a `execute_script_async` /
-  `execute_file_async` worker executing on a libuv thread → heap corruption.
-- **Reason deferred:** the trigger is narrow (V8 GC collecting a wrapper *during*
-  a multi-second worker run). The worker-thread async model is already the
-  lower-capability path (no JS callbacks); `execute_async` (coroutine-driven,
-  main-thread) is preferred.
-- **Fix shape:** a deferred-unref queue drained on the main thread after the
-  worker completes (or on the next main-thread entry).
+#### H9c — finalizer `luaL_unref` racing a worker run *(high)* — ✅ RESOLVED
+- **Original gap:** an N-API finalizer running `luaL_unref` on the main thread at
+  GC time could mutate the Lua registry **concurrently** with a
+  `execute_script_async` / `execute_file_async` worker executing on a libuv
+  thread → heap corruption.
+- **Resolution:** a deferred-unref queue guarded by a mutex (`src/core`). The
+  worker brackets its off-thread run with
+  `BeginWorkerUnrefDeferral` / `EndWorkerUnrefDeferral`; while a worker is active,
+  the registry-owner deleter routes through `LuaRuntime::UnrefOrDefer`, which
+  *queues* the ref instead of unref'ing. `EndWorkerUnrefDeferral` drains the
+  queue on the main state under the mutex after the worker finishes touching Lua.
+  Every `luaL_unref` (finalizer path and drain) and every flag flip happens under
+  the one mutex, so no two unrefs — and no unref and the worker's own registry
+  mutation — race. The deleter resolves the runtime from the main state's
+  **extra space** (`lua_getextraspace`, set in `InitState`), so it reads no
+  registry and takes no Lua lock. C++ tests: `LuaRuntimeWorkerUnref.*`.
 
-#### M1 — awaiting a JS promise from inside a *user* coroutine *(medium)*
-- Under `execute_async`, `await`-ing a JS promise from inside a user-created
-  coroutine (`coroutine.create(...)` + `coroutine.resume`) yields to the wrong
-  resumer: it suspends the innermost coroutine, the script's `resume` returns
-  immediately with no values, and when the promise settles the binding resumes
-  the *driver* thread — the value is delivered to the wrong frame (compounding
-  M2 if the driver has finished).
-- **Reason deferred:** correctness-of-a-niche-usage item.
-- **Fix shape:** a core guard that refuses to yield when the yielding state
-  isn't the driver thread (raise "cannot await inside a user coroutine"), or
-  document the feature as top-level-only.
+#### M1 — awaiting a JS promise from inside a *user* coroutine *(medium)* — ✅ RESOLVED
+- **Original gap:** under `execute_async`, `await`-ing a JS promise from inside a
+  user-created coroutine yielded the wrong thread and delivered the settled value
+  to the driver frame.
+- **Resolution:** the core records the driver coroutine thread
+  (`SetAwaitDriverThread`, set in `ExecuteAsync`, cleared in `FinishAsync`). The
+  host-call bridge and the method bridge (`LuaCallHostFunction` / the userdata
+  method dispatch) now compare the running `lua_State` against the driver thread
+  before suspending; a promise awaited from a non-driver thread raises
+  `"cannot await a JS Promise inside a coroutine … await only at the top level of
+  execute_async"` instead of yielding. TS tests: the two `M1:` cases (rejects
+  inside a user coroutine; top-level await still works).
 
-#### L5 — hostile `Promise` subclass double-firing the await callbacks *(low)*
-- A spec-violating `Promise` subclass whose `then` invokes callbacks twice
-  causes read-after-free of the `AwaitCookie` (freed on first settlement). A
-  never-settling promise leaks it (minor).
-- **Reason deferred:** low risk; requires deliberately malformed input.
-- **Fix shape:** a settled flag inside the cookie, or a finalizer-owned cookie.
+#### L5 — hostile `Promise` subclass double-firing the await callbacks *(low)* — ✅ RESOLVED
+- **Original gap:** a spec-violating `Promise` whose `then` invoked the callbacks
+  twice caused a read-after-free of the `AwaitCookie` (freed on first
+  settlement); a never-settling promise leaked it.
+- **Resolution:** the cookie carries a `settled` flag (a second invocation is a
+  no-op) and is no longer freed by the callbacks. Its lifetime is owned by an
+  `Napi::External` finalizer rooted as a hidden prop on **both** callback
+  functions, so it stays valid for any late/duplicate settlement and is reclaimed
+  only when the promise (and its callbacks) is garbage-collected — which also
+  fixes the never-settling leak. TS test: the `L5:` double-firing case.
 
-#### L6 — hidden owner properties are `configurable` / deletable from JS *(low)*
-- The hidden `__luaFnOwner` (and similar) owner properties are `configurable`,
-  so `delete fn.__luaFnOwner; gc(); fn()` frees the `*Data` while bound
-  functions still hold the raw pointer.
-- **Reason deferred:** deliberate misuse required.
-- **Fix shape:** define the owner props with `configurable: false`.
+#### L6 — hidden owner properties are `configurable` / deletable from JS *(low)* — ✅ RESOLVED
+- **Original gap:** the hidden `__luaFnOwner` owner property was `configurable`
+  and `writable`, so `delete fn.__luaFnOwner; gc(); fn()` (or reassigning it)
+  freed the `LuaFunctionData` the bound C function still calls through.
+- **Resolution:** `DefineHiddenProp` now defines all hidden markers
+  `configurable: false` (blocks `delete`), and `__luaFnOwner` — the only true
+  lifetime owner — additionally `writable: false` (blocks reassignment). Identity
+  markers that may legitimately be re-tagged (a `construct()` returning a pooled
+  object gets a fresh `__luaClassRef`) stay `writable: true`, so re-tagging
+  doesn't throw. TS tests: the two `L6:` cases.
 
-#### L7 — `js_error_registry_` accumulation on non-`CallScope` paths *(low)*
-- Staged JS errors on paths without a `CallScope` (coroutine resume, table
-  traps) are neither consumed (error fidelity silently absent) nor cleared until
-  an unrelated guarded call runs.
-- **Reason deferred:** low severity.
+#### L7 — `js_error_registry_` accumulation on non-`CallScope` paths *(low)* — ✅ RESOLVED
+- **Original gap:** JS errors staged on paths without a `CallScope` (coroutine
+  resume, table traps) were neither consumed nor cleared until an unrelated
+  guarded call ran.
+- **Resolution:** `LuaContext::ResumeCoroutine` now runs under a `CallScope` and
+  consumes the staged fidelity state (registry entry + `last_error_value_`) via
+  `LuaErrorToJsValue` on the error path (the string API is preserved; the
+  reconstructed Error is discarded). The `TableRefGetTrap` / `TableRefSetTrap`
+  Proxy traps scope their field operation under a `CallScope` so a staged entry
+  from a raising `__index`/`__newindex` host callback is cleared at the outermost
+  access instead of accumulating.
 
-#### L8 — `cancel()` is a no-op for worker-thread async *(low)* — ⚠️ PARTIALLY RESOLVED
-- Nothing ever calls `RequestCancel()`; worker-thread runs
-  (`execute_script_async` / `execute_file_async`) cannot be interrupted at all,
-  and the `IsCancelRequested` branch in `OnAwaitSettled` is dead code.
-- **Progress:** the `lua_sethook` count-hook this item depended on (gap **A3b**)
-  now exists — see the **Execution Time Limits** entry below. The hook polls
-  `IsCancelRequested()`, so a compute-bound loop is now cooperatively
-  interruptible *once a cancel is signalled*.
-- **Still open:** the worker-thread `cancel()` path does not yet call
-  `RequestCancel()`, so worker runs still can't actually be cancelled. Wiring
-  that single call (plus removing the dead `OnAwaitSettled` branch, or making it
-  live) completes A3b.
+#### L8 — `cancel()` is a no-op for worker-thread async *(low)* — ✅ RESOLVED
+- **Original gap:** nothing called `RequestCancel()` for worker-thread runs, and
+  the `IsCancelRequested` branch in `OnAwaitSettled` was dead code.
+- **Resolution:** `cancel()` now calls `runtime->RequestCancel()` when a
+  worker-thread run is in flight; the instruction count-hook (gap **A3b**, see
+  below) polls `IsCancelRequested()` and aborts the VM loop, so a compute-bound
+  worker run is cooperatively interruptible when `maxInstructions` is set (the
+  hook exists only then). `ClearBusy` clears the flag on worker teardown so a
+  cancelled run can't pre-abort the next one. The unreachable `OnAwaitSettled`
+  cancel branch was removed (a cancel while suspended awaiting a promise tears the
+  run down in `Cancel()`; worker and coroutine async are mutually exclusive, so
+  the branch could never fire). TS test: the `L8:` worker-cancel case.
 
-#### M11 — no `HandleScope` in Lua→JS reentrant callbacks *(medium)*
-- Every `CoreToNapi` result / `Call` return created during a long script run
-  accumulates in the outer N-API entry's scope (e.g. `for i=1,1e7 do cb(i) end`
-  holds tens of millions of handles until the call returns).
-- **Reason deferred:** left as-is per low practical severity in the residuals
-  triage. *(Note: M10 in CODE-REVIEW-2 added `HandleScope` to the host-callback
-  wrapper, property getter/setter, and print handler; M11's remaining reentrant
-  sites were not all wrapped.)*
-- **Fix shape:** wrap each callback body in `Napi::HandleScope`, escaping values
-  that must survive.
+#### M11 — no `HandleScope` in Lua→JS reentrant callbacks *(medium)* — ✅ RESOLVED
+- **Original gap:** handles created in reentrant Lua→JS callbacks accumulated in
+  the outer N-API entry scope (e.g. `for i=1,1e6 do MyClass() end`).
+- **Resolution:** the one remaining unbounded reentrant site,
+  `CreateConstructorWrapper`, now opens a `Napi::HandleScope` at the top of its
+  lambda (mirroring the M10 placement in `CreateJsCallbackWrapper`). Nothing needs
+  escaping — the constructed instance survives via its `Napi::Persistent`. Every
+  other Lua-invoked callback either was already scoped in M10 or routes through
+  the scoped `CreateJsCallbackWrapper`; the Proxy traps / table-handle methods are
+  JS→Lua boundaries that already get an automatic N-API scope. TS smoke test: the
+  `M11:` 5,000-instance construction loop.
 
-#### M12 — stale staged searcher error mis-raised by a later failure *(medium)*
-- When a JS searcher throws, the wrapper stages `pending_error_value_` but
-  `JsSearcher`'s catch raises its own string without consuming it. The stale
-  structured error survives until the next wrapper error that doesn't stage, at
-  which point the **old** error object is raised.
-- **Reason deferred:** left as-is per the residuals triage.
-- **Fix shape:** clear or consume the staged value on the searcher error path.
+#### M12 — stale staged searcher error mis-raised by a later failure *(medium)* — ✅ RESOLVED
+- **Original gap:** when a JS searcher threw, the wrapper staged
+  `pending_error_value_` but `JsSearcher`'s catch raised its own string without
+  consuming it; the stale structured error survived and was mis-raised by the
+  next host call that didn't stage.
+- **Resolution:** `JsSearcher` now discards any staged `pending_error_value_` on
+  its raise path (`TakePendingErrorValue`) before `lua_error`, so a searcher
+  failure can't leak a structured error into a later, unrelated raise. TS test:
+  the `M12:` stale-searcher-error case.
 
-#### Stored-`env` documentation *(low, from M11/M12 grouping)*
-- The `LuaContext::env` stored-member documentation items (see CODE-REVIEW-1
-  M12) were left as-is.
+#### Stored-`env` documentation *(low, from M11/M12 grouping)* — ✅ RESOLVED
+- The `LuaContext::env` stored-member is documented at its declaration
+  (`src/lua-native.h`): it is captured at construction and safe to reuse from
+  later instance methods (same JS thread, ObjectWrap lifetime) but must not be
+  used from a worker thread — the async workers take their `env` from the
+  `AsyncWorker` instead.
 
 ---
 
 ## Suggested order for a future hardening pass
 
-1. **M5 remainder** — the trapped-`_G` half (M4) is now resolved; what remains is
-   the OOM half: route the still-unprotected *allocating* sites through protected
+Every finding from CODE-REVIEW-1 and CODE-REVIEW-2 is now resolved except the
+**M5 remainder** below.
+
+1. **M5 remainder** — the trapped-`_G` half (M4) is resolved; what remains is the
+   OOM half: route the still-unprotected *allocating* sites through protected
    shims — `CreateTableFrom` (`lua_newtable`), the `luaL_ref` sites, and the
    closure/string allocations in `RegisterFunction` (`lua_pushstring` /
    `lua_pushcclosure`) that still run outside the protected frame. Closes the last
    panic/abort surface from ordinary API usage under `maxMemory`.
-2. **M12** — consume/clear the staged searcher error (one-site correctness fix).
-3. **M1** — user-coroutine await guard. *(M6's `__luaClassRef` identity check is
-   now resolved — see above.)*
-4. **H9c** — deferred-unref queue for the worker-thread async path (or continue
-   steering users to `execute_async`).
-5. **M11** — `HandleScope` coverage on the remaining reentrant callback sites.
-6. **L5–L8, L6, stored-env docs, M9/M10/L1 cleanups** — polish, done
-   opportunistically. L8's A3b hook now exists (see below); only the
-   worker-`cancel()` → `RequestCancel()` wiring remains.
 
 ---
 

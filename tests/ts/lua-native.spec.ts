@@ -4641,4 +4641,131 @@ describe('lua-native Node adapter', () => {
       t.release();
     });
   });
+
+  // ============================================
+  // DEFERRED-REVIEW FINDINGS (CODE-REVIEW-DEFERRED.md)
+  // ============================================
+  describe('deferred-review regressions', () => {
+    it('L6: the hidden __luaFnOwner on a returned Lua function cannot be deleted or reassigned', () => {
+      const lua = new lua_native.init({}, { libraries: 'safe' });
+      const fn: any = lua.execute_script('return function(a, b) return a + b end');
+      // Non-configurable: delete throws in strict mode (this file is an ES module).
+      expect(() => { delete fn.__luaFnOwner; }).toThrow();
+      // Non-writable: reassigning throws too — neither vector can free the
+      // backing data out from under the still-callable function.
+      expect(() => { fn.__luaFnOwner = null; }).toThrow();
+      // The function still works and the owner is intact.
+      expect(fn(2, 3)).toBe(5);
+    });
+
+    it('L6: a class instance marker cannot be deleted but re-tagging (pooled object) still works', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'all' });
+      const pooled = { x: 1 };
+      lua.register_class('Pool', {
+        construct: () => pooled, // returns the SAME object every time
+        readable: true,
+      });
+      const a = lua.execute_script('return Pool.new()');
+      // Marker is non-configurable (delete throws) ...
+      expect(() => { delete a.__luaClassRef; }).toThrow();
+      // ... but re-tagging the pooled object with a fresh ref must still succeed
+      // (writable:true), not throw a "redefine non-configurable" error.
+      expect(() => lua.execute_script('return Pool.new()')).not.toThrow();
+    });
+
+    it('M1: awaiting a JS promise inside a user coroutine is rejected, not silently mis-resumed', async () => {
+      const lua: any = new lua_native.init(
+        { fetchThing: async () => 42 },
+        { libraries: 'all' }
+      );
+      // The await happens inside a coroutine.create'd thread — not the driver.
+      await expect(lua.execute_async(`
+        local co = coroutine.create(function() return fetchThing() end)
+        local ok, err = coroutine.resume(co)
+        if not ok then error(err) end
+        return err
+      `)).rejects.toThrow(/inside a coroutine/);
+      // Context is not wedged.
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1')).toBe(1);
+    });
+
+    it('M1: a top-level await still works (guard does not break the normal path)', async () => {
+      const lua = new lua_native.init(
+        { fetchThing: async () => 42 },
+        { libraries: 'all' }
+      );
+      expect(await lua.execute_async('return fetchThing() + 1')).toBe(43);
+    });
+
+    it('M12: a thrown JS searcher does not leave a stale error to be mis-raised by a later host call', () => {
+      const lua: any = new lua_native.init(
+        { boom: () => { throw new Error('later unrelated failure'); } },
+        { libraries: 'all' }
+      );
+      lua.add_searcher(() => { throw new Error('searcher exploded'); });
+      // First: a require whose searcher throws.
+      expect(() => lua.execute_script("require('anything')")).toThrow(/searcher/);
+      // Then: an unrelated host call throws WITHOUT staging a structured error.
+      // It must surface ITS OWN message, not the stale searcher error.
+      let caught: any;
+      try { lua.execute_script('boom()'); } catch (e) { caught = e; }
+      expect(caught?.message).toContain('later unrelated failure');
+      expect(caught?.message).not.toContain('searcher exploded');
+    });
+
+    it('L5: a promise whose then() fires both callbacks settles once and does not corrupt the run', async () => {
+      // A spec-violating Promise subclass whose then() invokes the settlement
+      // callbacks multiple times (and both of them). napi_is_promise recognizes
+      // it, so the await machinery attaches its callbacks — and must honor only
+      // the first settlement, ignoring the rest without a use-after-free of the
+      // cookie freed on first settlement in the old code.
+      class EvilPromise<T> extends Promise<T> {
+        then(onF?: any, onR?: any): any {
+          onF?.(7);                       // first settlement wins
+          onF?.(8);                       // duplicate — must be ignored
+          onR?.(new Error('late reject')); // sibling — must be ignored
+          return this;
+        }
+      }
+      const lua: any = new lua_native.init(
+        { weird: () => new EvilPromise<number>((resolve) => resolve(0)) },
+        { libraries: 'all' }
+      );
+      expect(await lua.execute_async('return weird() + 1')).toBe(8);
+      expect(lua.is_busy()).toBe(false);
+      // Still usable afterwards (no corruption / no wedged busy state).
+      expect(await lua.execute_async('return 100')).toBe(100);
+    });
+
+    it('M11: constructing many class instances in a loop stays correct (HandleScope smoke test)', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'all' });
+      let count = 0;
+      lua.register_class('Widget', {
+        construct: () => { count++; return { id: count }; },
+        readable: true,
+      });
+      const total = lua.execute_script(`
+        local sum = 0
+        for i = 1, 5000 do sum = sum + Widget.new().id end
+        return sum
+      `);
+      expect(count).toBe(5000);
+      expect(total).toBe((5000 * 5001) / 2);
+    });
+
+    it('L8: cancel() aborts a compute-bound worker run when maxInstructions is set', async () => {
+      const lua: any = new lua_native.init({}, {
+        libraries: 'safe',
+        maxInstructions: 5_000_000_000, // high enough not to trip on its own quickly
+      });
+      const p = lua.execute_script_async('while true do end');
+      // Signal cancellation; the count-hook polls it and aborts the VM loop.
+      setTimeout(() => lua.cancel(), 20);
+      await expect(p).rejects.toThrow(/cancelled|instruction limit/);
+      // The cancel flag was cleared, so a fresh run is not pre-aborted.
+      expect(await lua.execute_script_async('return 1 + 1')).toBe(2);
+      expect(lua.is_busy()).toBe(false);
+    });
+  });
 });

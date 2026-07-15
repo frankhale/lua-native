@@ -3036,6 +3036,44 @@ TEST(LuaRuntimeInstructions, SetMaxInstructionsPostConstruction) {
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res2));
 }
 
+// H9c: registry unrefs are deferred while a worker run is bracketed and drained
+// by EndWorkerUnrefDeferral, and are immediate otherwise. (The thread-safety is
+// exercised by the async TS suite; this pins the queue-or-drain logic.)
+TEST(LuaRuntimeWorkerUnref, DeferredDuringWorkerThenDrainedLeavesStateUsable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  lua_State* L = rt.RawState();
+
+  rt.BeginWorkerUnrefDeferral();
+  // Stand in for main-thread finalizers freeing registry slots mid-run.
+  std::vector<int> refs;
+  for (int i = 0; i < 128; ++i) {
+    lua_pushinteger(L, i);
+    refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
+  }
+  for (int ref : refs) rt.UnrefOrDefer(ref);  // queued, not unref'd yet
+  rt.EndWorkerUnrefDeferral();                 // drains the queue
+
+  // The state is intact and fully usable after the drain.
+  const auto res = rt.ExecuteScript("return 1 + 1");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+}
+
+TEST(LuaRuntimeWorkerUnref, ImmediateUnrefWhenNoWorkerActive) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  lua_State* L = rt.RawState();
+
+  // Outside a worker bracket, UnrefOrDefer frees the slot immediately, so it is
+  // available for reuse by the next luaL_ref.
+  lua_pushinteger(L, 42);
+  const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  rt.UnrefOrDefer(ref);
+  lua_pushinteger(L, 43);
+  const int reused = luaL_ref(L, LUA_REGISTRYINDEX);
+  EXPECT_EQ(reused, ref);  // Lua's registry free-list reclaims the freed slot
+  luaL_unref(L, LUA_REGISTRYINDEX, reused);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

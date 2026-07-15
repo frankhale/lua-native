@@ -187,6 +187,12 @@ void LuaRuntime::InitState() {
   lua_pushlightuserdata(L_, this);
   lua_setfield(L_, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
 
+  // Also stash `this` in the main state's extra space so a registry-owner
+  // deleter can resolve the runtime without touching the registry (H9c). Set
+  // before any ref could be created (refs only cross the boundary during
+  // execution, after construction), so the deleter always reads a valid pointer.
+  *static_cast<LuaRuntime**>(lua_getextraspace(L_)) = this;
+
   // Register userdata metatables
   RegisterUserdataMetatable();
   RegisterProxyUserdataMetatable();
@@ -462,6 +468,50 @@ void LuaRuntime::SetPropertyHandlers(PropertyGetter getter, PropertySetter sette
 void LuaRuntime::SetAsyncMode(bool enabled) { async_mode_ = enabled; }
 bool LuaRuntime::IsAsyncMode() const { return async_mode_; }
 
+// --- Worker-thread registry-unref deferral (H9c) ---
+
+void LuaRuntime::BeginWorkerUnrefDeferral() {
+  std::lock_guard<std::mutex> lk(deferred_unref_mutex_);
+  worker_active_ = true;
+}
+
+void LuaRuntime::EndWorkerUnrefDeferral() {
+  std::lock_guard<std::mutex> lk(deferred_unref_mutex_);
+  worker_active_ = false;
+  // Drain under the lock: any concurrent main-thread finalizer blocks here, so
+  // the drain's unrefs never overlap a finalizer's. The worker has finished
+  // touching Lua and the main thread is still blocked (is_busy_), so mutating
+  // the registry now is safe.
+  for (int ref : deferred_unrefs_) luaL_unref(L_, LUA_REGISTRYINDEX, ref);
+  deferred_unrefs_.clear();
+}
+
+void LuaRuntime::UnrefOrDefer(int ref) {
+  std::lock_guard<std::mutex> lk(deferred_unref_mutex_);
+  if (worker_active_) {
+    // A worker is mid-run off-thread; queue the unref for EndWorkerUnrefDeferral
+    // rather than mutating the registry concurrently with the worker's Lua.
+    deferred_unrefs_.push_back(ref);
+  } else {
+    luaL_unref(L_, LUA_REGISTRYINDEX, ref);
+  }
+}
+
+// Free function the registry-owner deleter routes through (declared in the
+// header before LuaRuntime is complete). Resolves the runtime from the main
+// state's extra space so it can consult the deferral queue without reading the
+// registry or taking a Lua lock.
+void detail::UnrefRegistrySlot(lua_State* mainL, int ref) {
+  auto* runtime = *static_cast<LuaRuntime**>(lua_getextraspace(mainL));
+  if (runtime) {
+    runtime->UnrefOrDefer(ref);
+  } else {
+    // No runtime recorded (should not happen once InitState has run): fall back
+    // to an immediate unref.
+    luaL_unref(mainL, LUA_REGISTRYINDEX, ref);
+  }
+}
+
 void LuaRuntime::CreateUserdataGlobal(const std::string& name, int ref_id) {
   auto* block = static_cast<int*>(lua_newuserdata(L_, sizeof(int)));
   *block = ref_id;
@@ -592,7 +642,17 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
           // A method that returned a JS Promise while in the async driver
           // suspends the coroutine until it settles (see LuaCallHostFunction).
           runtime->await_pending_ = false;
-          outcome = HostCallOutcome::Yield;
+          if (L != runtime->await_driver_thread_) {
+            // Same guard as LuaCallHostFunction: a promise-returning method
+            // called from inside a user coroutine can't suspend correctly (M1).
+            lua_pushfstring(L,
+              "cannot await a JS Promise inside a coroutine (method '%s'); "
+              "await only at the top level of execute_async",
+              func_name ? func_name : "<unknown>");
+            outcome = HostCallOutcome::Raise;
+          } else {
+            outcome = HostCallOutcome::Yield;
+          }
         } else {
           try {
             PushLuaValue(L, resultHolder);
@@ -1084,7 +1144,14 @@ int LuaRuntime::JsSearcher(lua_State* L) {
     }
   }  // result, args, source, chunkname destroyed here, before any longjmp
 
-  if (raise) return lua_error(L);
+  if (raise) {
+    // The searcher raises its own descriptive string, not the host bridge's
+    // structured value. A JS searcher that threw left a staged error value
+    // (StageJsError set it before throwing); drop it so it can't leak to and be
+    // mis-raised by a later, unrelated host call that doesn't stage (M12).
+    if (runtime->HasPendingErrorValue()) runtime->TakePendingErrorValue();
+    return lua_error(L);
+  }
   return nresults;
 }
 
@@ -1159,7 +1226,18 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
           // suspend the coroutine until it settles (AsyncContinuation delivers
           // the resolved value).
           runtime->await_pending_ = false;
-          outcome = HostCallOutcome::Yield;
+          if (L != runtime->await_driver_thread_) {
+            // Awaiting from inside a user-created coroutine: yielding here would
+            // suspend the wrong thread and deliver the settled value to the
+            // driver frame instead. Raise rather than silently misbehave (M1).
+            lua_pushfstring(L,
+              "cannot await a JS Promise inside a coroutine (called '%s'); "
+              "await only at the top level of execute_async",
+              func_name ? func_name : "<unknown>");
+            outcome = HostCallOutcome::Raise;
+          } else {
+            outcome = HostCallOutcome::Yield;
+          }
         } else {
           try {
             PushLuaValue(L, resultHolder);
@@ -2063,6 +2141,7 @@ CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) co
 
 void LuaRuntime::SetAwaitDriverMode(bool enabled) { await_driver_mode_ = enabled; }
 bool LuaRuntime::IsAwaitDriverMode() const { return await_driver_mode_; }
+void LuaRuntime::SetAwaitDriverThread(lua_State* thread) { await_driver_thread_ = thread; }
 void LuaRuntime::RequestAwaitYield() { await_pending_ = true; }
 void LuaRuntime::RequestCancel() { cancel_requested_ = true; }
 bool LuaRuntime::IsCancelRequested() const { return cancel_requested_; }
