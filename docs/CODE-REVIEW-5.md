@@ -30,6 +30,38 @@ re-run during this review against the freshly built debug binary.
 
 ---
 
+## Resolution status (July 19, 2026)
+
+All findings resolved. Two additional defects were discovered *while* fixing
+them and are recorded below as F11 and F12 (both fixed in the same pass).
+
+After the fixes: **448 TypeScript tests** (up from 438 — ten new regression and
+coverage tests) and **178 C++ tests** pass, plus the GC-exposed leak harness
+(F1's two measured paths now flat) and a `tsc --strict --moduleResolution
+nodenext` typecheck of the public type surface.
+
+| # | Status | Resolution |
+|---|--------|------------|
+| F1 | ✅ Done | `JsCallbackCollectorScope` now sweeps in its **destructor**, making every exit path self-cleaning, and a method-level scope was added at all five entry points (function-call trampoline, `ResumeCoroutine`, `SetMetatable`, `RegisterModule`, `CreateTableMethod`). Sibling conversions and post-conversion core-call failures are therefore covered. The two explicit sweep calls added in CR-4 became redundant and were removed. Measured: `set_metatable` path 55.9 → **-0.1** bytes/iter, multi-arg call path 56.1 → **0.1** bytes/iter (control unchanged at 0.0). Three regression tests added. |
+| F2 | ✅ Done | `CMakeLists.txt` now defines `NODE_ADDON_API_CPP_EXCEPTIONS`, matching `binding.gyp`. Verified end-to-end: a CMake-built addon (Debug and Release) loads and correctly **throws** on a bad argument, which under the old `NAPI_DISABLE_CPP_EXCEPTIONS` define it would have swallowed. |
+| F3 | ✅ Done | Added a `collect_node_gyp_dirs()` helper that expands the node-gyp cache with `file(GLOB)` (newest version first) into explicit candidate lists — `find_path`/`find_library` never see a wildcard again. Windows now locates `node.lib` from `<cache>/<version>/<arch>` with an actionable `npx node-gyp install` error if absent. Verified on macOS: `NODE_INCLUDE_DIR` now resolves to the node-gyp cache (`.../node-gyp/24.18.0/include/node`), which the old code could never match. **Caveat: the Windows path is structurally fixed but untested — no Windows machine was available.** |
+| F4 | ✅ Done | The backward-compat test now binds the table to a global and asserts `t.a` is still `1` in Lua after the JS copy is mutated — it fails if plain tables ever regress to live proxies. |
+| F5 | ✅ Done | `register_class` reserves the class name **before** reading any property off the definition (an RAII guard rolls the reservation back on every failure exit), so a hostile getter can no longer re-enter and half-merge a definition. `construct` is read once into a local, like `metamethods`; `readable`/`writable`/`methods` were given the same single-read treatment. Three regression tests added, including one asserting a reentrant registration is rejected and one asserting a rejected definition releases the name for retry. |
+| F6 | ✅ Done | Added a `LuaInput` type — the JS→Lua direction — covering `undefined`, `Date`, `Map`, `Set`, `ArrayBuffer`/`ArrayBufferView`, and recursive containers, and applied it to every input position (`set_global`, handle `set`, `resume`, `create_table`, call/method/pcall arguments, `LuaCallbacks`, `MetatableDefinition`). Results keep the narrower `LuaValue`. `set_print_handler`'s argument is now optional, matching the C++. Verified by typechecking a consumer file that passes each previously-rejected type. |
+| F7 | ✅ Done | The libnode search, `GLOB_RECURSE`-links-the-first-file-it-finds fallback, executable-as-rpath, and the dead `NODE_RUNTIME_LINK` branch are all deleted: Windows links `node.lib`, everything else uses runtime symbol resolution (`-undefined dynamic_lookup` on macOS). `lua_native_core` now receives the same `LUA_STATIC`/`NOMINMAX`/`WIN32_LEAN_AND_MEAN`/`_DARWIN_C_SOURCE` defines as the gyp build. Version floor lowered 3.31 → 3.20. |
+| F8 | ✅ Done (documented) | New `docs/RELEASING.md` records the per-platform prebuild requirement, the legacy `lua-native.node` name to delete once real prebuilds exist, the `MACOSX_DEPLOYMENT_TARGET` un-deferral (CR-3 M5), and tarball/consumer smoke-test steps. Pack contents verified: 14 files, no `tests/` or `vendor/`. |
+| F9 | ✅ Done | `execute_file` no-return now uses a new side-effect-only fixture and asserts `undefined`; the userdata-GC test exercises the refcount through a surviving alias; both `stripDebug` tests (TS and C++) assert strict `<` on a chunk with real debug info and check the stripped bytecode still runs; fixture paths use `fileURLToPath` (Windows-safe) and, in C++, a `RepoPath()` helper that walks up to the repo root — verified by running the gtest binary from `build/Debug`, where those tests previously failed; `CompileFileAndLoadBytecodeMatch` compares values, not just arity; the C++ suite dropped `unistd.h`/`mkstemp` for `std::filesystem` so it can compile for Windows. All three coverage gaps closed with new tests (busy guard across five sync entry points and two table-handle methods mid-worker, coroutine argument validation, non-primitive call arguments). |
+| F10 | ✅ Done | Four conditional message assertions gained `FAIL()` sentinels; the unguarded `GetGlobal` deref gained `ASSERT_NE`; the spec converted to real ESM imports (`node:fs`/`node:path`/`node:os`, `fileURLToPath`-derived `__dirname`) so it no longer depends on vitest's CJS shims; the vcpkg library declaration went from six copies to two (one per gyp target); `prebuild` renamed to `prebuildify` (removing the npm lifecycle-hook trap) with doc references updated; `clean` now removes the `cmake-build-*` directories. The dead mac `cflags`/`ldflags` blocks were left as-is — they are inert and removing them risks disturbing a working build for no behavioural gain. |
+| **F11** (new) | ✅ Done | **Discovered while fixing F5.** `LuaContext::RegisterClass` called `runtime->RegisterClass` with **no try/catch**, but the core builds inside `RunProtected`, which throws `std::runtime_error` on OOM under `maxMemory` or a raising `__newindex` on a `_G` metatable. That exception unwound across the N-API boundary and **terminated the process** — the H1 class, in a path every earlier pass missed. Now wrapped, surfacing a JS error; the reservation guard releases the name. Regression test added (confirmed it throws `not enough memory` instead of aborting). |
+| **F12** (new) | ✅ Done | **Discovered while verifying F6.** `index.d.ts` imported from `'./types'` without an extension. The package is `"type": "module"`, so any consumer on TypeScript's `node16`/`nodenext` resolution got a hard `TS2834` error importing the package's types. Changed to `'./types.js'` (TS maps it to `types.d.ts`); a strict `nodenext` typecheck now passes clean. |
+
+(M5 from CODE-REVIEW-3 remains deferred by decision; `docs/RELEASING.md` records
+it as a release blocker.)
+
+The original findings follow unchanged for reference.
+
+---
+
 ## Verification of the CODE-REVIEW-4 remediation
 
 Every resolution row in CODE-REVIEW-4's table was checked against the diff
@@ -70,7 +102,7 @@ medium-low (F4), the rest low/nit.
 
 ## Findings
 
-### F1. The N4 sweep does not span sibling conversions — five entry points still strand reclaimable entries, confirmed at ~56 bytes/iteration (medium)
+### F1. The N4 sweep does not span sibling conversions — five entry points still strand reclaimable entries, confirmed at ~56 bytes/iteration (medium) — ✅ DONE
 
 The `JsCallbackCollectorScope` installed by `NapiToCoreInstance` covers exactly
 one top-level conversion: a failure *inside* that conversion sweeps its own
@@ -114,7 +146,7 @@ count-0 guard already makes a sweep after a *partial* push safe, so the
 (A stale named `__mt_N_key`/`__module_N_key` entry from a mid-loop failure is
 the known, separately-accepted L4-shape residual — unchanged by this.)
 
-### F2. The CMake build compiles the addon in the opposite N-API exception mode from the gyp build (medium)
+### F2. The CMake build compiles the addon in the opposite N-API exception mode from the gyp build (medium) — ✅ DONE
 
 `CMakeLists.txt:392` defines `NAPI_DISABLE_CPP_EXCEPTIONS`; `binding.gyp:134`
 (and the project convention) defines `NODE_ADDON_API_CPP_EXCEPTIONS`. The
@@ -128,7 +160,7 @@ addon from identical sources. The two build systems must agree; align CMake to
 `NODE_ADDON_API_CPP_EXCEPTIONS` (and see F7 for the other per-target define
 asymmetries).
 
-### F3. CMake Node.js discovery is structurally broken; the CMake build cannot work on Windows at all (medium)
+### F3. CMake Node.js discovery is structurally broken; the CMake build cannot work on Windows at all (medium) — ✅ DONE (Windows path untested)
 
 `CMakeLists.txt:104-120` (headers) and `:239-272` (libraries) pass literal
 glob patterns (`"$ENV{HOME}/Library/Caches/node-gyp/*/include/node"`,
@@ -144,7 +176,7 @@ node-gyp cache. Fix by expanding candidates with `file(GLOB ...)` before the
 already-present `-undefined dynamic_lookup` fallback, and implement a real
 `node.lib` strategy for Windows.
 
-### F4. A backward-compat test cannot fail on the behavior it pins (medium-low)
+### F4. A backward-compat test cannot fail on the behavior it pins (medium-low) — ✅ DONE
 
 `tests/ts/lua-native.spec.ts:1630-1638`
 (`plain table still deep-copies (backward compat)`): after `result.a = 999`
@@ -156,7 +188,7 @@ suite stays green. Add
 `expect(lua.execute_script('return t.a')).toBe(1)`-style read-back through a
 named global, mirroring the sibling test.
 
-### F5. `register_class` residuals in the N3 trust class: `construct` double-read, and reentrancy bypasses the duplicate-name rejection (low)
+### F5. `register_class` residuals in the N3 trust class: `construct` double-read, and reentrancy bypasses the duplicate-name rejection (low) — ✅ DONE
 
 Two hostile-definition-object paths survive the N3 snapshot (both
 pre-existing, neither introduced by the fix):
@@ -176,7 +208,7 @@ pre-existing, neither introduced by the fix):
   reentrancy instead of a second call. Reserving the name (inserting before
   the property reads, erasing on the failure exits) closes it.
 
-### F6. `LuaValue` input typing omits documented, supported types (low)
+### F6. `LuaValue` input typing omits documented, supported types (low) — ✅ DONE
 
 `types.d.ts:19-29` — the `LuaValue` union excludes `Buffer`, `TypedArray`,
 `Date`, `Map`, `Set`, and `undefined`, all of which the binding converts
@@ -191,7 +223,7 @@ return shapes (`PcallResult`, `CoroutineResult`, handle methods) and all
 JSDoc claims spot-verified against the implementation (library lists,
 `maxMemory`/`maxInstructions`, bytecode default chunk name).
 
-### F7. CMake secondary defects: mismatched linking strategy, missing defines, inflated version floor (low)
+### F7. CMake secondary defects: mismatched linking strategy, missing defines, inflated version floor (low) — ✅ DONE
 
 - `CMakeLists.txt:140-152`: preferring a discovered Homebrew `libnode` over
   `-undefined dynamic_lookup` hard-binds the addon to a dylib that need not
@@ -207,7 +239,7 @@ JSDoc claims spot-verified against the implementation (library lists,
   uses (`CMAKE_MSVC_RUNTIME_LIBRARY` needs 3.15); stock CMake 3.28–3.30
   installs fail to configure for no reason.
 
-### F8. Prebuilds cover one of three declared platforms as committed (low, state-of-tree)
+### F8. Prebuilds cover one of three declared platforms as committed (low, state-of-tree) — ✅ DONE (documented in docs/RELEASING.md)
 
 `prebuilds/` contains only `darwin-arm64`. On win32-x64 and darwin-x64 a
 published-package install falls back to `node-gyp rebuild`, which requires
@@ -218,7 +250,7 @@ it. The checked-in binary's non-prebuildify name (`lua-native.node`, not
 `*.napi.node`) was verified to still match `node-gyp-build`'s resolver, but
 `npm run prebuild` will deposit a second, differently-named binary beside it.
 
-### F9. Test-suite weaknesses (low)
+### F9. Test-suite weaknesses (low) — ✅ DONE
 
 Beyond F4, verified in the sources:
 
@@ -250,7 +282,7 @@ untested; (2) `create_coroutine`/`resume` argument-validation error paths;
 (3) calling returned Lua functions from JS with non-primitive arguments
 (every existing test passes only numbers).
 
-### F10. Nits
+### F10. Nits — ✅ DONE
 
 - `binding.gyp`: the vcpkg library is specified three times (`:20-27`
   `libraries` + `link_settings.libraries`, plus the `OS=='win'` block `:31`;

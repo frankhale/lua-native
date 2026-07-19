@@ -1097,7 +1097,7 @@ All verification steps passed:
 
 1. `npm run build-debug` — no warnings
 2. `npm run test-cpp` — 105 tests passed (101 existing + 4 new async)
-3. `npm run prebuild` — created fresh prebuild
+3. `npm run prebuildify` — created fresh prebuild
 4. `npm run build-debug` — rebuilt debug after prebuild
 5. `npm run test-cpp` — 105 tests still passed
 6. `npm test` — 197 tests passed (184 existing + 13 new async)

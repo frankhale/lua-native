@@ -491,7 +491,11 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  // Convert JS arguments to Lua values
+  // Convert JS arguments to Lua values. One collector spans every argument so
+  // that a later argument failing to convert sweeps the reclaimable callbacks
+  // minted by the earlier ones — each argument's own conversion scope has
+  // already closed by then, so it cannot clean up its siblings (F1).
+  LuaContext::JsCallbackCollectorScope collector(data->context);
   std::vector<lua_core::LuaPtr> args;
   args.reserve(info.Length());
   try {
@@ -504,7 +508,9 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  // Call the Lua function
+  // Call the Lua function. A failed call can also leave arguments unpushed
+  // (CallFunction restores the stack if an arg push raises); the collector's
+  // destructor sweeps those too.
   LuaContext::CallScope _cs(data->context);
   const auto result = data->runtime->CallFunction(data->funcRef, args);
 
@@ -871,14 +877,6 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   const std::string class_name = info[0].As<Napi::String>().Utf8Value();
   auto def = info[1].As<Napi::Object>();
 
-  if (!def.Has("construct") || !def.Get("construct").IsFunction()) {
-    Napi::TypeError::New(env,
-      "register_class() definition requires a 'construct' function")
-      .ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-  auto constructFn = def.Get("construct").As<Napi::Function>();
-
   // Reject a duplicate class name before any callback is registered (L7).
   if (registered_classes_.count(class_name)) {
     Napi::Error::New(env,
@@ -887,15 +885,40 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // Reserve the name *before* reading any property off `def`. Every read below
+  // can run user JS (a getter or Proxy trap), and a reentrant
+  // register_class(sameName) from one of them would otherwise pass the check
+  // above, register fully, and then be half-merged over by this outer call when
+  // luaL_newmetatable silently returns the existing metatable — the L7 hazard
+  // reached through reentrancy instead of a second top-level call (F5). The
+  // guard rolls the reservation back on every failure exit.
+  registered_classes_.insert(class_name);
+  struct ReservationGuard {
+    std::unordered_set<std::string>* set;
+    const std::string* name;
+    ~ReservationGuard() { if (set) set->erase(*name); }
+    void Commit() { set = nullptr; }
+  } reservation{&registered_classes_, &class_name};
+
+  // Each property is read exactly once, into a local. A hostile getter/Proxy
+  // therefore cannot show validation one value and hand registration another
+  // (N3, extended to `construct` by F5) — everything below uses the snapshot.
+  const Napi::Value constructVal = def.Get("construct");
+  if (!constructVal.IsFunction()) {
+    Napi::TypeError::New(env,
+      "register_class() definition requires a 'construct' function")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  auto constructFn = constructVal.As<Napi::Function>();
+
   // Validate reserved metamethods up front, before anything is registered, so a
   // rejected definition doesn't strand the constructor/method callbacks in
   // js_callbacks_/host_functions_ (L4). The property, its key list, and each
-  // value are read exactly once into this snapshot — a hostile getter/Proxy
-  // cannot show validation a clean object and hand registration a different
-  // one containing the reserved keys (N3); registration below uses the same
-  // snapshot.
+  // value are read exactly once into this snapshot (N3); registration below
+  // uses the same snapshot.
   std::vector<std::pair<std::string, Napi::Function>> mm_snapshot;
-  if (def.Has("metamethods")) {
+  {
     const Napi::Value mmsVal = def.Get("metamethods");
     if (mmsVal.IsObject()) {
       auto mms = mmsVal.As<Napi::Object>();
@@ -917,14 +940,10 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     }
   }
 
-  bool readable = false;
-  bool writable = false;
-  if (def.Has("readable") && def.Get("readable").IsBoolean()) {
-    readable = def.Get("readable").As<Napi::Boolean>().Value();
-  }
-  if (def.Has("writable") && def.Get("writable").IsBoolean()) {
-    writable = def.Get("writable").As<Napi::Boolean>().Value();
-  }
+  const Napi::Value readableVal = def.Get("readable");
+  const Napi::Value writableVal = def.Get("writable");
+  const bool readable = readableVal.IsBoolean() && readableVal.As<Napi::Boolean>().Value();
+  const bool writable = writableVal.IsBoolean() && writableVal.As<Napi::Boolean>().Value();
 
   const uint64_t class_id = next_class_id_++;
 
@@ -936,8 +955,8 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
 
   // Instance methods (obj:method()).
   std::unordered_map<std::string, std::string> method_map;
-  if (def.Has("methods") && def.Get("methods").IsObject()) {
-    auto methods = def.Get("methods").As<Napi::Object>();
+  if (const Napi::Value methodsVal = def.Get("methods"); methodsVal.IsObject()) {
+    auto methods = methodsVal.As<Napi::Object>();
     Napi::Array keys = methods.GetPropertyNames();
     for (uint32_t i = 0; i < keys.Length(); ++i) {
       std::string name = keys.Get(i).As<Napi::String>().Utf8Value();
@@ -966,8 +985,17 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     metamethods.push_back(std::move(entry));
   }
 
-  runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
-  registered_classes_.insert(class_name);
+  // RegisterClass builds inside RunProtected, which throws on OOM under
+  // maxMemory or a raising __newindex on a _G metatable at the class-global
+  // write. Surface that as a JS error: letting a std::runtime_error unwind
+  // across the N-API boundary terminates the process (the H1 class).
+  try {
+    runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();  // reservation guard releases the name
+  }
+  reservation.Commit();
   return env.Undefined();
 }
 
@@ -984,6 +1012,12 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
 
   uint64_t mt_id = next_metatable_id_++;
   std::vector<lua_core::MetatableEntry> entries;
+
+  // One collector spans the whole entry build and the core call: SetGlobalMetatable
+  // validates the target global only after every entry has been converted, so a
+  // missing/non-table global discards them all. The destructor sweeps any
+  // reclaimable callback that never reached Lua (F1).
+  JsCallbackCollectorScope collector(this);
 
   for (uint32_t i = 0; i < keys.Length(); i++) {
     const std::string key = keys[i].As<Napi::String>().Utf8Value();
@@ -1059,6 +1093,10 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 
   uint64_t mod_id = next_module_id_++;
   std::vector<lua_core::MetatableEntry> entries;
+
+  // See SetMetatable: one collector spans the entry build and the core call so
+  // entries discarded by a later failure sweep their reclaimable callbacks (F1).
+  JsCallbackCollectorScope collector(this);
 
   for (uint32_t i = 0; i < keys.Length(); i++) {
     const std::string key = keys[i].As<Napi::String>().Utf8Value();
@@ -1218,6 +1256,10 @@ Napi::Value LuaContext::CreateTableMethod(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
 
   int ref;
+  // One collector spans the element loop and CreateTableFrom so a failure part
+  // way through (or in the core call) sweeps the reclaimable callbacks minted
+  // by the elements already converted (F1).
+  JsCallbackCollectorScope collector(this);
   if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
     try {
       if (info[0].IsArray()) {
@@ -1772,8 +1814,7 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   // the liveness+generation guard before driving so we neither dereference a
   // disengaged optional nor inject this settlement into a newer run (H2).
   if (!async_co_ || !async_deferred_ || gen != async_generation_) {
-    SweepUnpushedJsCallbacks(collector.names);
-    return env.Undefined();
+    return env.Undefined();  // collector's destructor sweeps the dropped args
   }
   DriveAsync(std::move(args), is_error);
   return env.Undefined();
@@ -1965,14 +2006,12 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   // destruction (N4). On success the names propagate to any enclosing scope,
   // which may still discard the converted value (see OnAwaitSettled).
   JsCallbackCollectorScope collector(this);
-  try {
-    lua_core::LuaValue result = NapiToCoreImpl(value, 0);
-    collector.PropagateToParent();
-    return result;
-  } catch (...) {
-    SweepUnpushedJsCallbacks(collector.names);
-    throw;
-  }
+  lua_core::LuaValue result = NapiToCoreImpl(value, 0);
+  // Success: hand the names to any enclosing method-level scope, which may
+  // still discard this value. A throw instead leaves them for the collector's
+  // destructor to sweep.
+  collector.PropagateToParent();
+  return result;
 }
 
 void LuaContext::SweepUnpushedJsCallbacks(const std::vector<std::string>& names) {
@@ -2349,7 +2388,10 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  // Collect arguments (skip the first one which is the coroutine object)
+  // Collect arguments (skip the first one which is the coroutine object). One
+  // collector spans every argument so a later argument's conversion failure
+  // sweeps the callbacks minted by the earlier ones (F1).
+  JsCallbackCollectorScope collector(this);
   std::vector<lua_core::LuaPtr> args;
   try {
     for (size_t i = 1; i < info.Length(); ++i) {

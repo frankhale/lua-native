@@ -63,7 +63,7 @@ automatically — no changes to `index.js` are needed.
 End users will not have vcpkg, node-gyp, or a C++ toolchain, so the
 `get_vcpkg_path.js` resolution would fail at their install time. Therefore:
 
-- Run `npm run prebuild` (which uses `prebuildify --napi --strip`) to produce a
+- Run `npm run prebuildify` (which uses `prebuildify --napi --strip`) to produce a
   binary under `prebuilds/<platform>-<arch>/`, and make sure that ships in the
   app.
 - Because Lua is statically linked (`LUA_STATIC` in `binding.gyp`), there is

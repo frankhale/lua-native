@@ -29,6 +29,25 @@ export type LuaValue =
   | LuaFunction;
 
 /**
+ * A value that may be *passed into* Lua. This is wider than {@link LuaValue}
+ * (what Lua hands back): the binding also converts `undefined` to nil and has
+ * built-in conversions for binary data and the common JS collection types, none
+ * of which Lua can produce on the way out.
+ *
+ * Use this for arguments; use {@link LuaValue} for results.
+ */
+export type LuaInput =
+  | LuaValue
+  | undefined
+  | Date
+  | Map<LuaInput, LuaInput>
+  | Set<LuaInput>
+  | ArrayBuffer
+  | ArrayBufferView
+  | LuaInput[]
+  | { [key: string]: LuaInput };
+
+/**
  * Represents a Lua table with string keys
  */
 export interface LuaTable {
@@ -39,7 +58,7 @@ export interface LuaTable {
  * Represents a function that can be called from Lua or returned from Lua
  */
 export interface LuaFunction {
-  (...args: LuaValue[]): LuaValue | LuaValue[] | void;
+  (...args: LuaInput[]): LuaValue | LuaValue[] | void;
 }
 
 /**
@@ -87,7 +106,7 @@ export interface LuaCallback {
  * Object containing callbacks and values that will be available in the Lua environment
  */
 export interface LuaCallbacks {
-  [key: string]: LuaCallback | LuaValue;
+  [key: string]: LuaCallback | LuaInput;
 }
 
 /**
@@ -95,7 +114,7 @@ export interface LuaCallbacks {
  * Functions become Lua C closures; other values are set directly.
  */
 export interface MetatableDefinition {
-  [key: string]: LuaCallback | LuaValue;
+  [key: string]: LuaCallback | LuaInput;
 }
 
 /**
@@ -115,7 +134,7 @@ export interface CompileOptions {
  * Remaining arguments come from the Lua call.
  */
 export interface UserdataMethod {
-  (self: any, ...args: LuaValue[]): LuaValue | LuaValue[] | void;
+  (self: any, ...args: LuaInput[]): LuaValue | LuaValue[] | void;
 }
 
 /**
@@ -203,7 +222,7 @@ export interface LuaTableHandle {
   get(key: string | number): LuaValue;
 
   /** Set a field by key. Triggers __newindex if the table has a metatable. See {@link get} for how the key's JS type maps to the Lua key type. */
-  set(key: string | number, value: LuaValue): void;
+  set(key: string | number, value: LuaInput): void;
 
   /** Check if a key exists in the table. See {@link get} for how the key's JS type maps to the Lua key type. */
   has(key: string | number): boolean;
@@ -261,7 +280,7 @@ export interface LuaContext {
    * @param name The name of the global variable or function
    * @param value The value to set (function, number, boolean, string, or object)
    */
-  set_global(name: string, value: LuaValue | LuaCallback): void;
+  set_global(name: string, value: LuaInput | LuaCallback): void;
 
   /**
    * Gets a global variable from the Lua environment
@@ -362,7 +381,7 @@ export interface LuaContext {
    * // result.status: 'suspended' | 'dead'
    * // result.values: yielded or returned values
    */
-  resume(coroutine: LuaCoroutine, ...args: LuaValue[]): CoroutineResult;
+  resume(coroutine: LuaCoroutine, ...args: LuaInput[]): CoroutineResult;
 
   /**
    * Executes a Lua script string asynchronously on a worker thread.
@@ -494,7 +513,7 @@ export interface LuaContext {
    * lua.set_global('point', t);
    * t.release();
    */
-  create_table(initial?: LuaTable | LuaValue[]): LuaTableHandle;
+  create_table(initial?: { [key: string]: LuaInput } | LuaInput[]): LuaTableHandle;
 
   /**
    * Get a live reference to a global table.
@@ -599,7 +618,7 @@ export interface LuaContext {
    * const a = lua.pcall(fn, 5);   // { ok: true, value: 5 }
    * const b = lua.pcall(fn, -1);  // { ok: false, error: Error("...neg...") }
    */
-  pcall(fn: LuaFunction | ((...args: LuaValue[]) => unknown), ...args: LuaValue[]): PcallResult;
+  pcall(fn: LuaFunction | ((...args: LuaInput[]) => unknown), ...args: LuaInput[]): PcallResult;
 
   /**
    * Redirects Lua `print()` and `io.write()` output to a JavaScript handler.
@@ -615,7 +634,7 @@ export interface LuaContext {
    * lua.execute_script('print("hello", 42)'); // lines: ["hello\t42\n"]
    * lua.set_print_handler(null); // back to stdout
    */
-  set_print_handler(handler: ((text: string) => void) | null): void;
+  set_print_handler(handler?: ((text: string) => void) | null): void;
 
   /**
    * Adds a module searcher backed by JavaScript, enabling dynamic/virtual

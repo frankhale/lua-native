@@ -158,10 +158,20 @@ public:
     };
 
     // RAII: collects the reclaimable __js_callback_ names minted while a
-    // JS→Lua conversion is in flight, so a conversion that is discarded before
-    // its value is ever pushed can sweep the entries it registered (N4).
-    // Scopes nest (a type converter can re-enter conversion from user JS);
-    // each restores its parent on destruction.
+    // JS→Lua conversion is in flight, so values that are discarded before ever
+    // being pushed sweep the entries they registered (N4/F1).
+    //
+    // The destructor sweeps whatever is left in `names`, which makes every exit
+    // path — early return, thrown exception, or a core call failing after the
+    // conversions succeeded — self-cleaning. Sweeping is unconditionally safe
+    // even on the success path: a name whose closure was materialized has a live
+    // count >= 1 (or its entry is already gone), and SweepUnpushedJsCallbacks
+    // only erases entries still at 0. Success paths that hand ownership upward
+    // call PropagateToParent(), which empties `names` so the sweep is a no-op.
+    //
+    // Scopes nest (a type converter can re-enter conversion from user JS, and a
+    // method-level scope encloses the per-conversion ones); each restores its
+    // parent on destruction.
     struct JsCallbackCollectorScope {
       LuaContext* ctx;
       std::vector<std::string>* prev;
@@ -170,7 +180,14 @@ public:
           : ctx(c), prev(c->js_callback_collector_) {
         ctx->js_callback_collector_ = &names;
       }
-      ~JsCallbackCollectorScope() { ctx->js_callback_collector_ = prev; }
+      ~JsCallbackCollectorScope() {
+        ctx->js_callback_collector_ = prev;
+        // A destructor must not throw; the sweep only erases map entries, but
+        // contain anything unexpected rather than risking std::terminate.
+        try {
+          if (!names.empty()) ctx->SweepUnpushedJsCallbacks(names);
+        } catch (...) {}
+      }
       // Hands the collected names to the enclosing scope (if any) when this
       // conversion succeeds but an outer scope may still discard the value.
       void PropagateToParent() {
@@ -178,6 +195,12 @@ public:
         names.clear();
       }
     };
+
+    // Drops the entries for any of `names` whose Lua closure was never
+    // materialized (live count 0), both runtime-side and the paired
+    // js_callbacks_ reference (N4). Public so JsCallbackCollectorScope and the
+    // static Lua-function trampoline can reach it.
+    void SweepUnpushedJsCallbacks(const std::vector<std::string>& names);
 
 private:
     // The addon env, captured at construction. Safe to reuse from later instance
@@ -276,10 +299,6 @@ private:
     // Active collector for in-flight conversions (nullptr when none). See
     // JsCallbackCollectorScope.
     std::vector<std::string>* js_callback_collector_ = nullptr;
-    // Drops the entries for any of `names` whose Lua closure was never
-    // materialized (live count 0), both runtime-side and the paired
-    // js_callbacks_ reference (N4).
-    void SweepUnpushedJsCallbacks(const std::vector<std::string>& names);
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);

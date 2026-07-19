@@ -1,4 +1,4 @@
-import type { LuaNative } from './types';
+import type { LuaNative } from './types.js';
 export type {
   ClassDefinition,
   CompileOptions,
@@ -9,6 +9,7 @@ export type {
   LuaCoroutine,
   LuaFunction,
   LuaInitOptions,
+  LuaInput,
   LuaLibrary,
   LuaLibraryPreset,
   LuaNative,
@@ -20,7 +21,7 @@ export type {
   PcallResult,
   UserdataMethod,
   UserdataOptions,
-} from './types';
+} from './types.js';
 
 declare const lua_module: LuaNative;
 export default lua_module;

@@ -16,7 +16,7 @@ npm run build-debug
 npm run build-release
 
 # Build (prebuild)
-npm run prebuild
+npm run prebuildify
 
 # Run TypeScript tests (Vitest, watch mode by default)
 npm test

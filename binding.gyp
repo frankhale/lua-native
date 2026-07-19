@@ -17,18 +17,16 @@
         "<!(npm run get-vcpkg-include --silent)",
         "src"
       ],
+      # Single source of truth for the vcpkg Lua library. gyp folds a
+      # target-level "libraries" into link_settings itself, so a separate
+      # link_settings block (and the copy in the OS=='win' condition below)
+      # would only be a third place to forget to update.
       "libraries": [
         "<!(npm run get-vcpkg-lib --silent)"
       ],
-      "link_settings": {
-          "libraries": [
-            "<!(npm run get-vcpkg-lib --silent)"
-          ]
-      },
       "conditions": [
         ["OS=='win'", {
           "libraries": [
-            "<!(npm run get-vcpkg-lib --silent)",
             "winmm.lib",
             "user32.lib",
             "gdi32.lib",
@@ -156,18 +154,13 @@
               "vendor/googletest/googletest/include",
               "vendor/googletest/googletest"
             ],
+          # See the addon target: one declaration only (F10).
           "libraries": [
               "<!(npm run get-vcpkg-lib --silent)"
           ],
-          "link_settings": {
-              "libraries": [
-                  "<!(npm run get-vcpkg-lib --silent)"
-              ]
-          },
           "conditions": [
             ["OS=='win'", {
               "libraries": [
-                "<!(npm run get-vcpkg-lib --silent)",
                 "winmm.lib",
                 "user32.lib",
                 "gdi32.lib",

@@ -1,15 +1,30 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <unistd.h>
 #include <limits>
 
 #include "core/lua-runtime.h"
 
 using namespace lua_core;
+
+// Resolves a repo-relative path (e.g. "tests/fixtures/x.lua") regardless of the
+// directory the test binary was launched from. Running the binary directly out
+// of build/Debug (an IDE run) would otherwise fail these tests with a confusing
+// "file not found" instead of exercising the feature (F9).
+static std::string RepoPath(const std::string& rel) {
+  namespace fs = std::filesystem;
+  fs::path dir = fs::current_path();
+  for (int i = 0; i < 8; ++i) {
+    if (fs::exists(dir / "tests" / "fixtures")) return (dir / rel).string();
+    if (!dir.has_parent_path() || dir.parent_path() == dir) break;
+    dir = dir.parent_path();
+  }
+  return rel;  // fall back to the literal path
+}
 
 // Helper to read a field from a value that may be LuaTableRef or LuaTable.
 // For LuaTableRef (metatabled table), uses runtime's GetTableField.
@@ -818,6 +833,7 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonExistentGlobal) {
 
   try {
     rt.SetGlobalMetatable("nonexistent", entries);
+    FAIL() << "expected SetGlobalMetatable to throw";
   } catch (const std::runtime_error& e) {
     EXPECT_NE(std::string(e.what()).find("does not exist"), std::string::npos);
   }
@@ -833,6 +849,7 @@ TEST(LuaRuntimeMetatable, SetGlobalMetatableThrowsForNonTable) {
 
   try {
     rt.SetGlobalMetatable("num", entries);
+    FAIL() << "expected SetGlobalMetatable to throw";
   } catch (const std::runtime_error& e) {
     EXPECT_NE(std::string(e.what()).find("not a table"), std::string::npos);
   }
@@ -1771,11 +1788,17 @@ protected:
   std::string tmp_path_;
 
   void WriteFile(const std::string& content) {
-    std::string tpl = (std::filesystem::temp_directory_path() / "lua_test_XXXXXX").string();
-    int fd = mkstemp(tpl.data());
-    close(fd);
-    tmp_path_ = tpl + ".lua";
-    std::rename(tpl.c_str(), tmp_path_.c_str());
+    // Portable unique name (mkstemp/unistd.h is POSIX-only and would not
+    // compile for the Windows target). A per-process counter plus the pid-like
+    // address entropy of the counter itself is enough: these files live only
+    // for the duration of one test.
+    static std::atomic<unsigned> counter{0};
+    const auto name = "lua_test_" + std::to_string(counter++) + "_" +
+                      std::to_string(
+                          std::hash<std::string>{}(
+                              ::testing::UnitTest::GetInstance()->current_test_info()->name())) +
+                      ".lua";
+    tmp_path_ = (std::filesystem::temp_directory_path() / name).string();
     std::ofstream ofs(tmp_path_);
     ofs << content;
     ofs.close();
@@ -2051,6 +2074,7 @@ TEST(LuaRuntimeModule, AddSearchPathThrowsWithoutPackageLib) {
 
   try {
     rt.AddSearchPath("./modules/?.lua");
+    FAIL() << "expected AddSearchPath to throw";
   } catch (const std::runtime_error& e) {
     EXPECT_NE(std::string(e.what()).find("package"), std::string::npos);
   }
@@ -2159,6 +2183,7 @@ TEST(LuaRuntimeModule, RegisterModuleTableThrowsWithoutPackageLib) {
 
   try {
     rt.RegisterModuleTable("mymod", entries);
+    FAIL() << "expected RegisterModuleTable to throw";
   } catch (const std::runtime_error& e) {
     EXPECT_NE(std::string(e.what()).find("package"), std::string::npos);
   }
@@ -2256,7 +2281,7 @@ TEST(LuaRuntimeModule, AddSearchPathAndRequireFile) {
 
   // Get the path to the test fixtures directory
   // This test assumes the test binary is run from the project root
-  rt.AddSearchPath("./tests/fixtures/modules/?.lua");
+  rt.AddSearchPath(RepoPath("tests/fixtures/modules/?.lua"));
 
   const auto res = rt.ExecuteScript(R"(
     local m = require('testmod')
@@ -2362,7 +2387,8 @@ TEST(LuaRuntimeBytecode, CompileScriptWithStripDebug) {
   auto stripped = runtime.CompileScript("local x = 1\nlocal y = 2\nreturn x + y", true);
   ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(full));
   ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(stripped));
-  EXPECT_LE(std::get<std::vector<uint8_t>>(stripped).size(),
+  // Strict: an ignored stripDebug would leave the sizes equal.
+  EXPECT_LT(std::get<std::vector<uint8_t>>(stripped).size(),
             std::get<std::vector<uint8_t>>(full).size());
 }
 
@@ -2380,12 +2406,13 @@ TEST(LuaRuntimeBytecode, CompileDoesNotExecute) {
   LuaRuntime runtime;
   (void)runtime.CompileScript("x = 999");
   auto global = runtime.GetGlobal("x");
+  ASSERT_NE(global, nullptr);
   EXPECT_TRUE(std::holds_alternative<std::monostate>(global->value));
 }
 
 TEST(LuaRuntimeBytecode, CompileFileReturnsBytes) {
   LuaRuntime runtime(LuaRuntime::AllLibraries());
-  auto result = runtime.CompileFile("tests/fixtures/return-values.lua");
+  auto result = runtime.CompileFile(RepoPath("tests/fixtures/return-values.lua"));
   ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(result));
   EXPECT_GT(std::get<std::vector<uint8_t>>(result).size(), 0u);
 }
@@ -2546,11 +2573,11 @@ TEST(LuaRuntimeBytecode, LoadBytecodeReturnsFunction) {
 TEST(LuaRuntimeBytecode, CompileFileAndLoadBytecodeMatch) {
   LuaRuntime runtime(LuaRuntime::AllLibraries());
 
-  auto compiled = runtime.CompileFile("tests/fixtures/return-values.lua");
+  auto compiled = runtime.CompileFile(RepoPath("tests/fixtures/return-values.lua"));
   ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
 
   auto fromBytecode = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
-  auto fromFile = runtime.ExecuteFile("tests/fixtures/return-values.lua");
+  auto fromFile = runtime.ExecuteFile(RepoPath("tests/fixtures/return-values.lua"));
 
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fromBytecode));
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fromFile));
@@ -2558,6 +2585,23 @@ TEST(LuaRuntimeBytecode, CompileFileAndLoadBytecodeMatch) {
   auto& bcVals = std::get<std::vector<LuaPtr>>(fromBytecode);
   auto& fileVals = std::get<std::vector<LuaPtr>>(fromFile);
   ASSERT_EQ(bcVals.size(), fileVals.size());
+  // Matching arity is not "matching": compare the values themselves, or wrong
+  // results of the right shape pass (F9).
+  for (size_t i = 0; i < bcVals.size(); ++i) {
+    ASSERT_NE(bcVals[i], nullptr);
+    ASSERT_NE(fileVals[i], nullptr);
+    EXPECT_EQ(bcVals[i]->value.index(), fileVals[i]->value.index())
+        << "type mismatch at result " << i;
+    if (std::holds_alternative<int64_t>(bcVals[i]->value)) {
+      EXPECT_EQ(std::get<int64_t>(bcVals[i]->value), std::get<int64_t>(fileVals[i]->value));
+    } else if (std::holds_alternative<double>(bcVals[i]->value)) {
+      EXPECT_DOUBLE_EQ(std::get<double>(bcVals[i]->value), std::get<double>(fileVals[i]->value));
+    } else if (std::holds_alternative<std::string>(bcVals[i]->value)) {
+      EXPECT_EQ(std::get<std::string>(bcVals[i]->value), std::get<std::string>(fileVals[i]->value));
+    } else if (std::holds_alternative<bool>(bcVals[i]->value)) {
+      EXPECT_EQ(std::get<bool>(bcVals[i]->value), std::get<bool>(fileVals[i]->value));
+    }
+  }
 }
 
 // --- Table Reference API tests ---

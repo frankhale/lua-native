@@ -1,4 +1,7 @@
-cmake_minimum_required(VERSION 3.31)
+# 3.20 covers everything used here (CMAKE_MSVC_RUNTIME_LIBRARY/CMP0091 needs
+# 3.15, list(SORT COMPARE NATURAL) needs 3.18). The previous 3.31 floor rejected
+# stock CMake on current LTS distros for no reason (F7).
+cmake_minimum_required(VERSION 3.20)
 
 # Use VCPKG_ROOT environment variable if set
 if(DEFINED ENV{VCPKG_ROOT})
@@ -99,23 +102,49 @@ if(NOT NAPI_INCLUDE_DIR)
     message(FATAL_ERROR "node-addon-api headers not found. Run 'npm install' to install dependencies.")
 endif()
 
-# Find Node.js headers and libraries automatically
-# Try to find Node.js using node-gyp cache first, then system installation
-find_path(NODE_INCLUDE_DIR node.h
-    PATHS
-        # Windows node-gyp cache paths
-        "$ENV{APPDATA}/node-gyp/Cache/*/include/node"
-        "$ENV{LOCALAPPDATA}/node-gyp/Cache/*/include/node"
-        # macOS node-gyp cache paths
-        "$ENV{HOME}/.node-gyp/*/include/node"
-        "$ENV{HOME}/Library/Caches/node-gyp/*/include/node"
-        # System installation paths
+# Find Node.js headers and libraries automatically.
+#
+# IMPORTANT: find_path()/find_library() treat PATHS entries literally — a "*" in
+# a path is NOT expanded. Every node-gyp cache directory must therefore be
+# globbed into an explicit candidate list first; passing the wildcard straight to
+# find_path silently matches nothing (F3).
+
+# Collects "<cache-root>/<version><suffix>" for every installed node-gyp version,
+# newest first, into the named output variable.
+function(collect_node_gyp_dirs OUT_VAR SUFFIX)
+    set(_result "")
+    foreach(_cache_root
+            "$ENV{APPDATA}/node-gyp/Cache"
+            "$ENV{LOCALAPPDATA}/node-gyp/Cache"
+            "$ENV{USERPROFILE}/AppData/Local/node-gyp/Cache"
+            "$ENV{HOME}/.node-gyp"
+            "$ENV{HOME}/Library/Caches/node-gyp")
+        if(EXISTS "${_cache_root}")
+            file(GLOB _versions "${_cache_root}/*")
+            # Newest version first, so a stale old cache never wins.
+            list(SORT _versions COMPARE NATURAL ORDER DESCENDING)
+            foreach(_v ${_versions})
+                if(IS_DIRECTORY "${_v}")
+                    list(APPEND _result "${_v}${SUFFIX}")
+                endif()
+            endforeach()
+        endif()
+    endforeach()
+    set(${OUT_VAR} "${_result}" PARENT_SCOPE)
+endfunction()
+
+collect_node_gyp_dirs(NODE_INCLUDE_CANDIDATES "/include/node")
+list(APPEND NODE_INCLUDE_CANDIDATES
         "/usr/include/node"
         "/usr/local/include/node"
         "/opt/homebrew/include/node"  # macOS Homebrew ARM
         "/usr/local/opt/node/include/node"  # macOS Homebrew Intel
         "C:/Program Files/nodejs/include/node"
         "C:/Program Files (x86)/nodejs/include/node"
+)
+
+find_path(NODE_INCLUDE_DIR node.h
+    PATHS ${NODE_INCLUDE_CANDIDATES}
     NO_DEFAULT_PATH
 )
 
@@ -130,165 +159,39 @@ endif()
 
 message(STATUS "NODE_INCLUDE_DIR: ${NODE_INCLUDE_DIR}")
 
-# Try to find Node.js version and architecture dynamically
-function(find_node_library_dynamic)
-    # On macOS, we need to find the actual Node.js library
-    if(APPLE)
-        message(STATUS "macOS detected - searching for Node.js library")
-        
-        # Try to find Node.js library in common macOS locations
-        find_library(NODE_LIBRARY
-            NAMES node libnode
-            PATHS
-                "/opt/homebrew/opt/node@22/lib"
-                "/opt/homebrew/lib"
-                "/usr/local/lib"
-                "/usr/lib"
-                "/System/Library/Frameworks"
-                "/Library/Frameworks"
-                "/System/Library/Frameworks/NodeJS.framework"
-                "/Library/Frameworks/NodeJS.framework"
-            NO_DEFAULT_PATH
-        )
-        
-        # If not found with specific paths, try without restrictions
-        if(NOT NODE_LIBRARY)
-            find_library(NODE_LIBRARY NAMES node libnode)
-        endif()
-        
-        if(NODE_LIBRARY)
-            message(STATUS "Found Node.js library on macOS: ${NODE_LIBRARY}")
-            # Verify it's actually a library file, not an executable
-            if(EXISTS "${NODE_LIBRARY}")
-                get_filename_component(NODE_LIBRARY_EXT "${NODE_LIBRARY}" EXT)
-                if(NODE_LIBRARY_EXT STREQUAL "" OR NODE_LIBRARY_EXT STREQUAL ".exe")
-                    message(STATUS "Found file is not a library, clearing NODE_LIBRARY")
-                    unset(NODE_LIBRARY CACHE)
-                else()
-                    return()
-                endif()
-            endif()
-        endif()
-        
-        # Try to find Node.js library in node-gyp cache
-        file(GLOB NODE_GYP_CACHE_DIRS "$ENV{HOME}/Library/Caches/node-gyp/*")
-        if(NODE_GYP_CACHE_DIRS)
-            list(GET NODE_GYP_CACHE_DIRS 0 LATEST_NODE_CACHE)
-            message(STATUS "Searching in node-gyp cache: ${LATEST_NODE_CACHE}")
-            
-            # Look for any library files in the cache
-            file(GLOB_RECURSE NODE_LIB_FILES "${LATEST_NODE_CACHE}/*.a" "${LATEST_NODE_CACHE}/*.dylib")
-            if(NODE_LIB_FILES)
-                list(GET NODE_LIB_FILES 0 FIRST_LIB)
-                message(STATUS "Found potential Node.js library in cache: ${FIRST_LIB}")
-                set(NODE_LIBRARY "${FIRST_LIB}" CACHE STRING "Node.js library from cache")
-                return()
-            endif()
-        endif()
-        
-        # On macOS, we need to find the actual Node.js library, not the executable
-        # The executable cannot be linked against directly
-        message(STATUS "macOS detected - Node.js library must be found separately")
-        message(STATUS "Node.js executable cannot be used as a library for linking")
-        
-        # If we still haven't found anything, try a broader search
-        message(STATUS "Performing final broad search for Node.js library")
-        find_library(NODE_LIBRARY NAMES node libnode)
-        if(NODE_LIBRARY)
-            message(STATUS "Found Node.js library in broad search: ${NODE_LIBRARY}")
-            return()
-        endif()
-    endif()
-    
-    # Try to get Node.js version from node-gyp cache
-    file(GLOB NODE_GYP_CACHE_DIRS "$ENV{HOME}/Library/Caches/node-gyp/*")
-    if(NODE_GYP_CACHE_DIRS)
-        list(GET NODE_GYP_CACHE_DIRS 0 LATEST_NODE_CACHE)
-        message(STATUS "Found node-gyp cache: ${LATEST_NODE_CACHE}")
-        
-        # Try different architecture subdirectories
-        set(ARCH_DIRS "arm64" "x64" "x86_64")
-        foreach(ARCH ${ARCH_DIRS})
-            set(TEST_PATH "${LATEST_NODE_CACHE}/${ARCH}")
-            if(EXISTS "${TEST_PATH}")
-                message(STATUS "Found Node.js architecture directory: ${TEST_PATH}")
-                find_library(NODE_LIBRARY
-                    NAMES node libnode
-                    PATHS "${TEST_PATH}"
-                    NO_DEFAULT_PATH
-                )
-                if(NODE_LIBRARY)
-                    message(STATUS "Found Node.js library: ${NODE_LIBRARY}")
-                    return()
-                endif()
-            endif()
-        endforeach()
-    endif()
-endfunction()
+# Node.js library discovery.
+#
+# A .node addon resolves Node's symbols from the hosting process at load time,
+# so on macOS (and ELF platforms) the correct strategy is dynamic lookup, NOT
+# linking a libnode: binding against a Homebrew libnode would hard-tie the addon
+# to a Node build that need not match the one running it. Only Windows requires
+# a real import library (node.lib), which node-gyp caches per version/arch (F3/F7).
+set(NODE_LIBRARY "")
 
-# Clear any previous NODE_LIBRARY value to ensure fresh detection
-unset(NODE_LIBRARY CACHE)
-
-# Try dynamic detection first
-find_node_library_dynamic()
-
-# If dynamic detection failed, fall back to traditional find_library
-if(NOT NODE_LIBRARY)
-    message(STATUS "Dynamic detection failed, trying traditional find_library")
-    # Find Node.js library with improved node-gyp cache paths
-find_library(NODE_LIBRARY
-    NAMES node libnode
-    PATHS
-        # Windows node-gyp cache paths - improved with more specific paths
-        "$ENV{USERPROFILE}/AppData/Local/node-gyp/Cache/*/x64"
-        "$ENV{APPDATA}/Local/node-gyp/Cache/*/x64"
-        "$ENV{APPDATA}/node-gyp/Cache/*/x64"
-        "$ENV{APPDATA}/node-gyp/Cache/*/$(Configuration)"
-        "$ENV{APPDATA}/node-gyp/Cache/*/Release"
-        "$ENV{APPDATA}/node-gyp/Cache/*/Debug"
-        "$ENV{LOCALAPPDATA}/node-gyp/Cache/*/x64"
-        "$ENV{LOCALAPPDATA}/node-gyp/Cache/*/$(Configuration)"
-        "$ENV{LOCALAPPDATA}/node-gyp/Cache/*/Release"
-        "$ENV{LOCALAPPDATA}/node-gyp/Cache/*/Debug"
-        # macOS node-gyp cache paths - improved structure
-        "$ENV{HOME}/.node-gyp/*/$(Configuration)"
-        "$ENV{HOME}/.node-gyp/*/out/Release"
-        "$ENV{HOME}/.node-gyp/*/out/Debug"
-        "$ENV{HOME}/Library/Caches/node-gyp/*/$(Configuration)"
-        "$ENV{HOME}/Library/Caches/node-gyp/*/out/Release"
-        "$ENV{HOME}/Library/Caches/node-gyp/*/out/Debug"
-        # macOS node-gyp cache paths - direct architecture subdirectories
-        "$ENV{HOME}/Library/Caches/node-gyp/*/arm64"
-        "$ENV{HOME}/Library/Caches/node-gyp/*/x64"
-        "$ENV{HOME}/Library/Caches/node-gyp/*/x86_64"
-        # System installation paths
-        "/usr/lib"
-        "/usr/local/lib"
-        "/opt/homebrew/lib/node_modules"  # macOS Homebrew ARM
-        "/usr/local/opt/node/lib"  # macOS Homebrew Intel
-        "C:/Program Files/nodejs"
-        "C:/Program Files (x86)/nodejs"
-    NO_DEFAULT_PATH
-)
-
-# If not found, try with default paths
-if(NOT NODE_LIBRARY)
-    find_library(NODE_LIBRARY NAMES node libnode)
-endif()
-endif()
-
-message(STATUS "NODE_LIBRARY: ${NODE_LIBRARY}")
-
-# Debug output for macOS
-if(APPLE AND NOT NODE_LIBRARY)
-    message(STATUS "macOS detected but NODE_LIBRARY not found")
-    message(STATUS "Checking if Node.js executable exists...")
-    find_program(DEBUG_NODE_EXECUTABLE NAMES node)
-    if(DEBUG_NODE_EXECUTABLE)
-        message(STATUS "Node.js executable found at: ${DEBUG_NODE_EXECUTABLE}")
+if(WIN32)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_node_arch "x64")
     else()
-        message(STATUS "Node.js executable not found")
+        set(_node_arch "x86")
     endif()
+    # Cache layout: <cache>/<version>/<arch>/node.lib
+    collect_node_gyp_dirs(NODE_LIB_CANDIDATES "/${_node_arch}")
+    find_library(NODE_LIBRARY
+        NAMES node
+        PATHS ${NODE_LIB_CANDIDATES}
+        NO_DEFAULT_PATH
+    )
+    if(NOT NODE_LIBRARY)
+        message(FATAL_ERROR
+            "node.lib not found for arch '${_node_arch}'.\n"
+            "Populate the node-gyp cache first (it downloads the headers and "
+            "import library):\n"
+            "    npx node-gyp install\n"
+            "or point -DNODE_LIBRARY=<path to node.lib> at an existing copy.")
+    endif()
+    message(STATUS "NODE_LIBRARY: ${NODE_LIBRARY}")
+else()
+    message(STATUS "NODE_LIBRARY: (none - using runtime symbol resolution)")
 endif()
 
 # Core static library (pure C++)
@@ -299,6 +202,17 @@ add_library(lua_native_core STATIC
 
 target_include_directories(lua_native_core PUBLIC ${LUA_INCLUDE_DIR} src)
 target_link_libraries(lua_native_core PUBLIC ${LUA_LIBRARIES})
+
+# The core compiles the same translation unit as the gyp build, so it must see
+# the same preprocessor environment (F7). LUA_STATIC matches the static vcpkg
+# triplets; NOMINMAX/WIN32_LEAN_AND_MEAN keep windows.h from injecting min/max
+# macros into this TU.
+target_compile_definitions(lua_native_core PRIVATE LUA_STATIC)
+if(WIN32)
+    target_compile_definitions(lua_native_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+elseif(APPLE)
+    target_compile_definitions(lua_native_core PRIVATE _DARWIN_C_SOURCE)
+endif()
 
 # Define the shared library for the Node.js addon (adapter)
 add_library(lua-native SHARED src/lua-native.h src/lua-native.cpp)
@@ -327,55 +241,19 @@ target_include_directories(lua-native PRIVATE
         src
 )
 
-# Link libraries - handle different Node.js linking strategies
-if(NODE_LIBRARY)
-    if(NODE_LIBRARY STREQUAL "NODE_RUNTIME_LINK")
-        message(STATUS "Linking against Node.js executable: ${NODE_EXECUTABLE}")
-        # On macOS, we link against the Node.js executable directly
-        target_link_libraries(lua-native PRIVATE lua_native_core ${NODE_EXECUTABLE})
-        # Set runtime path to the Node.js executable
-        set_target_properties(lua-native PROPERTIES
-            BUILD_WITH_INSTALL_RPATH TRUE
-            INSTALL_RPATH "${NODE_EXECUTABLE}"
-        )
-    else()
-        message(STATUS "Linking against Node.js library: ${NODE_LIBRARY}")
-        target_link_libraries(lua-native PRIVATE ${NODE_LIBRARY} lua_native_core)
-    endif()
+# Link libraries. Windows links node.lib; every other platform resolves Node's
+# symbols from the hosting process at load time (F3/F7). The old code linked a
+# discovered libnode when one happened to exist and set INSTALL_RPATH to the node
+# *executable* (rpath entries are directories, so that was a no-op) — both are
+# gone.
+target_link_libraries(lua-native PRIVATE lua_native_core)
+
+if(WIN32)
+    target_link_libraries(lua-native PRIVATE ${NODE_LIBRARY})
+elseif(APPLE)
+    target_link_options(lua-native PRIVATE "-Wl,-undefined,dynamic_lookup")
 else()
-    if(APPLE)
-        # On macOS with Homebrew, Node.js doesn't provide a separate library file
-        # We need to use a different approach - link against the Node.js executable
-        # or use runtime symbol resolution
-        message(STATUS "macOS detected - using runtime symbol resolution for Node.js")
-        
-        # Try to find the Node.js executable for runtime linking
-        find_program(NODE_EXECUTABLE NAMES node
-            PATHS
-                "/opt/homebrew/bin"
-                "/usr/local/bin"
-                "/usr/bin"
-        )
-        
-        if(NODE_EXECUTABLE)
-            message(STATUS "Found Node.js executable: ${NODE_EXECUTABLE}")
-            # On macOS, we link against the core library and use runtime symbol resolution
-            target_link_libraries(lua-native PRIVATE lua_native_core)
-            # Add runtime symbol resolution flags
-            target_link_options(lua-native PRIVATE 
-                "-Wl,-undefined,dynamic_lookup"
-            )
-            # Set runtime path to the Node.js executable
-            set_target_properties(lua-native PROPERTIES
-                BUILD_WITH_INSTALL_RPATH TRUE
-                INSTALL_RPATH "${NODE_EXECUTABLE}"
-            )
-        else()
-            message(FATAL_ERROR "Node.js executable not found on macOS")
-        endif()
-    else()
-        message(FATAL_ERROR "Node.js library not found. Cannot build native addon without Node.js library.")
-    endif()
+    # ELF shared objects permit undefined symbols by default; nothing to add.
 endif()
 
 # Add standard CRT libraries (Windows MSVC only)
@@ -387,9 +265,15 @@ if(WIN32 AND MSVC)
     endif()
 endif()
 
-# Define NAPI_DISABLE_CPP_EXCEPTIONS to match node-addon-api requirements
+# Must match binding.gyp exactly: the binding layer is written for C++ exception
+# mode (its error handling relies on node-addon-api throwing Napi::Error into the
+# surrounding try/catch, and the core throws std::runtime_error). Defining
+# NAPI_DISABLE_CPP_EXCEPTIONS here instead would still compile, but failed N-API
+# calls would set a pending exception and return, so the addon would silently
+# continue past failed conversions with default-constructed values — a
+# behaviourally different binary from the gyp build (F2).
 target_compile_definitions(lua-native PRIVATE
-        NAPI_DISABLE_CPP_EXCEPTIONS
+        NODE_ADDON_API_CPP_EXCEPTIONS
         NAPI_VERSION=8  # Set appropriate NAPI version
         NODE_ADDON_API_DISABLE_DEPRECATED
 )

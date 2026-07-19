@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import lua_native from '../../index.js';
+
+/** This spec is an ES module: derive paths from import.meta.url, never CJS
+ *  __dirname, and never URL.pathname (which yields "/C:/..." on Windows). */
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** Load all standard libraries (opt-in since bare state is the default) */
 const ALL_LIBS = { libraries: 'all' as const };
@@ -1317,12 +1325,19 @@ describe('lua-native Node adapter', () => {
     it('userdata cleanup on GC', () => {
       const obj = { data: 'test' };
       const lua = new lua_native.init({}, ALL_LIBS);
-      lua.set_userdata('handle', obj);
-      // Set to nil and force GC
-      lua.execute_script('handle = nil; collectgarbage()');
-      // The global is now nil
-      const result = lua.execute_script('return handle == nil');
-      expect(result).toBe(true);
+      lua.set_userdata('handle', obj, { readable: true });
+      // A second reference keeps the underlying JS object reachable after the
+      // first global is dropped, so the refcount (not just the global) is what
+      // this exercises.
+      lua.execute_script('alias = handle; handle = nil; collectgarbage()');
+      expect(lua.execute_script('return handle == nil')).toBe(true);
+      // The surviving alias must still resolve to the same JS object: a
+      // premature release (refcount dropping to zero on the first collection)
+      // would leave a dangling entry and fail this read.
+      expect(lua.execute_script('return alias.data')).toBe('test');
+      // Dropping the last reference and collecting must not corrupt the state.
+      lua.execute_script('alias = nil; collectgarbage(); collectgarbage()');
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
     });
   });
 
@@ -1629,12 +1644,16 @@ describe('lua-native Node adapter', () => {
 
     it('plain table still deep-copies (backward compat)', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      const result = lua.execute_script('return {a = 1, b = 2}') as any;
+      // Bind the table to a global so the copy semantics can actually be
+      // observed from Lua after mutating the JS side.
+      lua.execute_script('t = {a = 1, b = 2}');
+      const result = lua.execute_script('return t') as any;
       expect(result.a).toBe(1);
       expect(result.b).toBe(2);
-      // Modifying JS copy should NOT affect Lua
+      // Modifying the JS copy must NOT write through to Lua (unlike the
+      // metatabled case above, which returns a live proxy).
       result.a = 999;
-      // Lua doesn't have this anonymous table anymore, but behavior is unchanged
+      expect(lua.execute_script('return t.a')).toBe(1);
     });
 
     it('round-trip through JS callback preserves metatabled table', () => {
@@ -2246,7 +2265,7 @@ describe('lua-native Node adapter', () => {
   // FILE EXECUTION
   // ============================================
   describe('file execution', () => {
-    const fixturesDir = new URL('../fixtures/', import.meta.url).pathname;
+    const fixturesDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
 
     it('executes a Lua file that returns multiple values', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
@@ -2292,12 +2311,11 @@ describe('lua-native Node adapter', () => {
 
     it('returns undefined for a file with no return value', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      // set-global.lua sets a global AND returns, but we can use execute_script
-      // to create a temp file scenario. Instead, test with a file that has side effects only.
-      lua.execute_script('x = 99');
-      const result = lua.execute_file(fixturesDir + 'set-global.lua');
-      // set-global.lua does return a value, so let's just verify it works
-      expect(result).toBe('hello from file');
+      // no-return.lua has side effects only; execute_file must yield undefined.
+      const result = lua.execute_file(fixturesDir + 'no-return.lua');
+      expect(result).toBeUndefined();
+      // The side effect still happened.
+      expect(lua.execute_script('return sideEffect')).toBe('ran');
     });
   });
 
@@ -2511,9 +2529,6 @@ describe('lua-native Node adapter', () => {
   describe('module / require integration', () => {
     describe('add_search_path', () => {
       it('loads a Lua module from a search path', () => {
-        const fs = require('fs');
-        const path = require('path');
-        const os = require('os');
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-modules-'));
         const modPath = path.join(tmpDir, 'mymod.lua');
         fs.writeFileSync(modPath, `
@@ -2540,7 +2555,6 @@ describe('lua-native Node adapter', () => {
       });
 
       it('loads a module from a fixture directory', () => {
-        const path = require('path');
         const lua = new lua_native.init({}, ALL_LIBS);
         const fixtureDir = path.resolve(__dirname, '../fixtures/modules');
         lua.add_search_path(path.join(fixtureDir, '?.lua'));
@@ -2552,9 +2566,6 @@ describe('lua-native Node adapter', () => {
       });
 
       it('supports multiple search paths', () => {
-        const fs = require('fs');
-        const path = require('path');
-        const os = require('os');
         const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mods1-'));
         const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mods2-'));
         fs.writeFileSync(path.join(dir1, 'mod_a.lua'), 'return { x = 1 }');
@@ -2591,9 +2602,6 @@ describe('lua-native Node adapter', () => {
       });
 
       it('require caches the module (loaded once)', () => {
-        const fs = require('fs');
-        const path = require('path');
-        const os = require('os');
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-cache-'));
         fs.writeFileSync(path.join(tmpDir, 'counter.lua'), `
           local M = { count = 0 }
@@ -2713,9 +2721,6 @@ describe('lua-native Node adapter', () => {
       });
 
       it('works alongside add_search_path', () => {
-        const fs = require('fs');
-        const path = require('path');
-        const os = require('os');
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-mixed-'));
         fs.writeFileSync(path.join(tmpDir, 'filemod.lua'),
           "return { source = 'file' }");
@@ -2768,9 +2773,14 @@ describe('lua-native Node adapter', () => {
 
       it('supports stripDebug option', () => {
         const lua = new lua_native.init();
-        const full = lua.compile('local x = 1; return x');
-        const stripped = lua.compile('local x = 1; return x', { stripDebug: true });
-        expect(stripped.length).toBeLessThanOrEqual(full.length);
+        // Use a chunk with locals and several lines so there is real debug info
+        // to strip; a strict inequality means a no-op option fails the test.
+        const src = 'local a = 1\nlocal b = 2\nlocal function f(x) return x + a + b end\nreturn f(3)';
+        const full = lua.compile(src);
+        const stripped = lua.compile(src, { stripDebug: true });
+        expect(stripped.length).toBeLessThan(full.length);
+        // Stripped bytecode must still run.
+        expect(lua.load_bytecode(stripped)).toBe(6);
       });
 
       it('supports chunkName option (visible in error messages)', () => {
@@ -2909,7 +2919,8 @@ describe('lua-native Node adapter', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         const full = lua.compile_file('./tests/fixtures/return-values.lua');
         const stripped = lua.compile_file('./tests/fixtures/return-values.lua', { stripDebug: true });
-        expect(stripped.length).toBeLessThanOrEqual(full.length);
+        // Strict: a no-op stripDebug would leave the sizes equal.
+        expect(stripped.length).toBeLessThan(full.length);
       });
     });
   });
@@ -4796,6 +4807,181 @@ describe('lua-native Node adapter', () => {
       expect(threw).toBe(true);
       // Still usable (no abort, no wedged state).
       expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+  });
+
+  // ============================================
+  // CODE-REVIEW-5 REGRESSIONS
+  // ============================================
+  describe('code-review-5 regressions', () => {
+    // --- F1: reclaimable callbacks stranded by a discarded sibling conversion
+
+    it('F1: a failed multi-argument call does not strand callback entries', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('function takesTwo(a, b) return 1 end');
+      const fn = lua.get_global('takesTwo');
+      // Second argument fails to convert AFTER the first (containing a nested
+      // JS function) has already been registered as a reclaimable callback.
+      for (let i = 0; i < 200; i++) {
+        expect(() => fn({ cb: () => 1 }, Symbol('bad'))).toThrow(/Symbol/);
+      }
+      // The context stays healthy and callbacks still work afterwards.
+      expect(fn(1, 2)).toBe(1);
+      lua.set_global('later', { cb: () => 7 });
+      expect(lua.execute_script('return later.cb()')).toBe(7);
+    });
+
+    it('F1: set_metatable on a missing global discards entries cleanly', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      // The entries convert successfully; the core call then rejects because the
+      // target global does not exist, discarding every converted entry.
+      for (let i = 0; i < 200; i++) {
+        expect(() => lua.set_metatable('noSuchGlobal', { payload: { cb: () => 1 } }))
+          .toThrow(/does not exist/);
+      }
+      lua.execute_script('t = {}');
+      lua.set_metatable('t', { __index: () => 'hit' });
+      expect(lua.execute_script('return t.anything')).toBe('hit');
+    });
+
+    it('F1: a failed create_table discards converted elements cleanly', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      for (let i = 0; i < 200; i++) {
+        expect(() => lua.create_table({ good: { cb: () => 1 }, bad: Symbol('x') }))
+          .toThrow(/Symbol/);
+      }
+      const t = lua.create_table({ ok: 1 });
+      expect(t.get('ok')).toBe(1);
+    });
+
+    // --- F5: register_class hardening
+
+    it('F5: a hostile getter cannot re-enter register_class for the same name', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      let reentered: string | null = null;
+      const def: any = { construct: () => ({ v: 1 }), methods: { get() { return 1; } } };
+      Object.defineProperty(def, 'readable', {
+        enumerable: true,
+        get() {
+          // Reentrant registration of the SAME name must be rejected: the outer
+          // call reserved it before reading any property.
+          try {
+            lua.register_class('Reentrant', { construct: () => ({ v: 2 }) });
+            reentered = 'succeeded';
+          } catch (e: any) {
+            reentered = e.message;
+          }
+          return true;
+        },
+      });
+      lua.register_class('Reentrant', def);
+      expect(reentered).toMatch(/already registered/);
+      // The outer definition is the one that took effect, un-merged.
+      expect(lua.execute_script('local r = Reentrant.new(); return r:get()')).toBe(1);
+    });
+
+    it('F5: a rejected definition releases the class name for retry', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.register_class('Retry', {
+        construct: () => ({}),
+        metamethods: { __gc: () => {} },
+      })).toThrow(/reserved/);
+      // The failed attempt must not leave the name reserved.
+      lua.register_class('Retry', { construct: () => ({ v: 5 }), methods: { get() { return 5; } } });
+      expect(lua.execute_script('local r = Retry.new(); return r:get()')).toBe(5);
+    });
+
+    it('F5: construct is read once and a non-function is rejected', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      let reads = 0;
+      const def: any = { methods: {} };
+      Object.defineProperty(def, 'construct', {
+        enumerable: true,
+        get() { reads++; return reads === 1 ? 'not a function' : () => ({}); },
+      });
+      expect(() => lua.register_class('Hostile2', def)).toThrow(/construct/);
+      expect(reads).toBe(1);
+    });
+
+    // --- F11: RegisterClass core failure must surface, not abort
+
+    it('F11: a class registration that exhausts memory throws instead of aborting', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'all', maxMemory: 900 * 1024 });
+      lua.execute_script("blob = string.rep('x', 400 * 1024)");
+      let threw = false;
+      try {
+        for (let i = 0; i < 20000; i++) {
+          lua.register_class('C' + i, { construct: () => ({}), methods: { m() { return 1; } } });
+        }
+      } catch (e: any) {
+        threw = true;
+        expect(String(e.message)).toMatch(/memory/i);
+      }
+      // Reaching here at all is the point: before the fix, RegisterClass's
+      // std::runtime_error unwound through the N-API boundary and terminated
+      // the process instead of surfacing as a catchable JS error.
+      expect(threw).toBe(true);
+      // The context object is still responsive. (The budget stays exhausted
+      // afterwards — a hard maxMemory ceiling legitimately leaves no headroom
+      // to even compile a recovery chunk — so query it without allocating.)
+      expect(typeof lua.get_memory_usage()).toBe('number');
+      // A fresh context is unaffected: no global/process state was corrupted.
+      const other: any = new lua_native.init({}, ALL_LIBS);
+      other.register_class('AfterOom', { construct: () => ({ v: 3 }), methods: { get() { return 3; } } });
+      expect(other.execute_script('local a = AfterOom.new(); return a:get()')).toBe(3);
+    });
+
+    // --- Coverage gap: the busy guard on synchronous entry points
+
+    it('rejects synchronous calls and table-handle use while a worker runs', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('shared = {v = 1}');
+      const handle = lua.get_global_ref('shared');
+      const pending = lua.execute_script_async('local s = 0 for i = 1, 4000000 do s = s + i end return s');
+      expect(lua.is_busy()).toBe(true);
+      // Every synchronous entry point must refuse while the worker owns the state.
+      expect(() => lua.execute_script('return 1')).toThrow(/busy/i);
+      expect(() => lua.set_global('x', 1)).toThrow(/busy/i);
+      expect(() => lua.get_global('shared')).toThrow(/busy/i);
+      expect(() => lua.create_table({})).toThrow(/busy/i);
+      expect(() => lua.register_class('Nope', { construct: () => ({}) })).toThrow(/busy/i);
+      // Table handles obtained before the run must refuse too.
+      expect(() => handle.get('v')).toThrow(/busy/i);
+      expect(() => handle.set('v', 2)).toThrow(/busy/i);
+      await pending;
+      // Everything works again once the worker finishes.
+      expect(lua.is_busy()).toBe(false);
+      expect(handle.get('v')).toBe(1);
+      expect(lua.execute_script('return 1')).toBe(1);
+    });
+
+    // --- Coverage gap: coroutine argument validation
+
+    it('validates create_coroutine and resume arguments', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.create_coroutine()).toThrow();
+      expect(() => lua.create_coroutine(42)).toThrow();
+      expect(() => lua.resume()).toThrow();
+      expect(() => lua.resume(42)).toThrow();
+      expect(() => lua.resume({})).toThrow(/coroutine/i);
+      expect(() => lua.resume({ _coroutine: 'not-an-external' })).toThrow(/coroutine/i);
+    });
+
+    // --- Coverage gap: non-primitive arguments to a returned Lua function
+
+    it('passes tables, arrays, and callbacks to a Lua function from JS', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        function inspect(tbl, arr, cb)
+          return tbl.name .. ':' .. #arr .. ':' .. cb(arr[1])
+        end
+      `);
+      const inspect = lua.get_global('inspect');
+      const result = inspect({ name: 'x' }, [10, 20, 30], (n: number) => n * 2);
+      expect(result).toBe('x:3:20');
+      // Nested structures round-trip too.
+      lua.execute_script('function depth(t) return t.a.b.c end');
+      expect(lua.get_global('depth')({ a: { b: { c: 'deep' } } })).toBe('deep');
     });
   });
 });
