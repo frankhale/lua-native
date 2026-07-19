@@ -23,7 +23,6 @@ const buildDirs = [
   "cmake-build-release-visual-studio",
 ];
 
-let found = false;
 for (const dir of buildDirs) {
   const fullPath = path.join(process.cwd(), dir, exeName);
   if (fs.existsSync(fullPath)) {
@@ -34,16 +33,12 @@ for (const dir of buildDirs) {
     } else {
       process.exit(1);
     }
-    found = true;
-    break;
   }
 }
 
-if (!found) {
-  console.error(
-    "Could not find lua-native-test executable. Please build the project first."
-  );
-  console.error("Tried searching in:");
-  buildDirs.forEach((dir) => console.error(` - ${path.join(dir, exeName)}`));
-  process.exit(1);
-}
+console.error(
+  "Could not find lua-native-test executable. Please build the project first."
+);
+console.error("Tried searching in:");
+buildDirs.forEach((dir) => console.error(` - ${path.join(dir, exeName)}`));
+process.exit(1);

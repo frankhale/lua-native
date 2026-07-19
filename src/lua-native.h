@@ -157,6 +157,28 @@ public:
       ~CallScope() { --ctx->call_depth_; }
     };
 
+    // RAII: collects the reclaimable __js_callback_ names minted while a
+    // JS→Lua conversion is in flight, so a conversion that is discarded before
+    // its value is ever pushed can sweep the entries it registered (N4).
+    // Scopes nest (a type converter can re-enter conversion from user JS);
+    // each restores its parent on destruction.
+    struct JsCallbackCollectorScope {
+      LuaContext* ctx;
+      std::vector<std::string>* prev;
+      std::vector<std::string> names;
+      explicit JsCallbackCollectorScope(LuaContext* c)
+          : ctx(c), prev(c->js_callback_collector_) {
+        ctx->js_callback_collector_ = &names;
+      }
+      ~JsCallbackCollectorScope() { ctx->js_callback_collector_ = prev; }
+      // Hands the collected names to the enclosing scope (if any) when this
+      // conversion succeeds but an outer scope may still discard the value.
+      void PropagateToParent() {
+        if (prev) prev->insert(prev->end(), names.begin(), names.end());
+        names.clear();
+      }
+    };
+
 private:
     // The addon env, captured at construction. Safe to reuse from later instance
     // methods because they all run on the same JS thread while this ObjectWrap is
@@ -246,6 +268,18 @@ private:
     // the caller can early-return. Centralizes the guard duplicated across the
     // synchronous API methods.
     bool RejectIfBusy();
+
+    // Recursive body of NapiToCoreInstance; the public entry wraps depth 0 in
+    // a JsCallbackCollectorScope so an aborted conversion sweeps the
+    // reclaimable callback entries it minted (N4).
+    lua_core::LuaValue NapiToCoreImpl(const Napi::Value& value, int depth);
+    // Active collector for in-flight conversions (nullptr when none). See
+    // JsCallbackCollectorScope.
+    std::vector<std::string>* js_callback_collector_ = nullptr;
+    // Drops the entries for any of `names` whose Lua closure was never
+    // materialized (live count 0), both runtime-side and the paired
+    // js_callbacks_ reference (N4).
+    void SweepUnpushedJsCallbacks(const std::vector<std::string>& names);
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);

@@ -706,9 +706,13 @@ void LuaRuntime::RegisterClass(
   // protected frame so an OOM under maxMemory, or a raising __newindex on a _G
   // metatable at the final lua_setglobal, throws instead of aborting (M3). Every
   // allocation and _G write below is therefore protected.
+  //
+  // The key strings live out here, not in the thunk: a Lua ERRMEM longjmp to
+  // the pcall skips destructors of thunk-local C++ objects (N2).
+  const std::string mt_name = std::string(kClassMetaPrefix) + class_name;
+  const std::string methods_key = std::string(kClassMethodsPrefix) + class_name;
   RunProtected([&]() {
   // 1. Create the shared per-class instance metatable.
-  const std::string mt_name = std::string(kClassMetaPrefix) + class_name;
   luaL_newmetatable(L_, mt_name.c_str());
 
   lua_pushcfunction(L_, UserdataGC);
@@ -747,7 +751,6 @@ void LuaRuntime::RegisterClass(
     lua_pushstring(L_, func_name.c_str());
     lua_setfield(L_, -2, name.c_str());
   }
-  const std::string methods_key = std::string(kClassMethodsPrefix) + class_name;
   lua_setfield(L_, LUA_REGISTRYINDEX, methods_key.c_str());
 
   // 3. Create the class global table with a `new` constructor function.
@@ -857,6 +860,14 @@ void LuaRuntime::RegisterReclaimableHostFunction(const std::string& name, Functi
   reclaimable_host_fns_[name] = 0;  // live-closure count, incremented on each push
 }
 
+bool LuaRuntime::EraseReclaimableIfUnpushed(const std::string& name) {
+  auto it = reclaimable_host_fns_.find(name);
+  if (it == reclaimable_host_fns_.end() || it->second != 0) return false;
+  reclaimable_host_fns_.erase(it);
+  host_functions_.erase(name);
+  return true;
+}
+
 void LuaRuntime::SetHostFunctionGCCallback(HostFunctionGCCallback cb) {
   host_fn_gc_callback_ = std::move(cb);
 }
@@ -950,23 +961,29 @@ void LuaRuntime::AddSearchPath(const std::string& path) const {
 
   // Protected so the pushstring/setfield allocation (M3) — and a __newindex on
   // a metatabled package table — throw rather than abort.
+  //
+  // The appended string lives out here so no std::string local sits in the
+  // thunk while a raise-capable Lua call executes — an ERRMEM longjmp to the
+  // pcall would skip its destructor (N2). The assigns/appends inside the thunk
+  // can only throw C++ exceptions, which the trampoline catches normally.
+  std::string appended;
   RunProtected([&]() {
     PushProtectedGlobal("package");
 
     // Get current package.path
     lua_getfield(L_, -1, "path");
     const char* current_raw = lua_tostring(L_, -1);
-    std::string current = current_raw ? current_raw : "";
+    appended.assign(current_raw ? current_raw : "");
     lua_pop(L_, 1);  // pop path string
 
     // Append the new path
-    if (!current.empty()) {
-      current += ";";
+    if (!appended.empty()) {
+      appended += ";";
     }
-    current += path;
+    appended += path;
 
     // Set the updated package.path
-    lua_pushstring(L_, current.c_str());
+    lua_pushstring(L_, appended.c_str());
     lua_setfield(L_, -2, "path");
   });
 }
@@ -1054,7 +1071,16 @@ int LuaRuntime::LuaPrint(lua_State* L) {
 
   size_t len = 0;
   const char* s = lua_tolstring(L, -1, &len);
-  std::string out(s ? s : "", s ? len : 0);
+  // The one remaining allocation in this frame: a bad_alloc must not unwind
+  // through the Lua C frame — fall back to raw stdout instead (N5).
+  std::string out;
+  try {
+    out.assign(s ? s : "", s ? len : 0);
+  } catch (const std::bad_alloc&) {
+    if (s) fwrite(s, 1, len, stdout);
+    lua_pop(L, 1);
+    return 0;
+  }
   lua_pop(L, 1);
 
   if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
@@ -1087,7 +1113,15 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
 
   size_t len = 0;
   const char* s = lua_tolstring(L, -1, &len);
-  std::string out(s ? s : "", s ? len : 0);
+  // See LuaPrint: trap the final allocation's bad_alloc (N5).
+  std::string out;
+  try {
+    out.assign(s ? s : "", s ? len : 0);
+  } catch (const std::bad_alloc&) {
+    if (s) fwrite(s, 1, len, stdout);
+    lua_pop(L, 1);
+    return 0;
+  }
   lua_pop(L, 1);
 
   if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
@@ -1710,7 +1744,6 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
   // Install _G[name] = <closure> inside a protected frame so BOTH a __newindex
   // metamethod on the globals table (M4) AND an OOM allocating the key string /
   // closure (M5) surface as a std::runtime_error instead of an unprotected panic.
-  host_functions_[name] = std::move(fn);
   RunProtected([&]() {
     lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
     lua_pushlstring(L_, name.data(), name.size());          // key (size-aware)
@@ -1719,6 +1752,9 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
     lua_settable(L_, -3);                                   // _G[key]=closure (may __newindex)
     lua_pop(L_, 1);                                         // pop globals table
   });
+  // Stored only after the protected _G write succeeds, so a raising __newindex
+  // doesn't leave an entry with no global pointing at it (N5).
+  host_functions_[name] = std::move(fn);
 }
 
 // Reads _G[name] through the protected table-get trampoline, leaving the value
@@ -1988,14 +2024,31 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
           lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
           if (auto* rt = static_cast<LuaRuntime*>(lua_touserdata(L, -1))) {
             lua_pop(L, 1);
-            auto it = rt->reclaimable_host_fns_.find(v.name);
-            if (it != rt->reclaimable_host_fns_.end()) {
+            if (rt->reclaimable_host_fns_.count(v.name)) {
               reclaimable = true;
-              ++it->second;
+              // Build the sentinel fully before touching the live count: if
+              // either allocation below raises LUA_ERRMEM, no accounting has
+              // happened, so no phantom +1 can strand the entry (N1). The slot
+              // stays null (its __gc no-ops) until the count owns a decrement.
               auto** slot = static_cast<std::string**>(
                   lua_newuserdatauv(L, sizeof(std::string*), 0));
-              *slot = new std::string(v.name);
+              *slot = nullptr;
               luaL_setmetatable(L, kHostFnSentinelMeta);
+              // Re-find after the raise-capable allocations: a GC step inside
+              // them can collect this name's last live closure and erase the
+              // entry (the count is not pinned yet). If that happened, the
+              // host function is gone — leave the sentinel inert; the closure
+              // raises the missing-function error if it is ever called.
+              auto it = rt->reclaimable_host_fns_.find(v.name);
+              if (it != rt->reclaimable_host_fns_.end()) {
+                // Arm, then count: a bad_alloc from the string copy leaves the
+                // slot null and the count untouched (still balanced), and once
+                // armed the increment cannot fail. If the closure push below
+                // raises, the unwound sentinel's __gc performs the matching
+                // decrement.
+                *slot = new std::string(v.name);
+                ++it->second;
+              }
             }
           } else {
             lua_pop(L, 1);

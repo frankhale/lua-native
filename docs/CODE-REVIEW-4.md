@@ -22,6 +22,29 @@ re-run during this review against the freshly built debug binary.
 
 ---
 
+## Resolution status (July 19, 2026)
+
+All findings resolved, including every N5 nit that called for code. After the
+fixes: 438 TypeScript tests and 178 C++ tests still pass, plus a behavioral
+harness (run with `--expose-gc`) confirming the N4 sweep (-0.1 bytes/iteration
+steady-state over 20,000 aborted `{ fn, Symbol }` conversions, nested callbacks
+still callable) and the N3 single-read snapshot (a hostile `metamethods` getter
+is invoked exactly once; method dispatch intact).
+
+| # | Status | Resolution |
+|---|--------|------------|
+| N1 | ✅ Done | `PushLuaValue` now builds the sentinel fully (null slot, metatable set) *before* touching the live count, then arms the slot and increments last — every raise path leaves the count balanced. **Deliberate deviation from the recommended reorder:** incrementing after `luaL_setmetatable` on the original iterator is unsafe — a GC step inside `lua_newuserdatauv`/`luaL_setmetatable` can collect the name's last live closure and erase the map entry (the count is not yet pinned), dangling `it` before `++it->second`. The fix instead re-finds the entry after the raise-capable allocations; if it vanished mid-push, the sentinel stays inert and the closure raises the ordinary missing-function error if called. |
+| N2 | ✅ Done | `RegisterClass`'s `mt_name`/`methods_key` are built before `RunProtected` and captured by reference; `AddSearchPath`'s appended path string lives in the caller frame and is assigned inside the thunk (string ops throw C++ exceptions, which the trampoline catches — no raise-capable Lua call executes while a thunk-local `std::string` is alive). |
+| N3 | ✅ Done | `register_class` reads `metamethods` (property, key list, and each value) exactly once into a snapshot, validates the snapshot, and registers from it — the definition object is never consulted a second time. |
+| N4 | ✅ Done (sweep) | `NapiToCoreInstance` wraps each top-level conversion in a `JsCallbackCollectorScope` that records the reclaimable names it mints; an aborted conversion sweeps entries whose live count is still 0 (`LuaRuntime::EraseReclaimableIfUnpushed`) along with the paired `js_callbacks_` reference. `OnAwaitSettled` keeps a scope across its args build and sweeps when the H2 re-check drops the settlement. Scopes nest (type-converter re-entry) and propagate names to their parent on success; sweeping is conservative — a pushed name has count ≥ 1 (or is already gone) and is never touched. |
+| N5 | ✅ Done | `LuaPrint`/`LuaIoWrite` trap `bad_alloc` on the final `std::string` and fall back to raw stdout; `run-tests.js` unreachable `found = true; break;` removed (flag dropped entirely); `RegisterFunction` stores the host function only after the protected `_G` write succeeds, and both binding sites (`SetGlobal`, `RegisterCallbacks`) register with the runtime before touching `js_callbacks_`, so a raising `__newindex` strands nothing. The `x64-unknown` fallback triplet is left as-is per the review (acceptable). |
+
+(M5 from CODE-REVIEW-3 remains deferred by decision.)
+
+The original findings follow unchanged for reference.
+
+---
+
 ## Verification of the CODE-REVIEW-3 remediation
 
 Every resolution row in CODE-REVIEW-3's table was checked against the diff
@@ -63,7 +86,7 @@ The build/test scripts reviewed for the first time are sound (nits only).
 
 ## Findings
 
-### N1. Reclaim live-count incremented before a raise-capable allocation — an OOM permanently strands the entry (medium-low)
+### N1. Reclaim live-count incremented before a raise-capable allocation — an OOM permanently strands the entry (medium-low) — ✅ DONE
 
 `src/core/lua-runtime.cpp:1993-1998` (the new reclaimable branch of
 `PushLuaValue`):
@@ -94,7 +117,7 @@ M2 guarantee for that entry.
 
 The current order is the only one of these that cannot self-balance.
 
-### N2. `std::string` locals constructed inside `RunProtected` thunks are skipped by an ERRMEM longjmp (low)
+### N2. `std::string` locals constructed inside `RunProtected` thunks are skipped by an ERRMEM longjmp (low) — ✅ DONE
 
 - `RegisterClass`: `mt_name` (`src/core/lua-runtime.cpp:711`) and
   `methods_key` (`:750`) are constructed inside the thunk, with raise-capable
@@ -116,7 +139,7 @@ built *outside* the lambda).
 `AddSearchPath`, build `current` in a first pass (the read side), then run
 the write side in the protected thunk with the finished string captured.
 
-### N3. `register_class` re-reads `metamethods` after validating it — a hostile getter bypasses the reserved-key check (low)
+### N3. `register_class` re-reads `metamethods` after validating it — a hostile getter bypasses the reserved-key check (low) — ✅ DONE
 
 `src/lua-native.cpp:889-890` (validation) vs `:940-941` (registration) —
 `def.Get("metamethods")` is evaluated **twice**, and `GetPropertyNames` is
@@ -136,7 +159,7 @@ snapshot, then register from the same snapshot. (The other double-reads in
 this function — `readable`/`writable` — only influence booleans and are
 harmless.)
 
-### N4. Reclaimable entries registered at conversion time but never pushed leak until context death (low, documented-residual candidate)
+### N4. Reclaimable entries registered at conversion time but never pushed leak until context death (low, documented-residual candidate) — ✅ DONE (sweep implemented)
 
 `src/lua-native.cpp:1956-1960`: `NapiToCoreInstance` registers the
 `__js_callback_N` entry (count 0) when the JS function is *converted*; the
@@ -162,7 +185,7 @@ converted value), erase any entries registered during that conversion whose
 count is still 0 (track the names minted per top-level conversion in a small
 scoped collector).
 
-### N5. Nits
+### N5. Nits — ✅ DONE
 
 - `LuaPrint` / `LuaIoWrite` (`src/core/lua-runtime.cpp:1057, :1090`): the
   final `std::string out(...)` construction can throw `bad_alloc` inside a

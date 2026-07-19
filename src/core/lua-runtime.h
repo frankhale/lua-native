@@ -348,6 +348,12 @@ public:
   // anonymous JS callbacks nested inside values crossing JS→Lua, which would
   // otherwise accumulate for the life of the context (M2).
   void RegisterReclaimableHostFunction(const std::string& name, Function fn);
+  // Erases a reclaimable entry that was registered but never materialized as a
+  // closure (live count still 0), so a conversion discarded before its value
+  // was pushed doesn't strand the entry for the context's lifetime (N4).
+  // Returns true if erased (the binding should drop its paired JS reference).
+  // Safe on pushed names: a non-zero count (or missing entry) is untouched.
+  bool EraseReclaimableIfUnpushed(const std::string& name);
   // Invoked when a reclaimable host function's last live closure is collected,
   // so the binding layer can drop its paired js_callbacks_ reference. Runs on
   // the thread the GC fires on; skipped during worker-thread async (off-thread

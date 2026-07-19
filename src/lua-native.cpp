@@ -724,8 +724,10 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
 
     try {
       if (val.IsFunction()) {
-        js_callbacks_[key_str] = Napi::Persistent(val.As<Napi::Function>());
+        // Runtime registration first: if the protected _G write throws, no
+        // js_callbacks_/host_functions_ entry is left behind (N5).
         runtime->RegisterFunction(key_str, CreateJsCallbackWrapper(key_str));
+        js_callbacks_[key_str] = Napi::Persistent(val.As<Napi::Function>());
       } else {
         runtime->SetGlobal(key_str, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
       }
@@ -750,8 +752,10 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
   // the whole body rather than letting the exception unwind past N-API.
   try {
     if (const Napi::Value value = info[1]; value.IsFunction()) {
-      js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
+      // Runtime registration first: if the protected _G write throws, no
+      // js_callbacks_/host_functions_ entry is left behind (N5).
       runtime->RegisterFunction(name, CreateJsCallbackWrapper(name));
+      js_callbacks_[name] = Napi::Persistent(value.As<Napi::Function>());
     } else {
       runtime->SetGlobal(name, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(value)));
     }
@@ -885,18 +889,30 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
 
   // Validate reserved metamethods up front, before anything is registered, so a
   // rejected definition doesn't strand the constructor/method callbacks in
-  // js_callbacks_/host_functions_ (L4).
-  if (def.Has("metamethods") && def.Get("metamethods").IsObject()) {
-    auto mms = def.Get("metamethods").As<Napi::Object>();
-    Napi::Array mmKeys = mms.GetPropertyNames();
-    for (uint32_t i = 0; i < mmKeys.Length(); ++i) {
-      std::string key = mmKeys.Get(i).As<Napi::String>().Utf8Value();
-      if (key == "__gc" || key == "__index" || key == "__newindex" ||
-          key == "__name" || key == lua_core::LuaRuntime::kClassMarkerField) {
-        Napi::TypeError::New(env,
-          "register_class(): metamethod '" + key + "' is reserved and cannot be overridden")
-          .ThrowAsJavaScriptException();
-        return env.Undefined();
+  // js_callbacks_/host_functions_ (L4). The property, its key list, and each
+  // value are read exactly once into this snapshot — a hostile getter/Proxy
+  // cannot show validation a clean object and hand registration a different
+  // one containing the reserved keys (N3); registration below uses the same
+  // snapshot.
+  std::vector<std::pair<std::string, Napi::Function>> mm_snapshot;
+  if (def.Has("metamethods")) {
+    const Napi::Value mmsVal = def.Get("metamethods");
+    if (mmsVal.IsObject()) {
+      auto mms = mmsVal.As<Napi::Object>();
+      Napi::Array mmKeys = mms.GetPropertyNames();
+      for (uint32_t i = 0; i < mmKeys.Length(); ++i) {
+        std::string key = mmKeys.Get(i).As<Napi::String>().Utf8Value();
+        if (key == "__gc" || key == "__index" || key == "__newindex" ||
+            key == "__name" || key == lua_core::LuaRuntime::kClassMarkerField) {
+          Napi::TypeError::New(env,
+            "register_class(): metamethod '" + key + "' is reserved and cannot be overridden")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        Napi::Value val = mms.Get(key);
+        if (val.IsFunction()) {
+          mm_snapshot.emplace_back(std::move(key), val.As<Napi::Function>());
+        }
       }
     }
   }
@@ -935,27 +951,19 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     }
   }
 
-  // Metamethods (operator overloads, __tostring, __call, etc.).
+  // Metamethods (operator overloads, __tostring, __call, etc.), registered
+  // from the snapshot validated above (N3) — the definition object is not
+  // consulted again.
   std::vector<lua_core::MetatableEntry> metamethods;
-  if (def.Has("metamethods") && def.Get("metamethods").IsObject()) {
-    auto mms = def.Get("metamethods").As<Napi::Object>();
-    Napi::Array keys = mms.GetPropertyNames();
-    for (uint32_t i = 0; i < keys.Length(); ++i) {
-      std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
-      // Reserved metamethods were already rejected up front (L4), so any key
-      // reaching here is a permitted operator/overload metamethod.
-      Napi::Value val = mms.Get(key);
-      if (val.IsFunction()) {
-        std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
-        js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
-        runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
-        lua_core::MetatableEntry entry;
-        entry.key = key;
-        entry.is_function = true;
-        entry.func_name = func_name;
-        metamethods.push_back(std::move(entry));
-      }
-    }
+  for (const auto& [key, fn] : mm_snapshot) {
+    std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
+    js_callbacks_[func_name] = Napi::Persistent(fn);
+    runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+    lua_core::MetatableEntry entry;
+    entry.key = key;
+    entry.is_function = true;
+    entry.func_name = func_name;
+    metamethods.push_back(std::move(entry));
   }
 
   runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
@@ -1724,6 +1732,10 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   }
 
   std::vector<lua_core::LuaPtr> args;
+  // Collect any reclaimable callback entries minted while converting the
+  // settled value into args: if the H2 re-check below drops this settlement,
+  // they were never pushed and must be swept (N4).
+  JsCallbackCollectorScope collector(this);
   if (is_error) {
     std::string msg;
     if (value.IsObject() && value.As<Napi::Object>().Get("message").IsString()) {
@@ -1760,6 +1772,7 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   // the liveness+generation guard before driving so we neither dereference a
   // disengaged optional nor inject this settlement into a newer run (H2).
   if (!async_co_ || !async_deferred_ || gen != async_generation_) {
+    SweepUnpushedJsCallbacks(collector.names);
     return env.Undefined();
   }
   DriveAsync(std::move(args), is_error);
@@ -1945,6 +1958,32 @@ Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
 NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)
 
 lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int depth) {
+  if (depth > 0) return NapiToCoreImpl(value, depth);
+  // Top-level conversion: if it aborts partway (a sibling value throwing after
+  // a function was already registered), sweep the reclaimable entries it
+  // minted — they will never be pushed and would otherwise live until context
+  // destruction (N4). On success the names propagate to any enclosing scope,
+  // which may still discard the converted value (see OnAwaitSettled).
+  JsCallbackCollectorScope collector(this);
+  try {
+    lua_core::LuaValue result = NapiToCoreImpl(value, 0);
+    collector.PropagateToParent();
+    return result;
+  } catch (...) {
+    SweepUnpushedJsCallbacks(collector.names);
+    throw;
+  }
+}
+
+void LuaContext::SweepUnpushedJsCallbacks(const std::vector<std::string>& names) {
+  for (const auto& name : names) {
+    if (runtime && runtime->EraseReclaimableIfUnpushed(name)) {
+      js_callbacks_.erase(name);
+    }
+  }
+}
+
+lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int depth) {
   if (depth > lua_core::LuaRuntime::kMaxDepth) {
     throw std::runtime_error("Value nesting depth exceeds the maximum of "
       + std::to_string(lua_core::LuaRuntime::kMaxDepth) + " levels");
@@ -1960,6 +1999,7 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
     // when the materialized Lua closure is garbage-collected, so anonymous
     // callbacks don't accumulate for the life of the context (M2).
     runtime->RegisterReclaimableHostFunction(name, CreateJsCallbackWrapper(name));
+    if (js_callback_collector_) js_callback_collector_->push_back(name);
     return lua_core::LuaValue::from(lua_core::HostFunctionName{name});
   }
 
