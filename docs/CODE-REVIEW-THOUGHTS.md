@@ -132,3 +132,70 @@ CODE-REVIEW-2 finding new sites of CODE-REVIEW-1's classes is the tell that the
 work is still happening site-by-site. Close that gap — fix classes, enforce with
 sanitizers — and the convergence you're expecting becomes the natural result
 rather than a hope.
+
+---
+
+## Addendum (July 21, 2026, after CODE-REVIEW-6)
+
+The prediction held, in the most literal way possible. Across CR-3 → CR-6 the
+severity of *net-new* findings fell (H-class systemic → OOM-window accounting →
+a coverage boundary), exactly the "shift in character" this document called the
+real measure of maturity. But the site-vs-class tell never went away:
+
+- **CR-4** found new sites of CR-3's classes (N1/N2 — longjmp/OOM accounting in
+  the *new* M2/M3 machinery).
+- **CR-5** found F1, a coverage *boundary* of CR-4's N4 sweep, plus F11 — a
+  brand-new instance of the H1 "std::runtime_error unwinds past N-API → process
+  abort" class, in `register_class`, a path every earlier pass missed.
+- **CR-6** then found that F11 had fixed the **site, not the class**: the exact
+  same defect was still live in `set_userdata` and `set_print_handler`, this time
+  triggerable by ordinary Lua (`setmetatable(_G, {__newindex=...})`) with no
+  `maxMemory` at all — a **high-severity process abort inside a fix that named
+  the class.**
+
+That is the whole thesis in one arc. A one-line `try`/`catch` around the site the
+review happened to name did not stop the class; the next pass simply found the
+next site, at higher severity. CR-6 closed all four reachable sites *and* added a
+per-entry-point regression matrix (arm a raising `_G` metamethod, invoke every
+binding method reaching a `RunProtected`-backed core call, assert a catchable
+throw and process survival) — the first class-level enforcement for this hazard.
+
+Mechanical enforcement is now in place — and deliberately **not** as a CI service
+(this project builds locally). Four sanitizer harnesses cover the memory/UB and
+race classes; all are local build flags in `binding.gyp`, run whenever you want.
+See `docs/SANITIZERS.md` for the full write-up and the July 2026 stress-test
+results; in brief:
+
+- **`test-cpp-asan`** — the `LuaRuntime` core under ASan+UBSan (178 tests clean).
+- **`test-ts-asan`** — the `.node` addon under ASan+UBSan, run through the whole
+  vitest suite via a preloaded runtime. **This is the important one**: the binding
+  layer is exactly where the historical use-after-frees lived (H3, L5, L6, H9c),
+  and the standard C++ ASan build never touches it. 454 tests clean, plus a
+  1,200-iteration `--expose-gc` stress run of every one of those UAF patterns —
+  no report.
+- **`test-cpp-tsan`** — the core under TSan; 0 races, expected, because the core
+  suite is single-threaded. A guard, not a finder.
+- **`test-ts-tsan`** — the addon under TSan through the async suite. It runs and
+  reports 0 races, but with a real limit: TSan can't see libuv/V8/Lua
+  synchronization, so a clean run is "no race in the interleavings that happened,"
+  not a proof. Best-effort probe, not a gate.
+
+Scope and honesty about what none of them catch:
+
+- ASan/UBSan target memory-safety and UB (use-after-free on a released handle, a
+  longjmp over a C++ destructor, out-of-bounds stack reads). They would **not**
+  have caught F1: an uncaught C++ exception reaching `std::terminate` is a
+  different failure mode. For the H1 abort class specifically, the CR-6
+  per-entry-point regression matrix is the enforcement.
+- Sanitizers are runtime tools — they only see bugs on paths a test executes. The
+  clean stress run above is strong evidence, not proof; its value came from
+  deliberately driving the adversarial + forced-GC paths. New adversarial tests
+  are what extend the coverage.
+
+So the tail is now closing from three directions: a behavioral matrix for the
+exception-abort class, ASan over both layers for the memory/UB classes, and a
+best-effort TSan probe for the async races. The remaining step is discipline —
+adding each new binding method to the H1 matrix, and running `test-ts-asan` (with
+a GC stress pass for lifetime changes) before shipping. CR-6 remains the
+cautionary tale for why the discipline matters: a fix that names a class but
+sweeps only one site leaves the next site for the next pass, at higher severity.

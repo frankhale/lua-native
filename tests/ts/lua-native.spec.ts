@@ -4984,4 +4984,81 @@ describe('lua-native Node adapter', () => {
       expect(lua.get_global('depth')({ a: { b: { c: 'deep' } } })).toBe('deep');
     });
   });
+
+  // ============================================
+  // CODE-REVIEW-6 REGRESSIONS
+  // ============================================
+  describe('code-review-6 regressions', () => {
+    // --- F1: a std::runtime_error from a RunProtected-backed core call must not
+    // unwind across the N-API boundary and terminate the process. Every binding
+    // method that reaches such a core call is exercised here with a raising
+    // __newindex on a _G metatable; each must throw a catchable JS error and the
+    // process must survive to run the next assertion. (Before the fix,
+    // set_userdata and set_print_handler aborted with SIGABRT.)
+
+    // Arms a _G.__newindex that raises on any global write, then returns the ctx.
+    const withHostileG = () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      // Clear print first so the print-redirection reassignment hits __newindex
+      // (assigning an existing key goes through rawset-like paths otherwise).
+      lua.execute_script(
+        "print = nil; setmetatable(_G, { __newindex = function() error('boom') end })");
+      return lua;
+    };
+
+    it('F1: set_userdata (opaque) throws instead of aborting', () => {
+      const lua = withHostileG();
+      expect(() => lua.set_userdata('h', { x: 1 })).toThrow(/boom/);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F1: set_userdata (proxy) throws instead of aborting', () => {
+      const lua = withHostileG();
+      expect(() => lua.set_userdata('h', { x: 1 }, { readable: true, writable: true }))
+        .toThrow(/boom/);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F1: set_userdata (methods) throws instead of aborting', () => {
+      const lua = withHostileG();
+      expect(() => lua.set_userdata('h', { x: 1 }, { methods: { m() { return 1; } } }))
+        .toThrow(/boom/);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F1: set_print_handler throws instead of aborting', () => {
+      const lua = withHostileG();
+      expect(() => lua.set_print_handler(() => {})).toThrow(/boom/);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F1: the already-guarded _G-writing siblings still throw cleanly', () => {
+      // These pass pre-fix too; included so the matrix covers the sibling entry
+      // points whose RunProtected-backed core call writes _G (so the hostile
+      // __newindex fires): the raising metamethod must surface as a catchable
+      // JS error, never an abort.
+      let lua = withHostileG();
+      expect(() => lua.set_global('x', 1)).toThrow(/boom/);
+      lua = withHostileG();
+      expect(() => lua.register_class('C', { construct: () => ({}) })).toThrow(/boom/);
+      // set_metatable validates the target global before writing, so a raising
+      // __newindex isn't reached here — but it must still surface as a throw,
+      // not an abort.
+      lua = withHostileG();
+      expect(() => lua.set_metatable('missing', { __index: () => 1 })).toThrow();
+    });
+
+    it('F1: a rejected set_userdata strands no state (name is reusable)', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(
+        "setmetatable(_G, { __newindex = function() error('boom') end })");
+      expect(() => lua.set_userdata('h', { x: 1 }, { methods: { m() { return 1; } } }))
+        .toThrow(/boom/);
+      // Remove the hostile metatable and retry: the ref_id / callback entries
+      // from the failed attempt must not interfere with a clean registration.
+      lua.execute_script('setmetatable(_G, nil)');
+      lua.set_userdata('h', { x: 42 }, { readable: true });
+      expect(lua.execute_script('return h.x')).toBe(42);
+    });
+  });
 });

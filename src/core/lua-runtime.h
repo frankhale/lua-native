@@ -342,6 +342,12 @@ public:
   void UnrefOrDefer(int ref);
   // Metatable support
   void StoreHostFunction(const std::string& name, Function fn);
+  // Drops a host function stored via StoreHostFunction. Used to roll back a
+  // partially-registered binding operation whose later step failed (e.g. an
+  // OOM building a userdata method table) so a rejected call strands nothing.
+  // Only removes the C++ entry; the caller is responsible for any Lua-side
+  // reference (there is none for a build that failed before installing it).
+  void RemoveHostFunction(const std::string& name);
   // Like StoreHostFunction, but the registry entry (and the binding's paired JS
   // reference, via the host-function GC callback) is reclaimed once every Lua
   // closure materialized from this name is garbage-collected. Used for the

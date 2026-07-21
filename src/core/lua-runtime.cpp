@@ -855,6 +855,10 @@ void LuaRuntime::StoreHostFunction(const std::string& name, Function fn) {
   host_functions_[name] = std::move(fn);
 }
 
+void LuaRuntime::RemoveHostFunction(const std::string& name) {
+  host_functions_.erase(name);
+}
+
 void LuaRuntime::RegisterReclaimableHostFunction(const std::string& name, Function fn) {
   host_functions_[name] = std::move(fn);
   reclaimable_host_fns_[name] = 0;  // live-closure count, incremented on each push

@@ -707,15 +707,25 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
   }
 
   // Apply I/O options after callbacks so the print override wins over any
-  // callback-provided print, and after libraries are loaded.
+  // callback-provided print, and after libraries are loaded. SetAllowBytecode
+  // and InstallPrintHandler both run protected _G writes that throw on OOM under
+  // maxMemory; surface that as a JS error instead of letting a std::runtime_error
+  // unwind out of the constructor and terminate the process (the H1 class, CR-6
+  // F1). A hostile _G metatable can't be armed before the constructor runs, so
+  // only the OOM trigger is reachable here.
   if (info.Length() > 1 && info[1].IsObject()) {
     auto options = info[1].As<Napi::Object>();
-    if (options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean() &&
-        !options.Get("allowBytecode").As<Napi::Boolean>().Value()) {
-      runtime->SetAllowBytecode(false);  // E3
-    }
-    if (options.Has("print") && options.Get("print").IsFunction()) {
-      InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
+    try {
+      if (options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean() &&
+          !options.Get("allowBytecode").As<Napi::Boolean>().Value()) {
+        runtime->SetAllowBytecode(false);  // E3
+      }
+      if (options.Has("print") && options.Get("print").IsFunction()) {
+        InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
+      }
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return;
     }
   }
 }
@@ -839,27 +849,46 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   entry.writable = writable;
   js_userdata_[ref_id] = std::move(entry);
 
-  bool needs_proxy = readable || writable || has_methods;
-  if (needs_proxy) {
-    runtime->CreateProxyUserdataGlobal(name, ref_id);
-  } else {
-    runtime->CreateUserdataGlobal(name, ref_id);
-  }
-
-  // Register methods if present
-  if (has_methods) {
-    std::unordered_map<std::string, std::string> method_map;
-
-    for (auto& [methodName, methodFunc] : method_funcs) {
-      std::string func_name = "__ud_method_" + std::to_string(ref_id)
-                            + "_" + methodName;
-
-      js_callbacks_[func_name] = Napi::Persistent(methodFunc);
-      runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
-      method_map[methodName] = func_name;
+  // The core calls below build inside RunProtected, which throws on OOM under
+  // maxMemory or a raising __newindex on a _G metatable at the global write.
+  // Surface that as a JS error: letting a std::runtime_error unwind across the
+  // N-API boundary terminates the process (the H1 class — the same defect F11
+  // fixed for register_class, here at its unswept sibling site, CR-6 F1). On
+  // failure, roll back the js_userdata_/js_callbacks_/host_functions_ entries
+  // registered above so a rejected call strands nothing.
+  std::vector<std::string> registered_method_fns;
+  try {
+    bool needs_proxy = readable || writable || has_methods;
+    if (needs_proxy) {
+      runtime->CreateProxyUserdataGlobal(name, ref_id);
+    } else {
+      runtime->CreateUserdataGlobal(name, ref_id);
     }
 
-    runtime->SetUserdataMethodTable(ref_id, method_map);
+    // Register methods if present
+    if (has_methods) {
+      std::unordered_map<std::string, std::string> method_map;
+
+      for (auto& [methodName, methodFunc] : method_funcs) {
+        std::string func_name = "__ud_method_" + std::to_string(ref_id)
+                              + "_" + methodName;
+
+        js_callbacks_[func_name] = Napi::Persistent(methodFunc);
+        runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+        registered_method_fns.push_back(func_name);
+        method_map[methodName] = func_name;
+      }
+
+      runtime->SetUserdataMethodTable(ref_id, method_map);
+    }
+  } catch (const std::exception& e) {
+    js_userdata_.erase(ref_id);
+    for (const auto& func_name : registered_method_fns) {
+      js_callbacks_.erase(func_name);
+      runtime->RemoveHostFunction(func_name);
+    }
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
   return env.Undefined();
@@ -1926,12 +1955,22 @@ void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
 
 Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
-  if (info.Length() >= 1 && info[0].IsFunction()) {
-    InstallPrintHandler(info[0].As<Napi::Function>());
-  } else {
-    // null/undefined clears redirection (print/io.write go to stdout).
-    print_handler_.Reset();
-    runtime->SetOutputHandler(nullptr);
+  // InstallPrintHandler routes through SetOutputHandler -> InstallOutputRedirection,
+  // which does a protected _G reassignment of print/io.write and throws on a
+  // raising __newindex on a _G metatable (or OOM under maxMemory). Surface that
+  // as a JS error rather than letting it terminate the process (the H1 class,
+  // CR-6 F1).
+  try {
+    if (info.Length() >= 1 && info[0].IsFunction()) {
+      InstallPrintHandler(info[0].As<Napi::Function>());
+    } else {
+      // null/undefined clears redirection (print/io.write go to stdout).
+      print_handler_.Reset();
+      runtime->SetOutputHandler(nullptr);
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
   }
   return env.Undefined();
 }

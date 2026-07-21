@@ -24,6 +24,12 @@ npm test
 # Run C++ tests (Google Test)
 npm run test-cpp
 
+# Sanitizer harnesses (macOS/Linux; see docs/SANITIZERS.md)
+npm run test-cpp-asan   # C++ core under ASan+UBSan
+npm run test-ts-asan    # .node addon under ASan+UBSan, via the full vitest suite
+npm run test-cpp-tsan   # C++ core under TSan (single-threaded — regression guard)
+npm run test-ts-tsan    # addon under TSan, via the async vitest suite
+
 # Clean build artifacts
 npm run clean
 ```
@@ -31,6 +37,23 @@ npm run clean
 **Prerequisites:** Lua must be available via vcpkg. The `get_vcpkg_path.js` script resolves include/lib paths from `VCPKG_ROOT` environment variable.
 
 **Important:** After C++ changes, you must `npm run build-debug` before running `npm test`. The debug build is required for testing — do not use prebuilt binaries.
+
+**Sanitizers (local, no CI required):** four harnesses cover the memory-safety /
+UB / data-race hazard classes the code reviews track. `test-cpp-asan` and
+`test-cpp-tsan` instrument the standalone C++ test binary; `test-ts-asan` and
+`test-ts-tsan` instrument the `.node` addon and run the full vitest suite under a
+preloaded sanitizer runtime (`run-sanitized-ts.js` handles the
+`DYLD_INSERT_LIBRARIES` preload and forces vitest's threads pool, since a forked
+worker would load the runtime too late). Each `test-*` script rebuilds the target,
+so run `build-debug` afterward to return to the normal binary. Highest-value one is
+`test-ts-asan` — the binding layer is where handle/finalizer use-after-frees live.
+`test-ts-tsan` is a best-effort probe only (TSan can't see libuv/V8/Lua
+synchronization, so a clean run is not a proof of race-freedom). Full details, the
+preload mechanics, and the July 2026 stress-test results are in
+`docs/SANITIZERS.md`. These sanitizers do **not** catch the exception-abort class
+(a `std::runtime_error` reaching `std::terminate`, e.g. CR-6 F1) — that stays the
+job of the CODE-REVIEW-6 behavioral matrix. See also
+`docs/CODE-REVIEW-THOUGHTS.md`.
 
 ## Architecture
 
