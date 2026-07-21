@@ -5061,4 +5061,126 @@ describe('lua-native Node adapter', () => {
       expect(lua.execute_script('return h.x')).toBe(42);
     });
   });
+
+  // ============================================
+  // CODE-REVIEW-7 REGRESSIONS
+  // ============================================
+  describe('code-review-7 regressions', () => {
+    // --- F1: the await-settlement callbacks carry a raw LuaContext*; a promise
+    // settling after cancel() tore the run down and GC collected the context
+    // dereferenced freed memory (use-after-free -> process abort). The cookie
+    // now carries the context's shared liveness flag and discards the late
+    // settlement. Requires --expose-gc (vitest.config.ts / run-sanitized-ts.js
+    // provide it); self-skips otherwise.
+    it('F1: a promise settling after cancel() and context GC is discarded, not a use-after-free', async () => {
+      if (typeof global.gc !== 'function') {
+        console.warn('CR-7 F1 regression skipped: global.gc unavailable (run node with --expose-gc)');
+        return;
+      }
+      let settle: ((v: unknown) => void) | undefined;
+      const start = () => {
+        const lua: any = new lua_native.init(
+          { slow: () => new Promise((res) => { settle = res; }) }, ALL_LIBS);
+        lua.execute_async('return slow()').catch(() => {});
+        lua.cancel(); // tears the run down; the settlement callbacks stay on the promise
+      };
+      start(); // the context is unreferenced past this point
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc();
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc();
+      settle!(42); // late settlement onto the collected context
+      await new Promise((r) => setTimeout(r, 20));
+      expect(1 + 1).toBe(2); // process survived: the stale settlement was discarded
+    });
+
+    // --- F2: a user-influenced `then` (own property or patched prototype) that
+    // throws — or isn't callable — must reject the run's promise instead of
+    // unwinding mid-drive and wedging the context busy forever.
+    it('F2: a promise with a throwing own `then` rejects the run instead of wedging the context', async () => {
+      const lua: any = new lua_native.init({
+        bad: () => {
+          const p = new Promise(() => {});
+          Object.defineProperty(p, 'then', {
+            value: () => { throw new Error('hostile then'); },
+          });
+          return p;
+        },
+      }, ALL_LIBS);
+      await expect(lua.execute_async('return bad()')).rejects.toThrow(/hostile then/);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F2: a promise whose own `then` is not callable rejects cleanly', async () => {
+      const lua: any = new lua_native.init({
+        bad: () => {
+          const p = new Promise(() => {});
+          Object.defineProperty(p, 'then', { value: 42 });
+          return p;
+        },
+      }, ALL_LIBS);
+      await expect(lua.execute_async('return bad()')).rejects.toThrow(/no callable 'then'/);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    // --- F3: when set_userdata's global write succeeds but a later build step
+    // OOMs, the rollback must remove the installed global too — pre-fix it
+    // stayed behind as an inert proxy (reads nil, writes dropped). Walk the
+    // OOM boundary byte-by-byte and assert no failing registration ever leaves
+    // the global bound.
+    it('F3: a set_userdata that fails mid-build removes the partially-installed global', () => {
+      const LIMIT = 200000;
+      const attempt = (pad: number): string => {
+        const lua: any = new lua_native.init(
+          {}, { libraries: ['base', 'string'], maxMemory: LIMIT });
+        try {
+          lua.execute_script(`pad = string.rep('x', ${pad})`);
+        } catch { return 'pad-failed'; }
+        try {
+          lua.set_userdata('h', { x: 1 }, {
+            readable: true,
+            methods: { a() {}, b() {}, c() {}, d() {}, e() {}, f() {}, g() {} },
+          });
+          return 'ok';
+        } catch {
+          let t: unknown;
+          try { t = lua.execute_script('return type(h)'); } catch { return 'unqueryable'; }
+          return t === 'nil' ? 'clean' : `split:${t}`;
+        }
+      };
+      // Coarse: find the last limit where registration succeeds outright.
+      let lastOk = -1;
+      let firstFail = -1;
+      for (let pad = 0; pad < LIMIT; pad += 1024) {
+        const r = attempt(pad);
+        if (r === 'ok') lastOk = pad;
+        else if (lastOk >= 0) { firstFail = pad; break; }
+      }
+      if (firstFail < 0) return; // could not provoke the OOM window on this platform
+      // Fine: every failing registration across the boundary must leave the
+      // global unbound ('clean'), never the pre-fix inert proxy ('split:...').
+      for (let pad = lastOk; pad <= firstFail; pad += 1) {
+        const r = attempt(pad);
+        expect(['ok', 'clean', 'pad-failed', 'unqueryable']).toContain(r);
+      }
+    });
+
+    // --- F4: add_searcher registered its callback pair before the core call,
+    // so a failure (no package library) stranded a pinned FunctionReference and
+    // a host_functions_ entry per attempt. Now the core call runs first.
+    it('F4: a failed add_searcher throws, strands nothing, and later registration still works', () => {
+      const lua: any = new lua_native.init({}, { libraries: ['base'] }); // no package
+      for (let i = 0; i < 3; i++) {
+        expect(() => lua.add_searcher(() => null)).toThrow(/package/);
+      }
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+      // A context WITH package registers and resolves through a searcher.
+      const lua2: any = new lua_native.init({}, ALL_LIBS);
+      lua2.add_searcher((name: string) => (name === 'virt' ? 'return 7' : null));
+      // require returns (module, loaderdata); take just the module.
+      expect(lua2.execute_script("local m = require('virt'); return m")).toBe(7);
+    });
+  });
 });

@@ -857,6 +857,7 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   // failure, roll back the js_userdata_/js_callbacks_/host_functions_ entries
   // registered above so a rejected call strands nothing.
   std::vector<std::string> registered_method_fns;
+  bool global_installed = false;
   try {
     bool needs_proxy = readable || writable || has_methods;
     if (needs_proxy) {
@@ -864,6 +865,7 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
     } else {
       runtime->CreateUserdataGlobal(name, ref_id);
     }
+    global_installed = true;
 
     // Register methods if present
     if (has_methods) {
@@ -886,6 +888,15 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
     for (const auto& func_name : registered_method_fns) {
       js_callbacks_.erase(func_name);
       runtime->RemoveHostFunction(func_name);
+    }
+    // If the global write succeeded before a later step failed, remove the
+    // installed global too — otherwise the name stays bound to an inert proxy
+    // whose js_userdata_ entry was just erased (CR-7 F3). Raw (no __newindex
+    // can re-raise) and best-effort: the removal can itself fail under the same
+    // OOM, and the inert global is the accepted floor then. Only when this call
+    // installed it — a pre-existing same-named global must not be deleted.
+    if (global_installed) {
+      try { runtime->RemoveGlobalRaw(name); } catch (...) {}
     }
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1698,11 +1709,19 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
 // by an Napi::External finalizer rooted on both callback functions, so it stays
 // valid for any late/duplicate settlement and is reclaimed only when the promise
 // (and thus the callbacks) is collected.
+//
+// `alive` is the context's shared liveness flag (the same one the function/table
+// handles carry). The callbacks outlive the run by design — cancel() releases
+// async_self_ref_, so the context can be garbage-collected while the awaited
+// promise is still pending — and a late settlement must then be discarded
+// WITHOUT touching `ctx`: dereferencing it reads freed memory and aborts the
+// process (CR-7 F1, the H3/H5 class).
 namespace {
 struct AwaitCookie {
   LuaContext* ctx;
   uint64_t gen;
   bool settled;
+  std::shared_ptr<std::atomic<bool>> alive;
 };
 }  // namespace
 
@@ -1748,18 +1767,53 @@ void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
     // owned by an External finalizer (not by the callbacks), and that External is
     // rooted as a hidden prop on BOTH callbacks — so the cookie outlives any
     // duplicate/late settlement from a misbehaving promise and is freed only when
-    // the promise and its callbacks are garbage-collected (L5).
+    // the promise and its callbacks are garbage-collected (L5). It also carries
+    // the context's shared liveness flag so a settlement arriving after the
+    // context is destroyed is discarded without dereferencing it (CR-7 F1).
+    //
+    // The whole attach runs guarded (CR-7 F2): `then` is user-influenced (an own
+    // property shadows Promise.prototype.then, and the prototype itself can be
+    // patched), so the lookup or the call can throw. Unwinding out of DriveAsync
+    // mid-run would leave the context wedged (is_busy_ true, async_co_ engaged)
+    // with a promise the caller may never have received — and the only recovery,
+    // cancel(), would then reject a promise nothing can have a handler on. On
+    // failure, settle the run instead: reject the deferred and tear down.
     Napi::Object promise = async_pending_promise_.Value();
     async_pending_promise_.Reset();
-    auto thenFn = promise.Get("then").As<Napi::Function>();
-    auto* cookie = new AwaitCookie{this, async_generation_, false};
-    auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", cookie);
-    auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", cookie);
-    auto cookieOwner = Napi::External<AwaitCookie>::New(env, cookie,
-      [](Napi::Env, AwaitCookie* c) { delete c; });
-    DefineHiddenProp(env, onResolve, "__cookie", cookieOwner);
-    DefineHiddenProp(env, onReject, "__cookie", cookieOwner);
-    thenFn.Call(promise, {onResolve, onReject});
+    std::string attach_err;
+    bool attached = false;
+    // A hostile `then` can settle synchronously (re-entering OnAwaitSettled and
+    // finishing this run) and THEN throw; the failure branch below must not
+    // tear down a run that already ended — or a newer one started meanwhile.
+    const uint64_t attach_gen = async_generation_;
+    try {
+      Napi::Value thenVal = promise.Get("then");
+      if (!thenVal.IsFunction()) {
+        attach_err = "awaited Promise has no callable 'then'";
+      } else {
+        auto thenFn = thenVal.As<Napi::Function>();
+        auto* cookie = new AwaitCookie{this, async_generation_, false, alive_};
+        // Hand ownership to the External before anything else can throw, so a
+        // failure below cannot leak the cookie (it is reclaimed with the
+        // then-unrooted handles).
+        auto cookieOwner = Napi::External<AwaitCookie>::New(env, cookie,
+          [](Napi::Env, AwaitCookie* c) { delete c; });
+        auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", cookie);
+        auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", cookie);
+        DefineHiddenProp(env, onResolve, "__cookie", cookieOwner);
+        DefineHiddenProp(env, onReject, "__cookie", cookieOwner);
+        thenFn.Call(promise, {onResolve, onReject});
+        attached = true;
+      }
+    } catch (const std::exception& e) {
+      attach_err = e.what();
+    }
+    if (!attached && async_deferred_ && async_generation_ == attach_gen) {
+      auto deferred = *async_deferred_;
+      FinishAsync();
+      deferred.Reject(Napi::Error::New(env,
+        "failed to attach to the awaited Promise: " + attach_err).Value());
+    }
     return;
   }
 
@@ -1871,6 +1925,11 @@ Napi::Value LuaContext::OnAwaitResolveStatic(const Napi::CallbackInfo& info) {
   // flag is always safe (L5).
   if (cookie->settled) return info.Env().Undefined();
   cookie->settled = true;
+  // The context may have been destroyed since the callbacks were attached (a
+  // cancel() released async_self_ref_ and GC collected the wrapper). Check the
+  // shared liveness flag BEFORE touching ctx — the generation guard inside
+  // OnAwaitSettled reads members of the (then freed) context (CR-7 F1).
+  if (!cookie->alive || !cookie->alive->load()) return info.Env().Undefined();
   return cookie->ctx->OnAwaitSettled(
     info.Length() > 0 ? info[0] : info.Env().Undefined(), false, cookie->gen);
 }
@@ -1879,6 +1938,9 @@ Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
   auto* cookie = static_cast<AwaitCookie*>(info.Data());
   if (cookie->settled) return info.Env().Undefined();
   cookie->settled = true;
+  // See OnAwaitResolveStatic: discard a settlement that outlived the context
+  // without dereferencing it (CR-7 F1).
+  if (!cookie->alive || !cookie->alive->load()) return info.Env().Undefined();
   return cookie->ctx->OnAwaitSettled(
     info.Length() > 0 ? info[0] : info.Env().Undefined(), true, cookie->gen);
 }
@@ -1983,14 +2045,20 @@ Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   const std::string name = "__searcher_" + std::to_string(next_searcher_id_++);
-  js_callbacks_[name] = Napi::Persistent(info[0].As<Napi::Function>());
-  runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
+  // Core call first: if it throws (e.g. the 'package' library isn't loaded — a
+  // trivially reachable failure), no js_callbacks_/host_functions_ entry is
+  // left behind, so retry loops can't accumulate stranded state (the N5
+  // ordering discipline, CR-7 F4). Safe to register after: AddJsSearcher only
+  // stores the name in the searcher closure's upvalue, and nothing resolves it
+  // in host_functions_ until a later require().
   try {
     runtime->AddJsSearcher(name);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  js_callbacks_[name] = Napi::Persistent(info[0].As<Napi::Function>());
+  runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
   return env.Undefined();
 }
 

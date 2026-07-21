@@ -24,28 +24,44 @@ if (platform === "win32") {
   process.exit(2);
 }
 
-// The runtime dylib name clang ships for this sanitizer + platform.
-const runtimeLib =
+// Candidate runtime dylibs for this sanitizer + platform, most specific first.
+// On Linux the clang runtime name embeds the target arch (so an x86_64
+// hardcode broke arm64 — CR-7 F5), and gcc ships its own libasan/libtsan;
+// probe each candidate until one resolves.
+const arch =
+  os.arch() === "x64" ? "x86_64" : os.arch() === "arm64" ? "aarch64" : os.arch();
+const candidates =
   platform === "darwin"
-    ? kind === "asan"
-      ? "libclang_rt.asan_osx_dynamic.dylib"
-      : "libclang_rt.tsan_osx_dynamic.dylib"
+    ? [
+        kind === "asan"
+          ? "libclang_rt.asan_osx_dynamic.dylib"
+          : "libclang_rt.tsan_osx_dynamic.dylib",
+      ]
     : kind === "asan"
-      ? "libclang_rt.asan-x86_64.so"
-      : "libclang_rt.tsan-x86_64.so";
+      ? [`libclang_rt.asan-${arch}.so`, "libasan.so"]
+      : [`libclang_rt.tsan-${arch}.so`, "libtsan.so"];
 
 // Ask the compiler where its sanitizer runtime lives. `-print-file-name` echoes
 // the name back unchanged if it can't resolve it, so treat that as "not found".
 const cc = process.env.CC || "clang";
-const probe = spawnSync(cc, [`-print-file-name=${runtimeLib}`], {
-  encoding: "utf8",
-});
-const resolved = (probe.stdout || "").trim();
-if (!resolved || resolved === runtimeLib || !fs.existsSync(resolved)) {
+let resolved = null;
+const tried = [];
+for (const lib of candidates) {
+  const probe = spawnSync(cc, [`-print-file-name=${lib}`], { encoding: "utf8" });
+  const out = (probe.stdout || "").trim();
+  tried.push(`${cc} -print-file-name=${lib} -> "${out}"`);
+  if (out && out !== lib && fs.existsSync(out)) {
+    resolved = out;
+    break;
+  }
+}
+if (!resolved) {
   console.error(
-    `Could not locate the ${kind.toUpperCase()} runtime (${runtimeLib}).\n` +
-      `Tried: ${cc} -print-file-name=${runtimeLib} -> "${resolved}".\n` +
-      `Ensure a clang with the sanitizer runtimes is on PATH (Xcode CLT on macOS).`,
+    `Could not locate the ${kind.toUpperCase()} runtime.\n` +
+      tried.map((t) => `Tried: ${t}`).join("\n") +
+      `\nEnsure a compiler with the sanitizer runtimes is on PATH ` +
+      `(Xcode CLT on macOS; clang or gcc on Linux — set CC to match the ` +
+      `compiler the addon was built with).`,
   );
   process.exit(2);
 }
@@ -70,7 +86,12 @@ const optionEnv =
         ASAN_OPTIONS:
           process.env.ASAN_OPTIONS ??
           "detect_leaks=0:detect_container_overflow=0:abort_on_error=1:print_stacktrace=1",
-        UBSAN_OPTIONS: process.env.UBSAN_OPTIONS ?? "print_stacktrace=1",
+        // halt_on_error=1: the addon is built UBSan-recoverable (a violation
+        // logs and continues), so without this the run would exit green with
+        // findings only in the scrollback (CR-7 F5). The runtime still halts
+        // when told to, recoverable build or not.
+        UBSAN_OPTIONS:
+          process.env.UBSAN_OPTIONS ?? "halt_on_error=1:print_stacktrace=1",
       }
     : {
         TSAN_OPTIONS:
@@ -100,9 +121,13 @@ const vitestBin = path.join(
   "vitest",
   "vitest.mjs",
 );
+// --expose-gc: V8 flags are process-wide, so the worker_threads isolates
+// inherit it and global.gc exists inside the suite — the GC-lifetime
+// regressions (e.g. CR-7 F1's cancel -> collect -> late-settle test) skip
+// themselves without it.
 const result = spawnSync(
   process.execPath,
-  [vitestBin, "run", "--pool=threads", "--no-file-parallelism"],
+  ["--expose-gc", vitestBin, "run", "--pool=threads", "--no-file-parallelism"],
   { stdio: "inherit", env },
 );
 process.exit(result.status ?? 1);

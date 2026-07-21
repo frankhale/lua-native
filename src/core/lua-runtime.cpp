@@ -545,6 +545,18 @@ void LuaRuntime::CreateProxyUserdataGlobal(const std::string& name, int ref_id) 
   IncrementUserdataRefCount(ref_id);
 }
 
+void LuaRuntime::RemoveGlobalRaw(const std::string& name) const {
+  // Raw so no metamethod can fire mid-rollback; protected because the key push
+  // allocates and this runs on OOM-failure paths (CR-7 F3).
+  RunProtected([&]() {
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // [_G]
+    lua_pushlstring(L_, name.data(), name.size());          // [_G, key]
+    lua_pushnil(L_);                                        // [_G, key, nil]
+    lua_rawset(L_, -3);                                     // _G[key] = nil (raw)
+    lua_pop(L_, 1);                                         // pop _G
+  });
+}
+
 void LuaRuntime::IncrementUserdataRefCount(int ref_id) {
   userdata_ref_counts_[ref_id]++;
 }

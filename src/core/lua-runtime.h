@@ -395,6 +395,13 @@ public:
 
   void CreateUserdataGlobal(const std::string& name, int ref_id);
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
+  // Raw removal of _G[name] (rawset, so no __newindex fires — a hostile _G
+  // metatable can't re-raise during a rollback). Used to undo a userdata global
+  // whose later build step failed, so a rejected set_userdata doesn't leave the
+  // name bound to an inert proxy (CR-7 F3). Runs inside RunProtected because
+  // the key push can itself fail under an exhausted maxMemory; that surfaces as
+  // a throw the caller may treat as best-effort.
+  void RemoveGlobalRaw(const std::string& name) const;
   void IncrementUserdataRefCount(int ref_id);
   void DecrementUserdataRefCount(int ref_id);
 
