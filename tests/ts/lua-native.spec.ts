@@ -5070,12 +5070,16 @@ describe('lua-native Node adapter', () => {
     // settling after cancel() tore the run down and GC collected the context
     // dereferenced freed memory (use-after-free -> process abort). The cookie
     // now carries the context's shared liveness flag and discards the late
-    // settlement. Requires --expose-gc (vitest.config.ts / run-sanitized-ts.js
-    // provide it); self-skips otherwise.
+    // settlement. Requires --expose-gc, which the harness must provide
+    // (vitest.config.ts execArgv for npm test; run-sanitized-ts.js passes it
+    // process-wide for the threads pool). If it is missing, the harness
+    // plumbing has rotted — fail loudly instead of silently skipping the pin
+    // on the use-after-free class (CR-8 F2).
     it('F1: a promise settling after cancel() and context GC is discarded, not a use-after-free', async () => {
       if (typeof global.gc !== 'function') {
-        console.warn('CR-7 F1 regression skipped: global.gc unavailable (run node with --expose-gc)');
-        return;
+        throw new Error(
+          'global.gc unavailable: the harness must provide --expose-gc ' +
+          '(vitest.config.ts / run-sanitized-ts.js) — refusing to silently skip');
       }
       let settle: ((v: unknown) => void) | undefined;
       const start = () => {
@@ -5181,6 +5185,153 @@ describe('lua-native Node adapter', () => {
       lua2.add_searcher((name: string) => (name === 'virt' ? 'return 7' : null));
       // require returns (module, loaderdata); take just the module.
       expect(lua2.execute_script("local m = require('virt'); return m")).toBe(7);
+    });
+  });
+
+  // ============================================
+  // CODE-REVIEW-8 REGRESSIONS
+  // ============================================
+  describe('code-review-8 regressions', () => {
+    /** Two GC passes with settle gaps. Asserts the harness provides gc first:
+     *  a GC-lifetime pin must fail loudly, never silently skip (CR-8 F2). */
+    const gcSettle = async () => {
+      expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc!();
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc!();
+    };
+
+    // --- F2: Vitest 4 removed test.poolOptions, silently disarming the
+    // --expose-gc plumbing (and with it the CR-7 F1 use-after-free pin). The
+    // config now uses top-level execArgv; this test rots loudly if the
+    // plumbing ever breaks again.
+    it('F2: the harness exposes global.gc (GC-lifetime pins must never silently skip)', () => {
+      expect(typeof global.gc).toBe('function');
+    });
+
+    // --- F1: the rejection path of the await-settlement handler read
+    // message/toString/name/stack off the rejection value unguarded; a value
+    // whose coercion throws (a Symbol, a null-prototype object) unwound into
+    // the reaction job — an unhandled rejection (process exit by default) with
+    // the run wedged busy and its promise never settled. Now the extraction is
+    // guarded and falls back to a generic message.
+    it('F1: a promise rejecting with a Symbol rejects the run instead of crashing or wedging', async () => {
+      const lua: any = new lua_native.init(
+        { slow: () => Promise.reject(Symbol('boom')) }, ALL_LIBS);
+      await expect(lua.execute_async('return slow()'))
+        .rejects.toThrow(/rejection value could not be converted/);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F1: a promise rejecting with a null-prototype object rejects the run instead of crashing or wedging', async () => {
+      const lua: any = new lua_native.init(
+        { slow: () => Promise.reject(Object.create(null)) }, ALL_LIBS);
+      await expect(lua.execute_async('return slow()'))
+        .rejects.toThrow(/rejection value could not be converted/);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    // --- F3: set_metatable / register_module / register_class registered their
+    // function-valued js_callbacks_/host_functions_ pairs before the core call,
+    // so a failing call (a typo'd global, a missing package library, a raising
+    // _G metamethod) stranded them forever — each failed attempt pinned the JS
+    // closures. The pairs are now registered only after the core call succeeds;
+    // a failed call must leave the closures collectable.
+    it('F3: a failed set_metatable strands no callback, and the same call then succeeds', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const wr = (() => {
+        const fn = () => 42;
+        const ref = new WeakRef(fn);
+        expect(() => lua.set_metatable('no_such_global', { __index: fn }))
+          .toThrow(/does not exist/);
+        return ref;
+      })();
+      await gcSettle();
+      expect(wr.deref()).toBeUndefined();
+      // The identical registration against an existing global still works.
+      lua.execute_script('target = {}');
+      lua.set_metatable('target', { __index: () => 'via_mt' });
+      expect(lua.execute_script('return target.anything')).toBe('via_mt');
+    });
+
+    it('F3: a failed register_module strands no callback, and a package-enabled context registers', async () => {
+      const lua: any = new lua_native.init({}, { libraries: ['base'] }); // no package
+      const wr = (() => {
+        const fn = () => 'mod';
+        const ref = new WeakRef(fn);
+        expect(() => lua.register_module('m', { f: fn })).toThrow(/package/);
+        return ref;
+      })();
+      await gcSettle();
+      expect(wr.deref()).toBeUndefined();
+      const lua2: any = new lua_native.init({}, ALL_LIBS);
+      lua2.register_module('m', { f: () => 9 });
+      expect(lua2.execute_script("return require('m').f()")).toBe(9);
+    });
+
+    it('F3: a failed register_class strands neither constructor nor methods, and a retry works', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(
+        'setmetatable(_G, { __newindex = function() error("no writes") end })');
+      const [wrCtor, wrMethod] = (() => {
+        const ctor = () => ({});
+        const method = () => 1;
+        const refs = [new WeakRef<object>(ctor), new WeakRef<object>(method)] as const;
+        expect(() => lua.register_class('Foo', { construct: ctor, methods: { m: method } }))
+          .toThrow(/no writes/);
+        return refs;
+      })();
+      await gcSettle();
+      expect(wrCtor.deref()).toBeUndefined();
+      expect(wrMethod.deref()).toBeUndefined();
+      // Disarm the hostile metatable: the reservation was rolled back, so the
+      // same class name registers cleanly and instances work.
+      lua.execute_script('setmetatable(_G, nil)');
+      lua.register_class('Foo', {
+        construct: () => ({ v: 5 }),
+        methods: { get: (self: any) => self.v },
+      });
+      expect(lua.execute_script('local o = Foo.new(); return o:get()')).toBe(5);
+    });
+
+    // --- F4: the worker-async OnOK marshalled results unguarded; a result that
+    // cannot cross to JS (here: a Lua string exceeding V8's maximum string
+    // length) unwound as an uncaughtException with the promise never settled.
+    // Now it rejects and the context stays usable. (Allocates ~1.2 GB
+    // transiently — in line with the suite's other stress cases. The explicit
+    // timeout is for the sanitizer harness, where the instrumented allocator
+    // makes the 600 MB rep much slower than the 5 s default.)
+    it('F4: a worker result too large for a JS string rejects instead of an uncaughtException', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async('return string.rep("a", 600 * 1024 * 1024)'))
+        .rejects.toThrow(/failed to convert async result/);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 2 + 2')).toBe(4);
+    }, 120_000);
+
+    // --- F5: the table-handle methods lacked the CallScope the Proxy traps
+    // got (L7/L3), so a js_error_registry_ entry staged by a raising __index
+    // host callback stayed pinned until some unrelated entry point ran. Each
+    // handle call now clears stale entries at its outermost CallScope.
+    it('F5: table-handle methods clear stale staged JS errors (CallScope on the handle surface)', async () => {
+      const refs: WeakRef<Error>[] = [];
+      const lua: any = new lua_native.init({
+        boom: () => {
+          const e = new Error('boom ' + refs.length);
+          refs.push(new WeakRef(e));
+          throw e;
+        },
+      }, ALL_LIBS);
+      lua.execute_script(
+        't = setmetatable({}, { __index = function() return boom() end })');
+      const handle = lua.get_global_ref('t');
+      expect(() => handle.get('x')).toThrow(); // stages refs[0]
+      expect(() => handle.get('y')).toThrow(); // its CallScope clears refs[0], stages refs[1]
+      await gcSettle();
+      expect(refs[0].deref()).toBeUndefined();
     });
   });
 });

@@ -102,6 +102,10 @@ const optionEnv =
 const env = {
   ...process.env,
   [preloadVar]: [resolved, process.env[preloadVar]].filter(Boolean).join(":"),
+  // Tells vitest.config.ts not to set test.execArgv: this runner uses the
+  // threads pool, whose workers reject V8 flags in execArgv — --expose-gc is
+  // provided process-wide on the node invocation below instead (CR-8 F2).
+  LUA_NATIVE_SANITIZED: "1",
   ...optionEnv,
 };
 

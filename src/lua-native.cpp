@@ -318,6 +318,12 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // Metamethod-capable operation: scope under a CallScope so a staged
+    // js_error_registry_ entry from a raising __index host callback is cleared
+    // at the next outermost access instead of accumulating (CR-8 F5 — the
+    // L7/L3 discipline the Proxy traps already follow, applied to the handle
+    // surface).
+    LuaContext::CallScope scope(data->context);
     auto result = data->runtime->GetTableFieldKeyed(data->tableRef.ref, key);
     return data->context->CoreToNapi(*result);
   } catch (const std::exception& e) {
@@ -346,6 +352,9 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // See TableHandleGet: CallScope so a raising __newindex host callback's
+    // staged entry can't accumulate (CR-8 F5).
+    LuaContext::CallScope scope(data->context);
     auto value = std::make_shared<lua_core::LuaValue>(
       data->context->NapiToCoreInstance(info[1]));
     data->runtime->SetTableFieldKeyed(data->tableRef.ref, key, value);
@@ -375,6 +384,8 @@ static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // See TableHandleGet: CallScope for the metamethod-capable probe (CR-8 F5).
+    LuaContext::CallScope scope(data->context);
     bool exists = data->runtime->HasTableFieldKeyed(data->tableRef.ref, key);
     return Napi::Boolean::New(env, exists);
   } catch (const std::exception& e) {
@@ -393,6 +404,9 @@ static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // See TableHandleGet: CallScope — __len can reach a raising host callback
+    // (CR-8 F5).
+    LuaContext::CallScope scope(data->context);
     int64_t len = data->runtime->GetTableLength(data->tableRef.ref);
     return Napi::Number::New(env, static_cast<double>(len));
   } catch (const std::exception& e) {
@@ -438,6 +452,9 @@ static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // See TableHandleGet: CallScope — the ipairs collection respects __index
+    // (CR-8 F5). pairs() is raw traversal and needs none.
+    LuaContext::CallScope scope(data->context);
     auto ipairs = data->runtime->TableIPairs(data->tableRef.ref);
     Napi::Array result = Napi::Array::New(env, ipairs.size());
     for (size_t i = 0; i < ipairs.size(); ++i) {
@@ -875,9 +892,13 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
         std::string func_name = "__ud_method_" + std::to_string(ref_id)
                               + "_" + methodName;
 
+        // Record the name before registering the pair, so the rollback below
+        // always sees it — a throw between the two registrations would
+        // otherwise strand the js_callbacks_ entry (CR-8 F7). The rollback's
+        // erase/RemoveHostFunction are no-ops for a name not yet registered.
+        registered_method_fns.push_back(func_name);
         js_callbacks_[func_name] = Napi::Persistent(methodFunc);
         runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
-        registered_method_fns.push_back(func_name);
         method_map[methodName] = func_name;
       }
 
@@ -987,14 +1008,21 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
 
   const uint64_t class_id = next_class_id_++;
 
-  // Constructor host function (special wrapper: builds + registers an instance).
+  // Names are minted and the JS functions collected here, but nothing is
+  // registered into js_callbacks_/host_functions_ until the core call below
+  // succeeds: RegisterClass can throw (OOM under maxMemory, or a raising
+  // __newindex on a _G metatable at the class-global write), and eager
+  // registration would strand the pairs — a retry mints fresh ids, so the
+  // previous attempt's entries would be pinned forever (CR-8 F3). Deferring is
+  // safe: the closures the core installs (the class table's `new`, the shared
+  // method table) carry these names only as upvalues, nothing resolves them in
+  // host_functions_ until Lua calls them, and no Lua runs between the core
+  // call and the registration (the N5 / CR-7 F4 ordering discipline).
   const std::string ctor_name = "__class_ctor_" + std::to_string(class_id);
-  js_callbacks_[ctor_name] = Napi::Persistent(constructFn);
-  runtime->StoreHostFunction(ctor_name,
-    CreateConstructorWrapper(ctor_name, class_name, readable, writable));
 
   // Instance methods (obj:method()).
   std::unordered_map<std::string, std::string> method_map;
+  std::vector<std::pair<std::string, Napi::Function>> deferred_fns;
   if (const Napi::Value methodsVal = def.Get("methods"); methodsVal.IsObject()) {
     auto methods = methodsVal.As<Napi::Object>();
     Napi::Array keys = methods.GetPropertyNames();
@@ -1003,21 +1031,19 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
       Napi::Value val = methods.Get(name);
       if (val.IsFunction()) {
         std::string func_name = "__class_method_" + std::to_string(class_id) + "_" + name;
-        js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
-        runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+        deferred_fns.emplace_back(func_name, val.As<Napi::Function>());
         method_map[name] = func_name;
       }
     }
   }
 
-  // Metamethods (operator overloads, __tostring, __call, etc.), registered
-  // from the snapshot validated above (N3) — the definition object is not
+  // Metamethods (operator overloads, __tostring, __call, etc.), taken from
+  // the snapshot validated above (N3) — the definition object is not
   // consulted again.
   std::vector<lua_core::MetatableEntry> metamethods;
   for (const auto& [key, fn] : mm_snapshot) {
     std::string func_name = "__class_mm_" + std::to_string(class_id) + "_" + key;
-    js_callbacks_[func_name] = Napi::Persistent(fn);
-    runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+    deferred_fns.emplace_back(func_name, fn);
     lua_core::MetatableEntry entry;
     entry.key = key;
     entry.is_function = true;
@@ -1033,8 +1059,19 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-    return env.Undefined();  // reservation guard releases the name
+    // The reservation guard releases the name; nothing was registered, so
+    // nothing is stranded (CR-8 F3).
+    return env.Undefined();
   }
+
+  js_callbacks_[ctor_name] = Napi::Persistent(constructFn);
+  runtime->StoreHostFunction(ctor_name,
+    CreateConstructorWrapper(ctor_name, class_name, readable, writable));
+  for (auto& [func_name, fn] : deferred_fns) {
+    js_callbacks_[func_name] = Napi::Persistent(fn);
+    runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+  }
+
   reservation.Commit();
   return env.Undefined();
 }
@@ -1059,6 +1096,16 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   // reclaimable callback that never reached Lua (F1).
   JsCallbackCollectorScope collector(this);
 
+  // Function-valued entries are collected here and registered only AFTER the
+  // core call succeeds: SetGlobalMetatable throws on a trivially reachable
+  // input (a nonexistent or non-table global), and eagerly-registered
+  // js_callbacks_/host_functions_ pairs would be stranded by it (CR-8 F3).
+  // Deferring is safe — the closures the core installs carry the names only as
+  // upvalues, nothing resolves a name in host_functions_ until a metamethod
+  // fires, and no Lua runs between the core call and the registration (the
+  // N5 / CR-7 F4 ordering discipline).
+  std::vector<std::pair<std::string, Napi::Function>> deferred_fns;
+
   for (uint32_t i = 0; i < keys.Length(); i++) {
     const std::string key = keys[i].As<Napi::String>().Utf8Value();
     const Napi::Value val = mt.Get(key);
@@ -1068,8 +1115,7 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
 
     if (val.IsFunction()) {
       const std::string func_name = "__mt_" + std::to_string(mt_id) + "_" + key;
-      js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
-      runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+      deferred_fns.emplace_back(func_name, val.As<Napi::Function>());
       entry.is_function = true;
       entry.func_name = func_name;
     } else {
@@ -1089,7 +1135,12 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
     runtime->SetGlobalMetatable(name, entries);
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env.Undefined();  // nothing registered, nothing stranded (CR-8 F3)
+  }
+
+  for (auto& [func_name, fn] : deferred_fns) {
+    js_callbacks_[func_name] = Napi::Persistent(fn);
+    runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
   }
 
   return env.Undefined();
@@ -1138,6 +1189,11 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   // entries discarded by a later failure sweep their reclaimable callbacks (F1).
   JsCallbackCollectorScope collector(this);
 
+  // See SetMetatable: function entries are registered only after the core call
+  // succeeds — RegisterModuleTable throws when the 'package' library isn't
+  // loaded, and eager registration would strand the pairs (CR-8 F3).
+  std::vector<std::pair<std::string, Napi::Function>> deferred_fns;
+
   for (uint32_t i = 0; i < keys.Length(); i++) {
     const std::string key = keys[i].As<Napi::String>().Utf8Value();
     const Napi::Value val = moduleObj.Get(key);
@@ -1147,8 +1203,7 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 
     if (val.IsFunction()) {
       const std::string func_name = "__module_" + std::to_string(mod_id) + "_" + key;
-      js_callbacks_[func_name] = Napi::Persistent(val.As<Napi::Function>());
-      runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+      deferred_fns.emplace_back(func_name, val.As<Napi::Function>());
       entry.is_function = true;
       entry.func_name = func_name;
     } else {
@@ -1168,7 +1223,12 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
     runtime->RegisterModuleTable(name, entries);
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env.Undefined();  // nothing registered, nothing stranded (CR-8 F3)
+  }
+
+  for (auto& [func_name, fn] : deferred_fns) {
+    js_callbacks_[func_name] = Napi::Persistent(fn);
+    runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
   }
 
   return env.Undefined();
@@ -1862,15 +1922,30 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   // they were never pushed and must be swept (N4).
   JsCallbackCollectorScope collector(this);
   if (is_error) {
+    // Every read below can run user JS and throw: the `message` probe (a
+    // hostile getter), the ToString fallback (a Symbol or null-prototype
+    // rejection value has no usable coercion), and StageJsError's name/stack
+    // reads. This callback cannot tolerate a throw — it would unwind into the
+    // promise reaction job (an unhandled rejection, process exit by default)
+    // and leave the run wedged with its deferred never settled. Fall back to a
+    // generic message and deliver the rejection to Lua anyway (CR-8 F1),
+    // mirroring the guarded resolve path below.
     std::string msg;
-    if (value.IsObject() && value.As<Napi::Object>().Get("message").IsString()) {
-      msg = value.As<Napi::Object>().Get("message").As<Napi::String>().Utf8Value();
-    } else {
-      msg = value.ToString().Utf8Value();
+    try {
+      if (value.IsObject() && value.As<Napi::Object>().Get("message").IsString()) {
+        msg = value.As<Napi::Object>().Get("message").As<Napi::String>().Utf8Value();
+      } else {
+        msg = value.ToString().Utf8Value();
+      }
+      // Stage a structured error for object rejections so the original JS Error
+      // is reconstructed if the rejection surfaces uncaught (D1 through async).
+      StageJsError(value, msg);
+    } catch (const std::exception&) {
+      msg = "(rejection value could not be converted)";
+      // Drop anything a partially-run StageJsError staged, so the fallback
+      // string (not a half-built structured error) is what Lua raises.
+      if (runtime->HasPendingErrorValue()) runtime->TakePendingErrorValue();
     }
-    // Stage a structured error for object rejections so the original JS Error is
-    // reconstructed if the rejection surfaces uncaught (D1 through async).
-    StageJsError(value, msg);
     if (runtime->HasPendingErrorValue()) {
       args.push_back(runtime->TakePendingErrorValue());
     } else {
@@ -2000,7 +2075,11 @@ Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
 }
 
 void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
-  print_handler_ = Napi::Persistent(fn);
+  // Run the runtime install first: it can throw (the protected print/io.write
+  // overrides fail under OOM), and print_handler_ must not be left pointing at
+  // a handler those overrides never reach (CR-8 F7). The lambda reads
+  // print_handler_ at call time, so committing it after the install is safe —
+  // no Lua runs between.
   runtime->SetOutputHandler([this](const std::string& text) {
     if (print_handler_.IsEmpty()) return;
     // This runs inside Lua's C call frame (print/io.write). Lua is built as C,
@@ -2013,6 +2092,7 @@ void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
       // A throwing print handler is swallowed rather than corrupting the VM.
     }
   });
+  print_handler_ = Napi::Persistent(fn);
 }
 
 Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
@@ -2072,7 +2152,15 @@ void LuaScriptAsyncWorker::OnOK() {
     deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
     return;
   }
-  deferred_.Resolve(context_->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result_)));
+  // Marshalling can throw (e.g. a result string exceeding V8's maximum string
+  // length). Unwinding out of OnOK is an uncaughtException with the promise
+  // never settled; reject it instead (CR-8 F4, mirroring DriveAsync's guard).
+  try {
+    deferred_.Resolve(context_->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result_)));
+  } catch (const std::exception& e) {
+    deferred_.Reject(Napi::Error::New(env,
+      std::string("failed to convert async result: ") + e.what()).Value());
+  }
 }
 
 void LuaScriptAsyncWorker::OnError(const Napi::Error& error) {
@@ -2088,7 +2176,14 @@ void LuaFileAsyncWorker::OnOK() {
     deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
     return;
   }
-  deferred_.Resolve(context_->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result_)));
+  // See LuaScriptAsyncWorker::OnOK: a marshalling failure must reject, not
+  // unwind (CR-8 F4).
+  try {
+    deferred_.Resolve(context_->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result_)));
+  } catch (const std::exception& e) {
+    deferred_.Reject(Napi::Error::New(env,
+      std::string("failed to convert async result: ") + e.what()).Value());
+  }
 }
 
 void LuaFileAsyncWorker::OnError(const Napi::Error& error) {

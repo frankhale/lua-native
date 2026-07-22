@@ -606,11 +606,33 @@ private:
   mutable ProtectedThunk* active_thunk_ = nullptr;
   static int ProtectedThunkRunner(lua_State* L);
 
-  // Reads _G[name] through the protected table-get trampoline (so an __index
-  // metamethod installed via setmetatable(_G, ...) surfaces as a
-  // std::runtime_error instead of an unprotected panic) and leaves the resulting
-  // value on top of the stack.
+  // Converts the value at `index` on `from` inside a lua_pcall frame, so the
+  // luaL_ref / table allocations ToLuaValue performs when it materializes a
+  // function, thread, userdata or metatabled-table *result* can't raise
+  // LUA_ERRMEM (exhausted maxMemory) outside any protected frame — the CR-2 M5
+  // documented residual, pinned to a concrete instance by CR-7. Scalars allocate
+  // nothing and are converted directly, so the pcall is off the common path.
+  // The frame always runs on the main state (a suspended coroutine can't be
+  // called into); a value living on another thread is copied across first, which
+  // is equivalent because the registry the refs land in is shared.
+  LuaPtr ToLuaValueProtected(lua_State* from, int index) const;
+  // The result + captured C++ exception for the active ToLuaValueProtected call.
+  struct ProtectedConvert {
+    LuaPtr result;
+    std::exception_ptr error;
+  };
+  mutable ProtectedConvert* active_convert_ = nullptr;
+  static int ProtectedConvertRunner(lua_State* L);
+
+  // Reads _G[name] inside a lua_pcall frame — so both an __index metamethod
+  // installed via setmetatable(_G, ...) (M4) and the allocation of the key
+  // string (M5) surface as a std::runtime_error instead of an unprotected panic
+  // — and leaves the resulting value on top of the stack. The name is handed to
+  // the trampoline out-of-band via `active_global_name_` rather than pushed as
+  // an argument, because pushing it is itself the allocation being protected.
   void PushProtectedGlobal(const std::string& name) const;
+  mutable const std::string* active_global_name_ = nullptr;
+  static int ProtectedGlobalGetRunner(lua_State* L);
 
   // I/O redirection and chunk-loading guards
   void InstallOutputRedirection();

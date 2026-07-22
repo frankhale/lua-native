@@ -3082,6 +3082,29 @@ TEST(LuaRuntimeInstructions, SetMaxInstructionsPostConstruction) {
 
 // M5: allocating API methods run under a protected frame, so hitting maxMemory
 // throws a catchable std::runtime_error instead of an unprotected panic/abort.
+// Drives a runtime's maxMemory budget to within a few bytes of the wall and
+// leaves it there, so the next allocation Lua attempts genuinely fails. The
+// failing allocation triggers an emergency GC, which hands back whatever garbage
+// the run itself made — hence the repeat until a round can no longer fit even
+// one more node. Nodes are fixed-size on purpose: a growing array that fails to
+// double leaves a doubling's worth of slack behind, which is plenty of room for
+// the small allocations these tests are trying to make fail.
+static void ExhaustLuaMemory(const LuaRuntime& rt) {
+  (void)rt.ExecuteScript("ballast = nil; added = 0");
+  for (int round = 0; round < 16; ++round) {
+    const auto exhaust = rt.ExecuteScript(R"(
+      added = 0
+      pcall(function()
+        while true do ballast = {prev = ballast}; added = added + 1 end
+      end)
+      return added
+    )");
+    if (!std::holds_alternative<std::vector<LuaPtr>>(exhaust)) break;
+    const auto& added = std::get<std::vector<LuaPtr>>(exhaust);
+    if (added.empty() || std::get<int64_t>(added[0]->value) == 0) break;
+  }
+}
+
 TEST(LuaRuntimeProtectedAlloc, CreateTableFromOverLimitThrowsInsteadOfAborting) {
   RuntimeConfig config;
   config.max_memory = 512 * 1024;  // small budget; bare state fits easily
@@ -3100,6 +3123,91 @@ TEST(LuaRuntimeProtectedAlloc, CreateTableFromOverLimitThrowsInsteadOfAborting) 
   const int ref = rt.CreateTable();
   EXPECT_NE(ref, LUA_NOREF);
   EXPECT_NE(ref, LUA_REFNIL);
+}
+
+// CR-2 M5 residual, pinned to a concrete instance by CR-7: materializing a
+// *result* that has to survive as a registry reference — a metatabled table,
+// function, thread or Lua userdata — runs luaL_ref, which allocates. On the
+// bare-API paths that conversion happens after the execution pcall has already
+// returned, so under an exhausted maxMemory the LUA_ERRMEM longjmped with no
+// protected frame in sight → panic → process abort. It must now come back as an
+// ordinary error result.
+TEST(LuaRuntimeProtectedAlloc, ResultConversionUnderExhaustedMemoryReportsInsteadOfAborting) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 1024 * 1024;  // bare state + safe libraries fit comfortably
+  LuaRuntime rt(config);
+
+  // Take the function handle first — everything the call itself needs must exist
+  // before the budget is gone.
+  const auto setup = rt.ExecuteScript(R"(
+    marked = setmetatable({}, {})
+    return function() return marked end
+  )");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(setup));
+  const auto& setupValues = std::get<std::vector<LuaPtr>>(setup);
+  ASSERT_EQ(setupValues.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setupValues[0]->value));
+  const auto& funcRef = std::get<LuaFunctionRef>(setupValues[0]->value);
+
+  ExhaustLuaMemory(rt);
+
+  // Every call refs `marked` into the registry again, and holding the results
+  // keeps those slots off the free list — so within a few iterations the registry
+  // has to grow, an allocation that can no longer succeed. The assertion that
+  // really matters is that the process is still alive to make it.
+  std::vector<ScriptResult> held;
+  bool reportedError = false;
+  for (int i = 0; i < 512 && !reportedError; ++i) {
+    held.push_back(rt.CallFunction(funcRef, {}));
+    reportedError = std::holds_alternative<std::string>(held.back());
+  }
+  EXPECT_TRUE(reportedError);
+}
+
+// The other half of the M5 residual class: the bare-API entry points used to
+// stage their arguments — the key string, and for the setters the entire
+// PushLuaValue of the caller's value — on the caller's stack BEFORE entering the
+// protected frame, so an OOM while staging panicked just as the result
+// conversion did. Keys/values here are >40 chars so Lua allocates a long string
+// rather than reusing an interned short one, which makes the failure exact
+// rather than incidental.
+TEST(LuaRuntimeProtectedAlloc, ArgumentStagingUnderExhaustedMemoryThrowsInsteadOfAborting) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 1024 * 1024;
+  LuaRuntime rt(config);
+
+  const int tableRef = rt.CreateTable();  // taken while there is still budget
+  ASSERT_NE(tableRef, LUA_NOREF);
+
+  // Well past 40 chars, so Lua allocates a fresh long string rather than reusing
+  // an interned short one — and large enough that it cannot fit in the few
+  // hundred bytes of slack the emergency GC hands back when the budget is hit.
+  const std::string longKey(64 * 1024, 'k');
+  const auto longValue = std::make_shared<LuaValue>(
+    LuaValue::from(std::string(64 * 1024, 'v')));
+
+  // Each failed attempt leaves a little slack behind — the emergency GC that
+  // accompanies the failure reclaims the garbage that attempt made — so the
+  // budget is driven back to the wall before every case.
+  const auto atTheWall = [&](const char* what, const std::function<void()>& op) {
+    ExhaustLuaMemory(rt);
+    SCOPED_TRACE(what);
+    EXPECT_THROW(op(), std::runtime_error);
+  };
+
+  // Reading a global: the key push inside PushProtectedGlobal.
+  atTheWall("GetGlobal", [&]() { (void)rt.GetGlobal(longKey); });
+  // Writing a global: the key push AND the whole of PushLuaValue.
+  atTheWall("SetGlobal", [&]() { rt.SetGlobal(longKey, longValue); });
+  // The same two staging steps on the table-reference API, string and typed keys.
+  atTheWall("GetTableField", [&]() { (void)rt.GetTableField(tableRef, longKey); });
+  atTheWall("SetTableField", [&]() { rt.SetTableField(tableRef, longKey, longValue); });
+  atTheWall("HasTableFieldKeyed",
+            [&]() { (void)rt.HasTableFieldKeyed(tableRef, TableKey(longKey)); });
+  atTheWall("SetTableFieldKeyed",
+            [&]() { rt.SetTableFieldKeyed(tableRef, TableKey(longKey), longValue); });
 }
 
 TEST(LuaRuntimeProtectedAlloc, RegisterFunctionAndCreateTableStillWorkUnderLimit) {

@@ -95,14 +95,9 @@ void PushTableKey(lua_State* L, const lua_core::TableKey& key) {
 // run under lua_pcall (see LuaRuntime::ProtectedTableCall) so a raising
 // __index/__newindex/__len is caught instead of aborting the process. They hold
 // no C++ locals, so the longjmp on raise has nothing to skip.
-int ProtectedTableGet(lua_State* L) {   // [t, key] -> [value]
-  lua_gettable(L, 1);
-  return 1;
-}
-int ProtectedTableSet(lua_State* L) {   // [t, key, value] -> []
-  lua_settable(L, 1);
-  return 0;
-}
+// (The former ProtectedTableGet/ProtectedTableSet trampolines are gone: the
+// field accessors now do the gettable/settable inside a RunProtected frame that
+// also covers staging the key and value, which those trampolines could not.)
 int ProtectedTableLen(lua_State* L) {   // [t] -> [len]
   lua_pushinteger(L, luaL_len(L, 1));
   return 1;
@@ -1044,9 +1039,15 @@ void LuaRuntime::RegisterModuleTable(const std::string& name,
 // --- Output redirection (E1) ---
 
 void LuaRuntime::SetOutputHandler(OutputHandler handler) {
-  output_handler_ = std::move(handler);
-  if (output_handler_) {
+  if (handler) {
+    // Install the redirection before committing the handler: the protected _G
+    // writes can throw (OOM under maxMemory), and assigning first would leave
+    // a handler set that print/io.write were never rewired to reach (CR-8 F7).
+    // The overrides read output_handler_ at call time, so the order is safe.
     InstallOutputRedirection();
+    output_handler_ = std::move(handler);
+  } else {
+    output_handler_ = nullptr;
   }
 }
 
@@ -1576,6 +1577,77 @@ void LuaRuntime::RunProtected(const std::function<void()>& op) const {
   }
 }
 
+// Trampoline for ToLuaValueProtected. Like ProtectedThunkRunner it is a light C
+// function (0 upvalues), but the value to convert is passed as its single
+// argument: a pcall frame cannot address the caller's stack slots, so the value
+// has to enter the frame the way any argument does.
+int LuaRuntime::ProtectedConvertRunner(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (!runtime || !runtime->active_convert_) return 0;
+  ProtectedConvert* convert = runtime->active_convert_;
+  try {
+    convert->result = ToLuaValue(L, 1);
+  } catch (...) {
+    convert->error = std::current_exception();
+  }
+  return 0;
+}
+
+// Reads a value out of Lua under protection (M5 residual). See the header for
+// why only aggregates take the protected path and why it runs on the main state.
+LuaPtr LuaRuntime::ToLuaValueProtected(lua_State* from, const int index) const {
+  const int abs_index = lua_absindex(from, index);
+  switch (lua_type(from, abs_index)) {
+    case LUA_TTABLE:
+    case LUA_TFUNCTION:
+    case LUA_TTHREAD:
+    case LUA_TUSERDATA:
+      break;
+    default:
+      // nil / boolean / number / string: ToLuaValue performs no Lua allocation
+      // for these, so there is nothing an ERRMEM could interrupt.
+      return ToLuaValue(from, abs_index);
+  }
+  // Reserve the trampoline + argument slots before the frame is set up, so the
+  // setup itself can't be the thing that fails (lua_checkstack reports failure
+  // by return value rather than raising).
+  if (!lua_checkstack(L_, 2) || (from != L_ && !lua_checkstack(from, 1))) {
+    throw std::runtime_error("Lua stack overflow while reading a value");
+  }
+  ProtectedConvert convert;
+  ProtectedConvert* prev = active_convert_;
+  active_convert_ = &convert;
+  // Light C function (0 upvalues) — its push never allocates, so the protected
+  // frame is established before anything inside it can raise.
+  lua_pushcfunction(L_, ProtectedConvertRunner);
+  if (from == L_) {
+    lua_pushvalue(L_, abs_index);
+  } else {
+    lua_pushvalue(from, abs_index);
+    lua_xmove(from, L_, 1);
+  }
+  const int status = lua_pcall(L_, 1, 0, 0);
+  active_convert_ = prev;
+
+  // A C++ exception thrown by ToLuaValue (depth/stack limits) was caught in the
+  // trampoline: rethrow it now that the pcall frame has been left.
+  if (convert.error) std::rethrow_exception(convert.error);
+  if (status != LUA_OK) {
+    // Typically LUA_ERRMEM under maxMemory. pcall left the message on top and
+    // unwound the stack; surface it as a catchable C++ exception.
+    const char* msg = lua_tostring(L_, -1);
+    std::string err = msg ? msg : "value conversion failed (out of memory?)";
+    lua_pop(L_, 1);
+    throw std::runtime_error(err);
+  }
+  if (!convert.result) {
+    throw std::runtime_error("value conversion failed");
+  }
+  return convert.result;
+}
+
 // Captures the error object at the top of L's stack: records the structured
 // value (for JS-Error reconstruction) and returns a display string.
 //
@@ -1585,7 +1657,7 @@ void LuaRuntime::RunProtected(const std::function<void()>& op) const {
 // __index), and stringification goes through a protected __tostring trampoline.
 std::string LuaRuntime::CaptureError(lua_State* L) const {
   try {
-    last_error_value_ = ToLuaValue(L, -1);
+    last_error_value_ = ToLuaValueProtected(L, -1);
   } catch (const std::exception&) {
     // A pathological error object (nested past kMaxDepth, or a stack overflow
     // while reading it) must not throw out of the error path — every execution
@@ -1668,7 +1740,7 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
   results.reserve(nresults);
   try {
     for (int i = 0; i < nresults; ++i) {
-      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+      results.push_back(ToLuaValueProtected(L_, stackBefore + 1 + i));
     }
   } catch (const std::exception& e) {
     lua_pop(L_, nresults);
@@ -1699,7 +1771,7 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   results.reserve(nresults);
   try {
     for (int i = 0; i < nresults; ++i) {
-      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+      results.push_back(ToLuaValueProtected(L_, stackBefore + 1 + i));
     }
   } catch (const std::exception& e) {
     lua_pop(L_, nresults);
@@ -1733,7 +1805,7 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
   results.reserve(nresults);
   try {
     for (int i = 0; i < nresults; ++i) {
-      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+      results.push_back(ToLuaValueProtected(L_, stackBefore + 1 + i));
     }
   } catch (const std::exception& e) {
     lua_pop(L_, nresults);
@@ -1744,16 +1816,20 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
 }
 
 void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
-  // Assign through a protected _G[name] = value so a __newindex metamethod on
-  // the globals table (rare, but reachable via setmetatable(_G, ...)) surfaces
-  // as a std::runtime_error instead of an unprotected panic. StackGuard also
-  // clears a partially-built value if PushLuaValue throws.
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableSet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
-  lua_pushlstring(L_, name.data(), name.size());          // key
-  PushLuaValue(L_, value);                                // value
-  ProtectedTableCall(3, 0);
+  // One protected frame covers the key-string allocation, the (arbitrarily
+  // large) value the caller is assigning, and the store itself — so both a
+  // __newindex metamethod on the globals table (M4) and an OOM building the
+  // key or value (M5) surface as a std::runtime_error instead of an
+  // unprotected panic. Staging the value in the caller, as this used to, left
+  // the whole of PushLuaValue outside the frame. StackGuard also clears a
+  // partially-built value if PushLuaValue throws a C++ exception.
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+    lua_pushlstring(L_, name.data(), name.size());          // key
+    PushLuaValue(L_, value);                                // value
+    lua_settable(L_, -3);                                   // may fire __newindex
+  });
 }
 
 void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
@@ -1773,13 +1849,42 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
   host_functions_[name] = std::move(fn);
 }
 
-// Reads _G[name] through the protected table-get trampoline, leaving the value
-// on top of the stack. Callers manage stack cleanup (typically via StackGuard).
+// Trampoline for PushProtectedGlobal: [] -> [value]. Light C function (0
+// upvalues) so its own push can't allocate; it then pushes the key string and
+// reads _G[key] from *inside* the frame, which is the point — staging the key
+// in the caller would leave that allocation unprotected.
+int LuaRuntime::ProtectedGlobalGetRunner(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (!runtime || !runtime->active_global_name_) {
+    lua_pushnil(L);
+    return 1;
+  }
+  const std::string& name = *runtime->active_global_name_;
+  lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
+  lua_pushlstring(L, name.data(), name.size());          // key (may allocate)
+  lua_gettable(L, -2);                                   // may fire __index
+  return 1;
+}
+
+// Reads _G[name] under protection, leaving the value on top of the stack.
+// Callers manage stack cleanup (typically via StackGuard).
 void LuaRuntime::PushProtectedGlobal(const std::string& name) const {
-  lua_pushcfunction(L_, ProtectedTableGet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
-  lua_pushlstring(L_, name.data(), name.size());          // key
-  ProtectedTableCall(2, 1);                               // -> value (may __index)
+  if (!lua_checkstack(L_, 2)) {
+    throw std::runtime_error("Lua stack overflow while reading a global");
+  }
+  const std::string* prev = active_global_name_;
+  active_global_name_ = &name;
+  lua_pushcfunction(L_, ProtectedGlobalGetRunner);
+  const int status = lua_pcall(L_, 0, 1, 0);
+  active_global_name_ = prev;
+  if (status != LUA_OK) {
+    const char* msg = lua_tostring(L_, -1);
+    std::string err = msg ? msg : "global access error";
+    lua_pop(L_, 1);
+    throw std::runtime_error(err);
+  }
 }
 
 LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
@@ -1787,7 +1892,7 @@ LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
   // table surfaces as a std::runtime_error instead of an unprotected panic.
   StackGuard guard(L_);
   PushProtectedGlobal(name);
-  return ToLuaValue(L_, -1);
+  return ToLuaValueProtected(L_, -1);
 }
 
 ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
@@ -1823,7 +1928,7 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
   results.reserve(nresults);
   try {
     for (int i = 0; i < nresults; ++i) {
-      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+      results.push_back(ToLuaValueProtected(L_, stackBefore + 1 + i));
     }
   } catch (const std::exception& e) {
     lua_pop(L_, nresults);
@@ -2077,87 +2182,114 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
 
 // --- Table reference operations ---
 
+// The six field accessors below all run key staging, value staging, the table
+// operation itself and (for the getters) the result conversion inside ONE
+// protected frame. Staging the key/value in the caller — as these used to —
+// left PushTableKey's string push and the whole of PushLuaValue outside any
+// pcall, so an OOM there under an exhausted maxMemory panicked (M5). Only PODs
+// live in the thunks; the C++ results are declared outside, so an ERRMEM
+// longjmp has no destructor of consequence to skip.
+
 LuaPtr LuaRuntime::GetTableField(int registry_ref, const std::string& key) const {
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableGet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
-  PushTableKey(L_, key);                             // key
-  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
-  return ToLuaValue(L_, -1);
+  LuaPtr result;
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    lua_gettable(L_, -2);                              // may trigger __index
+    result = ToLuaValue(L_, -1);
+  });
+  return result;
 }
 
 void LuaRuntime::SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const {
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableSet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
-  PushTableKey(L_, key);                             // key
-  PushLuaValue(L_, value);                           // value
-  ProtectedTableCall(3, 0);                          // may trigger __newindex
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    PushLuaValue(L_, value);                           // value
+    lua_settable(L_, -3);                              // may trigger __newindex
+  });
 }
 
 bool LuaRuntime::HasTableField(int registry_ref, const std::string& key) const {
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableGet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
-  PushTableKey(L_, key);                             // key
-  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
-  return !lua_isnil(L_, -1);
+  bool present = false;
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    lua_gettable(L_, -2);                              // may trigger __index
+    present = !lua_isnil(L_, -1);
+  });
+  return present;
 }
 
 LuaPtr LuaRuntime::GetTableFieldKeyed(int registry_ref, const TableKey& key) const {
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableGet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
-  PushTableKey(L_, key);                             // key
-  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
-  return ToLuaValue(L_, -1);
+  LuaPtr result;
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    lua_gettable(L_, -2);                              // may trigger __index
+    result = ToLuaValue(L_, -1);
+  });
+  return result;
 }
 
 void LuaRuntime::SetTableFieldKeyed(int registry_ref, const TableKey& key, const LuaPtr& value) const {
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableSet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
-  PushTableKey(L_, key);                             // key
-  PushLuaValue(L_, value);                           // value
-  ProtectedTableCall(3, 0);                          // may trigger __newindex
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    PushLuaValue(L_, value);                           // value
+    lua_settable(L_, -3);                              // may trigger __newindex
+  });
 }
 
 bool LuaRuntime::HasTableFieldKeyed(int registry_ref, const TableKey& key) const {
-  StackGuard guard(L_);
-  lua_pushcfunction(L_, ProtectedTableGet);
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
-  PushTableKey(L_, key);                             // key
-  ProtectedTableCall(2, 1);                          // -> value (may trigger __index)
-  return !lua_isnil(L_, -1);
+  bool present = false;
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    lua_gettable(L_, -2);                              // may trigger __index
+    present = !lua_isnil(L_, -1);
+  });
+  return present;
 }
 
 std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
-  StackGuard guard(L_);
-
+  // Protected because stringifying a *number* key allocates the resulting Lua
+  // string (M5); traversal itself is raw and fires no metamethod. `keys` is
+  // declared out here so an ERRMEM longjmp can't skip its destructor — the
+  // partial result is simply discarded with the exception.
   std::vector<std::string> keys;
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
-  // A stale/released ref (or a non-table slot) must not reach lua_next: raw
-  // traversal of a non-table is an API violation. Bail out with no keys.
-  if (!lua_istable(L_, -1)) {
-    return keys;
-  }
-
-  lua_pushnil(L_);
-  while (lua_next(L_, -2) != 0) {
-    if (lua_type(L_, -2) == LUA_TSTRING) {
-      // Length-aware so keys containing embedded NULs aren't truncated.
-      size_t len = 0;
-      const char* str = lua_tolstring(L_, -2, &len);
-      keys.emplace_back(str, len);
-    } else if (lua_type(L_, -2) == LUA_TNUMBER) {
-      lua_pushvalue(L_, -2);  // stringify a copy (never mutate the live key)
-      size_t len = 0;
-      const char* str = lua_tolstring(L_, -1, &len);
-      keys.emplace_back(str, len);
-      lua_pop(L_, 1);
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+    // A stale/released ref (or a non-table slot) must not reach lua_next: raw
+    // traversal of a non-table is an API violation. Bail out with no keys.
+    if (!lua_istable(L_, -1)) {
+      return;
     }
-    lua_pop(L_, 1);  // pop value, keep key
-  }
+
+    lua_pushnil(L_);
+    while (lua_next(L_, -2) != 0) {
+      if (lua_type(L_, -2) == LUA_TSTRING) {
+        // Length-aware so keys containing embedded NULs aren't truncated.
+        size_t len = 0;
+        const char* str = lua_tolstring(L_, -2, &len);
+        keys.emplace_back(str, len);
+      } else if (lua_type(L_, -2) == LUA_TNUMBER) {
+        lua_pushvalue(L_, -2);  // stringify a copy (never mutate the live key)
+        size_t len = 0;
+        const char* str = lua_tolstring(L_, -1, &len);
+        keys.emplace_back(str, len);
+        lua_pop(L_, 1);
+      }
+      lua_pop(L_, 1);  // pop value, keep key
+    }
+  });
   return keys;
 }
 
@@ -2269,7 +2401,7 @@ std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) 
       lua_pop(L_, 1);
       continue;
     }
-    LuaPtr value = ToLuaValue(L_, lua_absindex(L_, -1));
+    LuaPtr value = ToLuaValueProtected(L_, lua_absindex(L_, -1));
     result.emplace_back(std::move(key), std::move(value));
     lua_pop(L_, 1);  // pop value, keep key for next iteration
   }
@@ -2295,7 +2427,7 @@ std::vector<std::pair<int64_t, LuaPtr>> LuaRuntime::TableIPairs(int registry_ref
   result.reserve(n);
   for (int i = 1; i <= n; ++i) {
     lua_rawgeti(L_, -1, i);
-    result.emplace_back(i, ToLuaValue(L_, -1));
+    result.emplace_back(i, ToLuaValueProtected(L_, -1));
     lua_pop(L_, 1);
   }
   return result;
@@ -2384,7 +2516,7 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     // Collect yielded values
     try {
       for (int i = 1; i <= nresults; ++i) {
-        result.values.push_back(ToLuaValue(threadRef.thread, i));
+        result.values.push_back(ToLuaValueProtected(threadRef.thread, i));
       }
     } catch (const std::exception& e) {
       result.values.clear();
@@ -2399,7 +2531,7 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     // Collect return values
     try {
       for (int i = 1; i <= nresults; ++i) {
-        result.values.push_back(ToLuaValue(threadRef.thread, i));
+        result.values.push_back(ToLuaValueProtected(threadRef.thread, i));
       }
     } catch (const std::exception& e) {
       result.values.clear();
@@ -2555,7 +2687,7 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   } else if (status == LUA_OK) {
     try {
       for (int i = 1; i <= nresults; ++i) {
-        result.values.push_back(ToLuaValue(threadRef.thread, i));
+        result.values.push_back(ToLuaValueProtected(threadRef.thread, i));
       }
     } catch (const std::exception& e) {
       result.values.clear();

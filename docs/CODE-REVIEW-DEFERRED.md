@@ -1,12 +1,27 @@
 # CODE-REVIEW-DEFERRED
 
-Consolidated list of findings from `CODE-REVIEW-1.md` and `CODE-REVIEW-2.md` that
-were **deferred, only partially resolved, or deliberately not applied**. Every
-other finding in those two reviews is fully resolved. Items are grouped by their
-source review and tagged with the original finding ID so they can be traced back.
+Consolidated tracker for findings across **all code reviews (CODE-REVIEW-1
+through CODE-REVIEW-8)** that were **deferred, only partially resolved,
+deliberately not applied, or resolved by documentation** — the standing
+backlog the reviews' priority lists point at. Items are grouped by their source
+review and tagged with the original finding ID so they can be traced back.
+Severity labels are carried over from the originating review.
 
-Use this as the backlog for a future hardening/cleanup pass. Severity labels are
-carried over from the originating review.
+**Last audited: July 22, 2026** (tree at the CODE-REVIEW-8 remediation; every
+"still current" claim below was re-checked against it).
+
+## Ledger
+
+| Review | Commit reviewed | Outstanding |
+|--------|-----------------|-------------|
+| CODE-REVIEW-1 | `f9a2459` | L1 (partial, style) and M10 (partial, cleanup) — deliberately not applied |
+| CODE-REVIEW-2 | `d87f62b` | none (the M5 residual — result conversion *and* the argument-staging gap it exposed — closed July 22, 2026) |
+| CODE-REVIEW-3 | `34d40c3` | M5 ⏸️ deferred — `MACOSX_DEPLOYMENT_TARGET` still `"26.0"`; release blocker per `docs/RELEASING.md` |
+| CODE-REVIEW-4 | `d031eea` | none |
+| CODE-REVIEW-5 | `052099b` | F3 caveat — Windows CMake path fixed but never verified; F8 — prebuilds still `darwin-arm64` only (release-time task, recorded in `docs/RELEASING.md`) |
+| CODE-REVIEW-6 | `08f4560` | none |
+| CODE-REVIEW-7 | `5f7b8f6` | none (its audit annotated the CR-2 M5 residual, since closed) |
+| CODE-REVIEW-8 | `330cc30` | F6 📄 documented residual — ERRMEM-longjmp leak in the host bridges (accepted floor) |
 
 ---
 
@@ -67,8 +82,9 @@ deliberately documented rather than changed:
   `_G` with a raising `__index` / `__newindex` reached through these paths could
   panic → process abort.
 - **Resolution:** added a `LuaRuntime::PushProtectedGlobal(name)` helper
-  (`src/core/lua-runtime.cpp`) that reads `_G[name]` through the existing
-  `ProtectedTableGet` trampoline under `lua_pcall`, and refactored `GetGlobal`,
+  (`src/core/lua-runtime.cpp`) that reads `_G[name]` under `lua_pcall` (via the
+  `ProtectedTableGet` trampoline at the time; since the M5 argument-staging fix
+  below, via its own `ProtectedGlobalGetRunner`), and refactored `GetGlobal`,
   `GetGlobalRef`, `SetGlobalMetatable`, and `HasPackageLibrary` / `AddSearchPath`
   onto it. `RegisterFunction` installs its closure inside a protected frame (see
   M5 — it now uses `RunProtected`, which subsumes the earlier `ProtectedTableSet`
@@ -104,12 +120,67 @@ deliberately documented rather than changed:
   `set_global` / `get_global_ref` were already guarded). Tests:
   `LuaRuntimeProtectedAlloc.*` (C++, an over-limit `CreateTableFrom` throws
   instead of aborting) and the two `M5:` TS cases.
-- **Documented residual:** the `luaL_ref` calls buried in the value-conversion
-  path (`ToLuaValue` materializing a function/thread/metatable *result*) are not
-  individually wrapped. In the common case they run inside the execution `pcall`
-  (script results are converted right after `ProtectedCall`); a bare-API result
-  conversion under an exhausted `maxMemory` remains a narrower unprotected site,
-  orthogonal to the direct-allocation-API class this finding targeted.
+- **Former residual — now closed (July 22, 2026).** The `luaL_ref` calls buried
+  in the value-conversion path (`ToLuaValue` materializing a
+  function/thread/userdata/metatabled-table *result*) were not individually
+  wrapped. They run after the execution `pcall` has already returned, so under an
+  exhausted `maxMemory` the `LUA_ERRMEM` longjmped with no protected frame in
+  sight → panic → **process abort**. CODE-REVIEW-7's audit pinned the concrete
+  instance: converting a metatabled-table error object, and any
+  function/thread/table-ref result after `ProtectedCall` returns.
+- **Resolution:** added `LuaRuntime::ToLuaValueProtected(from, index)`
+  (`src/core/lua-runtime.cpp`), the read-side counterpart to `RunProtected`. It
+  runs `ToLuaValue` inside a `lua_pcall` frame via a light C-function trampoline
+  (`ProtectedConvertRunner`, 0 upvalues → its push never allocates), passing the
+  value to convert **as the trampoline's argument** — a pcall frame can't address
+  the caller's stack slots, so it can't be handed an index the way `RunProtected`
+  ops work on the caller's stack. An `LUA_ERRMEM` is rethrown as a
+  `std::runtime_error`; a C++ exception from `ToLuaValue` (depth/stack limits) is
+  captured and rethrown after the frame unwinds. The frame always runs on the
+  main state — `lua_pcall` on a suspended coroutine is illegal — so a value
+  living on a coroutine thread is `lua_xmove`d across first, which is equivalent
+  because the registry the refs land in is shared. Scalars (nil/boolean/number/
+  string) allocate nothing on this path and are converted directly, keeping the
+  pcall off the common path.
+- Every previously unprotected conversion site now routes through it:
+  `CaptureError`, the four post-`ProtectedCall` result loops
+  (`ExecuteScript`/`ExecuteFile`/`CallFunction`/the bytecode path), `GetGlobal`,
+  `GetTableField` / `GetTableFieldKeyed`, `TablePairs` / `TableIPairs`, and the
+  three coroutine result loops (`ResumeCoroutine` yield + return,
+  `ResumeAsyncStep`). Sites already inside a `pcall` (the host bridges) are left
+  alone. Regression test:
+  `LuaRuntimeProtectedAlloc.ResultConversionUnderExhaustedMemoryReportsInsteadOfAborting`
+  — it drives the budget to within ~100 bytes of the wall with a chain of
+  fixed-size nodes, then calls a Lua function returning a metatabled table until
+  the registry has to grow; **verified to abort the test process without the
+  fix**, and to come back as an ordinary error result with it.
+- **Second half, found while closing the above (July 22, 2026) — also fixed.**
+  Closing the read side exposed the mirror-image gap on the *write* side: the
+  bare-API entry points staged their arguments on the caller's stack **before**
+  entering the protected frame, so the staging allocations were themselves
+  unprotected. `PushProtectedGlobal` pushed the key string outside its
+  `lua_pcall` (masked in practice only because global names are usually already
+  interned); worse, `SetGlobal`, `SetTableField` and `SetTableFieldKeyed` ran the
+  entire `PushLuaValue` of the caller's value — arbitrarily large — outside the
+  frame. Same failure mode as the residual above: ERRMEM → panic → abort.
+- **Resolution:** the six field accessors (`Get`/`Set`/`Has` × plain/`Keyed`),
+  `SetGlobal` and `GetTableKeys` now do key staging, value staging, the table
+  operation *and* the result conversion inside a single `RunProtected` frame,
+  calling `lua_gettable` / `lua_settable` directly. `PushProtectedGlobal` grew a
+  dedicated trampoline (`ProtectedGlobalGetRunner`) that pushes the key string
+  from *inside* the frame; the name reaches it out-of-band via
+  `active_global_name_`, because pushing it as an argument is the very
+  allocation being protected. `GetTableKeys` is protected for its number-key
+  stringification (traversal itself is raw and fires no metamethod). The now-dead
+  `ProtectedTableGet` / `ProtectedTableSet` trampolines were removed —
+  `ProtectedTableCall` remains for `GetTableLength` / `TableIPairs`, whose
+  arguments are pushed with `lua_rawgeti` and so allocate nothing. Only PODs live
+  inside the thunks and every C++ result is declared outside, so an ERRMEM
+  longjmp has no destructor of consequence to skip. Regression test:
+  `LuaRuntimeProtectedAlloc.ArgumentStagingUnderExhaustedMemoryThrowsInsteadOfAborting`
+  — **verified to abort the test process without the fix.**
+- Distinct from CR-8 F6 below: that one is a *leak inside* a protected frame;
+  both of these were a *panic outside* any, and are now gone.
 
 #### M6 — cross-context round-trip marker identity check *(medium)* — ✅ RESOLVED
 - **Original gap:** `_tableRef` / `_userdata` markers were already honored only
@@ -238,13 +309,113 @@ deliberately documented rather than changed:
 
 ---
 
+## From CODE-REVIEW-3 (commit `34d40c3`)
+
+All findings resolved **except M5**, which remains deferred by decision:
+
+### M5 — `MACOSX_DEPLOYMENT_TARGET` is `"26.0"` *(medium)* — ⏸️ DEFERRED (intentional; release blocker)
+- **The gap:** both `xcode_settings` blocks in `binding.gyp` pin the macOS
+  deployment target to `26.0` (**still true as of July 22, 2026** —
+  `binding.gyp:142`, `:306`). Prebuilds compiled with this fail to `dlopen` on
+  anything older than the current-year macOS, and the CMake build (which
+  doesn't set it) produces artifacts with a different OS floor.
+- **Why deferred:** the project author is currently the only user, so the
+  restrictive floor has no real-world impact today. Lower to `"11.0"` (arm64's
+  floor) **before publishing for outside consumers** — `docs/RELEASING.md`
+  records this as a release blocker, alongside the related prebuild coverage
+  item (CR-5 F8 below).
+
+---
+
+## From CODE-REVIEW-4 (commit `d031eea`)
+
+**Nothing deferred.** All five findings (N1–N5) fully resolved in the
+remediation pass. (N1's resolution deviates deliberately from the review's
+recommended reorder for a GC-safety reason — that is a design record in
+CODE-REVIEW-4's resolution table, not an open item.)
+
+---
+
+## From CODE-REVIEW-5 (commit `052099b`)
+
+All twelve findings (F1–F10 plus the discovered F11/F12) resolved, with two
+state-of-tree caveats that stay open until acted on:
+
+### F3 (caveat) — Windows CMake discovery fixed but never verified *(medium)* — ⚠️ UNVERIFIED
+- The CMake Node.js discovery rewrite (node-gyp cache candidate lists,
+  `node.lib` location on Windows) is structurally complete, but **no Windows
+  machine was available** — the Windows path has never been exercised. Verify
+  (or delegate to a Windows CI job) before treating the CMake build as a
+  supported Windows path.
+
+### F8 — prebuild coverage *(low, state-of-tree)* — 📄 DOCUMENTED (release-time task)
+- `prebuilds/` still contains **`darwin-arm64` only** (re-checked July 22,
+  2026) of the three declared platforms (macOS arm64/x64, Windows x64).
+  Resolved by documentation: `docs/RELEASING.md` records the per-platform
+  prebuild requirement, the legacy `lua-native.node` name to delete once real
+  prebuilds exist, and the CR-3 M5 un-deferral — all release-time work, not
+  tree defects.
+
+---
+
+## From CODE-REVIEW-6 (commit `08f4560`)
+
+**Nothing deferred.** Both findings (F1, F2) fully resolved.
+
+---
+
+## From CODE-REVIEW-7 (commit `5f7b8f6`)
+
+**Nothing deferred.** All five findings (F1–F5) fully resolved. The pass's
+audit additionally pinned a concrete instance onto the CR-2 M5 documented
+residual — that residual has since been closed (see the CR-2 M5 entry above). (The CR-7 F1
+regression test was later silently disarmed by a Vitest major-version change;
+that was found and fixed as CODE-REVIEW-8 F2, and the guard now fails loudly.)
+
+---
+
+## From CODE-REVIEW-8 (commit `330cc30`)
+
+### F6 — ERRMEM longjmp over live C++ locals in the host bridges *(low)* — 📄 DOCUMENTED (accepted floor)
+- **The residual:** the host bridges (`LuaCallHostFunction`, `UserdataMethodCall`,
+  `UserdataIndex` in `src/core/lua-runtime.cpp`) stage errors carefully and only
+  `lua_error` after C++ locals are destroyed — but a **Lua memory error raised by
+  an allocation inside the scope** (the `PushLuaValue` of the result under an
+  exhausted `maxMemory`) longjmps directly to the enclosing `pcall`, skipping the
+  destructors of the live `args` vector and `resultHolder` (`try`/`catch` cannot
+  see a longjmp; the linked Lua is a C build). The skipped `shared_ptr`s leak
+  their `LuaValue`s and any registry slots they own; the constructor wrapper's
+  freshly-inserted `js_userdata_` entry is similarly stranded if the push of its
+  result raises.
+- **Why deferred:** the frame *is* protected, so the cost is a bounded leak in an
+  OOM window — not the panic/abort of the M5 residual above, and not memory
+  corruption (nothing dangles; things merely never free). Closing it would mean
+  restructuring every bridge's result push into a pre-staged protected frame,
+  disproportionate to a leak-under-OOM. (Its former companion, the M5
+  result-conversion residual, was a panic rather than a leak and has since been
+  closed — see that entry.) Revisit only if the OOM story hardens.
+
+---
+
 ## Suggested order for a future hardening pass
 
-**Every finding from CODE-REVIEW-1 and CODE-REVIEW-2 is now resolved.** The only
-remaining item is the narrow, documented M5 residual (result-conversion
-`luaL_ref` sites — see the M5 entry above), which is orthogonal to the
-direct-allocation-API panic class the review targeted and normally runs inside
-the execution `pcall` anyway.
+Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-8 is resolved.
+What remains, in the order it should be acted on:
+
+1. **Before the first publish for outside consumers** (release blockers, both
+   already recorded in `docs/RELEASING.md`): lower `MACOSX_DEPLOYMENT_TARGET`
+   to `"11.0"` (CR-3 M5) and produce the missing `darwin-x64` / `win32-x64`
+   prebuilds (CR-5 F8).
+2. **If the CMake build is ever offered as a supported Windows path:** verify
+   the node-gyp-cache discovery on a real Windows machine or CI job (CR-5 F3
+   caveat).
+3. **Accepted floor — revisit only if the OOM/`maxMemory` story hardens:**
+   CR-8 F6 (ERRMEM longjmp over live bridge locals — a leak *inside* a protected
+   frame). Not visible to the sanitizer harnesses. Its former companion, the
+   CR-2 M5 result-conversion residual (a panic *outside* any frame), was closed
+   on July 22, 2026.
+4. **No action planned:** CR-1 L1/M10 (style/cleanup, deliberately not
+   applied).
 
 ---
 

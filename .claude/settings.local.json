@@ -27,7 +27,8 @@
       "WebFetch(domain:www.moonsharp.org)",
       "WebFetch(domain:docs.rs)",
       "Bash(git -C /Users/frankhale/DEV/lua-native log --oneline -10)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(LUA_NATIVE_SANITIZED=1 node --expose-gc node_modules/vitest/vitest.mjs run --pool=threads --no-file-parallelism)"
     ]
   }
 }
