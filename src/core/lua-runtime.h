@@ -624,6 +624,27 @@ private:
   mutable ProtectedConvert* active_convert_ = nullptr;
   static int ProtectedConvertRunner(lua_State* L);
 
+  // Pushes a value onto `L` inside its own lua_pcall frame (CR-8 F6). The
+  // host-call bridges (LuaCallHostFunction, UserdataMethodCall, UserdataIndex,
+  // ClassIndex) run inside the caller's pcall, but an LUA_ERRMEM raised by
+  // PushLuaValue's allocations would longjmp straight to that pcall, skipping
+  // the destructors of the bridge's live C++ locals — the args vector, the
+  // result holder, and any registry slots they own. This turns the raise into
+  // a status code: returns LUA_OK with the pushed value on top, or the pcall
+  // error status with the error message on top (Lua's preallocated
+  // memory-error string for ERRMEM), so control returns normally and the
+  // bridge's locals are destroyed before it re-raises via lua_error. A C++
+  // exception from the conversion (depth/stack limits) is rethrown in normal
+  // control flow. Static, and the descriptor travels as a light-userdata
+  // argument (pushing one never allocates), so it works on whichever thread
+  // the bridge was invoked on without a registry read.
+  struct ProtectedPush {
+    const LuaPtr* value;
+    std::exception_ptr error;
+  };
+  static int PushLuaValueProtected(lua_State* L, const LuaPtr& value);
+  static int ProtectedPushRunner(lua_State* L);
+
   // Reads _G[name] inside a lua_pcall frame — so both an __index metamethod
   // installed via setmetatable(_G, ...) (M4) and the allocation of the key
   // string (M5) surface as a std::runtime_error instead of an unprotected panic

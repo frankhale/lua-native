@@ -8,7 +8,9 @@ review and tagged with the original finding ID so they can be traced back.
 Severity labels are carried over from the originating review.
 
 **Last audited: July 22, 2026** (tree at the CODE-REVIEW-8 remediation; every
-"still current" claim below was re-checked against it).
+"still current" claim below was re-checked against it). **Updated July 23,
+2026**: the CR-8 F6 main class was closed by code (`PushLuaValueProtected`);
+see its entry for the two narrowed residuals that replace it.
 
 ## Ledger
 
@@ -21,7 +23,7 @@ Severity labels are carried over from the originating review.
 | CODE-REVIEW-5 | `052099b` | F3 caveat — Windows CMake path fixed but never verified; F8 — prebuilds still `darwin-arm64` only (release-time task, recorded in `docs/RELEASING.md`) |
 | CODE-REVIEW-6 | `08f4560` | none |
 | CODE-REVIEW-7 | `5f7b8f6` | none (its audit annotated the CR-2 M5 residual, since closed) |
-| CODE-REVIEW-8 | `330cc30` | F6 📄 documented residual — ERRMEM-longjmp leak in the host bridges (accepted floor) |
+| CODE-REVIEW-8 | `330cc30` | F6 ✅ main restructure done July 23, 2026 (bridge value pushes now protected); two narrow residuals remain documented (error-message staging allocations; the stranded constructor `js_userdata_` entry) |
 
 ---
 
@@ -179,8 +181,9 @@ deliberately documented rather than changed:
   longjmp has no destructor of consequence to skip. Regression test:
   `LuaRuntimeProtectedAlloc.ArgumentStagingUnderExhaustedMemoryThrowsInsteadOfAborting`
   — **verified to abort the test process without the fix.**
-- Distinct from CR-8 F6 below: that one is a *leak inside* a protected frame;
-  both of these were a *panic outside* any, and are now gone.
+- Distinct from CR-8 F6 below: that one was a *leak inside* a protected frame
+  (its main class now also closed, by `PushLuaValueProtected`); both of these
+  were a *panic outside* any, and are now gone.
 
 #### M6 — cross-context round-trip marker identity check *(medium)* — ✅ RESOLVED
 - **Original gap:** `_tableRef` / `_userdata` markers were already honored only
@@ -376,24 +379,44 @@ that was found and fixed as CODE-REVIEW-8 F2, and the guard now fails loudly.)
 
 ## From CODE-REVIEW-8 (commit `330cc30`)
 
-### F6 — ERRMEM longjmp over live C++ locals in the host bridges *(low)* — 📄 DOCUMENTED (accepted floor)
-- **The residual:** the host bridges (`LuaCallHostFunction`, `UserdataMethodCall`,
-  `UserdataIndex` in `src/core/lua-runtime.cpp`) stage errors carefully and only
-  `lua_error` after C++ locals are destroyed — but a **Lua memory error raised by
-  an allocation inside the scope** (the `PushLuaValue` of the result under an
-  exhausted `maxMemory`) longjmps directly to the enclosing `pcall`, skipping the
-  destructors of the live `args` vector and `resultHolder` (`try`/`catch` cannot
-  see a longjmp; the linked Lua is a C build). The skipped `shared_ptr`s leak
-  their `LuaValue`s and any registry slots they own; the constructor wrapper's
-  freshly-inserted `js_userdata_` entry is similarly stranded if the push of its
-  result raises.
-- **Why deferred:** the frame *is* protected, so the cost is a bounded leak in an
-  OOM window — not the panic/abort of the M5 residual above, and not memory
-  corruption (nothing dangles; things merely never free). Closing it would mean
-  restructuring every bridge's result push into a pre-staged protected frame,
-  disproportionate to a leak-under-OOM. (Its former companion, the M5
-  result-conversion residual, was a panic rather than a leak and has since been
-  closed — see that entry.) Revisit only if the OOM story hardens.
+### F6 — ERRMEM longjmp over live C++ locals in the host bridges *(low)* — ✅ RESOLVED (main class, July 23, 2026); two narrow residuals documented below
+- **Original gap:** the host bridges (`LuaCallHostFunction`, `UserdataMethodCall`,
+  `UserdataIndex`, `ClassIndex` in `src/core/lua-runtime.cpp`) stage errors
+  carefully and only `lua_error` after C++ locals are destroyed — but a **Lua
+  memory error raised by an allocation inside the scope** (the `PushLuaValue` of
+  the result under an exhausted `maxMemory`) longjmped directly to the enclosing
+  `pcall`, skipping the destructors of the live `args` vector and `resultHolder`
+  (`try`/`catch` cannot see a longjmp; the linked Lua is a C build). The skipped
+  `shared_ptr`s leaked their `LuaValue`s and any registry slots they own.
+- **Resolution:** every bridge value push now runs inside its own `lua_pcall`
+  frame via `LuaRuntime::PushLuaValueProtected` / `ProtectedPushRunner` — the
+  result pushes in `LuaCallHostFunction` and `UserdataMethodCall`, both bridges'
+  staged-JS-error (`errVal`) pushes, and the property-getter result pushes in
+  `UserdataIndex` and `ClassIndex`. The descriptor travels as a light-userdata
+  pcall argument (pushing one never allocates), so the helper works on whichever
+  thread the bridge was invoked on with no registry read. An ERRMEM now returns
+  as a status code with the message (Lua's preallocated memory-error string) on
+  top; the bridge destroys its locals normally and only then re-raises. Two
+  regression tests
+  (`LuaRuntimeProtectedAlloc.HostFunctionResultPushUnderExhaustedMemoryReportsAndFrees`,
+  `…PropertyGetterPushUnderExhaustedMemoryReportsAndFrees`) pin the leak by
+  `shared_ptr` use_count on a sentinel result (LSan is unavailable under Apple
+  clang) — **verified to fail (count 3, holder leaked) without the fix**, which
+  also upgrades F6 from code-reading-only to reproduced.
+- **Narrowed residuals (accepted floor):**
+  1. The bridges' *error-message* stagings (`lua_pushfstring`, and the
+     `lua_pushstring(e.what())` fallback when a staged error value fails to
+     push) still allocate from Lua inside the scope, so an ERRMEM there can
+     still skip locals. Bounded to small string buffers on paths already
+     reporting a failure; no registry slots involved.
+  2. The constructor wrapper's freshly-committed `js_userdata_` entry
+     (`CreateConstructorWrapper`, `src/lua-native.cpp`) is still stranded if
+     the — now protected, non-leaking — push of its result fails: the entry
+     pins the JS instance until context teardown. Whether a partially-pushed
+     value already materialized the Lua userdata (whose `__gc` would erase the
+     entry, making an eager rollback a double-free of the slot) is undecidable
+     at the failure site, so the rollback is deliberately not attempted.
+     OOM-window-only, bounded, reclaimed at context teardown.
 
 ---
 
@@ -410,10 +433,12 @@ What remains, in the order it should be acted on:
    the node-gyp-cache discovery on a real Windows machine or CI job (CR-5 F3
    caveat).
 3. **Accepted floor — revisit only if the OOM/`maxMemory` story hardens:**
-   CR-8 F6 (ERRMEM longjmp over live bridge locals — a leak *inside* a protected
-   frame). Not visible to the sanitizer harnesses. Its former companion, the
-   CR-2 M5 result-conversion residual (a panic *outside* any frame), was closed
-   on July 22, 2026.
+   the two narrowed CR-8 F6 residuals (error-message staging allocations in the
+   bridges; the stranded constructor `js_userdata_` entry — see the F6 entry).
+   The main F6 class — the bridge *value* pushes — was closed on July 23, 2026
+   with `PushLuaValueProtected`. Not visible to the sanitizer harnesses. Its
+   former companion, the CR-2 M5 result-conversion residual (a panic *outside*
+   any frame), was closed on July 22, 2026.
 4. **No action planned:** CR-1 L1/M10 (style/cleanup, deliberately not
    applied).
 

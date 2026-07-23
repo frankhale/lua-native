@@ -396,8 +396,13 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
         } else {
         try {
           auto result = runtime->property_getter_(*block, key);
-          PushLuaValue(L, result);
-          have_result = true;
+          if (PushLuaValueProtected(L, result) == LUA_OK) {
+            have_result = true;
+          } else {
+            // ERRMEM mid-push (F6): the frame unwound with the message on
+            // top; raise it after the locals below are destroyed.
+            raise = true;
+          }
         } catch (const std::exception& e) {
           // If this userdata has methods but isn't readable, return nil instead
           // of erroring (methods work independently of readable).
@@ -648,7 +653,9 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
       } catch (const std::exception& e) {
         if (runtime->HasPendingErrorValue()) {
           LuaPtr errVal = runtime->TakePendingErrorValue();
-          try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+          // Protected (F6): an ERRMEM here must not longjmp over errVal/args.
+          // On failure the pcall's message is on top and is raised instead.
+          try { PushLuaValueProtected(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
         } else {
           lua_pushfstring(L, "Method '%s' threw an exception: %s",
                           func_name ? func_name : "<unknown>", e.what());
@@ -680,7 +687,11 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
           }
         } else {
           try {
-            PushLuaValue(L, resultHolder);
+            if (PushLuaValueProtected(L, resultHolder) != LUA_OK) {
+              // ERRMEM mid-push (F6): the frame unwound with the message on
+              // top; raise it after the locals below are destroyed.
+              outcome = HostCallOutcome::Raise;
+            }
           } catch (const std::exception& e) {
             lua_pushfstring(L, "Error converting return value from method '%s': %s",
                             func_name ? func_name : "<unknown>", e.what());
@@ -829,8 +840,13 @@ int LuaRuntime::ClassIndex(lua_State* L) {
         } else {
         try {
           auto result = runtime->property_getter_(*block, key);
-          PushLuaValue(L, result);
-          have_result = true;
+          if (PushLuaValueProtected(L, result) == LUA_OK) {
+            have_result = true;
+          } else {
+            // ERRMEM mid-push (F6): the frame unwound with the message on
+            // top; raise it after the locals below are destroyed.
+            raise = true;
+          }
         } catch (const std::exception& e) {
           // Class with methods but not readable: return nil rather than erroring
           // (methods work independently of readable, matching userdata behavior).
@@ -1357,7 +1373,9 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
         // that table so the original error can be reconstructed on the way out.
         if (runtime->HasPendingErrorValue()) {
           LuaPtr errVal = runtime->TakePendingErrorValue();
-          try { PushLuaValue(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
+          // Protected (F6): an ERRMEM here must not longjmp over errVal/args.
+          // On failure the pcall's message is on top and is raised instead.
+          try { PushLuaValueProtected(L, errVal); } catch (...) { lua_pushstring(L, e.what()); }
         } else {
           lua_pushfstring(L, "Host function '%s' threw an exception: %s",
                           func_name ? func_name : "<unknown>", e.what());
@@ -1391,7 +1409,11 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
           }
         } else {
           try {
-            PushLuaValue(L, resultHolder);
+            if (PushLuaValueProtected(L, resultHolder) != LUA_OK) {
+              // ERRMEM mid-push (F6): the frame unwound with the message on
+              // top; raise it after the locals below are destroyed.
+              outcome = HostCallOutcome::Raise;
+            }
           } catch (const std::exception& e) {
             lua_pushfstring(L, "Error converting return value from '%s': %s",
                             func_name ? func_name : "<unknown>", e.what());
@@ -1646,6 +1668,46 @@ LuaPtr LuaRuntime::ToLuaValueProtected(lua_State* from, const int index) const {
     throw std::runtime_error("value conversion failed");
   }
   return convert.result;
+}
+
+// Trampoline for PushLuaValueProtected: [desc] -> [value]. The descriptor
+// arrives as a light-userdata argument rather than via a runtime member
+// because the bridges run on whichever thread called them and a pcall frame
+// can't see the caller's stack — and a light userdata is a value, so pushing
+// it never allocates. A C++ exception from PushLuaValue is captured so it
+// can't unwind across the pcall's C frame; a Lua ERRMEM longjmps to the pcall
+// and is reported via its status code.
+int LuaRuntime::ProtectedPushRunner(lua_State* L) {
+  auto* push = static_cast<ProtectedPush*>(lua_touserdata(L, 1));
+  if (!push) return 0;
+  try {
+    PushLuaValue(L, *push->value);
+    return 1;
+  } catch (...) {
+    push->error = std::current_exception();
+    return 0;
+  }
+}
+
+// Pushes a bridge result under protection (CR-8 F6); see the header. The
+// two-slot setup (trampoline + descriptor) is reserved via lua_checkstack,
+// which reports failure by return value rather than raising.
+int LuaRuntime::PushLuaValueProtected(lua_State* L, const LuaPtr& value) {
+  if (!lua_checkstack(L, 2)) {
+    throw std::runtime_error("Lua stack overflow while pushing a result");
+  }
+  ProtectedPush push{&value, nullptr};
+  lua_pushcfunction(L, ProtectedPushRunner);  // light C function: never raises
+  lua_pushlightuserdata(L, &push);            // a value, not an allocation
+  const int status = lua_pcall(L, 1, 1, 0);
+  if (push.error) {
+    // The conversion threw C++-side; the runner returned 0 results and the
+    // pcall pushed a nil to satisfy nresults = 1. Drop it and rethrow now, in
+    // normal control flow.
+    if (status == LUA_OK) lua_pop(L, 1);
+    std::rethrow_exception(push.error);
+  }
+  return status;
 }
 
 // Captures the error object at the top of L's stack: records the structured

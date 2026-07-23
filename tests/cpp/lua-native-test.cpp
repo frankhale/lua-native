@@ -3229,6 +3229,103 @@ TEST(LuaRuntimeProtectedAlloc, RegisterFunctionAndCreateTableStillWorkUnderLimit
   EXPECT_NE(ref, LUA_NOREF);
 }
 
+// CR-8 F6: an ERRMEM raised by the result push inside a host-call bridge used
+// to longjmp straight to the enclosing pcall, skipping the destructors of the
+// bridge's live C++ locals (the args vector and the result holder — here a
+// 200k-element LuaArray of shared_ptrs). The push now runs in its own pcall
+// frame, so the failure comes back as an ordinary Lua error after the locals
+// are destroyed. The leak is pinned via the sentinel's use_count — LSan is not
+// available under Apple clang, so the refcount is the observable.
+TEST(LuaRuntimeProtectedAlloc, HostFunctionResultPushUnderExhaustedMemoryReportsAndFrees) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 1024 * 1024;
+  LuaRuntime rt(config);
+
+  // Built in C++ heap (unbounded); only the *push* into Lua hits maxMemory.
+  LuaArray big;
+  big.reserve(200000);
+  for (int i = 0; i < 200000; ++i) {
+    big.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(i))));
+  }
+  auto sentinel = std::make_shared<LuaValue>(LuaValue::from(std::move(big)));
+  rt.RegisterFunction("bigresult",
+    [sentinel](const std::vector<LuaPtr>&) -> LuaPtr { return sentinel; });
+
+  // Take the function handle while there is still budget, so the call itself
+  // needs no compilation once the budget is gone.
+  const auto setup = rt.ExecuteScript("return bigresult");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(setup));
+  const auto& setupValues = std::get<std::vector<LuaPtr>>(setup);
+  ASSERT_EQ(setupValues.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setupValues[0]->value));
+  const auto& funcRef = std::get<LuaFunctionRef>(setupValues[0]->value);
+
+  ExhaustLuaMemory(rt);
+
+  // The 200k-element push cannot fit in the emergency-GC slack, so the first
+  // call's result push fails and must surface as an ordinary error result.
+  const auto res = rt.CallFunction(funcRef, {});
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("memory"), std::string::npos);
+
+  // The F6 pin: the bridge's resultHolder was destroyed on the failure path.
+  // Before the fix the ERRMEM longjmp skipped its destructor, leaving this
+  // count at 3 forever. Expected owners now: this local + the lambda capture.
+  EXPECT_EQ(sentinel.use_count(), 2);
+
+  // The runtime is not corrupted: release the ballast and run something small
+  // (the 200k result itself can never fit a 1 MB budget, exhausted or not).
+  (void)rt.ExecuteScript("ballast = nil");
+  lua_gc(rt.RawState(), LUA_GCCOLLECT, 0);
+  const auto again = rt.ExecuteScript("return 1 + 1");
+  EXPECT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(again));
+}
+
+// The same F6 class on the property-getter bridge (UserdataIndex): the pushed
+// property value fails mid-push under an exhausted budget and must surface as
+// a Lua error, not longjmp over the getter result's destructor.
+TEST(LuaRuntimeProtectedAlloc, PropertyGetterPushUnderExhaustedMemoryReportsAndFrees) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 1024 * 1024;
+  LuaRuntime rt(config);
+
+  LuaArray big;
+  big.reserve(200000);
+  for (int i = 0; i < 200000; ++i) {
+    big.push_back(std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(i))));
+  }
+  auto sentinel = std::make_shared<LuaValue>(LuaValue::from(std::move(big)));
+  rt.SetPropertyHandlers(
+    [sentinel](int, const std::string&) -> LuaPtr { return sentinel; },
+    nullptr);
+  rt.CreateProxyUserdataGlobal("obj", 1);
+
+  // A closure taken up front, so the failing call needs no compilation.
+  const auto setup = rt.ExecuteScript("return function() return obj.anything end");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(setup));
+  const auto& setupValues = std::get<std::vector<LuaPtr>>(setup);
+  ASSERT_EQ(setupValues.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setupValues[0]->value));
+  const auto& funcRef = std::get<LuaFunctionRef>(setupValues[0]->value);
+
+  ExhaustLuaMemory(rt);
+
+  const auto res = rt.CallFunction(funcRef, {});
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("memory"), std::string::npos);
+
+  // The F6 pin (see the host-function variant): the getter result's holder
+  // must have been destroyed despite the failed push.
+  EXPECT_EQ(sentinel.use_count(), 2);
+
+  (void)rt.ExecuteScript("ballast = nil");
+  lua_gc(rt.RawState(), LUA_GCCOLLECT, 0);
+  const auto again = rt.ExecuteScript("return 1 + 1");
+  EXPECT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(again));
+}
+
 // H9c: registry unrefs are deferred while a worker run is bracketed and drained
 // by EndWorkerUnrefDeferral, and are immediate otherwise. (The thread-safety is
 // exercised by the async TS suite; this pins the queue-or-drain logic.)
