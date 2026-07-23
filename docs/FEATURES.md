@@ -995,6 +995,62 @@ not loading the `io`/`os` libraries (the `safe` preset excludes them).
 
 ---
 
+## Reference Lifecycle — `release()` (July 2026)
+
+### Overview
+
+Every Lua value that crosses to JS as a *reference* (a function, a coroutine, a
+table handle, or a metatabled-table Proxy) pins a Lua registry slot until its JS
+wrapper is garbage-collected. For long-lived contexts that mint many references,
+that accumulation is Lua-side memory the JS GC has no pressure to reclaim.
+`lua.release(value)` drops the registry reference immediately;
+`LuaTableHandle.release()` remains as the handle-local equivalent.
+
+### Architecture
+
+`LuaContext::Release` (binding layer only — no core changes) recognizes the
+wrapper kind by its marker property and calls `release()` on the ref inside the
+wrapper's `*Data` struct:
+
+| Wrapper | Marker | Ref struct |
+|---|---|---|
+| Lua function (JS callable) | `__luaFnOwner` External | `LuaFunctionData.funcRef` |
+| Coroutine object | `_coroutine` External | `LuaThreadData.threadRef` |
+| Table handle / metatabled Proxy | `_tableRef` External | `LuaTableRefData.tableRef` |
+
+The ref structs use shared ownership (`MakeRegistryOwner`), so `release()`
+drops this wrapper's share and the slot is unref'd exactly once. The released
+state is observable as `ref == LUA_NOREF`, which every consumer checks:
+
+- The function trampoline (`LuaFunctionCallbackStatic`) throws
+  `"Lua function has been released"` — covering direct calls, `pcall`, and a
+  released function round-tripped into Lua and called from there.
+- `resume()` throws `"coroutine has been released"` (a released `LuaThreadRef`
+  carries a null thread pointer, so this check also prevents resuming a freed
+  thread).
+- The table-handle methods and all five Proxy traps (get/set/has/ownKeys/
+  getOwnPropertyDescriptor) throw `"table handle has been released"`, as does
+  passing a released table reference back into Lua.
+
+### Design Decisions
+
+**Double release is a no-op.** Matches `LuaTableHandle.release()`; release-heavy
+cleanup code shouldn't need try/catch.
+
+**Foreign wrappers are rejected.** A wrapper minted by another context is
+refused (`"value belongs to a different Lua context"`), mirroring the round-trip
+identity checks in `NapiToCoreImpl` — a registry index is only meaningful in the
+registry that issued it.
+
+**Non-reference values throw a `TypeError`.** A plain JS function or object
+holds no registry slot; silently succeeding would mask bugs in cleanup paths.
+
+**Release is rejected while busy.** Like other sync entry points,
+`release()` throws while an async operation is in flight — the unref mutates the
+registry, which the worker thread may be using.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1018,3 +1074,4 @@ not loading the `io`/`os` libraries (the `safe` preset excludes them).
 | Coroutine-driven async (await JS promises, callbacks, cancel) | High | July 2026 |
 | Error fidelity (stack traces, JS Error round-trip, pcall) | Moderate | July 2026 |
 | I/O redirection, JS require searcher, bytecode guard | Moderate | July 2026 |
+| Reference lifecycle (`release()` for function/coroutine/table refs) | Low | July 2026 |

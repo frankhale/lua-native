@@ -2,6 +2,10 @@
 
 Potential enhancements for lua-native, organized by priority.
 
+> Statuses in this document were verified against the source
+> (`src/lua-native.cpp`, `src/core/lua-runtime.cpp`, `types.d.ts`) on
+> July 23, 2026.
+
 ## Priority Assessment
 
 Features are grouped into tiers based on impact and the availability of
@@ -22,7 +26,7 @@ workarounds rank lowest.
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
 | 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
-| 3 | Reference Lifecycle Management | Partially done | `LuaTableHandle.release()` exists (July 2026); function and coroutine refs still lack explicit release |
+| 3 | ~~Reference Lifecycle Management~~ | Completed | `LuaTableHandle.release()` (July 2026) plus context-level `release(value)` for function, coroutine, and table refs (July 23, 2026) |
 | 4 | Dotted Path Globals | Not started | Workaround: `execute_script` |
 | 4 | Shared State Between Contexts | Not started | Workaround: `set_global` on each context |
 | — | ~~File Execution~~ | Completed | |
@@ -35,6 +39,27 @@ workarounds rank lowest.
 together as "sandboxing." Tier 2 follows naturally — error stack traces and
 userdata methods are standard across Lua bridges and relatively straightforward.
 Tier 3 and 4 can be driven by actual user requests.
+
+### Interop gaps tracked in `BRIDGE-GAP-ANALYSIS.md`
+
+The bridge-parity survey in `BRIDGE-GAP-ANALYSIS.md` tracks the interop
+dimension this document doesn't (async, type fidelity, class binding, error
+fidelity, I/O). Its remaining items as of July 2026, in that document's
+numbering:
+
+| # | Gap | Rec. tier |
+|---|---|---|
+| B3 | Lua→JS direction of the type-converter registry | 3 |
+| A4 | Coroutine as (async) iterator; coroutine from a `LuaFunction` ref | 3 |
+| F1 | Metatables on non-global tables (table handles / `create_table`) | 3 |
+| C4 | Class inheritance / `__index` chaining | 4 |
+| F2 | Call a Lua global by name (`lua.call('fn', ...args)`) | 4 |
+| F3 | Per-call environment table on `execute_script` | 4 |
+| A5 | Worker pool / true parallelism | 4 (by design) |
+
+Everything else in that survey (Promise await, cancellation incl. A3b,
+type fidelity, converter registry, class binding, error fidelity/`pcall`,
+print redirection, JS searchers, `allowBytecode`) is implemented.
 
 ---
 
@@ -475,12 +500,28 @@ separate contexts as a workaround. The implementation is moderately complex —
 
 ---
 
-### Reference Lifecycle Management (Partially done — July 2026)
+### ~~Reference Lifecycle Management~~ (Completed — July 23, 2026)
 
-`LuaTableHandle.release()` is implemented (double-release is a safe no-op, and
-use-after-release throws a clear error). Still missing: explicit release for
-`LuaFunction` and `LuaCoroutine` refs, which accumulate in the registry the
-same way.
+Implemented in two steps. `LuaTableHandle.release()` came first (double-release
+is a safe no-op, and use-after-release throws a clear error). The context-level
+`release(value)` method completed the feature for the remaining ref kinds.
+
+**As built:**
+- `lua.release(value)` accepts a Lua function returned to JS, a coroutine, or a
+  table reference (a `LuaTableHandle` or a metatabled-table Proxy) and drops its
+  registry reference so Lua's GC can reclaim the referent.
+- Use-after-release throws a clear error: `"Lua function has been released"`,
+  `"coroutine has been released"`, or `"table handle has been released"` — from
+  direct calls, `pcall`, `resume`, Proxy property access, and round-trips back
+  into Lua alike.
+- Double release is a safe no-op. Values from a different context are rejected
+  (`"value belongs to a different Lua context"`), and non-reference values throw
+  a `TypeError`.
+- No core-layer changes were needed: the shared-ownership ref structs
+  (`LuaFunctionRef` etc.) already expose `release()`; the binding layer's
+  `LuaContext::Release` extracts the wrapper's `*Data` and calls it.
+
+The original design notes follow for reference.
 
 Provide explicit control over registry references to prevent memory leaks in
 long-lived contexts. When Lua functions, coroutines, or metatabled tables are
@@ -628,6 +669,11 @@ Implemented. See `set_userdata()` with the `methods` option in the API documenta
 ### ~~Table Reference API~~ (Completed)
 
 Implemented. See `create_table()`, `get_global_ref()`, and the `LuaTableHandle` interface in the API documentation.
+
+### ~~Reference Lifecycle Management~~ (Completed)
+
+Implemented. See `release()` in the API documentation (context-level release for
+function, coroutine, and table references) and `LuaTableHandle.release()`.
 
 ### ~~Memory Limits~~ (Completed)
 

@@ -23,6 +23,7 @@ data structures.
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
+- Reference lifecycle — explicitly free the registry reference behind a returned Lua function, coroutine, or table reference with `release()`, so long-lived contexts don't accumulate Lua-side memory
 - Module / require integration — register JS modules, add search paths, or resolve modules dynamically with a JS searcher (`add_searcher`) for Lua's `require()`
 - Output redirection — route Lua `print()` / `io.write()` to a JS handler via `set_print_handler` or the `print` option
 - Bytecode guard — `allowBytecode: false` refuses untrusted binary chunks (blocks `load_bytecode` and forces `load()` to text-only)
@@ -2193,6 +2194,33 @@ Lua table in place.
 **Returns:** `LuaTableHandle` — a live reference to the table
 
 **Throws:** Error if the global does not exist or is not a table
+
+### `LuaContext.release(value)`
+
+Releases the Lua registry reference held by a value that crossed the boundary: a
+Lua function returned to JS, a coroutine, or a table reference (a
+`LuaTableHandle` or a metatabled-table Proxy). Without an explicit release, the
+reference occupies its registry slot until the JS wrapper is garbage-collected;
+releasing lets Lua's GC reclaim the referent on its next cycle. Equivalent to
+`handle.release()` for table handles.
+
+After release, using the wrapper throws a clear error (`"Lua function has been
+released"`, `"coroutine has been released"`, `"table handle has been
+released"`). Releasing the same value again is a safe no-op.
+
+```javascript
+const fn = lua.execute_script('return function(x) return x * 2 end');
+fn(21); // 42
+lua.release(fn); // registry slot freed
+fn(21); // throws: Lua function has been released
+```
+
+**Parameters:**
+
+- `value`: The Lua function, coroutine, or table reference to release
+
+**Throws:** `TypeError` if the value holds no Lua reference; Error if the value
+belongs to a different Lua context
 
 ### `LuaTableHandle`
 

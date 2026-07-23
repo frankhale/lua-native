@@ -160,6 +160,13 @@ static Napi::Value TableRefGetTrap(const Napi::CallbackInfo& info) {
   // "then" suppression - prevents Proxy from being treated as a thenable
   if (key == "then") return env.Undefined();
 
+  // A Proxy released via lua.release() must fail clearly instead of indexing
+  // registry slot LUA_NOREF (nil), matching the table-handle methods.
+  if (data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
   try {
     // A __index metamethod reached here can call a JS host function that throws,
     // which stages a js_error_registry_ entry. This trap raises a plain string
@@ -187,6 +194,12 @@ static Napi::Value TableRefSetTrap(const Napi::CallbackInfo& info) {
 
   std::string key = prop.As<Napi::String>().Utf8Value();
 
+  // See TableRefGetTrap: a released Proxy fails clearly.
+  if (data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, true);
+  }
+
   try {
     // See TableRefGetTrap: clear the registry at the outermost access so a
     // staged entry from a raising __newindex host callback can't accumulate (L7).
@@ -213,6 +226,12 @@ static Napi::Value TableRefHasTrap(const Napi::CallbackInfo& info) {
 
   if (key == "_tableRef") return Napi::Boolean::New(env, true);
 
+  // See TableRefGetTrap: a released Proxy fails clearly.
+  if (data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
   try {
     // Clear the JS-error registry at the outermost access so a staged entry from
     // a raising __index host callback can't accumulate (L3, mirrors get/set).
@@ -229,6 +248,12 @@ static Napi::Value TableRefOwnKeysTrap(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
   if (RejectIfWorkerBusy(env, data)) return env.Undefined();
+
+  // See TableRefGetTrap: a released Proxy fails clearly.
+  if (data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return Napi::Array::New(env, 0);
+  }
 
   try {
     LuaContext::CallScope scope(data->context);
@@ -254,6 +279,12 @@ static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo
   if (!prop.IsString()) return env.Undefined();
 
   std::string key = prop.As<Napi::String>().Utf8Value();
+
+  // See TableRefGetTrap: a released Proxy fails clearly.
+  if (data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
   try {
     LuaContext::CallScope scope(data->context);
@@ -497,6 +528,15 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // A released ref would rawget registry slot LUA_NOREF (nil) and fail with an
+  // opaque "attempt to call a nil value" — surface a clear error instead,
+  // matching the table-handle behavior.
+  if (data->funcRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "Lua function has been released")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
   // Reject reentry while any async op is in flight. Checking the context's
   // is_busy_ (set synchronously before either a worker Queue() or an
   // execute_async begins) closes two gaps that a runtime->IsAsyncMode() check
@@ -568,7 +608,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("register_class", &LuaContext::RegisterClass),
     InstanceMethod("pcall", &LuaContext::Pcall),
     InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
-    InstanceMethod("add_searcher", &LuaContext::AddSearcher)
+    InstanceMethod("add_searcher", &LuaContext::AddSearcher),
+    InstanceMethod("release", &LuaContext::Release)
   });
 
   // The constructor is kept alive by the persistent reference InitModule stores
@@ -2074,6 +2115,70 @@ Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
   return result;
 }
 
+// Explicit registry-reference release for the wrapper kinds that outlive a
+// single call: Lua functions (__luaFnOwner), coroutines (_coroutine), and
+// table handles / metatabled-table Proxies (_tableRef). Dropping the ref frees
+// the registry slot on the next Lua GC cycle instead of waiting for the JS
+// wrapper to be garbage-collected. Double release is a safe no-op; using a
+// wrapper after release throws a clear "has been released" error.
+Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 1) {
+    Napi::TypeError::New(env,
+      "release(value) requires a Lua function, coroutine, or table reference")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const Napi::Value target = info[0];
+
+  // Only trust a marker minted by THIS context's runtime — a ref index from
+  // another context would address an unrelated slot in that registry (the same
+  // policy as the round-trip identity checks in NapiToCoreImpl).
+  const auto rejectForeign = [this]() {
+    Napi::Error::New(env, "value belongs to a different Lua context")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  };
+
+  if (target.IsFunction()) {
+    const auto fn = target.As<Napi::Object>();
+    if (fn.Has("__luaFnOwner") && fn.Get("__luaFnOwner").IsExternal()) {
+      auto* data = fn.Get("__luaFnOwner").As<Napi::External<LuaFunctionData>>().Data();
+      if (data && data->runtime.get() != runtime.get()) return rejectForeign();
+      if (data && data->funcRef.ref != LUA_NOREF) data->funcRef.release();
+      return env.Undefined();
+    }
+    Napi::TypeError::New(env,
+      "release(value): the function is not a Lua function reference")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (target.IsObject()) {
+    const auto obj = target.As<Napi::Object>();
+
+    if (obj.Has("_coroutine") && obj.Get("_coroutine").IsExternal()) {
+      auto* data = obj.Get("_coroutine").As<Napi::External<LuaThreadData>>().Data();
+      if (data && data->runtime.get() != runtime.get()) return rejectForeign();
+      if (data && data->threadRef.ref != LUA_NOREF) data->threadRef.release();
+      return env.Undefined();
+    }
+
+    if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
+      auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
+      if (data && data->runtime.get() != runtime.get()) return rejectForeign();
+      if (data && data->tableRef.ref != LUA_NOREF) data->tableRef.release();
+      return env.Undefined();
+    }
+  }
+
+  Napi::TypeError::New(env,
+    "release(value) requires a Lua function, coroutine, or table reference")
+    .ThrowAsJavaScriptException();
+  return env.Undefined();
+}
+
 void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
   // Run the runtime install first: it can throw (the protected print/io.write
   // overrides fail under OOM), and print_handler_ must not be left pointing at
@@ -2587,6 +2692,13 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
   if (threadData->runtime.get() != runtime.get()) {
     Napi::Error::New(env, "coroutine belongs to a different Lua context")
       .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // A released ref carries LUA_NOREF and a null thread pointer — resuming it
+  // would drive lua_resume on nullptr. Surface a clear error instead.
+  if (threadData->threadRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "coroutine has been released").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 

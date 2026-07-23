@@ -5334,4 +5334,143 @@ describe('lua-native Node adapter', () => {
       expect(refs[0].deref()).toBeUndefined();
     });
   });
+
+  // ============================================
+  // REFERENCE LIFECYCLE — lua.release()
+  // ============================================
+  describe('reference lifecycle - lua.release()', () => {
+    describe('Lua functions', () => {
+      it('calling a released function throws a clear error', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fn: any = lua.execute_script('return function(x) return x * 2 end');
+        expect(fn(21)).toBe(42);
+        lua.release(fn);
+        expect(() => fn(21)).toThrow('Lua function has been released');
+      });
+
+      it('double release is a no-op', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fn: any = lua.execute_script('return function() return 1 end');
+        lua.release(fn);
+        expect(() => lua.release(fn)).not.toThrow();
+      });
+
+      it('pcall on a released function reports the release error', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fn: any = lua.execute_script('return function() return 1 end');
+        lua.release(fn);
+        const result = lua.pcall(fn);
+        expect(result.ok).toBe(false);
+        expect(String((result as { ok: false; error: unknown }).error))
+          .toContain('Lua function has been released');
+      });
+
+      it('a released function passed back into Lua fails when called from Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fn: any = lua.execute_script('return function() return 5 end');
+        lua.release(fn);
+        lua.set_global('released_fn', fn);
+        expect(() => lua.execute_script('return released_fn()')).toThrow(/released/);
+      });
+
+      it('other references to the same Lua function are unaffected', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('shared = function() return 7 end');
+        const a: any = lua.execute_script('return shared');
+        const b: any = lua.execute_script('return shared');
+        lua.release(a);
+        expect(() => a()).toThrow('released');
+        expect(b()).toBe(7); // independent registry slot
+      });
+
+      it('releasing a plain JS function throws a TypeError', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.release((() => 1) as any)).toThrow('not a Lua function');
+      });
+
+      it('rejects a function belonging to a different context', () => {
+        const luaA = new lua_native.init({}, ALL_LIBS);
+        const luaB = new lua_native.init({}, ALL_LIBS);
+        const fn: any = luaA.execute_script('return function() return 1 end');
+        expect(() => luaB.release(fn)).toThrow('different Lua context');
+        expect(fn()).toBe(1); // untouched
+      });
+    });
+
+    describe('coroutines', () => {
+      it('resuming a released coroutine throws a clear error', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const coro = lua.create_coroutine(`
+          return function()
+            coroutine.yield(1)
+            return 2
+          end
+        `);
+        lua.release(coro);
+        expect(() => lua.resume(coro)).toThrow('coroutine has been released');
+      });
+
+      it('release after partial consumption, and double release is a no-op', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const coro = lua.create_coroutine('return function() coroutine.yield(1) return 2 end');
+        expect(lua.resume(coro).values).toEqual([1]);
+        lua.release(coro);
+        expect(() => lua.release(coro)).not.toThrow();
+        expect(() => lua.resume(coro)).toThrow('released');
+      });
+    });
+
+    describe('table references', () => {
+      it('releases a table handle (equivalent to handle.release())', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ x: 1 });
+        lua.release(t);
+        expect(() => t.get('x')).toThrow('released');
+        expect(() => lua.release(t)).not.toThrow(); // double release no-op
+      });
+
+      it('releases a metatabled-table Proxy; later use throws', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const proxy: any = lua.execute_script(`
+          return setmetatable({ n = 1 }, { __index = function() return 7 end })
+        `);
+        expect(proxy.n).toBe(1);
+        lua.release(proxy);
+        expect(() => proxy.n).toThrow('table handle has been released');
+        expect(() => { proxy.n = 2; }).toThrow('table handle has been released');
+        expect(() => Object.keys(proxy)).toThrow('table handle has been released');
+        expect(() => lua.set_global('back', proxy)).toThrow('table handle has been released');
+      });
+    });
+
+    describe('validation', () => {
+      it('throws for values that hold no Lua reference', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.release({} as any)).toThrow('requires a Lua function');
+        expect(() => lua.release(42 as any)).toThrow('requires a Lua function');
+        expect(() => (lua as any).release()).toThrow('requires a Lua function');
+      });
+    });
+
+    describe('memory reclamation', () => {
+      it('released function refs let Lua GC reclaim their closures', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fns: any[] = [];
+        for (let i = 0; i < 500; i++) {
+          // Each closure pins a distinct 4KB string (long strings are not
+          // interned) so the drop after release is unambiguous.
+          fns.push(lua.execute_script(`
+            local payload = string.rep('${i % 10}', 4096)
+            return function() return payload end
+          `));
+        }
+        lua.execute_script('collectgarbage("collect")');
+        const before = lua.get_memory_usage();
+        for (const fn of fns) lua.release(fn);
+        lua.execute_script('collectgarbage("collect")');
+        const after = lua.get_memory_usage();
+        expect(after).toBeLessThan(before - 500 * 2048); // at least half the payload bytes freed
+      });
+    });
+  });
 });

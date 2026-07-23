@@ -124,6 +124,7 @@ public:
     Napi::Value Pcall(const Napi::CallbackInfo& info);
     Napi::Value SetPrintHandler(const Napi::CallbackInfo& info);
     Napi::Value AddSearcher(const Napi::CallbackInfo& info);
+    Napi::Value Release(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 

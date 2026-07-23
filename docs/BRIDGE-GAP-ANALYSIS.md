@@ -143,6 +143,13 @@ checks.
 > functions or awaits Promises cancels promptly; a pure-Lua compute loop
 > (`while true do end`) does not. Full cancellation coverage is blocked on the
 > Tier 1 instruction-limit hook in `FUTURE.md` (tracked below as **A3b**).
+>
+> **Update (July 2026): A3b is closed.** The `maxInstructions` count-hook now
+> also polls `IsCancelRequested()` and raises `"execution cancelled"`, and the
+> worker-thread `cancel()` path calls `RequestCancel()`. Compute-bound loops
+> are therefore cooperatively cancellable — in both `execute_async` and the
+> worker-thread `execute_script_async`/`execute_file_async` — whenever
+> `maxInstructions` is set (the hook only exists then).
 
 #### A4. Coroutine ↔ JS async iterator ergonomics
 
@@ -349,6 +356,7 @@ matrix below:
   host-call/await boundaries; there is no `lua_sethook` interrupt, so a
   compute-bound Lua loop is uncancellable. Fixing this is the same work as
   `FUTURE.md`'s Tier 1 instruction limits — implement them together.
+  *(Since closed — see the update note under A3 and the completed matrix.)*
 - **B3 — no Lua→JS custom conversion.** The converter registry only covers
   JS→Lua. wasmoon's `TypeExtension` is bidirectional.
 - **A4 (extended) — coroutines only from source strings.** `create_coroutine()`
@@ -357,6 +365,8 @@ matrix below:
 Also noted while auditing (already tracked in `FUTURE.md`, status updated
 there): stack traces are done; reference lifecycle is partially done
 (`LuaTableHandle.release()` exists, function/coroutine refs have none).
+*(Since closed — July 23, 2026: context-level `release(value)` now covers
+function, coroutine, and table refs. See `FUTURE.md`.)*
 
 ---
 
@@ -379,12 +389,12 @@ with no reasonable JS-side workaround and broad demand.
 | E3 | ✅ Bytecode text-only guard (`allowBytecode`) | Medium (security) |
 | B2 | ✅ Pluggable type-converter registry (JS→Lua; see B3) | Medium |
 | E2 | ✅ Dynamic `require` via JS searcher | Medium |
+| A3b | ✅ Hook-based cancellation of compute-bound loops (via the `maxInstructions` count-hook; requires `maxInstructions` to be set) | High (sandboxing) |
 
 ### Remaining
 
 | # | Gap | Impact | Workaround exists? | Rec. tier |
 |---|---|---|---|---|
-| A3b ⭐ | Hook-based cancellation of compute-bound loops (= `FUTURE.md` Tier 1 instruction limits) | High (sandboxing) | No | **1** |
 | B3 | Lua→JS direction of the type-converter registry | Medium | Manual post-processing of results | **3** |
 | A4 | Coroutine as (async) iterator + coroutine-from-`LuaFunction` | Low-med | Manual `resume` loop | **3** |
 | F1 | Metatables on non-global tables (table handles / `create_table`) | Low-med | `execute_script` | **3** |
@@ -399,15 +409,16 @@ with no reasonable JS-side workaround and broad demand.
 The original three phases (correctness quick-wins → async overhaul → class
 binding) are **complete**. What remains, in order:
 
-1. **Sandboxing completion (A3b + `FUTURE.md` Tier 1):** instruction limits,
-   wall-clock timeout, and hook-based cancellation are one body of work sharing
-   `lua_sethook`. This is the only remaining item with *no* workaround and it
-   closes the last hole in the untrusted-code story (`safe` preset + memory
-   limits + `allowBytecode: false` are already in place).
+1. ~~**Sandboxing completion (A3b + `FUTURE.md` Tier 1)**~~ — **done (July
+   2026):** instruction limits (`maxInstructions`) and hook-based cancellation
+   shipped together, closing the last no-workaround hole in the untrusted-code
+   story (`safe` preset + memory limits + instruction limits +
+   `allowBytecode: false` are all in place). The optional wall-clock timeout
+   remains a `FUTURE.md` Tier 3 nicety.
 2. **Operational control (`FUTURE.md` Tier 2):** GC control, context reset.
-   Small, low-risk, natural follow-ons to the sandboxing theme. Extend
+   Small, low-risk, natural follow-ons to the sandboxing theme. ~~Extend
    `release()` from table handles to function/coroutine refs while in the area
-   (Tier 3 ref lifecycle).
+   (Tier 3 ref lifecycle).~~ *(Done — July 23, 2026: `lua.release(value)`.)*
 3. **Interop polish, by demand:** B3 (Lua→JS converters), A4 (iterators +
    coroutine-from-function), F1 (metatables on handles). Each is small and
    independent.

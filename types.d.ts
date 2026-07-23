@@ -654,6 +654,30 @@ export interface LuaContext {
    * lua.execute_script('return require("greet")("Ada")'); // "Hi Ada"
    */
   add_searcher(searcher: (name: string) => string | null | undefined): void;
+
+  /**
+   * Releases the Lua registry reference held by a value that crossed the
+   * boundary: a Lua function returned to JS, a coroutine, or a table
+   * reference (a `LuaTableHandle` or a metatabled-table Proxy).
+   *
+   * Without an explicit release, such references occupy their registry slot
+   * until the JS wrapper is garbage-collected, which for long-lived contexts
+   * that mint many references can accumulate significant Lua-side memory.
+   * Releasing lets Lua's GC reclaim the referent on its next cycle.
+   *
+   * After release, using the wrapper throws a clear error ("Lua function has
+   * been released" / "coroutine has been released" / "table handle has been
+   * released"). Releasing the same value again is a safe no-op. Equivalent to
+   * `handle.release()` for table handles.
+   *
+   * @param value The Lua function, coroutine, or table reference to release
+   * @example
+   * const fn = lua.execute_script<LuaFunction>('return function(x) return x * 2 end');
+   * fn(21);          // 42
+   * lua.release(fn); // registry slot freed
+   * fn(21);          // throws: Lua function has been released
+   */
+  release(value: LuaFunction | LuaCoroutine | LuaTableRef | LuaTableHandle): void;
 }
 
 /**
