@@ -37,7 +37,7 @@ struct LuaFunctionData {
   }
 
   // True while the backing LuaContext is still alive and usable.
-  bool ContextLive() const { return contextAlive && contextAlive->load(); }
+  [[nodiscard]] bool ContextLive() const { return contextAlive && contextAlive->load(); }
 };
 
 struct LuaThreadData {
@@ -83,7 +83,7 @@ struct LuaTableRefData {
   }
 
   // True while the backing LuaContext is still alive and usable.
-  bool ContextLive() const { return contextAlive && contextAlive->load(); }
+  [[nodiscard]] bool ContextLive() const { return contextAlive && contextAlive->load(); }
 };
 
 struct UserdataEntry {
@@ -246,7 +246,7 @@ private:
     // can't drive a later run's coroutine.
     uint64_t async_generation_ = 0;
 
-    void DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error);
+    void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error);
     Napi::Value OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen);
     void FinishAsync();
     static Napi::Value OnAwaitResolveStatic(const Napi::CallbackInfo& info);
@@ -305,5 +305,5 @@ private:
     lua_core::LuaRuntime::Function CreateConstructorWrapper(
         const std::string& name, const std::string& class_name,
         bool readable, bool writable);
-    Napi::Object CreateTableHandle(Napi::Env env, int registry_ref);
+    Napi::Object CreateTableHandle(Napi::Env env_, int registry_ref);
 };

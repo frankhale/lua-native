@@ -16,24 +16,24 @@
 // the value also can't be reassigned (closing the `fn.__luaFnOwner = null`
 // vector); pass `writable = true` for identity markers that may be re-tagged
 // (e.g. a construct() that returns a pooled object gets a fresh __luaClassRef).
-static void DefineHiddenProp(Napi::Env env, Napi::Object obj,
-                             const char* key, Napi::Value value,
-                             bool writable = true) {
-  auto Object = env.Global().Get("Object").As<Napi::Object>();
-  auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
+static void DefineHiddenProp(const Napi::Env env, Napi::Object obj,
+                             const char* key, const Napi::Value value,
+                             const bool writable = true) {
+  const auto Object = env.Global().Get("Object").As<Napi::Object>();
+  const auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
   Napi::Object desc = Napi::Object::New(env);
-  desc.Set("value", value);
-  desc.Set("enumerable", Napi::Boolean::New(env, false));
-  desc.Set("configurable", Napi::Boolean::New(env, false));
-  desc.Set("writable", Napi::Boolean::New(env, writable));
+  (void)desc.Set("value", value);
+  (void)desc.Set("enumerable", Napi::Boolean::New(env, false));
+  (void)desc.Set("configurable", Napi::Boolean::New(env, false));
+  (void)desc.Set("writable", Napi::Boolean::New(env, writable));
   defineProperty.Call({obj, Napi::String::New(env, key), desc});
 }
 
 // True when `value` is an instance of the named global constructor
 // (e.g. "Map", "Set", "RegExp"). Robust against subclassing.
 static bool IsInstanceOfGlobal(const Napi::Value& value, const char* ctorName) {
-  Napi::Env env = value.Env();
-  Napi::Value ctor = env.Global().Get(ctorName);
+  const Napi::Env env = value.Env();
+  const Napi::Value ctor = env.Global().Get(ctorName);
   if (!ctor.IsFunction()) return false;
   bool result = false;
   napi_instanceof(env, value, ctor, &result);
@@ -44,14 +44,14 @@ static bool IsInstanceOfGlobal(const Napi::Value& value, const char* ctorName) {
 // (binary-safe). Guards zero-length views to avoid constructing from nullptr.
 static std::string BinaryBytesToString(const Napi::Value& value) {
   if (value.IsBuffer()) {
-    auto buf = value.As<Napi::Buffer<char>>();
+    const auto buf = value.As<Napi::Buffer<char>>();
     return buf.Length() ? std::string(buf.Data(), buf.Length()) : std::string();
   }
   if (value.IsTypedArray()) {
-    auto ta = value.As<Napi::TypedArray>();
+    const auto ta = value.As<Napi::TypedArray>();
     auto ab = ta.ArrayBuffer();
     const size_t len = ta.ByteLength();
-    const char* base = static_cast<const char*>(ab.Data());
+    const auto base = static_cast<const char*>(ab.Data());
     return len ? std::string(base + ta.ByteOffset(), len) : std::string();
   }
   auto ab = value.As<Napi::ArrayBuffer>();
@@ -66,7 +66,7 @@ static std::string BinaryBytesToString(const Napi::Value& value) {
 static std::optional<lua_core::LuaValue> ConvertBuiltinType(
     const Napi::Value& value, int depth,
     const std::function<lua_core::LuaValue(const Napi::Value&, int)>& recurse) {
-  Napi::Env env = value.Env();
+  const Napi::Env env = value.Env();
 
   // Binary data -> binary-safe Lua string (Buffer is also a TypedArray, so it
   // must be checked first, but BinaryBytesToString handles the ordering).
@@ -81,12 +81,12 @@ static std::optional<lua_core::LuaValue> ConvertBuiltinType(
 
   // Map -> Lua table. Keys are stringified, matching plain-object behavior.
   if (IsInstanceOfGlobal(value, "Map")) {
-    Napi::Function arrayFrom =
+    const auto arrayFrom =
       env.Global().Get("Array").As<Napi::Object>().Get("from").As<Napi::Function>();
-    Napi::Array entries = arrayFrom.Call({value}).As<Napi::Array>();
+    const auto entries = arrayFrom.Call({value}).As<Napi::Array>();
     lua_core::LuaTable tbl;
     for (uint32_t i = 0; i < entries.Length(); ++i) {
-      Napi::Array pair = entries.Get(i).As<Napi::Array>();
+      auto pair = entries.Get(i).As<Napi::Array>();
       std::string k = pair.Get(static_cast<uint32_t>(0)).ToString().Utf8Value();
       tbl.emplace(std::move(k), std::make_shared<lua_core::LuaValue>(
         recurse(pair.Get(static_cast<uint32_t>(1)), depth + 1)));
@@ -96,9 +96,9 @@ static std::optional<lua_core::LuaValue> ConvertBuiltinType(
 
   // Set -> Lua array
   if (IsInstanceOfGlobal(value, "Set")) {
-    Napi::Function arrayFrom =
+    const auto arrayFrom =
       env.Global().Get("Array").As<Napi::Object>().Get("from").As<Napi::Function>();
-    Napi::Array vals = arrayFrom.Call({value}).As<Napi::Array>();
+    const auto vals = arrayFrom.Call({value}).As<Napi::Array>();
     lua_core::LuaArray arr;
     arr.reserve(vals.Length());
     for (uint32_t i = 0; i < vals.Length(); ++i) {
@@ -235,7 +235,7 @@ static Napi::Value TableRefOwnKeysTrap(const Napi::CallbackInfo& info) {
     auto keys = data->runtime->GetTableKeys(data->tableRef.ref);
     Napi::Array arr = Napi::Array::New(env, keys.size());
     for (size_t i = 0; i < keys.size(); i++) {
-      arr.Set(static_cast<uint32_t>(i), Napi::String::New(env, keys[i]));
+      (void)arr.Set(static_cast<uint32_t>(i), Napi::String::New(env, keys[i]));
     }
     return arr;
   } catch (const std::exception& e) {
@@ -260,9 +260,9 @@ static Napi::Value TableRefGetOwnPropertyDescriptorTrap(const Napi::CallbackInfo
     if (data->runtime->HasTableField(data->tableRef.ref, key)) {
       auto value = data->runtime->GetTableField(data->tableRef.ref, key);
       Napi::Object desc = Napi::Object::New(env);
-      desc.Set("configurable", Napi::Boolean::New(env, true));
-      desc.Set("enumerable", Napi::Boolean::New(env, true));
-      desc.Set("value", data->context->CoreToNapi(*value));
+      (void)desc.Set("configurable", Napi::Boolean::New(env, true));
+      (void)desc.Set("enumerable", Napi::Boolean::New(env, true));
+      (void)desc.Set("value", data->context->CoreToNapi(*value));
       return desc;
     }
   } catch (const std::exception& e) {
@@ -429,11 +429,11 @@ static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
     Napi::Array result = Napi::Array::New(env, pairs.size());
     for (size_t i = 0; i < pairs.size(); ++i) {
       Napi::Array entry = Napi::Array::New(env, 2);
-      entry.Set(static_cast<uint32_t>(0),
+      (void)entry.Set(static_cast<uint32_t>(0),
                 data->context->CoreToNapi(*pairs[i].first));
-      entry.Set(static_cast<uint32_t>(1),
+      (void)entry.Set(static_cast<uint32_t>(1),
                 data->context->CoreToNapi(*pairs[i].second));
-      result.Set(static_cast<uint32_t>(i), entry);
+      (void)result.Set(static_cast<uint32_t>(i), entry);
     }
     return result;
   } catch (const std::exception& e) {
@@ -459,11 +459,11 @@ static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
     Napi::Array result = Napi::Array::New(env, ipairs.size());
     for (size_t i = 0; i < ipairs.size(); ++i) {
       Napi::Array entry = Napi::Array::New(env, 2);
-      entry.Set(static_cast<uint32_t>(0),
+      (void)entry.Set(static_cast<uint32_t>(0),
                 Napi::Number::New(env, static_cast<double>(ipairs[i].first)));
-      entry.Set(static_cast<uint32_t>(1),
+      (void)entry.Set(static_cast<uint32_t>(1),
                 data->context->CoreToNapi(*ipairs[i].second));
-      result.Set(static_cast<uint32_t>(i), entry);
+      (void)result.Set(static_cast<uint32_t>(i), entry);
     }
     return result;
   } catch (const std::exception& e) {
@@ -574,7 +574,7 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   // The constructor is kept alive by the persistent reference InitModule stores
   // as instance data (and by `exports` itself), so no separate leaked
   // FunctionReference is needed here.
-  exports.Set(Napi::String::New(env, "init"), func);
+  (void)exports.Set(Napi::String::New(env, "init"), func);
 
   return exports;
 }
@@ -1263,7 +1263,7 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
   }
 
   const auto& bytecode = std::get<std::vector<uint8_t>>(result);
-  return Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size());
+  return {env, Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size())};
 }
 
 Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
@@ -1291,7 +1291,7 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
   }
 
   const auto& bytecode = std::get<std::vector<uint8_t>>(result);
-  return Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size());
+  return {env, Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size())};
 }
 
 Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
@@ -1301,8 +1301,8 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  auto buffer = info[0].As<Napi::Buffer<uint8_t>>();
-  std::vector<uint8_t> bytecode(buffer.Data(), buffer.Data() + buffer.Length());
+  const auto buffer = info[0].As<Napi::Buffer<uint8_t>>();
+  const std::vector<uint8_t> bytecode(buffer.Data(), buffer.Data() + buffer.Length());
 
   std::string chunk_name = "bytecode";
   if (info.Length() >= 2 && info[1].IsString()) {
@@ -1319,11 +1319,11 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
   return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(res));
 }
 
-Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
+Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int registry_ref) {
   auto* dataPtr = new LuaTableRefData(
     runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this, alive_);
 
-  Napi::Object handle = Napi::Object::New(env);
+  const Napi::Object handle = Napi::Object::New(env_);
 
   // The External's finalizer is the sole owner of dataPtr. Root it on _tableRef
   // AND on every method function below, so a method destructured off the handle
@@ -1331,15 +1331,15 @@ Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
   // freed memory once the handle object is collected. Non-configurable so it
   // can't be deleted to free the data out from under the still-bound methods —
   // the same ownership discipline used for __luaFnOwner (H3 / L6).
-  auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
-    [](Napi::Env, LuaTableRefData* d) { delete d; });
-  DefineHiddenProp(env, handle, "_tableRef", external, /*writable=*/false);
+  const auto external = Napi::External<LuaTableRefData>::New(env_, dataPtr,
+    [](Napi::Env, const LuaTableRefData* d) { delete d; });
+  DefineHiddenProp(env_, handle, "_tableRef", external, /*writable=*/false);
 
   auto addMethod = [&](const char* name,
                        Napi::Value (*cb)(const Napi::CallbackInfo&)) {
-    Napi::Function fn = Napi::Function::New(env, cb, name, dataPtr);
-    DefineHiddenProp(env, fn, "_tableOwner", external, /*writable=*/false);
-    handle.Set(name, fn);
+    const Napi::Function fn = Napi::Function::New(env_, cb, name, dataPtr);
+    DefineHiddenProp(env_, fn, "_tableOwner", external, /*writable=*/false);
+    (void)handle.Set(name, fn);
   };
   addMethod("get", TableHandleGet);
   addMethod("set", TableHandleSet);
@@ -1587,7 +1587,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
 
     // Register the new instance as JS-backed userdata.
     const int ref_id = next_userdata_id_++;
-    auto instObj = instance.As<Napi::Object>();
+    const auto instObj = instance.As<Napi::Object>();
     // Tag the instance so that passing the JS object back into Lua re-materializes
     // it as the same class userdata instead of deep-copying it to a table. The
     // owner marker carries this context's runtime pointer so a ref_id from a
@@ -1610,8 +1610,8 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     // with the per-class metatable.
     return std::make_shared<lua_core::LuaValue>(
       lua_core::LuaValue::from(lua_core::LuaUserdataRef(
-        ref_id, runtime->RawState(), /*opaque=*/false, LUA_NOREF,
-        /*proxy=*/false, class_name)));
+        ref_id, runtime->RawState(), /*is_opaque=*/false, LUA_NOREF,
+        /*is_proxy=*/false, class_name)));
   };
 }
 
@@ -1785,7 +1785,7 @@ struct AwaitCookie {
 };
 }  // namespace
 
-void LuaContext::DriveAsync(std::vector<lua_core::LuaPtr> args, bool is_error) {
+void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error) {
   // Mark the resume window so a cancel() arriving re-entrantly from a host
   // callback defers its teardown until after the coroutine leaves the C stack
   // (see Cancel()). Tearing down here would free the running coroutine. RAII so
@@ -1974,7 +1974,7 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   if (!async_co_ || !async_deferred_ || gen != async_generation_) {
     return env.Undefined();  // collector's destructor sweeps the dropped args
   }
-  DriveAsync(std::move(args), is_error);
+  DriveAsync(args, is_error);
   return env.Undefined();
 }
 
@@ -2033,7 +2033,7 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
     }
     // Abandon the suspended coroutine and reject immediately. Any pending
     // promise settlement becomes a no-op (async_co_ is cleared).
-    auto deferred = *async_deferred_;
+    const auto deferred = *async_deferred_;
     FinishAsync();
     deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
   } else if (is_busy_) {
@@ -2056,20 +2056,20 @@ Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  auto fn = info[0].As<Napi::Function>();
+  const auto fn = info[0].As<Napi::Function>();
   std::vector<napi_value> args;
   for (size_t i = 1; i < info.Length(); ++i) args.push_back(info[i]);
 
-  Napi::Object result = Napi::Object::New(env);
+  const Napi::Object result = Napi::Object::New(env);
   try {
-    Napi::Value r = fn.Call(args);
-    result.Set("ok", Napi::Boolean::New(env, true));
-    result.Set("value", r);
+    const Napi::Value r = fn.Call(args);
+    (void)result.Set("ok", Napi::Boolean::New(env, true));
+    (void)result.Set("value", r);
   } catch (const Napi::Error& e) {
     // The thrown value is preserved (reconstructed original JS Error when the
     // failure came from a JS callback; otherwise a Lua-error Error object).
-    result.Set("ok", Napi::Boolean::New(env, false));
-    result.Set("error", e.Value());
+    (void)result.Set("ok", Napi::Boolean::New(env, false));
+    (void)result.Set("error", e.Value());
   }
   return result;
 }
@@ -2327,8 +2327,8 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
           const int ref_id = r.As<Napi::Number>().Int32Value();
           if (js_userdata_.find(ref_id) != js_userdata_.end()) {
             return lua_core::LuaValue::from(lua_core::LuaUserdataRef(
-              ref_id, runtime->RawState(), /*opaque=*/false, LUA_NOREF,
-              /*proxy=*/false, cn.As<Napi::String>().Utf8Value()));
+              ref_id, runtime->RawState(), /*is_opaque=*/false, LUA_NOREF,
+              /*is_proxy=*/false, cn.As<Napi::String>().Utf8Value()));
           }
         }
       }
@@ -2340,9 +2340,9 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
     // function handles out BEFORE calling match(): a match/convert callback may
     // re-enter and register another converter, reallocating the vector and
     // invalidating any reference held across the call.
-    for (size_t i = 0; i < type_converters_.size(); ++i) {
-      Napi::Function match = type_converters_[i].first.Value();
-      Napi::Function convert = type_converters_[i].second.Value();
+    for (auto &[fst, snd] : type_converters_) {
+      Napi::Function match = fst.Value();
+      Napi::Function convert = snd.Value();
       if (match.Call({value}).ToBoolean().Value()) {
         return NapiToCoreInstance(convert.Call({value}), depth + 1);
       }
@@ -2350,7 +2350,7 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
 
     // B1: common built-in JS types (binary data, Date, Map, Set, RegExp)
     if (auto builtin = ConvertBuiltinType(value, depth,
-          [this](const Napi::Value& v, int d) { return NapiToCoreInstance(v, d); })) {
+          [this](const Napi::Value& v, const int d) { return NapiToCoreInstance(v, d); })) {
       return std::move(*builtin);
     }
 
@@ -2380,7 +2380,7 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
 Napi::Value LuaContext::ResultsToJs(const std::vector<lua_core::LuaPtr>& values) {
   if (values.empty()) return env.Undefined();
   if (values.size() == 1) return CoreToNapi(*values[0]);
-  Napi::Array array = Napi::Array::New(env, values.size());
+  const Napi::Array array = Napi::Array::New(env, values.size());
   for (size_t i = 0; i < values.size(); ++i) array.Set(i, CoreToNapi(*values[i]));
   return array;
 }
@@ -2421,7 +2421,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           // The data is owned by a finalizer tied to the JS function, so it (and
           // its registry ref) is freed when the function is garbage-collected.
           auto* dataPtr = new LuaFunctionData(runtime, v, this, alive_);
-          Napi::Function fn =
+          const Napi::Function fn =
             Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
           // Non-writable + non-configurable: this External's finalizer owns the
           // LuaFunctionData that `fn` still calls through, so it must not be
@@ -2470,8 +2470,8 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           // Store _tableRef as non-enumerable on target for round-trip detection
           auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
             [](Napi::Env, LuaTableRefData* d) { delete d; });
-          auto Object = env.Global().Get("Object").As<Napi::Object>();
-          auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
+          const auto Object = env.Global().Get("Object").As<Napi::Object>();
+          const auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
           Napi::Object descriptor = Napi::Object::New(env);
           descriptor.Set("value", external);
           descriptor.Set("enumerable", Napi::Boolean::New(env, false));
@@ -2488,7 +2488,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
                              Napi::Value (*cb)(const Napi::CallbackInfo&)) {
             Napi::Function fn = Napi::Function::New(env, cb, name, dataPtr);
             DefineHiddenProp(env, fn, "_tableOwner", external, /*writable=*/false);
-            handler.Set(name, fn);
+            (void)handler.Set(name, fn);
           };
           addTrap("get", TableRefGetTrap);
           addTrap("set", TableRefSetTrap);
@@ -2563,7 +2563,7 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  Napi::Object coroObj = info[0].As<Napi::Object>();
+  const auto coroObj = info[0].As<Napi::Object>();
   if (!coroObj.Has("_coroutine")) {
     Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -2575,7 +2575,7 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  auto* threadData = externalVal.As<Napi::External<LuaThreadData>>().Data();
+  const auto* threadData = externalVal.As<Napi::External<LuaThreadData>>().Data();
   if (!threadData || !threadData->runtime) {
     Napi::Error::New(env, "Invalid coroutine reference").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -2605,14 +2605,14 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
   }
 
   // Resume the coroutine
-  lua_core::CoroutineResult result = runtime->ResumeCoroutine(threadData->threadRef, args);
+  auto [status, values, error] = runtime->ResumeCoroutine(threadData->threadRef, args);
 
   // Build the result object
-  Napi::Object resultObj = Napi::Object::New(env);
+  const Napi::Object resultObj = Napi::Object::New(env);
 
   // Set status
   std::string statusStr;
-  switch (result.status) {
+  switch (status) {
     case lua_core::CoroutineStatus::Suspended:
       statusStr = "suspended";
       break;
@@ -2629,20 +2629,20 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
   coroObj.Set("status", Napi::String::New(env, statusStr));
 
   // Set values
-  Napi::Array valuesArr = Napi::Array::New(env, result.values.size());
-  for (size_t i = 0; i < result.values.size(); ++i) {
-    valuesArr.Set(i, CoreToNapi(*result.values[i]));
+  const Napi::Array valuesArr = Napi::Array::New(env, values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    valuesArr.Set(i, CoreToNapi(*values[i]));
   }
-  resultObj.Set("values", valuesArr);
+  (void)resultObj.Set("values", valuesArr);
 
   // Set error if present
-  if (result.error.has_value()) {
+  if (error.has_value()) {
     // Consume any staged fidelity state (the js_error_registry_ entry and
     // last_error_value_) so it doesn't linger after this resume (L7). The
     // coroutine API surfaces the error as a string, so the reconstructed Error
     // object LuaErrorToJsValue returns is intentionally discarded.
-    (void)LuaErrorToJsValue(result.error.value());
-    resultObj.Set("error", Napi::String::New(env, result.error.value()));
+    (void)LuaErrorToJsValue(error.value());
+    resultObj.Set("error", Napi::String::New(env, error.value()));
   }
 
   return resultObj;
