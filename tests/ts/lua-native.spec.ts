@@ -5616,6 +5616,322 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // GC CONTROL
+  // ============================================
+  describe('GC control - lua.gc()', () => {
+    describe('count', () => {
+      it('reports memory in use as a positive number of KB', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const kb = lua.gc('count');
+        expect(typeof kb).toBe('number');
+        expect(kb).toBeGreaterThan(0);
+      });
+
+      it('preserves the fractional part', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        // count * 1024 is the exact byte count, so the value is essentially
+        // never a whole number of KB.
+        const samples = [lua.gc('count'), lua.gc('count')];
+        expect(samples.some((kb) => !Number.isInteger(kb))).toBe(true);
+      });
+
+      it('tracks allocation of collectable objects', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const before = lua.gc('count');
+        lua.execute_script('kept = {} for i = 1, 20000 do kept[i] = { n = i } end');
+        expect(lua.gc('count')).toBeGreaterThan(before + 512);
+      });
+
+      it('reports the same accounting as Lua\'s own collectgarbage("count")', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        // Not bit-identical: evaluating collectgarbage("count") means compiling
+        // and running a chunk, which allocates. Agreement to within a couple of
+        // KB is the point — the allocator's view diverges by orders of
+        // magnitude more (see the luaL_Buffer test below).
+        const agrees = () => {
+          const fromLua = lua.execute_script<number>('return collectgarbage("count")');
+          expect(Math.abs(lua.gc('count') - fromLua)).toBeLessThan(2);
+        };
+        agrees();
+        lua.execute_script('kept = {} for i = 1, 5000 do kept[i] = { n = i } end');
+        agrees();
+      });
+
+      it('agrees with get_memory_usage once nothing is pending collection', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.gc('collect');
+        expect(lua.gc('count') * 1024).toBe(lua.get_memory_usage());
+      });
+
+      it('never exceeds get_memory_usage, which counts allocator scratch too', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        // string.rep builds its result in a luaL_Buffer, whose scratch memory
+        // goes straight to the allocator and is invisible to Lua's own GC
+        // accounting until the buffer's box userdata is collected. So the two
+        // figures legitimately diverge, always in this direction.
+        lua.execute_script(`big = string.rep('x', 512 * 1024)`);
+        expect(lua.gc('count') * 1024).toBeLessThan(lua.get_memory_usage());
+
+        // ...and converge again once the scratch is reclaimed.
+        lua.execute_script('big = nil');
+        lua.gc('collect');
+        expect(lua.gc('count') * 1024).toBe(lua.get_memory_usage());
+      });
+    });
+
+    describe('collect', () => {
+      it('returns undefined and does not throw', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(lua.gc('collect')).toBeUndefined();
+      });
+
+      it('reclaims unreachable memory', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('store = {} for i = 1, 20000 do store[i] = { n = i } end');
+        const held = lua.gc('count');
+        lua.execute_script('store = nil');
+        lua.gc('collect');
+        expect(lua.gc('count')).toBeLessThan(held - 512); // at least 512KB back
+      });
+
+      it('runs pending __gc finalizers', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          finalized = 0
+          do
+            local t = setmetatable({}, { __gc = function() finalized = finalized + 1 end })
+          end
+        `);
+        lua.gc('collect');
+        expect(lua.execute_script('return finalized')).toBe(1);
+      });
+
+      it('is safe from inside a host callback', () => {
+        const lua = new lua_native.init(
+          { sweep: () => { lua.gc('collect'); return 'swept'; } },
+          ALL_LIBS
+        );
+        // Unlike reset(), collecting with Lua frames live is a normal operation.
+        expect(lua.execute_script(`
+          local junk = {}
+          for i = 1, 100 do junk[i] = string.rep('y', 1024) end
+          junk = nil
+          return sweep()
+        `)).toBe('swept');
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('stop / restart / isrunning', () => {
+      it('reports the collector as running by default', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(lua.gc('isrunning')).toBe(true);
+      });
+
+      it('stops and restarts automatic collection', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(lua.gc('stop')).toBeUndefined();
+        expect(lua.gc('isrunning')).toBe(false);
+        expect(lua.gc('restart')).toBeUndefined();
+        expect(lua.gc('isrunning')).toBe(true);
+      });
+
+      it('holds garbage until an explicit collect while stopped', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.gc('collect');
+        lua.gc('stop');
+
+        // Churn through garbage that a running collector would reclaim.
+        lua.execute_script(`
+          for i = 1, 400 do local s = string.rep('x', 8192) end
+        `);
+        const stopped = lua.gc('count');
+
+        // An explicit collect still works while stopped.
+        lua.gc('collect');
+        const collected = lua.gc('count');
+        expect(collected).toBeLessThan(stopped);
+
+        lua.gc('restart');
+        expect(lua.gc('isrunning')).toBe(true);
+      });
+
+      it('keeps maxMemory enforced while the collector is stopped', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', maxMemory: 4 * 1024 * 1024 });
+        lua.gc('stop');
+        // Lua still runs an emergency collection when an allocation would
+        // exceed the cap, so a stopped collector cannot turn the limit into a
+        // spurious failure — this loop stays well under 4MB of live data.
+        expect(lua.execute_script(`
+          for i = 1, 2000 do local s = string.rep('x', 1024) end
+          return 'survived'
+        `)).toBe('survived');
+        // ...and the cap is still a cap.
+        expect(() => lua.execute_script(`
+          keep = {}
+          for i = 1, 1e6 do keep[i] = string.rep('x', 1024) end
+        `)).toThrow(/memory/i);
+      });
+    });
+
+    describe('step', () => {
+      it('returns a boolean for a basic step', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(typeof lua.gc('step')).toBe('boolean');
+      });
+
+      it('accepts an explicit step size', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(typeof lua.gc('step', 1024)).toBe('boolean');
+      });
+
+      it('eventually finishes a cycle when driven repeatedly', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.gc('stop');
+        lua.execute_script(`
+          for i = 1, 200 do local s = string.rep('x', 4096) end
+        `);
+        let finished = false;
+        for (let i = 0; i < 10_000 && !finished; i++) finished = lua.gc('step', 4096);
+        expect(finished).toBe(true);
+        lua.gc('restart');
+      });
+
+      it('rejects a negative step size', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.gc('step', -1)).toThrow(/non-negative/);
+      });
+    });
+
+    describe('mode switching', () => {
+      it('switches to generational and back, reporting the previous mode', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const first = lua.gc('generational');
+        expect(['incremental', 'generational']).toContain(first);
+        expect(lua.gc('incremental')).toBe('generational');
+        expect(lua.gc('generational')).toBe('incremental');
+        lua.gc('incremental');
+      });
+
+      it('keeps the context usable in generational mode', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.gc('generational');
+        expect(lua.execute_script(`
+          local t = {}
+          for i = 1, 5000 do t[i] = { n = i } end
+          return #t
+        `)).toBe(5000);
+        lua.gc('collect');
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('param', () => {
+      it('reads a parameter without changing it', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const pause = lua.gc('param', 'pause');
+        expect(typeof pause).toBe('number');
+        expect(pause).toBeGreaterThan(0);
+        expect(lua.gc('param', 'pause')).toBe(pause);
+      });
+
+      it('sets a parameter and returns the previous value', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const original = lua.gc('param', 'pause');
+        expect(lua.gc('param', 'pause', 400)).toBe(original);
+        expect(lua.gc('param', 'pause')).toBe(400);
+        lua.gc('param', 'pause', original);
+      });
+
+      it('supports every documented parameter name', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        for (const name of ['minormul', 'majorminor', 'minormajor',
+                            'pause', 'stepmul', 'stepsize'] as const) {
+          expect(typeof lua.gc('param', name)).toBe('number');
+        }
+      });
+
+      it('rejects an unknown parameter name', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.gc('param', 'nope' as any)).toThrow(/Unknown GC parameter/);
+      });
+
+      it('rejects an out-of-range value', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.gc('param', 'pause', 100001)).toThrow(/between 0 and 100000/);
+        expect(() => lua.gc('param', 'pause', -5)).toThrow(/between 0 and 100000/);
+      });
+
+      it('requires a parameter name', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).gc('param')).toThrow(/parameter name/);
+      });
+    });
+
+    describe('validation and guards', () => {
+      it('rejects an unknown command', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).gc('explode')).toThrow(/Unknown GC command/);
+      });
+
+      it('requires a command string', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua as any).gc()).toThrow(/command string/);
+        expect(() => (lua as any).gc(42)).toThrow(/command string/);
+      });
+
+      it('throws while a worker-thread async run is in flight', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const pending = lua.execute_script_async(`
+          local s = 0
+          for i = 1, 3e6 do s = s + i end
+          return s
+        `);
+        expect(() => lua.gc('collect')).toThrow('busy');
+        expect(() => lua.gc('count')).toThrow('busy');
+        await pending;
+        expect(() => lua.gc('collect')).not.toThrow();
+      });
+
+      it('rejects a call made from inside a __gc finalizer', () => {
+        const lua = new lua_native.init(
+          { fromFinalizer: () => { lua.gc('collect'); return null; } },
+          ALL_LIBS
+        );
+        // Lua forbids lua_gc during a collection; the error must surface as a
+        // clean throw rather than corrupting the collector. Errors inside a
+        // finalizer become warnings, so record what happened in Lua instead.
+        // A JS callback's throw arrives as a structured error table (D1), so
+        // read its message field rather than stringifying the table.
+        lua.execute_script(`
+          gcError = nil
+          do
+            local t = setmetatable({}, { __gc = function()
+              local ok, err = pcall(fromFinalizer)
+              if ok then gcError = 'no error'
+              elseif type(err) == 'table' then gcError = err.message
+              else gcError = tostring(err) end
+            end })
+          end
+        `);
+        lua.gc('collect');
+        expect(String(lua.execute_script('return gcError')))
+          .toMatch(/collection is in progress/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('bare state', () => {
+      it('works without any standard libraries loaded', () => {
+        const lua = new lua_native.init();
+        expect(lua.gc('count')).toBeGreaterThan(0);
+        expect(lua.gc('isrunning')).toBe(true);
+        expect(lua.gc('collect')).toBeUndefined();
+      });
+    });
+  });
+
+  // ============================================
   // CONTEXT RESET
   // ============================================
   describe('context reset - lua.reset()', () => {
@@ -5920,6 +6236,16 @@ describe('lua-native Node adapter', () => {
         // clears that record along with the state.
         lua.register_class('Point', definition);
         expect(lua.execute_script('return Point.new(9):getX()')).toBe(9);
+      });
+
+      it('restores default (running) GC behavior', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.gc('stop');
+        expect(lua.gc('isrunning')).toBe(false);
+        lua.reset();
+        // A paused collector is a transient tuning knob, not context config —
+        // a fresh state must not inherit it.
+        expect(lua.gc('isrunning')).toBe(true);
       });
 
       it('drops metatables set before the reset', () => {

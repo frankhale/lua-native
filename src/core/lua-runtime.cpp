@@ -140,7 +140,7 @@ int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
     if (it == kLibFlags.end()) {
       std::string msg = "Unknown Lua library: '";
       msg += lib;
-      msg += "'";
+      msg += '\'';
       throw std::runtime_error(msg);
     }
     mask |= it->second;
@@ -239,6 +239,95 @@ void LuaRuntime::SetMaxInstructions(size_t limit) {
   max_instructions_ = limit;
   config_.max_instructions = limit;  // keep GetConfig() replayable
   InstallExecutionHook();
+}
+
+namespace {
+// lua_gc answers -1 to *every* option while the collector is internally
+// stopped: it is mid-collection (a __gc finalizer that re-entered the host and
+// called back in — the manual's "should not be called by a finalizer") or the
+// state is closing. Every option this file issues otherwise returns a
+// non-negative value, so -1 is an unambiguous "not now" rather than an
+// in-band result.
+int CheckGCAvailable(const int res, const std::string& command) {
+  if (res < 0) {
+    std::string msg = "gc('";
+    msg += command;
+    msg += "') is not available while a collection is in progress";
+    throw std::runtime_error(msg);
+  }
+  return res;
+}
+} // namespace
+
+LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
+                                                const size_t step_size) const {
+  if (command == "collect") {
+    (void)CheckGCAvailable(lua_gc(L_, LUA_GCCOLLECT), command);
+    return std::monostate{};
+  }
+  if (command == "stop") {
+    (void)CheckGCAvailable(lua_gc(L_, LUA_GCSTOP), command);
+    return std::monostate{};
+  }
+  if (command == "restart") {
+    (void)CheckGCAvailable(lua_gc(L_, LUA_GCRESTART), command);
+    return std::monostate{};
+  }
+  if (command == "count") {
+    // Lua reports whole KB and the leftover bytes separately; recombine them so
+    // the fractional part is preserved (count * 1024 == exact bytes in use).
+    const int kb = CheckGCAvailable(lua_gc(L_, LUA_GCCOUNT), command);
+    const int rem = CheckGCAvailable(lua_gc(L_, LUA_GCCOUNTB), command);
+    return static_cast<double>(kb) + static_cast<double>(rem) / 1024.0;
+  }
+  if (command == "step") {
+    // The vararg is read as a size_t: the number of bytes to treat as newly
+    // allocated. 0 performs one basic step.
+    return CheckGCAvailable(lua_gc(L_, LUA_GCSTEP, step_size), command) != 0;
+  }
+  if (command == "isrunning") {
+    return CheckGCAvailable(lua_gc(L_, LUA_GCISRUNNING), command) != 0;
+  }
+  if (command == "incremental" || command == "generational") {
+    const int prev = CheckGCAvailable(
+        lua_gc(L_, command == "incremental" ? LUA_GCINC : LUA_GCGEN), command);
+    return std::string(prev == LUA_GCGEN ? "generational" : "incremental");
+  }
+
+  std::string msg = "Unknown GC command: '";
+  msg += command;
+  msg += '\'';
+  throw std::runtime_error(msg);
+}
+
+int LuaRuntime::GarbageCollectParam(const std::string& param, const int value) const {
+  // Maps the `collectgarbage('param', ...)` names to the LUA_GCP* constants.
+  static const std::unordered_map<std::string, int> kGCParams = {
+    {"minormul",   LUA_GCPMINORMUL},
+    {"majorminor", LUA_GCPMAJORMINOR},
+    {"minormajor", LUA_GCPMINORMAJOR},
+    {"pause",      LUA_GCPPAUSE},
+    {"stepmul",    LUA_GCPSTEPMUL},
+    {"stepsize",   LUA_GCPSTEPSIZE},
+  };
+
+  const auto it = kGCParams.find(param);
+  if (it == kGCParams.end()) {
+    std::string msg = "Unknown GC parameter: '";
+    msg += param;
+    msg += '\'';
+    throw std::runtime_error(msg);
+  }
+  if (value > kMaxGCParam) {
+    std::string msg = "GC parameter '";
+    msg += param;
+    msg += "' must be at most ";
+    msg += std::to_string(kMaxGCParam);
+    throw std::runtime_error(msg);
+  }
+  // A negative value tells Lua to read without writing; the api_check on the
+  // parameter index is already satisfied by the lookup above.
+  return CheckGCAvailable(lua_gc(L_, LUA_GCPARAM, it->second, value), "param");
 }
 
 std::vector<std::string> LuaRuntime::AllLibraries() {

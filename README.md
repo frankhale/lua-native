@@ -33,6 +33,7 @@ data structures.
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
+- GC control — trigger, pause, step, and tune Lua's collector from JavaScript with `gc()`, using Lua's own `collectgarbage` command vocabulary
 - Execution limits — cap Lua VM instructions with `maxInstructions` option so infinite loops abort instead of hanging
 - Coroutine support with yield/resume semantics
 - Error fidelity — Lua errors carry stack tracebacks, thrown JS `Error` objects round-trip with full fidelity (type, message, stack, custom props), and `pcall()` runs a function protected, returning `{ ok, value/error }`
@@ -557,6 +558,10 @@ console.log(lua.get_memory_usage()); // increased after allocation
 
 Memory tracking works even without `maxMemory` — every Lua context tracks its
 memory usage automatically.
+
+For deterministic cleanup, run a collection explicitly with
+[`gc('collect')`](#luacontextgccommand-), and see that section for how
+`gc('count')` relates to `get_memory_usage()`.
 
 ### Execution Time Limits
 
@@ -1936,6 +1941,58 @@ Returns the current memory usage of the Lua state in bytes.
 
 **Throws:** Error if the context is busy with an async operation (the allocator
 counter is being updated on another thread).
+
+### `LuaContext.gc(command, ...)`
+
+Controls Lua's garbage collector. The command names mirror Lua's own
+`collectgarbage`, so anything you know from Lua transfers directly.
+
+| Command | Returns | Description |
+| ------- | ------- | ----------- |
+| `'collect'` | `undefined` | Runs a full collection cycle, including pending `__gc` finalizers |
+| `'stop'` | `undefined` | Stops automatic collection |
+| `'restart'` | `undefined` | Resumes automatic collection |
+| `'count'` | `number` | Memory in use, in KB (fractional — `× 1024` is the exact byte count) |
+| `'isrunning'` | `boolean` | Whether automatic collection is running |
+| `'step'` | `boolean` | Performs one step; `true` if it finished a cycle. Optional second argument: bytes to treat as newly allocated (`0`/omitted = one basic step) |
+| `'incremental'` / `'generational'` | `'incremental' \| 'generational'` | Switches mode, returning the previous one |
+| `'param'` | `number` | Reads or sets a tuning parameter, returning the previous value |
+
+```javascript
+lua.gc('collect'); // full cycle
+
+// Keep a latency-sensitive batch free of collector pauses.
+lua.gc('stop');
+lua.execute_script('process_batch()');
+lua.gc('restart');
+
+const kb = lua.gc('count'); // e.g. 19.07
+const done = lua.gc('step', 1024); // drive collection in slices
+
+const previousMode = lua.gc('generational'); // 'incremental'
+const previousPause = lua.gc('param', 'pause', 400);
+```
+
+Tunable parameters for `gc('param', name, value?)` are `'minormul'`,
+`'majorminor'`, `'minormajor'` (generational mode) and `'pause'`, `'stepmul'`,
+`'stepsize'` (incremental mode). Omit `value` to read without changing;
+values must be in the range 0–100000.
+
+**`gc('count')` vs `get_memory_usage()`:** both report the same memory, but from
+different sources. `gc('count')` is Lua's own GC accounting (KB), identical to
+`collectgarbage('count')` inside Lua. `get_memory_usage()` is this binding's
+allocator tally (bytes) and is the larger of the two — `luaL_Buffer` scratch
+memory (used by `string.rep`, `table.concat`, and friends) goes straight to the
+allocator, bypassing Lua's accounting until the buffer is collected. The
+allocator tally is what `maxMemory` enforces against.
+
+Stopping the collector does **not** defeat `maxMemory`: Lua still runs an
+emergency collection when an allocation would exceed the cap.
+
+**Throws:** `TypeError` for a missing or non-string command; Error for an
+unrecognized command or parameter name, if the context is busy with an async
+operation, or if called while a collection is in progress (Lua forbids
+`lua_gc` from inside a `__gc` finalizer).
 
 ### `LuaContext.add_search_path(path)`
 

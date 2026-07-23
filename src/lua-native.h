@@ -126,6 +126,7 @@ public:
     Napi::Value AddSearcher(const Napi::CallbackInfo& info);
     Napi::Value Release(const Napi::CallbackInfo& info);
     Napi::Value Reset(const Napi::CallbackInfo& info);
+    Napi::Value GC(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 

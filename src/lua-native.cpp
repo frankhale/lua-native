@@ -610,7 +610,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
     InstanceMethod("add_searcher", &LuaContext::AddSearcher),
     InstanceMethod("release", &LuaContext::Release),
-    InstanceMethod("reset", &LuaContext::Reset)
+    InstanceMethod("reset", &LuaContext::Reset),
+    InstanceMethod("gc", &LuaContext::GC)
   });
 
   // The constructor is kept alive by the persistent reference InitModule stores
@@ -1554,6 +1555,103 @@ Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& /*info*/) {
   // reading it concurrently would be a data race.
   if (RejectIfBusy()) return env.Undefined();
   return Napi::Number::New(env, static_cast<double>(runtime->GetMemoryUsage()));
+}
+
+// Garbage-collector control: a thin pass-through to lua_gc, using Lua's own
+// `collectgarbage` command vocabulary.
+//
+//   gc('collect' | 'stop' | 'restart')     -> undefined
+//   gc('count')                            -> number (KB, fractional)
+//   gc('isrunning')                        -> boolean
+//   gc('step', stepSize?)                  -> boolean (step finished a cycle)
+//   gc('incremental' | 'generational')     -> string  (the previous mode)
+//   gc('param', name, value?)              -> number  (the previous value)
+//
+// No reentrancy guard beyond the busy check: unlike reset(), lua_gc is a normal
+// API call that is safe with Lua frames live on the C stack — it is what the VM
+// does implicitly on any allocation. Calling it from inside a __gc finalizer is
+// the one exception, and Lua reports that itself (the core turns the -1 into a
+// thrown error).
+Napi::Value LuaContext::GC(const Napi::CallbackInfo& info) {
+  // A worker thread owns the Lua state during async execution; collecting from
+  // the main thread meanwhile would be a data race, and a finalizer reaching
+  // the userdata GC callback would be an off-thread N-API call.
+  if (RejectIfBusy()) return env.Undefined();
+
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env,
+      "gc(command) requires a command string (e.g. 'collect', 'count')")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const std::string command = info[0].As<Napi::String>().Utf8Value();
+
+  try {
+    if (command == "param") {
+      if (info.Length() < 2 || !info[1].IsString()) {
+        Napi::TypeError::New(env,
+          "gc('param', name, value?) requires a parameter name string")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      const std::string param = info[1].As<Napi::String>().Utf8Value();
+      // Omitting the value reads the current setting without changing it, which
+      // Lua spells as a negative value.
+      int value = -1;
+      if (info.Length() > 2 && !info[2].IsUndefined() && !info[2].IsNull()) {
+        if (!info[2].IsNumber()) {
+          Napi::TypeError::New(env, "gc('param', name, value): value must be a number")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        const double raw = info[2].As<Napi::Number>().DoubleValue();
+        if (raw < 0 || raw > lua_core::LuaRuntime::kMaxGCParam) {
+          Napi::RangeError::New(env,
+            "gc('param', name, value): value must be between 0 and " +
+            std::to_string(lua_core::LuaRuntime::kMaxGCParam))
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        value = static_cast<int>(raw);
+      }
+      return Napi::Number::New(env, runtime->GarbageCollectParam(param, value));
+    }
+
+    size_t step_size = 0;
+    if (command == "step" && info.Length() > 1 &&
+        !info[1].IsUndefined() && !info[1].IsNull()) {
+      if (!info[1].IsNumber()) {
+        Napi::TypeError::New(env, "gc('step', stepSize): stepSize must be a number")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      const double raw = info[1].As<Napi::Number>().DoubleValue();
+      if (raw < 0) {
+        Napi::RangeError::New(env,
+          "gc('step', stepSize): stepSize must be non-negative")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      step_size = static_cast<size_t>(raw);
+    }
+
+    const auto result = runtime->GarbageCollect(command, step_size);
+    return std::visit([this](auto&& v) -> Napi::Value {
+      using T = std::decay_t<decltype(v)>;
+      if constexpr (std::is_same_v<T, double>) {
+        return Napi::Number::New(env, v);
+      } else if constexpr (std::is_same_v<T, bool>) {
+        return Napi::Boolean::New(env, v);
+      } else if constexpr (std::is_same_v<T, std::string>) {
+        return Napi::String::New(env, v);
+      } else {
+        return env.Undefined();
+      }
+    }, result);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 }
 
 Napi::Value LuaContext::RegisterTypeConverter(const Napi::CallbackInfo& info) {
@@ -2730,7 +2828,7 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
           Napi::Object coro = Napi::Object::New(env);
           coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr,
             [](Napi::Env, LuaThreadData* d) { delete d; }));
-          lua_core::CoroutineStatus status = runtime->GetCoroutineStatus(v);
+          const lua_core::CoroutineStatus status = lua_core::LuaRuntime::GetCoroutineStatus(v);
           coro.Set("status", Napi::String::New(env,
             status == lua_core::CoroutineStatus::Suspended ? "suspended" :
             status == lua_core::CoroutineStatus::Running ? "running" : "dead"));

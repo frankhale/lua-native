@@ -19,7 +19,7 @@ workarounds rank lowest.
 | 1 | ~~Execution Time Limits~~ | Completed | No workaround — an infinite loop hangs the process. See `maxInstructions` in `LuaInitOptions`. The count-hook also polls `IsCancelRequested()`; with the worker-`cancel()` wiring now in place, hook-based `cancel()` (`BRIDGE-GAP-ANALYSIS.md` A3b) is fully complete |
 | 2 | ~~Error Stack Traces~~ | Completed | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
-| 2 | GC Control | Not started | Small scope, complements sandboxing |
+| 2 | ~~GC Control~~ | Completed | `lua.gc()` covers collect/stop/restart/count/step/isrunning/mode/param (July 23, 2026) |
 | 2 | ~~Context Reset~~ | Completed | `lua.reset()` replaces the state and replays callbacks, print handler, `allowBytecode`, and search paths (July 23, 2026) |
 | — | ~~Table Reference API~~ | Completed | Universal in bridges (7/7); workaround: `execute_script` |
 | 3 | Environment Tables | Not started | Common in bridges (5/7); enables per-script sandboxing |
@@ -156,7 +156,34 @@ one pass.
 These features are standard across Lua bridge libraries and address real gaps
 in debugging, ergonomics, and operational control.
 
-### GC Control
+### ~~GC Control~~ (Completed — July 2026)
+
+Implemented as `lua.gc()`. See the "GC Control" section in `FEATURES.md` for the
+as-built design; the original plan is retained below.
+
+**As built, differing from the plan:**
+- The plan's five commands (`collect`, `stop`, `restart`, `count`, `step`) are
+  joined by the rest of Lua's own `collectgarbage` vocabulary: `isrunning`
+  (which is what makes `stop`/`restart` observable — the plan's own test list
+  needs it), `incremental` / `generational` mode switching, and `param` for the
+  tuning knobs. The command names match `collectgarbage` exactly.
+- **The plan's snippet is 5.4-flavored and would be undefined behavior on 5.5.**
+  `lua_gc` is variadic, and 5.5 changed the arities: `LUA_GCSTEP` takes a
+  `size_t` (not the plan's `0` int literal), `LUA_GCGEN`/`LUA_GCINC` take no
+  arguments, and `LUA_GCSETPAUSE`/`LUA_GCSETSTEPMUL` no longer exist — tuning
+  goes through `LUA_GCPARAM (int param, int val)`. Each option's arity was read
+  off `lapi.c`.
+- `lua_gc` returns -1 for every option while a collection is in progress (the
+  manual's "should not be called by a finalizer"); the core turns that into a
+  thrown error rather than returning a nonsensical -1 KB count.
+- Return type is `variant<monostate, double, bool, string>` rather than the
+  plan's `variant<int, double, monostate>`, since `isrunning`/`step` are
+  booleans and the mode switches return a mode name.
+
+**Worth knowing:** `gc('count')` (Lua's GC accounting) and `get_memory_usage()`
+(this binding's allocator tally) legitimately disagree — `luaL_Buffer` scratch
+memory bypasses Lua's accounting. See the FEATURES.md discussion; the allocator
+tally is what `maxMemory` enforces.
 
 Expose `lua_gc` to trigger or configure Lua's garbage collector from JS:
 

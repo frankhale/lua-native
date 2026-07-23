@@ -3053,6 +3053,139 @@ TEST(LuaRuntimeMemory, RecoveryAfterOOM) {
 
 // ---- Execution time limits (maxInstructions) ----
 
+// --- GC control (lua_gc pass-through) ---
+
+TEST(LuaRuntimeGC, CountReportsPositiveKilobytes) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto res = rt.GarbageCollect("count");
+  ASSERT_TRUE(std::holds_alternative<double>(res));
+  EXPECT_GT(std::get<double>(res), 0.0);
+}
+
+TEST(LuaRuntimeGC, CountTracksAllocationAndCollection) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  const double before = std::get<double>(rt.GarbageCollect("count"));
+
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(
+      rt.ExecuteScript("store = {} for i = 1, 20000 do store[i] = { n = i } end")));
+  const double held = std::get<double>(rt.GarbageCollect("count"));
+  EXPECT_GT(held, before + 512);  // at least 512KB of live tables
+
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(
+      rt.ExecuteScript("store = nil")));
+  (void)rt.GarbageCollect("collect");
+  EXPECT_LT(std::get<double>(rt.GarbageCollect("count")), held - 512);
+}
+
+TEST(LuaRuntimeGC, CollectReturnsMonostate) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(rt.GarbageCollect("collect")));
+}
+
+TEST(LuaRuntimeGC, CollectRunsFinalizers) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(rt.ExecuteScript(R"(
+    finalized = 0
+    do
+      local t = setmetatable({}, { __gc = function() finalized = finalized + 1 end })
+    end
+  )")));
+  (void)rt.GarbageCollect("collect");
+  EXPECT_EQ(std::get<int64_t>(rt.GetGlobal("finalized")->value), 1);
+}
+
+TEST(LuaRuntimeGC, StopRestartAndIsRunning) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_TRUE(std::get<bool>(rt.GarbageCollect("isrunning")));
+
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(rt.GarbageCollect("stop")));
+  EXPECT_FALSE(std::get<bool>(rt.GarbageCollect("isrunning")));
+
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(rt.GarbageCollect("restart")));
+  EXPECT_TRUE(std::get<bool>(rt.GarbageCollect("isrunning")));
+}
+
+TEST(LuaRuntimeGC, StepReturnsBoolAndEventuallyFinishesACycle) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_TRUE(std::holds_alternative<bool>(rt.GarbageCollect("step")));
+
+  (void)rt.GarbageCollect("stop");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(
+      rt.ExecuteScript("for i = 1, 20000 do local t = { n = i } end")));
+  bool finished = false;
+  for (int i = 0; i < 10000 && !finished; ++i) {
+    finished = std::get<bool>(rt.GarbageCollect("step", 4096));
+  }
+  EXPECT_TRUE(finished);
+  (void)rt.GarbageCollect("restart");
+}
+
+TEST(LuaRuntimeGC, ModeSwitchReturnsPreviousMode) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  // Whatever the starting mode, the reported previous mode must track the
+  // switches we make.
+  (void)rt.GarbageCollect("incremental");
+  EXPECT_EQ(std::get<std::string>(rt.GarbageCollect("generational")), "incremental");
+  EXPECT_EQ(std::get<std::string>(rt.GarbageCollect("incremental")), "generational");
+}
+
+TEST(LuaRuntimeGC, UnknownCommandThrows) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_THROW((void)rt.GarbageCollect("explode"), std::runtime_error);
+  EXPECT_THROW((void)rt.GarbageCollect(""), std::runtime_error);
+}
+
+TEST(LuaRuntimeGC, ParamReadsAndWrites) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int original = rt.GarbageCollectParam("pause", -1);
+  EXPECT_GT(original, 0);
+  // A negative value reads without writing.
+  EXPECT_EQ(rt.GarbageCollectParam("pause", -1), original);
+  // A write returns the previous value and takes effect.
+  EXPECT_EQ(rt.GarbageCollectParam("pause", 400), original);
+  EXPECT_EQ(rt.GarbageCollectParam("pause", -1), 400);
+}
+
+TEST(LuaRuntimeGC, ParamAcceptsEveryDocumentedName) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  for (const char* name : {"minormul", "majorminor", "minormajor",
+                           "pause", "stepmul", "stepsize"}) {
+    EXPECT_GE(rt.GarbageCollectParam(name, -1), 0) << "param: " << name;
+  }
+}
+
+TEST(LuaRuntimeGC, ParamRejectsUnknownNameAndOutOfRangeValue) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_THROW((void)rt.GarbageCollectParam("nope", -1), std::runtime_error);
+  EXPECT_THROW((void)rt.GarbageCollectParam("pause", LuaRuntime::kMaxGCParam + 1),
+               std::runtime_error);
+}
+
+TEST(LuaRuntimeGC, WorksOnABareStateWithNoLibraries) {
+  const LuaRuntime rt;
+  EXPECT_GT(std::get<double>(rt.GarbageCollect("count")), 0.0);
+  EXPECT_TRUE(std::get<bool>(rt.GarbageCollect("isrunning")));
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(rt.GarbageCollect("collect")));
+}
+
+TEST(LuaRuntimeGC, StoppedCollectorStillHonorsTheMemoryLimit) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_memory = 4 * 1024 * 1024;
+  const LuaRuntime rt(config);
+  (void)rt.GarbageCollect("stop");
+
+  // Lua runs an emergency collection when an allocation would exceed the cap,
+  // even with automatic collection stopped, so transient garbage is survivable.
+  EXPECT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(
+      rt.ExecuteScript("for i = 1, 2000 do local s = string.rep('x', 1024) end")));
+
+  // The cap is nonetheless still a cap.
+  const auto res = rt.ExecuteScript(
+      "keep = {} for i = 1, 1e6 do keep[i] = string.rep('x', 1024) end");
+  EXPECT_TRUE(std::holds_alternative<std::string>(res));
+}
+
 // --- GetConfig: the record a caller replays to build a replacement state
 // (how the binding layer implements reset()) ---
 

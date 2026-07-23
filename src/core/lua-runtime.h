@@ -464,6 +464,41 @@ public:
   [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
   [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
 
+  // Garbage-collector control (lua_gc). The command vocabulary deliberately
+  // mirrors Lua's own `collectgarbage` names:
+  //
+  //   "collect"       full collection cycle              -> monostate
+  //   "step"          one step; step_size is the number  -> bool: true if the
+  //                   of bytes to act as if allocated,      step finished a
+  //                   0 for one basic step                  cycle
+  //   "stop"          pause automatic collection         -> monostate
+  //   "restart"       resume automatic collection        -> monostate
+  //   "count"         memory in use, in KB (fractional)  -> double
+  //   "isrunning"     is automatic collection on         -> bool
+  //   "incremental"   switch mode, returns previous mode -> string
+  //   "generational"  switch mode, returns previous mode -> string
+  //
+  // Throws std::runtime_error for an unrecognized command, and for any command
+  // issued while a collection is in progress (see the GCUnavailable note in the
+  // implementation). step_size is consulted only by "step".
+  //
+  // lua_gc never raises a Lua error, so these need no protected frame — but
+  // "collect"/"step" do run __gc finalizers, which can re-enter the host via
+  // the userdata GC callback and Lua __gc metamethods.
+  using GCResult = std::variant<std::monostate, double, bool, std::string>;
+  [[nodiscard]] GCResult GarbageCollect(const std::string& command,
+                                        size_t step_size = 0) const;
+
+  // Reads (value < 0) or sets a collector tuning parameter, returning its
+  // previous value. Parameter names mirror `collectgarbage('param', ...)`:
+  // "minormul", "majorminor", "minormajor", "pause", "stepmul", "stepsize".
+  // Throws for an unrecognized name, a value above kMaxGCParam, or while a
+  // collection is in progress.
+  [[nodiscard]] int GarbageCollectParam(const std::string& param, int value) const;
+
+  // Upper bound Lua documents for a collector parameter value.
+  static constexpr int kMaxGCParam = 100000;
+
   // Execution time limits: cap the number of VM instructions a single execution
   // (execute_script/file, a Lua function call, or one coroutine resume) may run
   // before it is aborted with "instruction limit exceeded". 0 = unlimited. The

@@ -730,7 +730,102 @@ export interface LuaContext {
    * lua.execute_script('log("hi")');  // callbacks still work
    */
   reset(): void;
+
+  /**
+   * Runs a full garbage-collection cycle. Reclaims everything unreachable,
+   * including running pending `__gc` finalizers.
+   *
+   * @example
+   * lua.gc('collect');
+   */
+  gc(command: 'collect'): void;
+
+  /**
+   * Stops (`'stop'`) or resumes (`'restart'`) automatic collection. While
+   * stopped, Lua collects only when you call `gc('collect')` or `gc('step')` —
+   * useful for keeping a latency-sensitive batch free of collector pauses.
+   *
+   * A `maxMemory` limit stays enforced while the collector is stopped: Lua
+   * still runs an emergency collection when an allocation would exceed the cap,
+   * so stopping the collector cannot turn the limit into a spurious failure.
+   *
+   * @example
+   * lua.gc('stop');
+   * lua.execute_script('process_batch()');
+   * lua.gc('restart');
+   * lua.gc('collect');
+   */
+  gc(command: 'stop' | 'restart'): void;
+
+  /**
+   * Returns the memory Lua currently has in use, in kilobytes. The value has a
+   * fractional part, so `gc('count') * 1024` is the exact byte count.
+   *
+   * This is Lua's own accounting; `get_memory_usage()` reports the same memory
+   * in bytes as tallied by this binding's allocator.
+   *
+   * @example
+   * const kb = lua.gc('count');
+   */
+  gc(command: 'count'): number;
+
+  /** Returns whether automatic collection is currently running (not stopped). */
+  gc(command: 'isrunning'): boolean;
+
+  /**
+   * Performs one garbage-collection step and returns whether the step finished
+   * a collection cycle (in generational mode, a major collection).
+   *
+   * @param stepSize Number of bytes to treat as newly allocated; omit or pass 0
+   *   for one basic step
+   * @example
+   * lua.gc('stop');
+   * // Drive collection in small slices, interleaved with other work.
+   * while (!lua.gc('step', 1024)) doSomeOtherWork();
+   */
+  gc(command: 'step', stepSize?: number): boolean;
+
+  /**
+   * Switches the collector mode and returns the previous mode. Generational
+   * mode favors workloads that allocate many short-lived objects; incremental
+   * mode spreads collection across smaller pauses.
+   *
+   * @example
+   * const previous = lua.gc('generational'); // 'incremental'
+   */
+  gc(command: 'incremental' | 'generational'): LuaGCMode;
+
+  /**
+   * Reads or sets a collector tuning parameter, returning its previous value.
+   * Omit `value` to read without changing anything. Values must be in the range
+   * 0–100000.
+   *
+   * @param name The parameter to read or set
+   * @param value The new value, or omit to read the current one
+   * @example
+   * const previousPause = lua.gc('param', 'pause');
+   * lua.gc('param', 'pause', 400); // let the heap grow 4x before collecting
+   */
+  gc(command: 'param', name: LuaGCParam, value?: number): number;
 }
+
+/**
+ * Garbage-collector modes reported and selected by `gc('incremental')` /
+ * `gc('generational')`.
+ */
+export type LuaGCMode = 'incremental' | 'generational';
+
+/**
+ * Tunable garbage-collector parameters for `gc('param', name, value?)`. The
+ * first three apply to generational mode, the last three to incremental mode.
+ */
+export type LuaGCParam =
+  | 'minormul'
+  | 'majorminor'
+  | 'minormajor'
+  | 'pause'
+  | 'stepmul'
+  | 'stepsize';
 
 /**
  * Available Lua standard library names for selective loading

@@ -8,6 +8,8 @@ export type {
   LuaContext,
   LuaCoroutine,
   LuaFunction,
+  LuaGCMode,
+  LuaGCParam,
   LuaInitOptions,
   LuaInput,
   LuaLibrary,

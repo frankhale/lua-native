@@ -1067,6 +1067,94 @@ registry, which the worker thread may be using.
 
 ---
 
+## GC Control — `gc()` (July 2026)
+
+### Overview
+
+`lua.gc(command, ...)` exposes `lua_gc` so JavaScript can trigger, pause, and
+tune Lua's collector. It pairs with the memory limits: users who care about
+`maxMemory` want `gc('count')` for monitoring and `gc('collect')` for
+deterministic cleanup, and latency-sensitive code wants to pause collection
+across a batch.
+
+```typescript
+lua.gc('collect');                    // full cycle
+lua.gc('stop'); /* batch */ lua.gc('restart');
+const kb = lua.gc('count');           // 19.07
+const wasRunning = lua.gc('isrunning');
+const done = lua.gc('step', 1024);    // incremental slice
+const prev = lua.gc('generational');  // 'incremental'
+const oldPause = lua.gc('param', 'pause', 400);
+```
+
+### Architecture
+
+Core: `LuaRuntime::GarbageCollect(command, step_size)` returning
+`GCResult = variant<monostate, double, bool, string>`, plus
+`GarbageCollectParam(name, value)` returning the previous value. Binding:
+`LuaContext::GC` parses the JS arguments and `std::visit`s the result into the
+matching JS type.
+
+The command vocabulary deliberately mirrors Lua's own `collectgarbage` names —
+`collect`, `stop`, `restart`, `count`, `step`, `isrunning`, `incremental`,
+`generational`, `param` — so anything a user knows from Lua transfers directly.
+
+`lua_gc` is documented `[-0, +0, –]`: it never raises a Lua error, so unlike the
+allocating operations elsewhere in the core it needs no `RunProtected` frame.
+
+### Lua 5.5 specifics
+
+The plan in `FUTURE.md` was written against 5.4's `lua_gc`. In 5.5:
+
+- `LUA_GCSTEP` takes a `size_t` vararg (bytes to treat as newly allocated; 0 =
+  one basic step) and returns whether the step finished a cycle.
+- `LUA_GCGEN` / `LUA_GCINC` take **no** varargs and return the previous mode.
+- `LUA_GCSETPAUSE` / `LUA_GCSETSTEPMUL` are gone, replaced by `LUA_GCPARAM`
+  with `(int param, int value)`, where a negative value reads without writing.
+
+Passing the wrong number of varargs to a `...` function is undefined behavior,
+so each option's arity was taken from `lapi.c` rather than assumed.
+
+### Design Decisions
+
+**`-1` is translated into a thrown error.** `lua_gc` answers -1 to *every*
+option while the collector is internally stopped — mid-collection or during
+state close. The manual states the function "should not be called by a
+finalizer", and that is exactly the reachable case here: a Lua `__gc` metamethod
+can call a host function that calls back into `lua.gc()`. Every option we issue
+otherwise returns a non-negative value, so -1 is unambiguous and becomes
+`"gc('...') is not available while a collection is in progress"` rather than a
+nonsensical in-band result (a -1 KB count).
+
+**No reentrancy guard beyond the busy check.** Unlike `reset()`, `lua_gc` is
+safe with Lua frames live on the C stack — it is what the VM does implicitly on
+any allocation. `RejectIfBusy` is still required: a worker thread owns the state
+during async execution, and a finalizer reaching the userdata GC callback would
+be an off-thread N-API call.
+
+**`gc('count')` and `get_memory_usage()` measure different things.** `count` is
+Lua's own GC accounting (`gettotalbytes`) in KB, verified to agree with
+`collectgarbage('count')` run inside Lua. `get_memory_usage()` is this binding's
+allocator tally in bytes, and it is the larger of the two: `luaL_Buffer` scratch
+memory (used by `string.rep`, `table.concat`, `string.format`, …) is obtained by
+calling the allocator function directly, bypassing `luaM_*` and therefore Lua's
+GC accounting, until the buffer's box userdata is collected. The allocator tally
+is what `maxMemory` enforces against, so it stays the authoritative figure;
+`count` is the right number for reasoning about collector behavior.
+
+**Stopping the collector cannot defeat `maxMemory`.** Lua's user stop flag
+(`gcstp`) is distinct from its emergency-collection flag (`gcstopem`), so an
+allocation that would exceed the cap still triggers a full emergency collection
+before failing. `gc('stop')` is therefore a safe latency knob rather than a way
+to turn a soft limit into a hard one.
+
+**`reset()` does not preserve a stopped collector.** A paused collector is a
+transient tuning knob, not context configuration; a fresh state inheriting one
+would be a memory leak waiting to happen. The replacement state starts with
+collection running.
+
+---
+
 ## Context Reset — `reset()` (July 2026)
 
 ### Overview
@@ -1196,3 +1284,4 @@ rebuilding that graph, so they are documented as the caller's job instead.
 | Reference lifecycle (`release()` for function/coroutine/table refs) | Low | July 2026 |
 | Dotted path globals (`set_global`/`get_global` nested field access) | Low | July 2026 |
 | Context reset (`reset()` — fresh state, replayed configuration) | Moderate | July 2026 |
+| GC control (`gc()` — collect, stop/restart, step, count, mode, params) | Low | July 2026 |
