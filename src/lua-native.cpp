@@ -609,7 +609,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("pcall", &LuaContext::Pcall),
     InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
     InstanceMethod("add_searcher", &LuaContext::AddSearcher),
-    InstanceMethod("release", &LuaContext::Release)
+    InstanceMethod("release", &LuaContext::Release),
+    InstanceMethod("reset", &LuaContext::Reset)
   });
 
   // The constructor is kept alive by the persistent reference InitModule stores
@@ -720,6 +721,40 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     runtime = std::make_shared<lua_core::LuaRuntime>();
   }
 
+  InstallRuntimeHandlers();
+
+  if (info.Length() > 0 && info[0].IsObject()) {
+    // Retained so reset() can re-register the same callbacks on a fresh state.
+    callbacks_ref_ = Napi::Persistent(info[0].As<Napi::Object>());
+    RegisterCallbacks(info[0].As<Napi::Object>());
+  }
+
+  // Apply I/O options after callbacks so the print override wins over any
+  // callback-provided print, and after libraries are loaded. SetAllowBytecode
+  // and InstallPrintHandler both run protected _G writes that throw on OOM under
+  // maxMemory; surface that as a JS error instead of letting a std::runtime_error
+  // unwind out of the constructor and terminate the process (the H1 class, CR-6
+  // F1). A hostile _G metatable can't be armed before the constructor runs, so
+  // only the OOM trigger is reachable here.
+  if (info.Length() > 1 && info[1].IsObject()) {
+    auto options = info[1].As<Napi::Object>();
+    try {
+      if (options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean() &&
+          !options.Get("allowBytecode").As<Napi::Boolean>().Value()) {
+        allow_bytecode_ = false;
+        runtime->SetAllowBytecode(false);  // E3
+      }
+      if (options.Has("print") && options.Get("print").IsFunction()) {
+        InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
+      }
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return;
+    }
+  }
+}
+
+void LuaContext::InstallRuntimeHandlers() {
   // Set up userdata GC callback
   runtime->SetUserdataGCCallback([this](int ref_id) {
     js_userdata_.erase(ref_id);
@@ -759,33 +794,14 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
       it->second.object.Value().Set(key, CoreToNapi(*value));
     }
   );
+}
 
-  if (info.Length() > 0 && info[0].IsObject()) {
-    RegisterCallbacks(info[0].As<Napi::Object>());
-  }
-
-  // Apply I/O options after callbacks so the print override wins over any
-  // callback-provided print, and after libraries are loaded. SetAllowBytecode
-  // and InstallPrintHandler both run protected _G writes that throw on OOM under
-  // maxMemory; surface that as a JS error instead of letting a std::runtime_error
-  // unwind out of the constructor and terminate the process (the H1 class, CR-6
-  // F1). A hostile _G metatable can't be armed before the constructor runs, so
-  // only the OOM trigger is reachable here.
-  if (info.Length() > 1 && info[1].IsObject()) {
-    auto options = info[1].As<Napi::Object>();
-    try {
-      if (options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean() &&
-          !options.Get("allowBytecode").As<Napi::Boolean>().Value()) {
-        runtime->SetAllowBytecode(false);  // E3
-      }
-      if (options.Has("print") && options.Get("print").IsFunction()) {
-        InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
-      }
-    } catch (const std::exception& e) {
-      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-      return;
-    }
-  }
+void LuaContext::DetachRuntimeHandlers() const {
+  if (!runtime) return;
+  runtime->SetUserdataGCCallback(nullptr);
+  runtime->SetHostFunctionGCCallback(nullptr);
+  runtime->SetPropertyHandlers(nullptr, nullptr);
+  runtime->SetOutputHandler(nullptr);
 }
 
 void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
@@ -1270,6 +1286,9 @@ Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  // Recorded only after the core call succeeds, so a rejected path is never
+  // replayed by reset().
+  search_paths_.push_back(path);
 
   return env.Undefined();
 }
@@ -1557,12 +1576,7 @@ LuaContext::~LuaContext() {
   if (alive_) alive_->store(false);
 
   // Clear callbacks to prevent accessing member state during lua_close()
-  if (runtime) {
-    runtime->SetUserdataGCCallback(nullptr);
-    runtime->SetHostFunctionGCCallback(nullptr);
-    runtime->SetPropertyHandlers(nullptr, nullptr);
-    runtime->SetOutputHandler(nullptr);
-  }
+  DetachRuntimeHandlers();
 }
 
 std::string LuaContext::StageJsError(const Napi::Value& value, const std::string& message) {
@@ -2238,6 +2252,117 @@ Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
   Napi::TypeError::New(env,
     "release(value) requires a Lua function, coroutine, or table reference")
     .ThrowAsJavaScriptException();
+  return env.Undefined();
+}
+
+// Replaces the Lua state with a freshly-constructed one carrying the same
+// configuration, then replays the context-level registrations (callbacks, print
+// handler, bytecode guard, search paths) onto it.
+//
+// The outgoing runtime is *not* closed here. Every handle that crossed the
+// boundary (function, coroutine, table, opaque userdata) holds a
+// shared_ptr<LuaRuntime>, so the old state stays open — and its registry slots
+// stay valid — for exactly as long as some handle can still reach it. Closing
+// it out from under those handles would leave their registry refs (and the
+// lua_State* their unref deleters captured) dangling. When the last handle is
+// collected the old runtime is destroyed and its memory reclaimed; with no
+// outstanding handles, that happens synchronously inside this call.
+//
+// Those handles are still invalidated: `alive_` is flipped and re-minted, so a
+// pre-reset function/table handle fails cleanly, and the `data->runtime.get() ==
+// runtime.get()` identity checks elsewhere (resume, release, round-trip markers)
+// stop recognizing pre-reset coroutines and userdata as belonging to this
+// context.
+Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
+  if (RejectIfBusy()) return env.Undefined();
+
+  // Reentrancy: a non-zero call depth means a Lua call is live on the C stack
+  // right now — a host callback, a metamethod, or a table trap re-entering JS.
+  // Retiring the state under it would free the lua_State the frames below are
+  // still executing on. Reject instead; the caller can reset once the call
+  // returns.
+  if (call_depth_ > 0) {
+    Napi::Error::New(env,
+      "reset() cannot be called while Lua is executing (from inside a host "
+      "callback or metamethod)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Build the replacement first: if construction fails (allocation failure),
+  // the context keeps its current, working state rather than being left
+  // runtime-less.
+  std::shared_ptr<lua_core::LuaRuntime> fresh;
+  try {
+    fresh = std::make_shared<lua_core::LuaRuntime>(runtime->GetConfig());
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, std::string("reset failed: ") + e.what())
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Unbind the outgoing runtime before it can be destroyed: lua_close fires __gc
+  // metamethods, and those must not reach members this call is about to clear
+  // and repopulate.
+  DetachRuntimeHandlers();
+
+  // async_co_ is the one registry ref the context holds directly (rather than
+  // through a handle that owns a shared_ptr to the runtime). Drop it while its
+  // state is still guaranteed open — the unref deleter captured that raw
+  // lua_State*. RejectIfBusy above means a run in flight can't reach here, so
+  // this only covers a defensive residue.
+  if (async_co_) {
+    async_co_->release();
+    async_co_.reset();
+  }
+
+  // Invalidate every outstanding handle, then mint a fresh flag for the handles
+  // this state will hand out.
+  if (alive_) alive_->store(false);
+  alive_ = std::make_shared<std::atomic<bool>>(true);
+
+  // Swap. This drops the context's share of the old runtime; it is destroyed
+  // here iff no handle still holds one.
+  runtime = std::move(fresh);
+
+  // Drop the bookkeeping that described the old state's contents. The id
+  // counters are deliberately left alone: they must stay monotonic so a name or
+  // ref_id minted before the reset can never collide with one minted after.
+  js_callbacks_.clear();
+  js_userdata_.clear();
+  js_error_registry_.clear();
+  registered_classes_.clear();
+
+  InstallRuntimeHandlers();
+
+  // Replay context-level configuration in the same order the constructor
+  // applies it, so the print override still wins over a callback-provided
+  // print. These run protected _G writes that can throw under maxMemory;
+  // surface that as a JS error rather than unwinding out (the H1 class).
+  try {
+    if (!allow_bytecode_) runtime->SetAllowBytecode(false);
+    for (const auto& path : search_paths_) runtime->AddSearchPath(path);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (!callbacks_ref_.IsEmpty()) {
+    RegisterCallbacks(callbacks_ref_.Value());  // throws a JS error on failure
+    if (env.IsExceptionPending()) return env.Undefined();
+  }
+
+  if (!print_handler_.IsEmpty()) {
+    // Take the function out first: InstallPrintHandler reassigns print_handler_,
+    // and the local keeps the value alive across that.
+    const Napi::Function handler = print_handler_.Value();
+    try {
+      InstallPrintHandler(handler);
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+
   return env.Undefined();
 }
 

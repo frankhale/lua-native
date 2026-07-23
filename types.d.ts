@@ -695,6 +695,41 @@ export interface LuaContext {
    * fn(21);          // throws: Lua function has been released
    */
   release(value: LuaFunction | LuaCoroutine | LuaTableRef | LuaTableHandle): void;
+
+  /**
+   * Discards the Lua state and replaces it with a fresh one carrying the same
+   * options, without creating a new context. Intended for long-lived server
+   * processes that run many independent scripts and would otherwise accumulate
+   * global state (and memory) indefinitely.
+   *
+   * **Replayed automatically** onto the new state: the callbacks object passed
+   * to `init()`, the print handler, the `allowBytecode` guard, and every path
+   * added with `add_search_path`. Registered type converters are pure
+   * JavaScript-side policy and are unaffected.
+   *
+   * **Not replayed** — these bind to Lua-side objects that die with the old
+   * state and must be re-applied after a reset: `set_global`, `set_userdata`,
+   * `set_metatable`, `register_module`, `register_class`, and `add_searcher`.
+   *
+   * Values that previously crossed into JavaScript (Lua functions, coroutines,
+   * table references, opaque userdata) belong to the old state and are
+   * invalidated: using one afterwards throws rather than reaching into the new
+   * state. The old state itself is kept alive until the last such wrapper is
+   * garbage-collected, so its memory is only reclaimed once they are gone —
+   * `release()` them first to reclaim it immediately.
+   *
+   * Throws if an async operation is in flight (`is_busy()`), or if called while
+   * Lua is executing — from inside a host callback, metamethod, or table trap —
+   * since the state being retired is the one those frames are running on.
+   *
+   * @example
+   * const lua = new lua_native.init({ log: console.log }, { libraries: 'safe' });
+   * lua.execute_script('x = 42');
+   * lua.reset();
+   * lua.execute_script('return x');   // null — the state was reset
+   * lua.execute_script('log("hi")');  // callbacks still work
+   */
+  reset(): void;
 }
 
 /**

@@ -1067,6 +1067,109 @@ registry, which the worker thread may be using.
 
 ---
 
+## Context Reset — `reset()` (July 2026)
+
+### Overview
+
+`lua.reset()` discards the Lua state and replaces it with a fresh one carrying
+the same options, without creating a new `LuaContext`. It targets long-lived
+server processes that run many independent scripts: without it, the only way to
+get a clean state is a new context, which means re-registering every callback,
+module, search path, and userdata binding.
+
+```typescript
+const lua = new lua_native.init({ log: console.log }, { libraries: 'safe' });
+lua.execute_script('x = expensive_computation()');
+lua.reset();                     // fresh state — same callbacks, same options
+lua.execute_script('return x');  // null
+lua.execute_script('log("hi")'); // callbacks still work
+```
+
+### Architecture
+
+Reset is implemented almost entirely in the binding layer. The core contributes
+only `LuaRuntime::GetConfig()` — the `RuntimeConfig` a runtime was constructed
+from, kept verbatim so a caller can build an identically-configured replacement
+(`max_instructions` tracks `SetMaxInstructions`; the rest is fixed at
+construction).
+
+`LuaContext::Reset` runs this sequence:
+
+1. **Reject if busy, or if Lua is on the C stack.** An in-flight async op
+   (worker-thread or coroutine-driven) owns the state. A non-zero `call_depth_`
+   — the counter `CallScope` maintains at every synchronous Lua entry point —
+   means a host callback, metamethod, or table trap has re-entered JS from a
+   live Lua frame; retiring the state there would free the `lua_State` those
+   frames are still executing on.
+2. **Build the replacement first.** `make_shared<LuaRuntime>(runtime->GetConfig())`
+   runs before anything is torn down, so a construction failure leaves the
+   context with its current, working state rather than no state at all.
+3. **Detach the outgoing runtime** (`DetachRuntimeHandlers`) — the userdata GC,
+   host-function GC, property, and output handlers all close over `this`, and
+   `lua_close` fires `__gc` metamethods that must not reach members this call is
+   about to clear.
+4. **Drop `async_co_`**, the one registry ref the context holds directly rather
+   than through a handle, while its state is still guaranteed open.
+5. **Invalidate outstanding handles**: flip `alive_` and mint a fresh flag.
+6. **Swap** `runtime`, then clear the bookkeeping that described the old state's
+   contents (`js_callbacks_`, `js_userdata_`, `js_error_registry_`,
+   `registered_classes_`).
+7. **Replay** the context-level configuration onto the new state, in the
+   constructor's order: `allowBytecode`, search paths, callbacks, print handler.
+
+What is replayed versus what must be re-applied:
+
+| Replayed automatically | Not replayed (rebind after reset) |
+|---|---|
+| Constructor callbacks object | `set_global` |
+| Print handler (option or `set_print_handler`) | `set_userdata` |
+| `allowBytecode` guard | `set_metatable` |
+| `add_search_path` paths | `register_module` |
+| Libraries, `maxMemory`, `maxInstructions` | `register_class` |
+| Type converters (JS-side, never touched) | `add_searcher` |
+
+### Design Decisions
+
+**The retired state is not closed — it is orphaned.** Every handle that crossed
+the boundary (`LuaFunctionData`, `LuaThreadData`, `LuaUserdataData`,
+`LuaTableRefData`) holds a `shared_ptr<LuaRuntime>`, so the old state stays open
+for exactly as long as some handle can still reach it. Closing it out from under
+them would dangle both their registry refs and the raw `lua_State*` their unref
+deleters captured (`MakeRegistryOwner` resolves the runtime from the main
+state's extra space — a use-after-free on a closed state). With no outstanding
+handles, the old runtime is destroyed synchronously inside `reset()`, which is
+the common case and the one the feature exists for.
+
+This is why the FUTURE.md sketch's `LuaRuntime::Reset()` (close + recreate
+in place) was **not** implemented: it would hand every ref-holding wrapper a
+dangling state with no way to detect it.
+
+**Stale handles are invalidated, not silently repointed.** `alive_` is flipped
+and re-minted, so pre-reset function handles and table Proxies throw. Coroutines
+and opaque userdata are covered by the existing `data->runtime.get() ==
+runtime.get()` identity checks in `resume()`, `release()`, and the
+`NapiToCoreImpl` round-trip markers — after the swap those simply stop matching,
+so a pre-reset value is treated as foreign rather than indexing an unrelated
+slot in the new registry.
+
+**Reentrancy is rejected, not deferred.** `reset()` from inside a host callback
+could in principle be queued and applied once the Lua call unwinds, but the
+callback's own return value would then be pushed onto a state that no longer
+exists. Failing loudly at the call site is both simpler and easier to diagnose.
+
+**Id counters stay monotonic across a reset.** `next_userdata_id_`,
+`next_js_callback_id_`, and friends are deliberately *not* rewound: a name or
+`ref_id` minted before the reset must never collide with one minted after, since
+the old runtime may still be alive and its GC callbacks reference those names.
+
+**Search paths are replayed but modules are not.** A search path is a plain
+string with no Lua-side identity, so replaying it is free. `register_module`,
+`register_class`, `set_metatable`, and `set_userdata` all mint generated
+host-function names bound to objects in the old state; replaying them would mean
+rebuilding that graph, so they are documented as the caller's job instead.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1092,3 +1195,4 @@ registry, which the worker thread may be using.
 | I/O redirection, JS require searcher, bytecode guard | Moderate | July 2026 |
 | Reference lifecycle (`release()` for function/coroutine/table refs) | Low | July 2026 |
 | Dotted path globals (`set_global`/`get_global` nested field access) | Low | July 2026 |
+| Context reset (`reset()` — fresh state, replayed configuration) | Moderate | July 2026 |

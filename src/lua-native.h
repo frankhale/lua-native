@@ -125,6 +125,7 @@ public:
     Napi::Value SetPrintHandler(const Napi::CallbackInfo& info);
     Napi::Value AddSearcher(const Napi::CallbackInfo& info);
     Napi::Value Release(const Napi::CallbackInfo& info);
+    Napi::Value Reset(const Napi::CallbackInfo& info);
 
     void ClearBusy();
 
@@ -300,6 +301,30 @@ private:
     // Active collector for in-flight conversions (nullptr when none). See
     // JsCallbackCollectorScope.
     std::vector<std::string>* js_callback_collector_ = nullptr;
+
+    // --- reset() support -------------------------------------------------
+    // State that is *context* configuration rather than Lua-state contents, so
+    // reset() can replay it onto the replacement runtime. Everything a reset
+    // does NOT replay (modules, userdata, classes, metatables) is bound to
+    // Lua-side objects that die with the old state; see reset()'s docs.
+    //
+    // The callbacks object handed to the constructor. Held as a strong
+    // reference so the same functions can be re-registered on a fresh state.
+    Napi::ObjectReference callbacks_ref_;
+    // Mirrors runtime->SetAllowBytecode: the E3 guard is applied after
+    // construction, so it isn't carried by RuntimeConfig.
+    bool allow_bytecode_ = true;
+    // Search paths added via add_search_path, in the order they were added.
+    std::vector<std::string> search_paths_;
+
+    // Installs the runtime-side handlers that bridge back into this context
+    // (userdata GC, host-function GC, proxy property access). Shared by the
+    // constructor and reset(), which must re-arm them on the new state.
+    void InstallRuntimeHandlers();
+    // Unbinds the outgoing runtime from this context so nothing it does during
+    // teardown (lua_close fires __gc) reaches a member being torn down or
+    // repopulated. Shared by ~LuaContext and reset().
+    void DetachRuntimeHandlers() const;
 
     void RegisterCallbacks(const Napi::Object& callbacks);
     lua_core::LuaRuntime::Function CreateJsCallbackWrapper(const std::string& name);

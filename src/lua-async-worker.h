@@ -4,7 +4,6 @@
 #include <memory>
 #include <string>
 #include <variant>
-#include <vector>
 
 #include "core/lua-runtime.h"
 
@@ -27,6 +26,8 @@ public:
       // safely use context_ even if JS drops its last reference meanwhile.
       contextRef_(std::move(contextRef)),
       deferred_(deferred) {}
+
+protected:
 
   void Execute() override {
     // Defer main-thread registry unrefs (GC finalizers) for the duration of the
@@ -70,6 +71,8 @@ public:
       context_(context),
       contextRef_(std::move(contextRef)),
       deferred_(deferred) {}
+
+protected:
 
   void Execute() override {
     // See LuaScriptAsyncWorker::Execute — defer main-thread registry unrefs for

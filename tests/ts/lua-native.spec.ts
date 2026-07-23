@@ -5614,4 +5614,322 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // CONTEXT RESET
+  // ============================================
+  describe('context reset - lua.reset()', () => {
+    describe('state clearing', () => {
+      it('discards globals set from Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('x = 42');
+        expect(lua.execute_script('return x')).toBe(42);
+        lua.reset();
+        expect(lua.execute_script('return x')).toBeNull();
+      });
+
+      it('discards globals set from JS via set_global', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('cfg', { host: 'localhost' });
+        expect(lua.get_global('cfg')).toEqual({ host: 'localhost' });
+        lua.reset();
+        expect(lua.get_global('cfg')).toBeNull();
+      });
+
+      it('discards functions, tables, and metatables defined in Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          function helper() return 1 end
+          shared = setmetatable({}, { __index = function() return 'meta' end })
+        `);
+        expect(lua.execute_script('return type(helper)')).toBe('function');
+        lua.reset();
+        expect(lua.execute_script('return type(helper)')).toBe('nil');
+        expect(lua.execute_script('return type(shared)')).toBe('nil');
+      });
+
+      it('discards modules cached by require()', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_module('greeter', { hello: () => 'hi' });
+        expect(lua.execute_script('return require("greeter").hello()')).toBe('hi');
+        lua.reset();
+        // register_module is bound to the old state and is not replayed.
+        expect(() => lua.execute_script('return require("greeter")')).toThrow();
+      });
+
+      it('leaves the context usable across repeated resets', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        for (let i = 0; i < 5; i++) {
+          expect(lua.execute_script('return counter')).toBeNull();
+          lua.execute_script('counter = 1');
+          lua.reset();
+        }
+        expect(lua.execute_script('return 6 * 7')).toBe(42);
+      });
+    });
+
+    describe('replayed configuration', () => {
+      it('keeps the constructor callbacks working', () => {
+        const seen: string[] = [];
+        const lua = new lua_native.init(
+          { log: (msg: string) => { seen.push(msg); return null; } },
+          ALL_LIBS
+        );
+        lua.execute_script('log("before")');
+        lua.reset();
+        lua.execute_script('log("after")');
+        expect(seen).toEqual(['before', 'after']);
+      });
+
+      it('keeps non-function constructor values as globals', () => {
+        const lua = new lua_native.init({ appName: 'demo' }, ALL_LIBS);
+        expect(lua.execute_script('return appName')).toBe('demo');
+        lua.reset();
+        expect(lua.execute_script('return appName')).toBe('demo');
+      });
+
+      it('keeps the libraries preset', () => {
+        const safe = new lua_native.init({}, { libraries: 'safe' });
+        safe.reset();
+        expect(safe.execute_script('return math.floor(3.7)')).toBe(3);
+        expect(safe.execute_script('return type(os)')).toBe('nil');
+
+        // A bare state has no base library either, so probe without calling.
+        const bare = new lua_native.init();
+        bare.reset();
+        expect(bare.execute_script('return math')).toBeNull();
+        expect(bare.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('keeps the maxMemory limit', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', maxMemory: 2 * 1024 * 1024 });
+        lua.reset();
+        expect(() => lua.execute_script(`
+          local t = {}
+          for i = 1, 1e7 do t[i] = string.rep('x', 100) end
+        `)).toThrow(/memory/i);
+        // The context survives the OOM and is still usable.
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('keeps the maxInstructions limit', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', maxInstructions: 100_000 });
+        lua.reset();
+        expect(() => lua.execute_script('while true do end'))
+          .toThrow('instruction limit exceeded');
+      });
+
+      it('keeps the allowBytecode guard', () => {
+        const trusted = new lua_native.init({}, ALL_LIBS);
+        const bytecode = trusted.compile('return 7');
+
+        const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+        lua.reset();
+        expect(() => lua.load_bytecode(bytecode)).toThrow(/bytecode/i);
+      });
+
+      it('keeps a print handler passed as a constructor option', () => {
+        const lines: string[] = [];
+        const lua = new lua_native.init({}, { libraries: 'all', print: (t) => lines.push(t) });
+        lua.execute_script('print("before")');
+        lua.reset();
+        lua.execute_script('print("after")');
+        expect(lines.map(l => l.trim())).toEqual(['before', 'after']);
+      });
+
+      it('keeps a print handler installed via set_print_handler', () => {
+        const lines: string[] = [];
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_print_handler((t) => { lines.push(t); });
+        lua.reset();
+        lua.execute_script('print("after")');
+        expect(lines.map(l => l.trim())).toEqual(['after']);
+      });
+
+      it('keeps search paths added with add_search_path', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fixtureDir = path.resolve(__dirname, '../fixtures/modules');
+        lua.add_search_path(path.join(fixtureDir, '?.lua'));
+        expect(lua.execute_script('return require("testmod").add(3, 4)')).toBe(7);
+        lua.reset();
+        // A fresh package.loaded, but the path still resolves the module.
+        expect(lua.execute_script('return require("testmod").add(3, 4)')).toBe(7);
+      });
+
+      it('keeps registered type converters', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v: any) => v instanceof Date,
+          (v: Date) => v.toISOString()
+        );
+        lua.reset();
+        lua.set_global('when', new Date(Date.UTC(2026, 6, 23)));
+        expect(lua.execute_script('return when')).toBe('2026-07-23T00:00:00.000Z');
+      });
+    });
+
+    describe('handles minted before the reset', () => {
+      it('invalidates Lua function references', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const fn = lua.execute_script<any>('return function(x) return x * 2 end');
+        expect(fn(21)).toBe(42);
+        lua.reset();
+        expect(() => fn(21)).toThrow(/destroyed|released/);
+      });
+
+      it('invalidates table handles', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        t.set('a', 1);
+        lua.reset();
+        expect(() => t.get('a')).toThrow(/destroyed|released/);
+      });
+
+      it('invalidates metatabled-table proxies', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const proxy = lua.execute_script<any>(`
+          return setmetatable({}, { __index = function() return 'x' end })
+        `);
+        expect(proxy.anything).toBe('x');
+        lua.reset();
+        expect(() => proxy.anything).toThrow(/destroyed|released/);
+      });
+
+      it('rejects coroutines created before the reset', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const co = lua.create_coroutine('return function() coroutine.yield(1) end');
+        lua.reset();
+        expect(() => lua.resume(co)).toThrow(/different Lua context/);
+      });
+
+      it('does not let a stale handle reach the new state', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        t.set('marker', 'old');
+        lua.reset();
+        // The new state has its own registry; the stale handle must not read or
+        // write through it.
+        expect(() => t.set('marker', 'new')).toThrow(/destroyed|released/);
+        expect(lua.execute_script('return marker')).toBeNull();
+      });
+
+      it('reclaims accumulated Lua memory', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          store = {}
+          for i = 1, 200 do store[i] = string.rep('x', 8192) end
+        `);
+        const before = lua.get_memory_usage();
+        expect(before).toBeGreaterThan(1024 * 1024);
+
+        lua.reset();
+        // get_memory_usage reports the live state's allocator, and the fresh
+        // state starts empty.
+        expect(lua.get_memory_usage()).toBeLessThan(before / 2);
+      });
+
+      it('handles a stale handle safely rather than crashing', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const held = lua.execute_script<any>('return function() return 1 end');
+        lua.reset();
+        // The retired state stays open behind `held`, so every operation that
+        // touches it fails cleanly instead of reaching freed memory.
+        expect(() => held()).toThrow(/destroyed|released/);
+        expect(() => lua.release(held)).toThrow(/different Lua context/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('guards', () => {
+      it('throws while a worker-thread async run is in flight', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const pending = lua.execute_script_async(`
+          local s = 0
+          for i = 1, 3e6 do s = s + i end
+          return s
+        `);
+        expect(() => lua.reset()).toThrow('busy');
+        await pending;
+        expect(() => lua.reset()).not.toThrow();
+      });
+
+      it('throws when called from inside a host callback', () => {
+        let inner: unknown;
+        const lua = new lua_native.init(
+          { tryReset: () => { try { lua.reset(); } catch (e) { inner = e; } return 1; } },
+          ALL_LIBS
+        );
+        // Resetting here would free the lua_State the running script is
+        // executing on; the guard must reject it and leave the state intact.
+        expect(lua.execute_script('return tryReset()')).toBe(1);
+        expect(String(inner)).toMatch(/while Lua is executing/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+        // Once the call has returned, a reset is allowed.
+        expect(() => lua.reset()).not.toThrow();
+        expect(lua.execute_script('return tryReset()')).toBe(1);
+      });
+
+      it('throws when called from inside a metamethod', () => {
+        let inner: unknown;
+        const lua = new lua_native.init(
+          { tryReset: () => { try { lua.reset(); } catch (e) { inner = e; } return 'ok'; } },
+          ALL_LIBS
+        );
+        lua.execute_script('obj = {}');
+        lua.set_metatable('obj', { __index: () => (lua.execute_script('return tryReset()')) });
+        expect(lua.execute_script('return obj.missing')).toBe('ok');
+        expect(String(inner)).toMatch(/while Lua is executing/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('throws while a coroutine-driven async run is suspended', async () => {
+        const lua = new lua_native.init(
+          { wait: () => new Promise((res) => setTimeout(() => res(1), 20)) },
+          ALL_LIBS
+        );
+        const pending = lua.execute_async('local v = wait() return v');
+        expect(() => lua.reset()).toThrow('busy');
+        await pending;
+        expect(() => lua.reset()).not.toThrow();
+      });
+    });
+
+    describe('bindings that must be re-applied', () => {
+      it('drops userdata registered before the reset', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_userdata('cfg', { debug: true }, { readable: true });
+        expect(lua.execute_script('return cfg.debug')).toBe(true);
+        lua.reset();
+        expect(lua.execute_script('return type(cfg)')).toBe('nil');
+        // Re-registering after the reset works, and uses the new state.
+        lua.set_userdata('cfg', { debug: false }, { readable: true });
+        expect(lua.execute_script('return cfg.debug')).toBe(false);
+      });
+
+      it('drops registered classes and allows re-registration', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const definition = {
+          construct: (x: any) => ({ x: x as number }),
+          methods: { getX: (self: any) => self.x },
+        };
+        lua.register_class('Point', definition);
+        expect(lua.execute_script('return Point.new(5):getX()')).toBe(5);
+        lua.reset();
+        expect(lua.execute_script('return type(Point)')).toBe('nil');
+        // register_class rejects a duplicate name on the same state; a reset
+        // clears that record along with the state.
+        lua.register_class('Point', definition);
+        expect(lua.execute_script('return Point.new(9):getX()')).toBe(9);
+      });
+
+      it('drops metatables set before the reset', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('obj = {}');
+        lua.set_metatable('obj', { __index: () => 'from-js' });
+        expect(lua.execute_script('return obj.missing')).toBe('from-js');
+        lua.reset();
+        expect(lua.execute_script('return type(obj)')).toBe('nil');
+      });
+    });
+  });
 });

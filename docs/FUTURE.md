@@ -20,7 +20,7 @@ workarounds rank lowest.
 | 2 | ~~Error Stack Traces~~ | Completed | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
 | 2 | GC Control | Not started | Small scope, complements sandboxing |
-| 2 | Context Reset | Not started | No workaround without re-registering everything |
+| 2 | ~~Context Reset~~ | Completed | `lua.reset()` replaces the state and replays callbacks, print handler, `allowBytecode`, and search paths (July 23, 2026) |
 | — | ~~Table Reference API~~ | Completed | Universal in bridges (7/7); workaround: `execute_script` |
 | 3 | Environment Tables | Not started | Common in bridges (5/7); enables per-script sandboxing |
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
@@ -200,7 +200,28 @@ Useful for performance tuning — e.g., pausing GC during a batch of operations,
 
 ---
 
-### Context Reset
+### ~~Context Reset~~ (Completed — July 2026)
+
+Implemented as `lua.reset()`. See the "Context Reset" section in `FEATURES.md`
+for the as-built design; the original plan is retained below.
+
+**As built, differing from the plan:**
+- **No core `LuaRuntime::Reset()`.** Closing and recreating the state in place
+  would dangle every registry ref held by a JS-side wrapper, along with the raw
+  `lua_State*` its unref deleter captured. Instead the binding layer constructs
+  a *replacement* `LuaRuntime` and orphans the old one: each wrapper holds a
+  `shared_ptr<LuaRuntime>`, so the retired state stays open until the last
+  wrapper is collected (synchronously inside `reset()` when there are none).
+- The core contributes only `LuaRuntime::GetConfig()`, the `RuntimeConfig` a
+  runtime was constructed from, so an identically-configured replacement can be
+  built.
+- Wrappers minted before the reset are invalidated rather than repointed
+  (`alive_` is flipped and re-minted; the existing runtime-identity checks cover
+  coroutines and userdata).
+- The plan's "simpler approach" was taken for bindings, plus search paths:
+  callbacks, print handler, `allowBytecode`, and `add_search_path` paths are
+  replayed; `set_global`, `set_userdata`, `set_metatable`, `register_module`,
+  `register_class`, and `add_searcher` must be re-applied by the caller.
 
 Destroy and recreate the Lua state without creating a new `LuaContext`. Useful
 for long-lived server processes that execute many scripts over time.

@@ -138,7 +138,10 @@ int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
   for (const auto& lib : libraries) {
     const auto it = kLibFlags.find(lib);
     if (it == kLibFlags.end()) {
-      throw std::runtime_error("Unknown Lua library: '" + lib + "'");
+      std::string msg = "Unknown Lua library: '";
+      msg += lib;
+      msg += "'";
+      throw std::runtime_error(msg);
     }
     mask |= it->second;
   }
@@ -234,6 +237,7 @@ void LuaRuntime::InstallExecutionHook() {
 
 void LuaRuntime::SetMaxInstructions(size_t limit) {
   max_instructions_ = limit;
+  config_.max_instructions = limit;  // keep GetConfig() replayable
   InstallExecutionHook();
 }
 
@@ -252,7 +256,7 @@ LuaRuntime::LuaRuntime() : LuaRuntime(RuntimeConfig{}) {}
 LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries)
     : LuaRuntime(RuntimeConfig{libraries, 0}) {}
 
-LuaRuntime::LuaRuntime(const RuntimeConfig& config) {
+LuaRuntime::LuaRuntime(const RuntimeConfig& config) : config_(config) {
   allocator_.limit = config.max_memory;
   max_instructions_ = config.max_instructions;  // installed by InitState()
   L_ = lua_newstate(LuaAllocator, &allocator_, 0);
@@ -356,8 +360,8 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
   {
     // 1. Check for a registered method
     bool has_method_table = false;
-    std::string registry_key =
-        std::string(kUserdataMethodsPrefix) + std::to_string(*block);
+    std::string registry_key = kUserdataMethodsPrefix;
+    registry_key += std::to_string(*block);
     lua_getfield(L, LUA_REGISTRYINDEX, registry_key.c_str());
     if (lua_istable(L, -1)) {
       has_method_table = true;
@@ -565,7 +569,8 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
       userdata_ref_counts_.erase(it);
 
       // Clean up method table if one exists
-      std::string registry_key = std::string(kUserdataMethodsPrefix) + std::to_string(ref_id);
+      std::string registry_key = kUserdataMethodsPrefix;
+      registry_key += std::to_string(ref_id);
       lua_pushnil(L_);
       lua_setfield(L_, LUA_REGISTRYINDEX, registry_key.c_str());
 
@@ -583,8 +588,8 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
 void LuaRuntime::SetUserdataMethodTable(
     int ref_id,
     const std::unordered_map<std::string, std::string>& method_map) {
-  const std::string registry_key =
-      std::string(kUserdataMethodsPrefix) + std::to_string(ref_id);
+  std::string registry_key = kUserdataMethodsPrefix;
+  registry_key += std::to_string(ref_id);
   // Protected so an OOM building the method table throws instead of aborting (M3).
   RunProtected([&]() {
     // Create a table: { method_name = "host_func_name", ... }
@@ -724,8 +729,8 @@ void LuaRuntime::RegisterClass(
   //
   // The key strings live out here, not in the thunk: a Lua ERRMEM longjmp to
   // the pcall skips destructors of thunk-local C++ objects (N2).
-  const std::string mt_name = std::string(kClassMetaPrefix) + class_name;
-  const std::string methods_key = std::string(kClassMethodsPrefix) + class_name;
+  const std::string mt_name = kClassMetaPrefix + class_name;
+  const std::string methods_key = kClassMethodsPrefix + class_name;
   RunProtected([&]() {
   // 1. Create the shared per-class instance metatable.
   luaL_newmetatable(L_, mt_name.c_str());
@@ -798,8 +803,8 @@ int LuaRuntime::ClassIndex(lua_State* L) {
   {
     // 1. Look up the key in the shared class method table.
     bool has_methods = false;
-    const std::string methods_key =
-        std::string(kClassMethodsPrefix) + std::string(class_name ? class_name : "");
+    std::string methods_key = kClassMethodsPrefix;
+    if (class_name) methods_key += class_name;
     lua_getfield(L, LUA_REGISTRYINDEX, methods_key.c_str());
     if (lua_istable(L, -1)) {
       has_methods = true;
@@ -943,10 +948,16 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
     // on the globals table can't panic.
     PushProtectedGlobal(name);
     if (lua_isnil(L_, -1)) {
-      throw std::runtime_error("Global '" + name + "' does not exist");
+      std::string msg = "Global '";
+      msg += name;
+      msg += "' does not exist";
+      throw std::runtime_error(msg);
     }
     if (!lua_istable(L_, -1)) {
-      throw std::runtime_error("Global '" + name + "' is not a table");
+      std::string msg = "Global '";
+      msg += name;
+      msg += "' is not a table";
+      throw std::runtime_error(msg);
     }
 
     // Create the metatable
@@ -1288,7 +1299,8 @@ int LuaRuntime::JsSearcher(lua_State* L) {
         raise = true;
       } else {
         const std::string& source = std::get<std::string>(result->value);
-        const std::string chunkname = "@" + std::string(modname);
+        std::string chunkname = "@";
+        chunkname += modname;
         // Force text mode so a searcher can never inject bytecode.
         if (luaL_loadbufferx(L, source.c_str(), source.size(),
                              chunkname.c_str(), "t") != LUA_OK) {
@@ -1747,7 +1759,10 @@ std::string LuaRuntime::CaptureError(lua_State* L) const {
   }
   lua_pop(L, 1);  // pop the failed pcall result / non-string
   // Fallback that never runs user code (the error value is still at -1).
-  return std::string("(error object is a ") + luaL_typename(L, -1) + " value)";
+  std::string result = "(error object is a ";
+  result += luaL_typename(L, -1);
+  result += " value)";
+  return result;
 }
 
 ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
@@ -1984,9 +1999,12 @@ void LuaRuntime::SetGlobalPath(const std::vector<std::string>& path, const LuaPt
         lua_remove(L_, -2);                            // drop current -> [table]
       } else {
         const std::string type = lua_typename(L_, lua_type(L_, -1));
-        throw std::runtime_error(
-          "cannot set global path: intermediate '" + seg + "' is a " + type +
-          ", not a table");
+        std::string msg = "cannot set global path: intermediate '";
+        msg += seg;
+        msg += "' is a ";
+        msg += type;
+        msg += ", not a table";
+        throw std::runtime_error(msg);
       }
     }
 
@@ -2005,8 +2023,7 @@ LuaPtr LuaRuntime::GetGlobalPath(const std::vector<std::string>& path) const {
     StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // current container
 
-    for (size_t i = 0; i < path.size(); ++i) {
-      const std::string& seg = path[i];
+    for (const auto & seg : path) {
       lua_pushlstring(L_, seg.data(), seg.size());  // key
       lua_gettable(L_, -2);                          // current[seg] (fires __index)
       lua_remove(L_, -2);                            // drop container, keep value
@@ -2044,7 +2061,9 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
     }
   } catch (const std::exception& e) {
     lua_settop(L_, stackBefore);
-    return std::string("Error converting argument to Lua function: ") + e.what();
+    std::string msg = "Error converting argument to Lua function: ";
+    msg += e.what();
+    return msg;
   }
 
   if (ProtectedCall(static_cast<int>(args.size()), LUA_MULTRET) != LUA_OK) {
@@ -2072,7 +2091,10 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
 
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
   if (depth > kMaxDepth) {
-    throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
+    std::string msg = "Value nesting depth exceeds the maximum of ";
+    msg += std::to_string(kMaxDepth);
+    msg += " levels";
+    throw std::runtime_error(msg);
   }
   // Reserve headroom for this level's working set (metatable probe, key/value
   // during traversal). Lua only guarantees LUA_MINSTACK free slots and the raw
@@ -2200,7 +2222,10 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
     return;
   }
   if (depth > kMaxDepth) {
-    throw std::runtime_error("Value nesting depth exceeds the maximum of " + std::to_string(kMaxDepth) + " levels");
+    std::string msg = "Value nesting depth exceeds the maximum of ";
+    msg += std::to_string(kMaxDepth);
+    msg += " levels";
+    throw std::runtime_error(msg);
   }
   // Reserve headroom before pushing (raw push APIs don't grow the stack). Each
   // recursion level ensures its own additional slots, so nested containers
@@ -2249,7 +2274,7 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             *block = v.ref_id;
             if (!v.class_name.empty()) {
               // Class instance - use the per-class metatable
-              const std::string mt_name = std::string(kClassMetaPrefix) + v.class_name;
+              const std::string mt_name = kClassMetaPrefix + v.class_name;
               luaL_setmetatable(L, mt_name.c_str());
             } else {
               luaL_setmetatable(L, v.proxy ? kProxyUserdataMetaName : kUserdataMetaName);
@@ -2492,13 +2517,17 @@ std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name)
     }
   });
   if (got_type != LUA_TTABLE) {
-    return "global '" + name + "' is not a table (got " +
-           lua_typename(L_, got_type) + ")";
+    std::string msg = "global '";
+    msg += name;
+    msg += "' is not a table (got ";
+    msg += lua_typename(L_, got_type);
+    msg += ')';
+    return msg;
   }
   return ref;
 }
 
-std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) const {
+std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(const int registry_ref) const {
   StackGuard guard(L_);
   std::vector<std::pair<LuaPtr, LuaPtr>> result;
 
@@ -2513,8 +2542,7 @@ std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(int registry_ref) 
   lua_pushnil(L_);
   while (lua_next(L_, -2) != 0) {
     LuaPtr key;
-    const int key_type = lua_type(L_, -2);
-    if (key_type == LUA_TSTRING) {
+    if (const int key_type = lua_type(L_, -2); key_type == LUA_TSTRING) {
       size_t len;
       const char* str = lua_tolstring(L_, -2, &len);
       key = std::make_shared<LuaValue>(LuaValue::from(std::string(str, len)));
@@ -2630,7 +2658,9 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     }
   } catch (const std::exception& e) {
     result.status = CoroutineStatus::Dead;
-    result.error = std::string("Error converting coroutine arguments: ") + e.what();
+    std::string msg = "Error converting coroutine arguments: ";
+    msg += e.what();
+    result.error = msg;
     return result;
   }
 
@@ -2799,7 +2829,9 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     }
   } catch (const std::exception& e) {
     result.state = AsyncStepResult::State::Error;
-    result.error = std::string("Error converting resume value: ") + e.what();
+    std::string msg = "Error converting resume value: ";
+    msg += e.what();
+    result.error = msg;
     return result;
   }
 

@@ -2,7 +2,6 @@
 
 #include <lua.hpp>
 #include <atomic>
-#include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -57,9 +56,9 @@ inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   lua_State* mainL = lua_tothread(L, -1);
   lua_pop(L, 1);
   if (!mainL) mainL = L;  // defensive: LUA_RIDX_MAINTHREAD is always populated
-  return std::shared_ptr<void>(nullptr, [mainL, ref](void*) {
+  return {nullptr, [mainL, ref](void*) {
     UnrefRegistrySlot(mainL, ref);
-  });
+  }};
 }
 }  // namespace detail
 
@@ -274,6 +273,12 @@ public:
 
   static std::vector<std::string> AllLibraries();
   static std::vector<std::string> SafeLibraries();
+
+  // The configuration this runtime was constructed from, kept verbatim so a
+  // caller can build an identically-configured replacement state — the way the
+  // binding layer implements reset(). max_instructions tracks
+  // SetMaxInstructions; the remaining fields are fixed at construction.
+  [[nodiscard]] const RuntimeConfig& GetConfig() const { return config_; }
 
   LuaRuntime(const LuaRuntime&) = delete;
   LuaRuntime& operator=(const LuaRuntime&) = delete;
@@ -499,6 +504,7 @@ private:
   // host_functions_ and read these members while the state is still open.
   MemoryAllocator allocator_;
   lua_State* L_ { nullptr };
+  RuntimeConfig config_;  // see GetConfig()
   std::unordered_map<std::string, Function> host_functions_;
   std::vector<std::pair<void*, void (*)(void*)>> stored_function_data_;
 

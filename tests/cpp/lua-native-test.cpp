@@ -3053,6 +3053,70 @@ TEST(LuaRuntimeMemory, RecoveryAfterOOM) {
 
 // ---- Execution time limits (maxInstructions) ----
 
+// --- GetConfig: the record a caller replays to build a replacement state
+// (how the binding layer implements reset()) ---
+
+TEST(LuaRuntimeConfig, ConfigConstructorRoundTrips) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 4 * 1024 * 1024;
+  config.max_instructions = 500000;
+  const LuaRuntime rt(config);
+
+  EXPECT_EQ(rt.GetConfig().libraries, LuaRuntime::SafeLibraries());
+  EXPECT_EQ(rt.GetConfig().max_memory, 4u * 1024 * 1024);
+  EXPECT_EQ(rt.GetConfig().max_instructions, 500000u);
+}
+
+TEST(LuaRuntimeConfig, LibraryListConstructorRecordsLibraries) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetConfig().libraries, LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetConfig().max_memory, 0u);
+  EXPECT_EQ(rt.GetConfig().max_instructions, 0u);
+}
+
+TEST(LuaRuntimeConfig, DefaultConstructorRecordsBareState) {
+  const LuaRuntime rt;
+  EXPECT_TRUE(rt.GetConfig().libraries.empty());
+}
+
+TEST(LuaRuntimeConfig, SetMaxInstructionsUpdatesConfig) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.SetMaxInstructions(250000);
+  EXPECT_EQ(rt.GetConfig().max_instructions, 250000u);
+}
+
+TEST(LuaRuntimeConfig, ReplayedConfigProducesAnEquivalentState) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_instructions = 1000000;
+  auto original = std::make_unique<LuaRuntime>(config);
+  original->SetGlobal("x", std::make_shared<LuaValue>(LuaValue::from(int64_t{42})));
+
+  // Build the replacement from the original's own record, then drop the
+  // original — the sequence reset() performs.
+  auto replacement = std::make_unique<LuaRuntime>(original->GetConfig());
+  original.reset();
+
+  // Same libraries: 'safe' has math but not os.
+  EXPECT_EQ(std::get<int64_t>(
+      std::get<std::vector<LuaPtr>>(
+          replacement->ExecuteScript("return math.floor(3.7)"))[0]->value), 3);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(
+      replacement->GetGlobal("os")->value));
+
+  // Clean globals: the original's global did not carry over.
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(
+      replacement->GetGlobal("x")->value));
+
+  // Same execution limit, still enforced.
+  EXPECT_EQ(replacement->GetMaxInstructions(), 1000000u);
+  const auto res = replacement->ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"),
+            std::string::npos);
+}
+
 TEST(LuaRuntimeInstructions, UnlimitedByDefault) {
   LuaRuntime rt(LuaRuntime::AllLibraries());
   EXPECT_EQ(rt.GetMaxInstructions(), 0u);
