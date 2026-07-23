@@ -27,7 +27,7 @@ workarounds rank lowest.
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
 | 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
 | 3 | ~~Reference Lifecycle Management~~ | Completed | `LuaTableHandle.release()` (July 2026) plus context-level `release(value)` for function, coroutine, and table refs (July 23, 2026) |
-| 4 | Dotted Path Globals | Not started | Workaround: `execute_script` |
+| 4 | ~~Dotted Path Globals~~ | Completed | `set_global`/`get_global` accept dotted paths (July 23, 2026) |
 | 4 | Shared State Between Contexts | Not started | Workaround: `set_global` on each context |
 | — | ~~File Execution~~ | Completed | |
 | — | ~~Selective Standard Library Loading~~ | Completed | |
@@ -575,7 +575,7 @@ option. Most short-lived use cases never accumulate enough references to matter.
 These features have straightforward JS-side workarounds. Implement only if users
 specifically request them.
 
-### Dotted Path Globals
+### ~~Dotted Path Globals~~ (Completed — July 23, 2026)
 
 Access nested table fields from JS without round-tripping through `execute_script`:
 
@@ -584,10 +584,36 @@ lua.set_global('config.db.host', 'localhost');
 const host = lua.get_global('config.db.host');
 ```
 
-**Workaround:** `lua.execute_script("config.db.host = 'localhost'")` — trivial,
-one line, no limitation. The convenience gain doesn't justify the implementation
-complexity (parsing dot paths, handling missing intermediate tables, deciding
-whether to auto-create vs error).
+**As built:**
+- `set_global` and `get_global` interpret a name containing `.` as a path of
+  segments; a name with no dot is unchanged (a single global key, which may
+  itself contain dots).
+- **Auto-vivification on set:** missing intermediate tables are created as the
+  path descends. Setting into an existing intermediate that is *not* a table
+  throws (`"...intermediate 'X' is a <type>, not a table"`).
+- **Optional-chaining on get:** a nil anywhere along the path yields `null`
+  (matching how a missing single global reads back). A non-nil, non-indexable
+  intermediate throws (`"attempt to index a <type> value"`), matching what the
+  equivalent Lua field access would do.
+- Traversal goes through `__index`/`__newindex` on each hop, so metatabled
+  intermediates behave exactly as in a Lua script. The whole walk runs inside a
+  single protected frame, so a metamethod raise or OOM surfaces as a JS error
+  rather than an unprotected panic.
+- Malformed paths (a leading, trailing, or doubled dot — empty segments) throw a
+  `TypeError`.
+- A function value at a dotted path is materialized as a nested Lua closure via
+  the reclaimable host-function path (the same mechanism as functions nested
+  inside a table argument), not the named-persistent top-level registration.
+
+**Core** (`lua-runtime.h/.cpp`): `SetGlobalPath(path, value)` and
+`GetGlobalPath(path)`. **N-API** (`lua-native.cpp`): `SplitGlobalPath` validates
+and splits the name; `SetGlobal`/`GetGlobal` route to the path variants when a
+dot is present. The original design notes follow for reference.
+
+**Workaround (historical):** `lua.execute_script("config.db.host = 'localhost'")`
+— trivial for a known path, but errors if `config`/`config.db` don't already
+exist. The implemented feature's auto-vivification is the real convenience gain
+over the workaround.
 
 ---
 
@@ -674,6 +700,11 @@ Implemented. See `create_table()`, `get_global_ref()`, and the `LuaTableHandle` 
 
 Implemented. See `release()` in the API documentation (context-level release for
 function, coroutine, and table references) and `LuaTableHandle.release()`.
+
+### ~~Dotted Path Globals~~ (Completed)
+
+Implemented. `set_global`/`get_global` accept a dotted `name` to read and
+auto-create nested table fields. See the API documentation.
 
 ### ~~Memory Limits~~ (Completed)
 

@@ -296,6 +296,17 @@ public:
 
   [[nodiscard]] LuaPtr GetGlobal(const std::string& name) const;
 
+  // Dotted-path variants of the two above. `path` addresses a nested field
+  // (e.g. {"config","db","host"} for config.db.host), traversing through
+  // __index/__newindex like real Lua field access. `path` must be non-empty.
+  //
+  // SetGlobalPath auto-creates missing intermediate tables and throws if an
+  // existing intermediate is a non-table value. GetGlobalPath returns nil if
+  // any intermediate is nil (optional-chaining semantics) and throws if an
+  // intermediate is a non-nil, non-indexable value.
+  void SetGlobalPath(const std::vector<std::string>& path, const LuaPtr& value) const;
+  [[nodiscard]] LuaPtr GetGlobalPath(const std::vector<std::string>& path) const;
+
   [[nodiscard]] ScriptResult CallFunction(const LuaFunctionRef& funcRef,
                                           const std::vector<LuaPtr>& args) const;
 

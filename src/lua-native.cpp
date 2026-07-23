@@ -812,6 +812,26 @@ void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
   }
 }
 
+// Splits a dotted global path ("config.db.host") into its segments. Returns
+// false for a malformed path — any empty segment from a leading, trailing, or
+// doubled dot (".a", "a.", "a..b") — so the caller can reject it with a clear
+// error. A name with no dot yields a single-element vector (but the callers
+// only reach this on a name that contains a dot).
+static bool SplitGlobalPath(const std::string& name, std::vector<std::string>& out) {
+  out.clear();
+  size_t start = 0;
+  while (true) {
+    const size_t dot = name.find('.', start);
+    std::string seg = name.substr(
+      start, dot == std::string::npos ? std::string::npos : dot - start);
+    if (seg.empty()) return false;  // empty segment => malformed path
+    out.push_back(std::move(seg));
+    if (dot == std::string::npos) break;
+    start = dot + 1;
+  }
+  return true;
+}
+
 Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString()) {
@@ -820,6 +840,27 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
   }
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
+
+  // A dotted name addresses a nested field: config.db.host = value, creating
+  // missing intermediate tables. Functions take the reclaimable nested-closure
+  // path (via NapiToCoreInstance) rather than the named-persistent top-level
+  // registration below — a nested field is conceptually an anonymous value.
+  if (name.find('.') != std::string::npos) {
+    std::vector<std::string> path;
+    if (!SplitGlobalPath(name, path)) {
+      Napi::TypeError::New(env, "Invalid global path '" + name +
+        "': path segments must be non-empty (no leading, trailing, or doubled dots)")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    try {
+      runtime->SetGlobalPath(
+        path, std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[1])));
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+  }
 
   // Both branches can throw a std::runtime_error (a raising __index/__newindex
   // on a _G metatable now routes through the protected global path), so guard
@@ -849,6 +890,27 @@ Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
   }
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
+
+  // A dotted name reads a nested field: config.db.host. A nil anywhere along
+  // the path yields null (optional chaining), matching how a missing single
+  // global reads back as null.
+  if (name.find('.') != std::string::npos) {
+    std::vector<std::string> path;
+    if (!SplitGlobalPath(name, path)) {
+      Napi::TypeError::New(env, "Invalid global path '" + name +
+        "': path segments must be non-empty (no leading, trailing, or doubled dots)")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    try {
+      auto result = runtime->GetGlobalPath(path);
+      return CoreToNapi(*result);
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+
   // GetGlobal can throw (an over-deep table, or a raising __index on a _G
   // metatable via the protected-get path). Surface it as a JS exception rather
   // than letting a std::runtime_error unwind through the N-API boundary.

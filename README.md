@@ -17,7 +17,7 @@ data structures.
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Type-system fidelity — `BigInt`, `Date`, `Map`, `Set`, `Buffer`/`TypedArray`, and `RegExp` convert to natural Lua representations, with 64-bit integer precision preserved in both directions; register app-specific converters with `register_type_converter()`
-- Global variable management (get and set)
+- Global variable management (get and set), including dotted paths (`set_global('config.db.host', v)`) that read and auto-create nested table fields
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access and method binding
 - Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, and use overloaded operators
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
@@ -201,6 +201,12 @@ console.log(a, b); // 7, 14
 // Read globals back from Lua
 lua.execute_script("y = x * 3");
 console.log(lua.get_global("y")); // 21
+
+// Dotted paths read and auto-create nested table fields
+lua.set_global("config.db.host", "localhost"); // creates config and config.db
+console.log(lua.get_global("config.db.host")); // 'localhost'
+console.log(lua.get_global("config.db.port")); // null (missing leaf)
+console.log(lua.get_global("missing.a.b")); // null (nil intermediate, no error)
 ```
 
 ### Complex Data Structures
@@ -1983,18 +1989,47 @@ the fully-formatted output text. Pass `null` to restore output to stdout.
 
 Sets a global variable or function in the Lua environment.
 
+A dotted `name` addresses a **nested field** and creates any missing
+intermediate tables as it descends:
+
+```javascript
+lua.set_global('config.db.host', 'localhost');
+lua.execute_script('return config.db.host'); // 'localhost' (config and config.db were auto-created)
+```
+
+Field access flows through `__index`/`__newindex` metamethods, like real Lua
+field access. It throws if an existing intermediate is a non-table value (e.g.
+`config` is already a number), or if the path is malformed (a leading, trailing,
+or doubled dot). A name with no dot sets a single global whose key may itself
+contain dots.
+
 **Parameters:**
 
-- `name`: Name of the global variable
+- `name`: Name of the global variable, or a dotted path to a nested field
 - `value`: Value to set (function, number, string, boolean, or object)
 
 ### `LuaContext.get_global(name)`
 
 Gets a global variable from the Lua environment.
 
+A dotted `name` reads a **nested field**, descending through `__index`
+metamethods. If any segment along the path is nil, the result is `null`
+(optional-chaining semantics), just as a missing single global reads back as
+`null`:
+
+```javascript
+lua.execute_script('config = { db = { host = "localhost" } }');
+lua.get_global('config.db.host'); // 'localhost'
+lua.get_global('config.db.port'); // null (leaf missing)
+lua.get_global('missing.a.b');    // null (intermediate nil — no error)
+```
+
+It throws only if a non-nil intermediate is a non-indexable value (e.g.
+`config.db` is a number) or if the path is malformed.
+
 **Parameters:**
 
-- `name`: Name of the global variable
+- `name`: Name of the global variable, or a dotted path to a nested field
 
 **Returns:** The value of the global (converted to JavaScript), or `null` if not set
 

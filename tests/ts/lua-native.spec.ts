@@ -1223,6 +1223,147 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // DOTTED PATH GLOBALS
+  // ============================================
+  describe('dotted path globals', () => {
+    describe('set_global with a dotted path', () => {
+      it('creates missing intermediate tables', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('config.db.host', 'localhost');
+        expect(lua.execute_script('return config.db.host')).toBe('localhost');
+        expect(lua.execute_script('return type(config)')).toBe('table');
+        expect(lua.execute_script('return type(config.db)')).toBe('table');
+      });
+
+      it('writes into an existing intermediate table without clobbering siblings', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('config = { db = { host = "a", port = 1 } }');
+        lua.set_global('config.db.host', 'b');
+        expect(lua.execute_script('return config.db.host')).toBe('b');
+        expect(lua.execute_script('return config.db.port')).toBe(1); // sibling intact
+      });
+
+      it('supports a two-segment path', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('settings.debug', true);
+        expect(lua.execute_script('return settings.debug')).toBe(true);
+      });
+
+      it('sets non-string leaf values (number, boolean, table, array)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('a.n', 42);
+        lua.set_global('a.flag', false);
+        lua.set_global('a.nested', { x: 1 });
+        lua.set_global('a.list', [10, 20, 30]);
+        expect(lua.execute_script('return a.n')).toBe(42);
+        expect(lua.execute_script('return a.flag')).toBe(false);
+        expect(lua.execute_script('return a.nested.x')).toBe(1);
+        expect(lua.execute_script('return a.list[2]')).toBe(20);
+      });
+
+      it('sets a function at a dotted path, callable from Lua', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('handlers.double', (x: number) => x * 2);
+        expect(lua.execute_script('return handlers.double(21)')).toBe(42);
+      });
+
+      it('overwrites an existing leaf value', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('a.b', 1);
+        lua.set_global('a.b', 2);
+        expect(lua.execute_script('return a.b')).toBe(2);
+      });
+
+      it('throws when an existing intermediate is not a table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('config', 5); // a number, not a table
+        expect(() => lua.set_global('config.db.host', 'x')).toThrow(/not a table/);
+      });
+
+      it('fires __newindex on a metatabled intermediate', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          _writes = {}
+          target = setmetatable({}, {
+            __newindex = function(_, k, v) _writes[k] = v end
+          })
+        `);
+        lua.set_global('target.x', 99);
+        expect(lua.execute_script('return _writes.x')).toBe(99);
+        expect(lua.execute_script('return rawget(target, "x")')).toBeNull();
+      });
+    });
+
+    describe('get_global with a dotted path', () => {
+      it('reads a nested field', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('config = { db = { host = "localhost", port = 5432 } }');
+        expect(lua.get_global('config.db.host')).toBe('localhost');
+        expect(lua.get_global('config.db.port')).toBe(5432);
+      });
+
+      it('round-trips with set_global', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('config.db.host', 'localhost');
+        expect(lua.get_global('config.db.host')).toBe('localhost');
+      });
+
+      it('returns null when the leaf is missing', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('config = { db = {} }');
+        expect(lua.get_global('config.db.host')).toBeNull();
+      });
+
+      it('returns null when an intermediate is nil (optional chaining)', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(lua.get_global('nope.db.host')).toBeNull();
+        lua.execute_script('config = {}');
+        expect(lua.get_global('config.db.host')).toBeNull();
+      });
+
+      it('returns a nested table when the path points at one', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('config = { db = { host = "h", port = 1 } }');
+        expect(lua.get_global('config.db')).toEqual({ host: 'h', port: 1 });
+      });
+
+      it('fires __index on a metatabled intermediate', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          config = setmetatable({}, { __index = function() return { host = "fallback" } end })
+        `);
+        expect(lua.get_global('config.anything.host')).toBe('fallback');
+      });
+
+      it('throws when a non-nil intermediate is not indexable', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('config = { db = 5 }'); // db is a number
+        expect(() => lua.get_global('config.db.host')).toThrow(/index a number/);
+      });
+    });
+
+    describe('malformed paths', () => {
+      it('rejects leading, trailing, and doubled dots', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.set_global('.a', 1)).toThrow(/Invalid global path/);
+        expect(() => lua.set_global('a.', 1)).toThrow(/Invalid global path/);
+        expect(() => lua.set_global('a..b', 1)).toThrow(/Invalid global path/);
+        expect(() => lua.get_global('.a')).toThrow(/Invalid global path/);
+        expect(() => lua.get_global('a..b')).toThrow(/Invalid global path/);
+      });
+    });
+
+    describe('single-key backward compatibility', () => {
+      it('a name with no dot is still a single global key', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('plain', 7);
+        expect(lua.get_global('plain')).toBe(7);
+        expect(lua.execute_script('return plain')).toBe(7);
+      });
+    });
+  });
+
+  // ============================================
   // USERDATA - OPAQUE HANDLES (Phase 1)
   // ============================================
   describe('userdata - opaque handles', () => {

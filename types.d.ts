@@ -276,15 +276,32 @@ export interface LuaContext {
   execute_file<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): T;
 
   /**
-   * Sets a global variable or function in the Lua environment
-   * @param name The name of the global variable or function
+   * Sets a global variable or function in the Lua environment.
+   *
+   * A dotted `name` addresses a nested field: `set_global('config.db.host', v)`
+   * assigns `config.db.host = v`, creating any missing intermediate tables
+   * (`config` and `config.db`) as it descends. Field access flows through
+   * `__index`/`__newindex` metamethods, like real Lua field access. It throws
+   * if an existing intermediate is a non-table value (e.g. `config` is a
+   * number), or if the path is malformed (a leading, trailing, or doubled dot).
+   * A name with no dot sets a single global whose key may itself contain dots.
+   *
+   * @param name The name of the global variable, or a dotted path to a nested field
    * @param value The value to set (function, number, boolean, string, or object)
    */
   set_global(name: string, value: LuaInput | LuaCallback): void;
 
   /**
-   * Gets a global variable from the Lua environment
-   * @param name The name of the global variable
+   * Gets a global variable from the Lua environment.
+   *
+   * A dotted `name` reads a nested field: `get_global('config.db.host')`
+   * returns `config.db.host`, descending through `__index` metamethods. If any
+   * segment along the path is nil, the result is `null` (optional-chaining
+   * semantics), just as a missing single global reads back as `null`. It throws
+   * only if a non-nil intermediate is a non-indexable value (e.g. `config.db`
+   * is a number) or if the path is malformed.
+   *
+   * @param name The name of the global variable, or a dotted path to a nested field
    * @returns The value of the global, or null if not set
    */
   get_global(name: string): LuaValue;

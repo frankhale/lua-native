@@ -102,6 +102,65 @@ TEST(LuaRuntimeCore, SetGlobalAndGetGlobal) {
   EXPECT_EQ(std::get<int64_t>(vals[0]->value), 42);
 }
 
+TEST(LuaRuntimeCore, SetGlobalPathAutoCreatesIntermediates) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.SetGlobalPath({"config", "db", "host"},
+                   std::make_shared<LuaValue>(LuaValue::from(std::string("localhost"))));
+  const auto res = rt.ExecuteScript("return config.db.host, type(config), type(config.db)");
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "localhost");
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "table");
+  EXPECT_EQ(std::get<std::string>(vals[2]->value), "table");
+}
+
+TEST(LuaRuntimeCore, SetGlobalPathPreservesSiblings) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("config = { db = { host = 'a', port = 1 } }");
+  rt.SetGlobalPath({"config", "db", "host"},
+                   std::make_shared<LuaValue>(LuaValue::from(std::string("b"))));
+  const auto res = rt.ExecuteScript("return config.db.host, config.db.port");
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), "b");
+  EXPECT_EQ(std::get<int64_t>(vals[1]->value), 1);
+}
+
+TEST(LuaRuntimeCore, SetGlobalPathThrowsOnNonTableIntermediate) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.SetGlobal("config", std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(5))));
+  EXPECT_THROW(
+      rt.SetGlobalPath({"config", "db"},
+                       std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)))),
+      std::runtime_error);
+}
+
+TEST(LuaRuntimeCore, GetGlobalPathReadsNested) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("config = { db = { host = 'localhost', port = 5432 } }");
+  const auto host = rt.GetGlobalPath({"config", "db", "host"});
+  ASSERT_NE(host, nullptr);
+  EXPECT_EQ(std::get<std::string>(host->value), "localhost");
+  const auto port = rt.GetGlobalPath({"config", "db", "port"});
+  EXPECT_EQ(std::get<int64_t>(port->value), 5432);
+}
+
+TEST(LuaRuntimeCore, GetGlobalPathNilShortCircuits) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("config = {}");
+  // Missing leaf and missing intermediate both yield nil (monostate), no throw.
+  const auto missingLeaf = rt.GetGlobalPath({"config", "db", "host"});
+  ASSERT_NE(missingLeaf, nullptr);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(missingLeaf->value));
+  const auto missingRoot = rt.GetGlobalPath({"nope", "db", "host"});
+  ASSERT_NE(missingRoot, nullptr);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(missingRoot->value));
+}
+
+TEST(LuaRuntimeCore, GetGlobalPathThrowsOnNonIndexableIntermediate) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("config = { db = 5 }");  // db is a number
+  EXPECT_THROW((void)rt.GetGlobalPath({"config", "db", "host"}), std::runtime_error);
+}
+
 TEST(LuaRuntimeCore, ErrorPropagation) {
   const LuaRuntime rt(LuaRuntime::AllLibraries());
   auto res = rt.ExecuteScript("error('boom')");

@@ -134,6 +134,22 @@ JavaScript functions registered via the constructor callbacks object, `set_globa
 
 **Constructor callbacks:** The callbacks object passed to `new lua_native.init({...})` is iterated in `RegisterCallbacks`. Functions and non-function values are handled identically to `set_global` — the constructor is just syntactic sugar for bulk registration.
 
+**Dotted paths (July 2026):** When `name` contains a `.`, both methods treat it
+as a path into nested tables (`config.db.host`). `SplitGlobalPath` (N-API layer)
+validates the name and splits it into segments — rejecting empty segments from a
+leading, trailing, or doubled dot — then routes to the core's `SetGlobalPath` /
+`GetGlobalPath`. Those walk the path with `lua_gettable`/`lua_settable`, so each
+hop fires `__index`/`__newindex`, inside one `RunProtected` frame (a metamethod
+raise or OOM becomes a catchable error). `SetGlobalPath` auto-creates missing
+intermediate tables and throws on a non-table intermediate; `GetGlobalPath`
+short-circuits to nil when any intermediate is nil (optional-chaining) and lets
+a non-nil, non-indexable intermediate raise the natural "attempt to index"
+error. A name with no dot keeps the exact single-key behavior above (so a
+literal key that contains a dot is still reachable by round-tripping through
+`create_table`/handles or by never using the dotted form). A function value at a
+dotted path is materialized as a nested closure via `NapiToCoreInstance`, not
+the named-persistent top-level registration.
+
 ---
 
 ## Lua Function Returns
@@ -1075,3 +1091,4 @@ registry, which the worker thread may be using.
 | Error fidelity (stack traces, JS Error round-trip, pcall) | Moderate | July 2026 |
 | I/O redirection, JS require searcher, bytecode guard | Moderate | July 2026 |
 | Reference lifecycle (`release()` for function/coroutine/table refs) | Low | July 2026 |
+| Dotted path globals (`set_global`/`get_global` nested field access) | Low | July 2026 |

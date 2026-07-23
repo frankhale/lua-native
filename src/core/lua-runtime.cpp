@@ -1954,6 +1954,77 @@ LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
   return ToLuaValueProtected(L_, -1);
 }
 
+void LuaRuntime::SetGlobalPath(const std::vector<std::string>& path, const LuaPtr& value) const {
+  // One protected frame covers the whole traversal: an __index/__newindex
+  // metamethod raise, an OOM building a key/table/value, or an attempt to index
+  // a non-table intermediate all surface as a std::runtime_error. StackGuard
+  // (a local of the lambda) restores the stack whether the lambda returns or
+  // throws — the ProtectedThunkRunner catches the C++ throw after unwinding.
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // current container
+
+    // Walk every segment but the last, descending into (or creating) tables.
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+      const std::string& seg = path[i];
+      lua_pushlstring(L_, seg.data(), seg.size());  // key
+      lua_gettable(L_, -2);                          // current[seg] (fires __index)
+
+      if (lua_isnil(L_, -1)) {
+        // Missing intermediate: create a fresh table, store it under the key,
+        // and descend into it. pushvalue keeps a copy so the stored table
+        // becomes the working container regardless of the store's mechanics.
+        lua_pop(L_, 1);                                // drop nil
+        lua_newtable(L_);                              // [current, newtable]
+        lua_pushlstring(L_, seg.data(), seg.size());   // [current, newtable, key]
+        lua_pushvalue(L_, -2);                         // [current, newtable, key, newtable]
+        lua_settable(L_, -4);                          // current[seg]=newtable (fires __newindex)
+        lua_remove(L_, -2);                            // drop current -> [newtable]
+      } else if (lua_istable(L_, -1)) {
+        lua_remove(L_, -2);                            // drop current -> [table]
+      } else {
+        const std::string type = lua_typename(L_, lua_type(L_, -1));
+        throw std::runtime_error(
+          "cannot set global path: intermediate '" + seg + "' is a " + type +
+          ", not a table");
+      }
+    }
+
+    // Assign the leaf: container[last] = value.
+    const std::string& last = path.back();
+    lua_pushlstring(L_, last.data(), last.size());  // key
+    PushLuaValue(L_, value);                         // value (may allocate / recurse)
+    lua_settable(L_, -3);                            // fires __newindex
+  });
+}
+
+LuaPtr LuaRuntime::GetGlobalPath(const std::vector<std::string>& path) const {
+  LuaPtr result;
+  // Protected for the same reasons as GetGlobal, extended across each hop.
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // current container
+
+    for (size_t i = 0; i < path.size(); ++i) {
+      const std::string& seg = path[i];
+      lua_pushlstring(L_, seg.data(), seg.size());  // key
+      lua_gettable(L_, -2);                          // current[seg] (fires __index)
+      lua_remove(L_, -2);                            // drop container, keep value
+      // A nil anywhere short-circuits the whole path to nil, and stops us from
+      // trying to index that nil on the next hop (which would raise). A non-nil,
+      // non-indexable intermediate instead falls through and the next
+      // lua_gettable raises "attempt to index a <type> value" — reported as an
+      // error, matching what `config.db.host` would do in a Lua script.
+      if (lua_isnil(L_, -1)) break;
+    }
+
+    // Convert the leaf (an aggregate is converted here under protection, the
+    // same pattern GetTableField uses).
+    result = ToLuaValue(L_, -1);
+  });
+  return result;
+}
+
 ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
                                       const std::vector<LuaPtr>& args) const {
   last_error_value_.reset();
