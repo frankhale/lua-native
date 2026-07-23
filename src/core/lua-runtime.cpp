@@ -1,9 +1,7 @@
 #include "lua-runtime.h"
 
-#include <cctype>
 #include <cerrno>
 #include <cstdio>
-#include <cstdlib>
 
 namespace lua_core {
 
@@ -28,7 +26,7 @@ enum class HostCallOutcome { Return1, Raise, Yield };
 // order for the array part).
 bool isSequentialArray(lua_State* L, int index) {
   const int abs_index = lua_absindex(L, index);
-  const lua_Integer len = static_cast<lua_Integer>(lua_rawlen(L, abs_index));
+  const auto len = static_cast<lua_Integer>(lua_rawlen(L, abs_index));
   lua_Integer int_keys = 0;
   lua_pushnil(L);
   while (lua_next(L, abs_index) != 0) {
@@ -36,8 +34,7 @@ bool isSequentialArray(lua_State* L, int index) {
       lua_pop(L, 2);
       return false;
     }
-    const lua_Integer k = lua_tointeger(L, -2);
-    if (k < 1 || k > len) {
+    if (const lua_Integer k = lua_tointeger(L, -2); k < 1 || k > len) {
       lua_pop(L, 2);
       return false;  // an integer key outside [1, #t] means it's not a sequence
     }
@@ -1005,7 +1002,7 @@ void LuaRuntime::AddSearchPath(const std::string& path) const {
 
     // Append the new path
     if (!appended.empty()) {
-      appended += ";";
+      appended += ';';
     }
     appended += path;
 
@@ -2167,9 +2164,9 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             PushLuaValue(L, val, depth + 1);
             lua_settable(L, -3);
           }
-        } else if constexpr (std::is_same_v<T, LuaFunctionRef>) {
-          lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
-        } else if constexpr (std::is_same_v<T, LuaThreadRef>) {
+        } else if constexpr (std::is_same_v<T, LuaFunctionRef> ||
+                             std::is_same_v<T, LuaThreadRef> ||
+                             std::is_same_v<T, LuaTableRef>) {
           lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
         } else if constexpr (std::is_same_v<T, LuaUserdataRef>) {
           if (v.opaque) {
@@ -2181,7 +2178,7 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             *block = v.ref_id;
             if (!v.class_name.empty()) {
               // Class instance - use the per-class metatable
-              std::string mt_name = std::string(kClassMetaPrefix) + v.class_name;
+              const std::string mt_name = std::string(kClassMetaPrefix) + v.class_name;
               luaL_setmetatable(L, mt_name.c_str());
             } else {
               luaL_setmetatable(L, v.proxy ? kProxyUserdataMetaName : kUserdataMetaName);
@@ -2192,8 +2189,6 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             lua_pop(L, 1);
             if (runtime) runtime->IncrementUserdataRefCount(v.ref_id);
           }
-        } else if constexpr (std::is_same_v<T, LuaTableRef>) {
-          lua_rawgeti(L, LUA_REGISTRYINDEX, v.ref);
         } else if constexpr (std::is_same_v<T, HostFunctionName>) {
           // Materialize a registered host function as a Lua closure (upvalue 1 =
           // the host function name), the same shape RegisterFunction installs.
@@ -2393,20 +2388,20 @@ int LuaRuntime::CreateTableFrom(const LuaTable& initial) {
   return ref;
 }
 
-int LuaRuntime::CreateTableFrom(const LuaArray& initial) {
+int LuaRuntime::CreateTableFrom(const LuaArray& initial) const {
   int ref = LUA_NOREF;
   RunProtected([&]() {
     lua_createtable(L_, static_cast<int>(initial.size()), 0);
     for (size_t i = 0; i < initial.size(); ++i) {
       PushLuaValue(L_, initial[i]);
-      lua_seti(L_, -2, static_cast<lua_Integer>(i + 1));
+      lua_seti(L_, -2, static_cast<lua_Integer>(i) + 1);
     }
     ref = luaL_ref(L_, LUA_REGISTRYINDEX);
   });
   return ref;
 }
 
-std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name) {
+std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name) const {
   // Read _G[name] and ref it inside one protected frame so both a raising
   // __index metamethod (M4) and an OOM in the lua_gettable/luaL_ref allocation
   // (M5) surface as a caught error instead of a panic. The value must be fetched
@@ -2618,13 +2613,12 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
 // Reports Suspended or Dead only. CoroutineStatus::Running is never returned:
 // with the single-threaded driver a coroutine is never observed mid-execution
 // from here (a resume runs to its next yield or completion before returning).
-CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) const {
+CoroutineStatus LuaRuntime::GetCoroutineStatus(const LuaThreadRef& threadRef) {
   if (!threadRef.thread) {
     return CoroutineStatus::Dead;
   }
 
-  int status = lua_status(threadRef.thread);
-  if (status == LUA_YIELD) {
+  if (const int status = lua_status(threadRef.thread); status == LUA_YIELD) {
     return CoroutineStatus::Suspended;
   } else if (status == LUA_OK) {
     // Check if coroutine has any code to run

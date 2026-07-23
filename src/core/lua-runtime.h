@@ -303,7 +303,7 @@ public:
   [[nodiscard]] std::variant<LuaThreadRef, std::string> CreateCoroutine(const LuaFunctionRef& funcRef) const;
   [[nodiscard]] CoroutineResult ResumeCoroutine(const LuaThreadRef& threadRef,
                                                  const std::vector<LuaPtr>& args) const;
-  [[nodiscard]] CoroutineStatus GetCoroutineStatus(const LuaThreadRef& threadRef) const;
+  [[nodiscard]] static CoroutineStatus GetCoroutineStatus(const LuaThreadRef& threadRef);
 
   // Coroutine-driven async execution (main thread; awaits JS promises).
   // Loads `script` as a chunk on a fresh coroutine thread.
@@ -439,8 +439,8 @@ public:
   // Table reference API — create and manage live table references
   [[nodiscard]] int CreateTable();
   [[nodiscard]] int CreateTableFrom(const LuaTable& initial);
-  [[nodiscard]] int CreateTableFrom(const LuaArray& initial);
-  [[nodiscard]] std::variant<int, std::string> GetGlobalRef(const std::string& name);
+  [[nodiscard]] int CreateTableFrom(const LuaArray& initial) const;
+  [[nodiscard]] std::variant<int, std::string> GetGlobalRef(const std::string& name) const;
   [[nodiscard]] std::vector<std::pair<LuaPtr, LuaPtr>> TablePairs(int registry_ref) const;
   [[nodiscard]] std::vector<std::pair<int64_t, LuaPtr>> TableIPairs(int registry_ref) const;
   void ReleaseTableRef(int registry_ref);
