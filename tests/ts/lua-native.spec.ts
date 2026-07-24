@@ -3481,6 +3481,123 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // STATE INTROSPECTION
+  // ============================================
+  describe('state introspection - lua.info()', () => {
+    it('reports the Lua version', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const info = lua.info();
+
+      expect(info.version).toMatch(/^Lua \d+\.\d+$/);
+      expect(info.release).toMatch(/^Lua \d+\.\d+\.\d+$/);
+      expect(info.release.startsWith(info.version)).toBe(true);
+      expect(info.versionNumber).toBeGreaterThanOrEqual(504);
+      // Agrees with what the state itself reports.
+      expect(lua.execute_script('return _VERSION')).toBe(info.version);
+    });
+
+    it('reports memory usage consistently with get_memory_usage()', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const info = lua.info();
+
+      expect(info.memoryBytes).toBeGreaterThan(0);
+      expect(info.memoryKB).toBeCloseTo(info.memoryBytes / 1024, 10);
+      // Same allocator counter, so the two must agree closely; allow for the
+      // handful of bytes the intervening call itself may allocate.
+      expect(Math.abs(lua.get_memory_usage() - info.memoryBytes)).toBeLessThan(4096);
+    });
+
+    it('tracks memory growth', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const before = lua.info().memoryBytes;
+      lua.execute_script('big = {} for i = 1, 20000 do big[i] = i end');
+      expect(lua.info().memoryBytes).toBeGreaterThan(before);
+    });
+
+    it('reports the configured limits', () => {
+      const lua = new lua_native.init({}, {
+        libraries: 'all',
+        maxMemory: 4 * 1024 * 1024,
+        maxInstructions: 250_000,
+      });
+      const info = lua.info();
+
+      expect(info.memoryLimit).toBe(4 * 1024 * 1024);
+      expect(info.maxInstructions).toBe(250_000);
+      expect(info.memoryBytes).toBeLessThan(info.memoryLimit);
+    });
+
+    it('reports 0 for unset limits', () => {
+      const info = new lua_native.init({}, ALL_LIBS).info();
+      expect(info.memoryLimit).toBe(0);
+      expect(info.maxInstructions).toBe(0);
+    });
+
+    it('expands a library preset to the names it loaded', () => {
+      expect(new lua_native.init({}, { libraries: 'all' }).info().libraries)
+        .toEqual(['base', 'package', 'coroutine', 'table', 'io', 'os', 'string', 'math', 'utf8', 'debug']);
+
+      const safe = new lua_native.init({}, { libraries: 'safe' }).info().libraries;
+      expect(safe).toContain('string');
+      expect(safe).not.toContain('io');
+      expect(safe).not.toContain('os');
+      expect(safe).not.toContain('debug');
+    });
+
+    it('reports an explicit library list verbatim', () => {
+      const lua = new lua_native.init({}, { libraries: ['base', 'math'] });
+      expect(lua.info().libraries).toEqual(['base', 'math']);
+    });
+
+    it('reports no libraries for a bare state', () => {
+      expect(new lua_native.init().info().libraries).toEqual([]);
+    });
+
+    it('runs no Lua code and triggers no collection', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      // A stopped collector must stay stopped: info() is a pure read.
+      lua.gc('stop');
+      lua.info();
+      expect(lua.gc('isrunning')).toBe(false);
+      lua.gc('restart');
+    });
+
+    it('returns a plain object, not a live view', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const first = lua.info();
+      lua.execute_script('big = {} for i = 1, 20000 do big[i] = i end');
+      const second = lua.info();
+
+      // The snapshot is a copy — the earlier one does not move.
+      expect(second.memoryBytes).toBeGreaterThan(first.memoryBytes);
+      expect(first).not.toBe(second);
+    });
+
+    it('survives a reset with the same configuration', () => {
+      const lua = new lua_native.init({}, { libraries: 'safe', maxMemory: 2 * 1024 * 1024 });
+      const before = lua.info();
+      lua.reset();
+      const after = lua.info();
+
+      expect(after.libraries).toEqual(before.libraries);
+      expect(after.memoryLimit).toBe(before.memoryLimit);
+      expect(after.version).toBe(before.version);
+    });
+
+    it('rejects a call while an async operation is in flight', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const pending = lua.execute_script_async(
+        'local s = 0 for i = 1, 3000000 do s = s + i end return s');
+
+      // The allocator counter is being mutated on the worker thread.
+      expect(() => lua.info()).toThrow('busy with an async operation');
+
+      await pending;
+      expect(lua.info().memoryBytes).toBeGreaterThan(0);
+    });
+  });
+
+  // ============================================
   // ENVIRONMENT TABLES
   // ============================================
   describe('environment tables', () => {

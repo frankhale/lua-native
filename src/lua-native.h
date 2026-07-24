@@ -185,6 +185,7 @@ public:
     Napi::Value CreateEnvironment(const Napi::CallbackInfo& info);
     Napi::Value ExecuteScriptIn(const Napi::CallbackInfo& info);
     Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
+    Napi::Value Info(const Napi::CallbackInfo& info);
     Napi::Value RegisterTypeConverter(const Napi::CallbackInfo& info);
     Napi::Value RegisterClass(const Napi::CallbackInfo& info);
     Napi::Value Pcall(const Napi::CallbackInfo& info);

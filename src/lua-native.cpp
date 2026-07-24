@@ -755,6 +755,7 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("create_environment", &LuaContext::CreateEnvironment),
     InstanceMethod("execute_script_in", &LuaContext::ExecuteScriptIn),
     InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage),
+    InstanceMethod("info", &LuaContext::Info),
     InstanceMethod("register_type_converter", &LuaContext::RegisterTypeConverter),
     InstanceMethod("register_class", &LuaContext::RegisterClass),
     InstanceMethod("pcall", &LuaContext::Pcall),
@@ -1885,6 +1886,46 @@ Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& /*info*/) {
   // reading it concurrently would be a data race.
   if (RejectIfBusy()) return env.Undefined();
   return Napi::Number::New(env, static_cast<double>(runtime->GetMemoryUsage()));
+}
+
+// State introspection: a diagnostics snapshot of this context — which Lua it is
+// running, how much memory it currently holds, and the limits and libraries it
+// was configured with. Everything here is read from state the runtime already
+// tracks, so `info()` runs no Lua code and cannot fail.
+//
+// `memoryKB` is `memoryBytes / 1024` rather than a second reading via
+// `gc('count')`: one source of truth means the two memory fields can never
+// disagree, and it keeps this consistent with `get_memory_usage()`.
+Napi::Value LuaContext::Info(const Napi::CallbackInfo& /*info*/) {
+  // Same reason as get_memory_usage: a worker thread mutates the allocator
+  // counter during async execution, so reading it concurrently is a data race.
+  if (RejectIfBusy()) return env.Undefined();
+
+  const auto memory_bytes = static_cast<double>(runtime->GetMemoryUsage());
+
+  Napi::Object result = Napi::Object::New(env);
+  (void)result.Set("version", Napi::String::New(env, lua_core::LuaRuntime::GetVersion()));
+  (void)result.Set("release", Napi::String::New(env, lua_core::LuaRuntime::GetRelease()));
+  (void)result.Set("versionNumber",
+    Napi::Number::New(env, lua_core::LuaRuntime::GetVersionNumber()));
+  (void)result.Set("memoryBytes", Napi::Number::New(env, memory_bytes));
+  (void)result.Set("memoryKB", Napi::Number::New(env, memory_bytes / 1024.0));
+  (void)result.Set("memoryLimit",
+    Napi::Number::New(env, static_cast<double>(runtime->GetMemoryLimit())));
+  (void)result.Set("maxInstructions",
+    Napi::Number::New(env, static_cast<double>(runtime->GetMaxInstructions())));
+
+  // The libraries this state was opened with, verbatim from the config the
+  // runtime kept — so a preset ('all'/'safe') reads back as the names it
+  // expanded to, and a bare state as an empty array.
+  const auto& libraries = runtime->GetConfig().libraries;
+  Napi::Array libs = Napi::Array::New(env, libraries.size());
+  for (size_t i = 0; i < libraries.size(); ++i) {
+    (void)libs.Set(static_cast<uint32_t>(i), Napi::String::New(env, libraries[i]));
+  }
+  (void)result.Set("libraries", libs);
+
+  return result;
 }
 
 // Garbage-collector control: a thin pass-through to lua_gc, using Lua's own

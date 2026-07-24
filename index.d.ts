@@ -17,6 +17,7 @@ export type {
   LuaLibrary,
   LuaLibraryPreset,
   LuaNative,
+  LuaStateInfo,
   LuaTable,
   LuaTableHandle,
   LuaTableRef,

@@ -338,6 +338,18 @@ std::vector<std::string> LuaRuntime::SafeLibraries() {
   return {"base", "package", "coroutine", "table", "string", "math", "utf8"};
 }
 
+std::string LuaRuntime::GetVersion() {
+  return LUA_VERSION;
+}
+
+std::string LuaRuntime::GetRelease() {
+  return LUA_RELEASE;
+}
+
+int LuaRuntime::GetVersionNumber() {
+  return LUA_VERSION_NUM;
+}
+
 // Delegating constructors funnel into the RuntimeConfig overload so state
 // creation, the null check, library loading, and InitState() live in one place.
 LuaRuntime::LuaRuntime() : LuaRuntime(RuntimeConfig{}) {}

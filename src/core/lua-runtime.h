@@ -488,6 +488,18 @@ public:
   [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
   [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
 
+  // Version identity of the linked Lua, for diagnostics:
+  //
+  //   GetVersion()        "Lua 5.5"   — LUA_VERSION, major.minor
+  //   GetRelease()        "Lua 5.5.0" — LUA_RELEASE, including the patch level
+  //   GetVersionNumber()  505         — LUA_VERSION_NUM (major * 100 + minor)
+  //
+  // Static: these are compile-time constants of the build, not per-state
+  // properties, so they are answerable without a live lua_State.
+  [[nodiscard]] static std::string GetVersion();
+  [[nodiscard]] static std::string GetRelease();
+  [[nodiscard]] static int GetVersionNumber();
+
   // Garbage-collector control (lua_gc). The command vocabulary deliberately
   // mirrors Lua's own `collectgarbage` names:
   //

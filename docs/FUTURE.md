@@ -25,7 +25,7 @@ workarounds rank lowest.
 | 3 | ~~Environment Tables~~ | Completed | `create_environment()` / `execute_script_in()` give each script its own `_ENV` (July 24, 2026) |
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
-| 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
+| 3 | ~~State Introspection~~ | Completed | `info()` reports version, memory, limits, and loaded libraries (July 24, 2026) |
 | 3 | ~~Reference Lifecycle Management~~ | Completed | `LuaTableHandle.release()` (July 2026) plus context-level `release(value)` for function, coroutine, and table refs (July 23, 2026) |
 | 4 | ~~Dotted Path Globals~~ | Completed | `set_global`/`get_global` accept dotted paths (July 23, 2026) |
 | 4 | ~~Shared State Between Contexts~~ | Completed | `createSharedTable()` + the `shared` init option (July 24, 2026) |
@@ -460,7 +460,40 @@ The instruction limit approach is also more deterministic and testable.
 
 ---
 
-### State Introspection
+### ~~State Introspection~~ (Completed — July 24, 2026)
+
+Implemented as `lua.info()`, reporting more than the two fields the sketch
+below showed — the limits and library list are what make the memory number
+actionable.
+
+**As built:**
+
+```typescript
+lua.info();
+// {
+//   version: 'Lua 5.5', release: 'Lua 5.5.0', versionNumber: 505,
+//   memoryBytes: 15022, memoryKB: 14.669921875,
+//   memoryLimit: 10485760, maxInstructions: 1000000,
+//   libraries: ['base', 'package', 'coroutine', 'table', 'string', 'math', 'utf8']
+// }
+```
+
+- **Core:** `GetVersion()` / `GetRelease()` / `GetVersionNumber()` — static,
+  since they are compile-time constants of the linked Lua rather than per-state
+  properties. Everything else came from getters that already existed
+  (`GetMemoryUsage`, `GetMemoryLimit`, `GetMaxInstructions`,
+  `GetConfig().libraries`).
+- **N-API:** `LuaContext::Info` behind the same `RejectIfBusy` guard
+  `get_memory_usage()` uses — a worker thread mutates the allocator counter
+  during async execution.
+- `memoryKB` is `memoryBytes / 1024`, not a second reading via `gc('count')`,
+  so the two memory fields (and `get_memory_usage()`) can never disagree.
+- `libraries` reports the names a preset expanded to, so `'safe'` reads back as
+  its seven libraries and a bare state as `[]`.
+- No Lua API call is made at all: `info()` cannot fail, allocate, or trigger a
+  collection, which is what makes it safe to poll on a monitoring timer.
+
+The original design notes follow for reference.
 
 Expose Lua version, memory usage, and basic state information for diagnostics
 and monitoring:

@@ -78,8 +78,8 @@ so this document stands alone:
 - ~~Error **stack traces** via `debug.traceback` (Tier 2)~~ — **done** (July
   2026, shipped with D2 via a `luaL_traceback` message handler in
   `lua-runtime.cpp`)
-- ~~GC control, context reset (Tier 2)~~ — **done** (July 23, 2026: `gc()` and
-  `reset()`). State introspection (Tier 3) is still open
+- ~~GC control, context reset (Tier 2), state introspection (Tier 3)~~ —
+  **done** (July 23–24, 2026: `gc()`, `reset()`, and `info()`)
 - Debug hooks (`lua_sethook`) (Tier 3) — still open
 - ~~Environment tables / per-script `_ENV` sandboxing (Tier 3)~~ — **done**
   (July 24, 2026: `create_environment()` / `execute_script_in()`)

@@ -35,6 +35,7 @@ data structures.
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
+- State introspection — `info()` returns a diagnostics snapshot: Lua version, current memory, configured limits, and loaded libraries
 - GC control — trigger, pause, step, and tune Lua's collector from JavaScript with `gc()`, using Lua's own `collectgarbage` command vocabulary
 - Execution limits — cap Lua VM instructions with `maxInstructions` option so infinite loops abort instead of hanging
 - Coroutine support with yield/resume semantics
@@ -564,6 +565,62 @@ memory usage automatically.
 For deterministic cleanup, run a collection explicitly with
 [`gc('collect')`](#luacontextgccommand-), and see that section for how
 `gc('count')` relates to `get_memory_usage()`.
+
+### State Introspection
+
+`info()` returns a diagnostics snapshot of a context — which Lua it runs, how
+much memory it holds right now, and the limits and libraries it was created
+with:
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, {
+  libraries: "safe",
+  maxMemory: 10 * 1024 * 1024,
+  maxInstructions: 1_000_000,
+});
+
+console.log(lua.info());
+// {
+//   version: 'Lua 5.5',
+//   release: 'Lua 5.5.0',
+//   versionNumber: 505,
+//   memoryBytes: 15022,
+//   memoryKB: 14.669921875,
+//   memoryLimit: 10485760,
+//   maxInstructions: 1000000,
+//   libraries: ['base', 'package', 'coroutine', 'table', 'string', 'math', 'utf8']
+// }
+```
+
+Everything reported comes from state the runtime already tracks, so `info()`
+runs no Lua code and never triggers a collection — it's safe to poll on a timer:
+
+```javascript
+setInterval(() => {
+  const { memoryBytes, memoryLimit } = lua.info();
+  if (memoryLimit > 0 && memoryBytes / memoryLimit > 0.9) {
+    console.warn("Lua context approaching its memory cap");
+    lua.reset();
+  }
+}, 30_000);
+```
+
+`libraries` reports the names a preset expanded to, which makes it easy to
+confirm what a sandboxed context can actually reach:
+
+```javascript
+new lua_native.init({}, { libraries: "safe" }).info().libraries;
+// ['base', 'package', 'coroutine', 'table', 'string', 'math', 'utf8'] — no io/os/debug
+
+new lua_native.init().info().libraries; // [] — bare state
+```
+
+`memoryBytes` is the same counter `get_memory_usage()` returns, and `memoryKB`
+is simply that divided by 1024 — one source of truth, so the two can never
+disagree. (Lua's own `gc('count')` is an independent reading; see the
+[`gc()`](#luacontextgccommand-) section for how the two relate.)
 
 ### Execution Time Limits
 
@@ -1841,6 +1898,7 @@ import type {
   LuaEnvironment,
   LuaInitOptions,
   LuaLibraryPreset,
+  LuaStateInfo,
   CoroutineResult,
   LuaFunction,
   LuaTableHandle,
@@ -2196,6 +2254,28 @@ otherwise.
 Returns the current memory usage of the Lua state in bytes.
 
 **Returns:** `number` — bytes currently allocated by the Lua state
+
+**Throws:** Error if the context is busy with an async operation (the allocator
+counter is being updated on another thread).
+
+### `LuaContext.info()`
+
+Returns a diagnostics snapshot of the context. Reads only state the runtime
+already tracks — no Lua code runs and no collection is triggered, so it is safe
+to call on a monitoring timer.
+
+**Returns:** `LuaStateInfo`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `version` | `string` | Lua version of the linked build, e.g. `'Lua 5.5'` |
+| `release` | `string` | Full version including the patch level, e.g. `'Lua 5.5.0'` |
+| `versionNumber` | `number` | Numeric form for comparisons: major × 100 + minor (e.g. `505`) |
+| `memoryBytes` | `number` | Memory currently held by the state — the same value as `get_memory_usage()` |
+| `memoryKB` | `number` | `memoryBytes / 1024` (fractional) |
+| `memoryLimit` | `number` | The `maxMemory` this context was created with, in bytes. `0` = unlimited |
+| `maxInstructions` | `number` | The `maxInstructions` limit in force. `0` = unlimited |
+| `libraries` | `string[]` | Standard libraries loaded, by name. A preset reads back as the names it expanded to; a bare state as `[]` |
 
 **Throws:** Error if the context is busy with an async operation (the allocator
 counter is being updated on another thread).

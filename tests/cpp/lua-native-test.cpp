@@ -2953,6 +2953,69 @@ TEST(LuaRuntimeTableAPI, TableIPairsEmptyTable) {
   rt.ReleaseTableRef(ref);
 }
 
+// --- State Introspection Tests ---
+
+TEST(LuaRuntimeIntrospection, ReportsLuaVersion) {
+  // Static: answerable without a state at all.
+  const std::string version = LuaRuntime::GetVersion();
+  EXPECT_EQ(version, LUA_VERSION);
+  EXPECT_EQ(version.rfind("Lua ", 0), 0u);  // "Lua <major>.<minor>"
+
+  const std::string release = LuaRuntime::GetRelease();
+  EXPECT_EQ(release, LUA_RELEASE);
+  // The release string extends the version with the patch level.
+  EXPECT_EQ(release.rfind(version, 0), 0u);
+  EXPECT_GT(release.size(), version.size());
+
+  EXPECT_EQ(LuaRuntime::GetVersionNumber(), LUA_VERSION_NUM);
+  EXPECT_GE(LuaRuntime::GetVersionNumber(), 504);
+}
+
+TEST(LuaRuntimeIntrospection, VersionIsAlsoReachableThroughAnInstance) {
+  const LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetVersion(), LUA_VERSION);
+  EXPECT_EQ(rt.GetVersionNumber(), LUA_VERSION_NUM);
+
+  // ...and agrees with what the state itself reports via _VERSION.
+  auto res = rt.ExecuteScript("return _VERSION");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(vals[0]->value), LuaRuntime::GetVersion());
+}
+
+TEST(LuaRuntimeIntrospection, ConfigAndMemoryBackTheInfoSnapshot) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::SafeLibraries();
+  config.max_memory = 4 * 1024 * 1024;
+  config.max_instructions = 250000;
+  const LuaRuntime rt(config);
+
+  // The four values the binding layer reads to build info().
+  EXPECT_EQ(rt.GetConfig().libraries, LuaRuntime::SafeLibraries());
+  EXPECT_EQ(rt.GetMemoryLimit(), 4u * 1024 * 1024);
+  EXPECT_EQ(rt.GetMaxInstructions(), 250000u);
+  EXPECT_GT(rt.GetMemoryUsage(), 0u);
+  EXPECT_LT(rt.GetMemoryUsage(), rt.GetMemoryLimit());
+}
+
+TEST(LuaRuntimeIntrospection, BareStateReportsNoLibrariesAndNoLimits) {
+  const LuaRuntime rt;
+  EXPECT_TRUE(rt.GetConfig().libraries.empty());
+  EXPECT_EQ(rt.GetMemoryLimit(), 0u);
+  EXPECT_EQ(rt.GetMaxInstructions(), 0u);
+  EXPECT_GT(rt.GetMemoryUsage(), 0u);
+}
+
+TEST(LuaRuntimeIntrospection, MemoryUsageTracksAllocation) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const size_t before = rt.GetMemoryUsage();
+
+  (void)rt.ExecuteScript("big = {} for i = 1, 20000 do big[i] = i end");
+
+  EXPECT_GT(rt.GetMemoryUsage(), before);
+}
+
 // --- Environment Tables Tests ---
 
 // Runs a script in `env_ref` and returns its single string result, or the error

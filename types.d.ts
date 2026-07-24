@@ -251,6 +251,39 @@ export interface LuaTableHandle {
 }
 
 /**
+ * A diagnostics snapshot of a Lua context, returned by
+ * {@link LuaContext.info}.
+ */
+export interface LuaStateInfo {
+  /** Lua version of the linked build, e.g. `'Lua 5.5'`. */
+  version: string;
+
+  /** Full version including the patch level, e.g. `'Lua 5.5.0'`. */
+  release: string;
+
+  /** Numeric version for comparisons: major * 100 + minor (e.g. `505`). */
+  versionNumber: number;
+
+  /** Memory currently held by the Lua state, in bytes. Same value as `get_memory_usage()`. */
+  memoryBytes: number;
+
+  /** Memory currently held by the Lua state, in kilobytes (fractional). */
+  memoryKB: number;
+
+  /** The `maxMemory` this context was created with, in bytes. `0` means unlimited. */
+  memoryLimit: number;
+
+  /** The `maxInstructions` limit in force. `0` means unlimited. */
+  maxInstructions: number;
+
+  /**
+   * Standard libraries loaded into this state, by name. A preset reads back as
+   * the names it expanded to (`'all'` → all ten), and a bare state as `[]`.
+   */
+  libraries: LuaLibrary[];
+}
+
+/**
  * An environment table: a private global namespace for scripts run with
  * {@link LuaContext.execute_script_in}.
  *
@@ -502,6 +535,31 @@ export interface LuaContext {
    * @returns The current memory usage in bytes
    */
   get_memory_usage(): number;
+
+  /**
+   * Returns a diagnostics snapshot of this context: the Lua version it runs,
+   * the memory it currently holds, and the limits and libraries it was
+   * configured with.
+   *
+   * Everything reported is read from state the runtime already tracks, so this
+   * runs no Lua code and never triggers a collection — safe to call on a timer
+   * for monitoring. It throws only while an async operation is in flight.
+   *
+   * @example
+   * lua.info();
+   * // {
+   * //   version: 'Lua 5.5', release: 'Lua 5.5.0', versionNumber: 505,
+   * //   memoryBytes: 19532, memoryKB: 19.07,
+   * //   memoryLimit: 0, maxInstructions: 0,
+   * //   libraries: ['base', 'package', ...]
+   * // }
+   *
+   * @example
+   * // Monitor headroom against the configured cap
+   * const { memoryBytes, memoryLimit } = lua.info();
+   * if (memoryLimit > 0 && memoryBytes / memoryLimit > 0.9) reset();
+   */
+  info(): LuaStateInfo;
 
   /**
    * Compiles Lua source code to bytecode without executing it.

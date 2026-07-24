@@ -1292,6 +1292,32 @@ The environment is returned as an ordinary `LuaTableHandle`, not a distinct opaq
 
 ---
 
+## State Introspection — `info()` (July 2026)
+
+### Overview
+
+`info()` returns a plain object describing the context: the Lua version it runs (`version`, `release`, `versionNumber`), the memory it currently holds (`memoryBytes`, `memoryKB`), the limits it was created with (`memoryLimit`, `maxInstructions`), and the standard libraries loaded into it (`libraries`). It is the "what is this context, and how close is it to its limits" snapshot that memory monitoring and bug reports need.
+
+### Architecture
+
+**Core layer:** three static accessors — `GetVersion()` (`LUA_VERSION`), `GetRelease()` (`LUA_RELEASE`), `GetVersionNumber()` (`LUA_VERSION_NUM`). Everything else `info()` reports already existed: `GetMemoryUsage()`, `GetMemoryLimit()`, `GetMaxInstructions()`, and `GetConfig().libraries`.
+
+**N-API layer:** `LuaContext::Info` assembles the object from those accessors behind the same `RejectIfBusy` guard `get_memory_usage()` uses — a worker thread mutates the allocator counter during async execution, so reading it concurrently would be a data race. No Lua API call is made at all.
+
+### Design Decisions
+
+**`memoryKB` is derived from `memoryBytes`, not read from `gc('count')`.** The plan offered either source. Deriving means the two memory fields can never disagree with each other or with `get_memory_usage()` — they are one counter presented in two units. Lua's own `LUA_GCCOUNT` is a separate accounting of the same heap and would drift from `get_memory_usage()` in ways a reader of a single snapshot could not explain. `gc('count')` remains available for the Lua-side view.
+
+**Version accessors are static.** They are compile-time constants of the linked Lua, not per-state properties, so they are answerable without a `lua_State` — the same reasoning that made `GetCoroutineStatus` static in CR-1. The plan wrote `GetVersion() const`; static is the more honest signature and still callable through an instance.
+
+**`info()` performs no Lua call, so it cannot fail or perturb the state.** That is what makes it safe to poll on a monitoring timer: no allocation, no collection, no metamethod, no chance of an `LUA_ERRMEM` mid-snapshot. Reading the version through `lua_getglobal(L, "_VERSION")` instead would have given a script the ability to lie about it — `_VERSION` is a writable global — and would have needed a protected frame.
+
+**Reported fields go beyond the plan's two.** The plan's example showed `{ version, memoryKB }`, both of which duplicate existing API (`get_memory_usage()` and a build constant). The limits and library list are what make the memory number actionable — a `memoryBytes` with no `memoryLimit` beside it cannot answer "how close am I?" — and all four come from getters the runtime already exposes, so the cost is a few `Set` calls.
+
+**`libraries` reflects the resolved names, not the preset.** `RuntimeConfig` keeps the library list verbatim, and presets are expanded at construction, so `'safe'` reads back as the seven names it opened. That is what a diagnostic wants: the actual reachable surface, not the label someone passed.
+
+---
+
 ## Shared State Between Contexts (July 2026)
 
 ### Overview
@@ -1361,3 +1387,4 @@ Lua states cannot share memory — two `lua_State*`s have no common heap, and th
 | GC control (`gc()` — collect, stop/restart, step, count, mode, params) | Low | July 2026 |
 | Environment tables (`create_environment()` / `execute_script_in()`) | Moderate | July 2026 |
 | Shared state between contexts (`createSharedTable()` + `shared` option) | Moderate | July 2026 |
+| State introspection (`info()` — version, memory, limits, libraries) | Low | July 2026 |
