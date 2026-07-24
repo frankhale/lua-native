@@ -1292,6 +1292,44 @@ The environment is returned as an ordinary `LuaTableHandle`, not a distinct opaq
 
 ---
 
+## Debug Hooks — `set_hook()` (July 2026)
+
+### Overview
+
+`set_hook(callback, options)` installs a `lua_sethook` hook that reports execution events to a JS callback: `'line'` per source line, `'call'` / `'tail call'` on function entry, `'return'` on exit, and `'count'` every N VM instructions. `remove_hook()` takes it back off. The callback receives `(event, line, name)`.
+
+The interesting part is not the hook itself but the fact that `lua_sethook` was already taken: instruction limits and `cancel()` have used it since Tier 1. Lua allows exactly **one** hook function, one mask, and one count interval per state, so this feature had to merge into that installation rather than sit beside it.
+
+### Architecture
+
+**Core layer:**
+- `SetDebugHook(cb, mask, count_interval)` / `RemoveDebugHook()` store the callback (behind a `shared_ptr`) plus the requested mask and interval, then re-run `InstallExecutionHook()`.
+- `InstallExecutionHook()` is now the single install point for both consumers. It ORs the debug mask with `LUA_MASKCOUNT` (if `maxInstructions` is set), picks the *finer* of the two count intervals, drops a `LUA_MASKCOUNT` with no positive interval, and records the chosen interval in `instruction_hook_interval_` — the value each firing represents.
+- `ExecutionHook` (formerly `InstructionCountHook`) is the one hook function. On a count event it runs the cancel check and the instruction budget first — both may `luaL_error`, and neither has non-trivial C++ locals live when it does — then calls `DispatchDebugHook`.
+- `DispatchDebugHook` maps `ar->event` to a name, tallies count firings up to the caller's requested granularity, calls `lua_getinfo(L, "nl", ar)`, and invokes the callback. It never raises.
+
+**N-API layer:** `SetHook` validates the callback and options, builds the `LUA_MASK*` bits, and installs a lambda that calls the stored `Napi::FunctionReference` inside a `HandleScope`. `RemoveHook` clears both sides. `InstallDebugHook` is shared with `Reset()`, which re-arms the hook on the replacement state; `DetachRuntimeHandlers` removes it from the outgoing one.
+
+### Design Decisions
+
+**One hook function, masks OR'd, finer interval wins.** Lua permits a single hook per state, so a naive `lua_sethook` for debugging would silently disable `maxInstructions` and `cancel()` — turning on a profiler would turn off the sandbox. Instead both consumers share one installation. When both want the count event the finer interval is installed and each tallies to its own granularity: the instruction budget adds `instruction_hook_interval_` per firing, and the debug dispatch accumulates into `debug_count_tally_` until the caller's interval is reached. So `{ count: 7 }` alongside `maxInstructions: 200000` gives the caller an event every 7 instructions *and* an accurate budget.
+
+**Budget checks run before the debug dispatch, and the dispatch never raises.** The safety consumers can `luaL_error`, which longjmps past C++ destructors — the H1 hazard the code reviews track. They run first, while the only locals are a pointer and a `size_t`. The debug dispatch runs afterwards and holds a `shared_ptr`, two `std::string`s and N-API handles, so it is written to never raise: `lua_getinfo` is called with `"nl"` (neither pushes to the stack, so it cannot error), and everything the callback might throw is caught.
+
+**The callback lives behind a `shared_ptr`, copied before dispatch.** "Trace until X, then stop" means calling `remove_hook()` *from inside the hook* — which would destroy the `std::function` currently executing. Copying the shared owner before the call keeps it alive for the duration; the same protection covers a hook that replaces itself with `set_hook()`. A bare `std::function` copy would usually be small-buffer-optimized, but "usually" is not a guarantee the core can make about a caller's callback.
+
+**A throwing callback is swallowed, not converted to a Lua error.** Raising from the dispatch would longjmp over the live locals described above. Turning it into a script error would also make the hook a control channel — a diagnostic that can abort the program it is observing. Contained-and-continue matches the output handler's precedent, and `maxInstructions` / `cancel()` are the supported ways to stop a script.
+
+**Cancellation and the instruction budget stay tied to the count event.** They could plausibly be checked on line events too, which would make `cancel()` more responsive whenever a line hook happens to be installed. That was deliberately not done: cancellation semantics should not depend on whether someone attached a profiler.
+
+**No JS dispatch on a worker thread.** A hook fires wherever Lua runs, including the worker thread of `execute_script_async`, where calling into JavaScript is illegal. `DispatchDebugHook` returns early under `async_mode_`, the same rule the userdata / host-function GC callbacks and the output handler follow. Documented rather than papered over: worker-thread async is simply not traced.
+
+**`lua_getinfo` fetches `"nl"`, not the plan's `"nSl"`.** The reported tuple is `(event, line, name)`, so the `"S"` source fields would be gathered and discarded on every line event — the hottest path in the feature.
+
+**The hook is replayed by `reset()` and removed by `DetachRuntimeHandlers`.** It is a JS callback plus a mask and interval, exactly like the print handler, so replaying it costs one call. Removing it on teardown matters more: `lua_close` fires `__gc` metamethods, which run Lua code, which would fire a line hook into a context that is being destroyed.
+
+---
+
 ## State Introspection — `info()` (July 2026)
 
 ### Overview
@@ -1388,3 +1426,4 @@ Lua states cannot share memory — two `lua_State*`s have no common heap, and th
 | Environment tables (`create_environment()` / `execute_script_in()`) | Moderate | July 2026 |
 | Shared state between contexts (`createSharedTable()` + `shared` option) | Moderate | July 2026 |
 | State introspection (`info()` — version, memory, limits, libraries) | Low | July 2026 |
+| Debug hooks (`set_hook()` — line/call/return/count tracing) | Moderate | July 2026 |

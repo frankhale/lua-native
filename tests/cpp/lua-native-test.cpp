@@ -2953,6 +2953,281 @@ TEST(LuaRuntimeTableAPI, TableIPairsEmptyTable) {
   rt.ReleaseTableRef(ref);
 }
 
+// --- Debug Hook Tests ---
+
+namespace {
+// Records every hook event a runtime reports, for the assertions below.
+struct HookRecorder {
+  struct Event {
+    std::string event;
+    int line;
+    std::string name;
+  };
+  std::vector<Event> events;
+
+  [[nodiscard]] LuaRuntime::DebugHookCallback Callback() {
+    return [this](const std::string& event, int line, const std::string& name) {
+      events.push_back({event, line, name});
+    };
+  }
+
+  [[nodiscard]] size_t CountOf(const std::string& event) const {
+    size_t n = 0;
+    for (const auto& e : events) {
+      if (e.event == event) ++n;
+    }
+    return n;
+  }
+
+  [[nodiscard]] bool Has(const std::string& event) const {
+    return CountOf(event) > 0;
+  }
+};
+}  // namespace
+
+TEST(LuaRuntimeDebugHook, LineHookReportsEachLine) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKLINE);
+
+  auto res = rt.ExecuteScript("local a = 1\nlocal b = 2\nlocal c = a + b\nreturn c");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 3);
+
+  // One line event per source line of the chunk.
+  EXPECT_EQ(rec.CountOf("line"), 4u);
+  std::vector<int> lines;
+  for (const auto& e : rec.events) lines.push_back(e.line);
+  EXPECT_EQ(lines, (std::vector<int>{1, 2, 3, 4}));
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, CallAndReturnEventsFire) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKCALL | LUA_MASKRET);
+
+  (void)rt.ExecuteScript(
+    "local function inner() return 1 end\n"
+    "local x = inner()\n"
+    "return x");
+
+  EXPECT_TRUE(rec.Has("call"));
+  EXPECT_TRUE(rec.Has("return"));
+  // The named local is resolvable from the call site.
+  bool saw_named_call = false;
+  for (const auto& e : rec.events) {
+    if (e.event == "call" && e.name == "inner") saw_named_call = true;
+  }
+  EXPECT_TRUE(saw_named_call);
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, CountEventFiresAtTheRequestedInterval) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKCOUNT, /*count_interval=*/100);
+
+  (void)rt.ExecuteScript("local s = 0 for i = 1, 5000 do s = s + i end");
+
+  // Thousands of instructions at one event per 100 — the exact count depends on
+  // the VM, so assert the order of magnitude rather than a fixed number.
+  EXPECT_GT(rec.CountOf("count"), 20u);
+  EXPECT_EQ(rec.CountOf("line"), 0u);  // only the requested mask fires
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, RemoveStopsFurtherEvents) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKLINE);
+  (void)rt.ExecuteScript("local a = 1");
+  const size_t after_first = rec.events.size();
+  EXPECT_GT(after_first, 0u);
+
+  rt.RemoveDebugHook();
+  EXPECT_FALSE(rt.HasDebugHook());
+
+  (void)rt.ExecuteScript("local a = 1\nlocal b = 2\nlocal c = 3");
+  EXPECT_EQ(rec.events.size(), after_first);
+}
+
+TEST(LuaRuntimeDebugHook, DoesNotDisturbExecutionResults) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKLINE | LUA_MASKCALL | LUA_MASKRET);
+
+  auto res = rt.ExecuteScript(
+    "local t = {}\n"
+    "for i = 1, 10 do t[i] = i * 2 end\n"
+    "return t[10], 'ok'");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_EQ(std::get<int64_t>(vals[0]->value), 20);
+  EXPECT_EQ(std::get<std::string>(vals[1]->value), "ok");
+  EXPECT_GT(rec.events.size(), 0u);
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, ErrorsStillPropagateWithAHookInstalled) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKLINE);
+
+  auto res = rt.ExecuteScript("error('boom')");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("boom"), std::string::npos);
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, ThrowingHookIsContained) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int fired = 0;
+  rt.SetDebugHook([&fired](const std::string&, int, const std::string&) {
+    ++fired;
+    throw std::runtime_error("hook exploded");
+  }, LUA_MASKLINE);
+
+  // The exception must not unwind through Lua's C frames; the script completes.
+  auto res = rt.ExecuteScript("local a = 1\nreturn a + 1");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+  EXPECT_GT(fired, 0);
+
+  rt.RemoveDebugHook();
+  // ...and the state is still usable.
+  auto after = rt.ExecuteScript("return 7");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(after));
+}
+
+TEST(LuaRuntimeDebugHook, HookRemovingItselfMidDispatchIsSafe) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  int fired = 0;
+  // The shared_ptr the dispatcher holds must keep the callback alive while it
+  // destroys the runtime's own reference to it.
+  rt.SetDebugHook([&rt, &fired](const std::string&, int, const std::string&) {
+    ++fired;
+    rt.RemoveDebugHook();
+  }, LUA_MASKLINE);
+
+  (void)rt.ExecuteScript("local a = 1\nlocal b = 2\nlocal c = 3\nlocal d = 4");
+
+  EXPECT_EQ(fired, 1);  // removed itself on the first event
+  EXPECT_FALSE(rt.HasDebugHook());
+}
+
+TEST(LuaRuntimeDebugHook, CoexistsWithInstructionLimit) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 200000;
+  LuaRuntime rt(config);
+
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKCOUNT, /*count_interval=*/7);
+
+  // The limit is still enforced even though the debug hook asked for a much
+  // finer count interval (the two share one lua_sethook installation).
+  auto res = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"),
+            std::string::npos);
+  EXPECT_GT(rec.CountOf("count"), 0u);
+
+  // ...and removing the debug hook leaves the limit intact.
+  rt.RemoveDebugHook();
+  auto again = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(again));
+  EXPECT_NE(std::get<std::string>(again).find("instruction limit exceeded"),
+            std::string::npos);
+}
+
+TEST(LuaRuntimeDebugHook, LineHookDoesNotWeakenTheInstructionLimit) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 100000;
+  LuaRuntime rt(config);
+
+  HookRecorder rec;
+  // A line-only mask must not displace the count hook the limit relies on.
+  rt.SetDebugHook(rec.Callback(), LUA_MASKLINE);
+
+  auto res = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"),
+            std::string::npos);
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, CoroutinesCreatedAfterInstallInheritTheHook) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+  rt.SetDebugHook(rec.Callback(), LUA_MASKLINE);
+
+  auto fn = rt.ExecuteScript("return function() local a = 1 return a end");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fn));
+  const auto& fnVals = std::get<std::vector<LuaPtr>>(fn);
+  ASSERT_EQ(fnVals.size(), 1u);
+  const auto& funcRef = std::get<LuaFunctionRef>(fnVals[0]->value);
+
+  auto co = rt.CreateCoroutine(funcRef);
+  ASSERT_TRUE(std::holds_alternative<LuaThreadRef>(co));
+
+  const size_t before = rec.events.size();
+  auto result = rt.ResumeCoroutine(std::get<LuaThreadRef>(co), {});
+  EXPECT_EQ(result.status, CoroutineStatus::Dead);
+  EXPECT_GT(rec.events.size(), before);  // the thread inherited the hook
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, EmptyMaskOrNullCallbackRemovesTheHook) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder rec;
+
+  rt.SetDebugHook(rec.Callback(), 0);  // no events requested
+  EXPECT_FALSE(rt.HasDebugHook());
+
+  rt.SetDebugHook(nullptr, LUA_MASKLINE);  // no callback
+  EXPECT_FALSE(rt.HasDebugHook());
+
+  (void)rt.ExecuteScript("local a = 1\nlocal b = 2");
+  EXPECT_TRUE(rec.events.empty());
+
+  // A count mask with no interval would never fire; it is dropped rather than
+  // installed with a zero count.
+  rt.SetDebugHook(rec.Callback(), LUA_MASKCOUNT, /*count_interval=*/0);
+  (void)rt.ExecuteScript("local s = 0 for i = 1, 5000 do s = s + i end");
+  EXPECT_TRUE(rec.events.empty());
+
+  rt.RemoveDebugHook();
+}
+
+TEST(LuaRuntimeDebugHook, ReplacingAHookSwapsTheCallback) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  HookRecorder first;
+  HookRecorder second;
+
+  rt.SetDebugHook(first.Callback(), LUA_MASKLINE);
+  (void)rt.ExecuteScript("local a = 1");
+  const size_t after_first = first.events.size();
+  EXPECT_GT(after_first, 0u);
+
+  rt.SetDebugHook(second.Callback(), LUA_MASKLINE);
+  (void)rt.ExecuteScript("local a = 1\nlocal b = 2");
+
+  EXPECT_EQ(first.events.size(), after_first);  // the old callback is detached
+  EXPECT_GT(second.events.size(), 0u);
+
+  rt.RemoveDebugHook();
+}
+
 // --- State Introspection Tests ---
 
 TEST(LuaRuntimeIntrospection, ReportsLuaVersion) {

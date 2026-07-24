@@ -80,7 +80,9 @@ so this document stands alone:
   `lua-runtime.cpp`)
 - ~~GC control, context reset (Tier 2), state introspection (Tier 3)~~ —
   **done** (July 23–24, 2026: `gc()`, `reset()`, and `info()`)
-- Debug hooks (`lua_sethook`) (Tier 3) — still open
+- ~~Debug hooks (`lua_sethook`) (Tier 3)~~ — **done** (July 24, 2026:
+  `set_hook()` / `remove_hook()`, sharing one hook installation with the
+  instruction limit and `cancel()`)
 - ~~Environment tables / per-script `_ENV` sandboxing (Tier 3)~~ — **done**
   (July 24, 2026: `create_environment()` / `execute_script_in()`)
 - ~~Reference lifecycle management / explicit `release()` (Tier 3)~~ — **done**
@@ -430,9 +432,10 @@ binding) are **complete**. What remains, in order:
 3. **Interop polish, by demand:** B3 (Lua→JS converters), A4 (iterators +
    coroutine-from-function), F1 (metatables on handles). Each is small and
    independent.
-4. **Defer until requested:** C4 (inheritance), F2, A5, debug hooks, and the
-   `FUTURE.md` Tier 4 items. ~~Environment tables / F3~~ *(Done — July 24,
-   2026: `create_environment()` + `execute_script_in()`.)*
+4. **Defer until requested:** C4 (inheritance), F2, A5, and the `FUTURE.md`
+   Tier 4 items. ~~Environment tables / F3~~ *(Done — July 24, 2026:
+   `create_environment()` + `execute_script_in()`.)* ~~Debug hooks~~ *(Done —
+   July 24, 2026: `set_hook()`.)*
 
 ---
 

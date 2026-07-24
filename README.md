@@ -36,6 +36,7 @@ data structures.
 - Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
 - State introspection — `info()` returns a diagnostics snapshot: Lua version, current memory, configured limits, and loaded libraries
+- Debug hooks — trace Lua execution from JavaScript with `set_hook()` (line, call, return, and instruction-count events) for profilers and debugger integrations
 - GC control — trigger, pause, step, and tune Lua's collector from JavaScript with `gc()`, using Lua's own `collectgarbage` command vocabulary
 - Execution limits — cap Lua VM instructions with `maxInstructions` option so infinite loops abort instead of hanging
 - Coroutine support with yield/resume semantics
@@ -667,6 +668,103 @@ const sandbox = new lua_native.init({}, {
   maxInstructions: 1_000_000,
 });
 ```
+
+### Debug Hooks
+
+`set_hook()` exposes Lua's `lua_sethook` to JavaScript: a callback that fires as
+the script runs, reporting lines, calls, returns, or instruction counts. It's
+the building block for profilers, tracers, and debugger integrations.
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+lua.set_hook((event, line, name) => {
+  console.log(`${event} at line ${line}${name ? ` in ${name}` : ""}`);
+}, { call: true, line: true });
+
+lua.execute_script(`
+  local function add(a, b)
+    return a + b
+  end
+  return add(1, 2)
+`);
+
+lua.remove_hook();
+```
+
+The callback receives `(event, line, name)`:
+
+| Argument | Meaning |
+| --- | --- |
+| `event` | `'call'`, `'tail call'`, `'return'`, `'line'`, or `'count'` |
+| `line` | Current source line, or `-1` where Lua has no line information |
+| `name` | The function's name if Lua can infer one from the call site, else `''` |
+
+Request events with the options object — at least one is required:
+
+```javascript
+lua.set_hook(fn, { line: true });    // every source line (most detailed, slowest)
+lua.set_hook(fn, { call: true });    // function entry ('call' and 'tail call')
+lua.set_hook(fn, { return: true });  // function exit
+lua.set_hook(fn, { count: 10_000 }); // every N VM instructions
+```
+
+#### Sampling Profiler
+
+`count` is the option to reach for when tracing whole programs — it samples
+instead of reporting everything, so the overhead stays bounded:
+
+```javascript
+const samples = new Map();
+
+lua.set_hook((_event, line) => {
+  samples.set(line, (samples.get(line) ?? 0) + 1);
+}, { count: 10_000 });
+
+lua.execute_file("./workload.lua");
+lua.remove_hook();
+
+const hottest = [...samples].sort((a, b) => b[1] - a[1]).slice(0, 10);
+console.log("Hottest lines:", hottest);
+```
+
+#### Tracing Until a Condition
+
+Calling `remove_hook()` from inside the callback is safe and is the usual way
+to trace only as far as you need:
+
+```javascript
+lua.set_hook((event, line) => {
+  console.log(event, line);
+  if (line >= 100) lua.remove_hook();
+}, { line: true });
+```
+
+#### What to Know Before Using It
+
+- **`line` is expensive.** It crosses into JavaScript for every source line
+  executed, which slows a script by orders of magnitude. Use `count` with a
+  coarse interval for anything long-running.
+- **A throwing callback is swallowed.** The hook is a diagnostic channel, not a
+  control one — an exception can't be allowed to unwind through Lua's C frames,
+  so it's contained and execution continues. To stop a running script, use
+  `maxInstructions` or `cancel()`.
+- **Coroutines inherit the hook at creation.** It's installed on the main state
+  and copied into coroutine threads created *afterwards*, so set it before
+  creating the coroutines you want traced — the same rule as `maxInstructions`.
+- **Worker-thread async is not traced.** `execute_script_async` /
+  `execute_file_async` run Lua on a worker thread, where calling into
+  JavaScript is not permitted, so the hook doesn't fire there. `execute_async`
+  (main thread) traces normally.
+- **It coexists with `maxInstructions` and `cancel()`.** All three share one
+  underlying `lua_sethook` installation, and the masks are combined — so
+  setting or removing a debug hook never disables the limit or cancellation,
+  and a `count` interval finer than the limit's own still works.
+
+Re-entering Lua from the hook is allowed — Lua disables the hook while it runs,
+so `lua.execute_script(...)` inside a callback won't recurse.
 
 ### Module / Require Integration
 
@@ -1894,6 +1992,7 @@ import type {
   ClassDefinition,
   CompileOptions,
   EnvironmentOptions,
+  HookOptions,
   LuaCoroutine,
   LuaEnvironment,
   LuaInitOptions,
@@ -2380,6 +2479,42 @@ the fully-formatted output text. Pass `null` to restore output to stdout.
 **Parameters:**
 
 - `handler`: `((text: string) => void) | null`
+
+### `LuaContext.set_hook(callback, options)`
+
+Installs a debug hook (`lua_sethook`) that reports execution events to a JS
+callback. Setting a hook replaces any previous one. See
+[Debug Hooks](#debug-hooks) for the caveats that matter in practice.
+
+**Parameters:**
+
+- `callback`: `(event, line, name) => void`
+  - `event`: `'call'` | `'tail call'` | `'return'` | `'line'` | `'count'`
+  - `line`: current source line, or `-1` where Lua has no line information
+  - `name`: the function's name if Lua can infer one, otherwise `''`
+- `options`: which events to fire on — at least one is required
+  - `call` (optional): fire on function entry (`'call'` and `'tail call'`)
+  - `return` (optional): fire on function return
+  - `line` (optional): fire on each new source line — the most expensive option
+  - `count` (optional): fire every N VM instructions (positive integer)
+
+**Throws:** `TypeError` if the callback is not a function, the options object is
+missing, or no event is requested; `RangeError` if `count` is not a positive
+integer; Error if an async operation is in flight.
+
+**Notes:** An exception thrown by the callback is swallowed. Hooks do not fire
+during worker-thread async execution (`execute_script_async` /
+`execute_file_async`). Coroutines inherit the hook only if created after it was
+installed. Shares one `lua_sethook` installation with `maxInstructions` and
+`cancel()`, which keep working regardless.
+
+### `LuaContext.remove_hook()`
+
+Removes the debug hook installed by `set_hook()`. Safe to call when no hook is
+set, and safe to call from inside the hook callback. `maxInstructions` and
+`cancel()` are unaffected.
+
+**Throws:** Error if an async operation is in flight.
 
 ### `LuaContext.set_global(name, value)`
 

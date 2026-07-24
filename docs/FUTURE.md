@@ -23,7 +23,7 @@ workarounds rank lowest.
 | 2 | ~~Context Reset~~ | Completed | `lua.reset()` replaces the state and replays callbacks, print handler, `allowBytecode`, and search paths (July 23, 2026) |
 | — | ~~Table Reference API~~ | Completed | Universal in bridges (7/7); workaround: `execute_script` |
 | 3 | ~~Environment Tables~~ | Completed | `create_environment()` / `execute_script_in()` give each script its own `_ENV` (July 24, 2026) |
-| 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
+| 3 | ~~Debug Hooks~~ | Completed | `set_hook()` / `remove_hook()`, sharing one `lua_sethook` with the instruction limit (July 24, 2026) |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
 | 3 | ~~State Introspection~~ | Completed | `info()` reports version, memory, limits, and loaded libraries (July 24, 2026) |
 | 3 | ~~Reference Lifecycle Management~~ | Completed | `LuaTableHandle.release()` (July 2026) plus context-level `release(value)` for function, coroutine, and table refs (July 23, 2026) |
@@ -360,7 +360,48 @@ short of wrapping every call in `xpcall` from Lua.
 
 ## Tier 3 — Developer Tooling
 
-### Debug Hooks
+### ~~Debug Hooks~~ (Completed — July 24, 2026)
+
+Implemented as planned, with the shared-`lua_sethook` concern the plan flagged
+("if both features are active, combine the hook masks and dispatch
+accordingly") handled as the central design problem rather than an afterthought.
+
+**As built:**
+- `lua.set_hook(callback, { call?, return?, line?, count? })` and
+  `lua.remove_hook()`. The callback receives `(event, line, name)`, where
+  `event` is `'call'`, `'tail call'`, `'return'`, `'line'`, or `'count'`.
+  At least one event must be requested; `count` must be a positive integer.
+- **One hook, masks combined.** Lua allows a single hook function, mask, and
+  count interval per state, and the instruction limit / `cancel()` already
+  owned it. `InstallExecutionHook()` is now the single install point: it ORs
+  the masks, installs the *finer* of the two count intervals, and each
+  consumer tallies up to its own granularity. Setting or removing a debug hook
+  never disables `maxInstructions` or `cancel()`, and a `{ count: 7 }` hook
+  alongside a 200k instruction limit gets both right.
+- **The dispatch never raises.** The budget/cancel checks (which longjmp) run
+  first, while no non-trivial C++ locals are live; the debug dispatch runs
+  after, and everything the callback throws is contained. `lua_getinfo` is
+  called with `"nl"` — no stack push, so it cannot error, and the unused `"S"`
+  source fields aren't gathered on the hot line path.
+- **A hook may remove or replace itself.** "Trace until X" is the obvious
+  pattern, so the callback is held behind a `shared_ptr` that the dispatcher
+  copies before invoking — destroying the runtime's reference mid-call is safe.
+- **Not traced on a worker thread.** `execute_script_async` /
+  `execute_file_async` run Lua where N-API calls are illegal, so the dispatch
+  returns early under `async_mode_` (the rule the GC callbacks and output
+  handler already follow). `execute_async` (main thread) traces normally.
+- Coroutines inherit the hook at creation, so it must be set before the
+  coroutines you want traced — the same caveat as `maxInstructions`.
+- `reset()` re-arms the hook on the fresh state; `DetachRuntimeHandlers`
+  removes it from the outgoing one, so a `__gc` metamethod running during
+  `lua_close` can't call into a context being torn down.
+
+**Core** (`lua-runtime.h/.cpp`): `SetDebugHook` / `RemoveDebugHook`,
+`ExecutionHook` (the merged hook function, formerly `InstructionCountHook`),
+`DispatchDebugHook`. **N-API** (`lua-native.cpp`): `SetHook` / `RemoveHook` /
+`InstallDebugHook`. See `FEATURES.md` for the design decisions.
+
+The original design notes follow for reference.
 
 Expose `lua_sethook` for line/call/return tracing from JS:
 

@@ -760,6 +760,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("register_class", &LuaContext::RegisterClass),
     InstanceMethod("pcall", &LuaContext::Pcall),
     InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
+    InstanceMethod("set_hook", &LuaContext::SetHook),
+    InstanceMethod("remove_hook", &LuaContext::RemoveHook),
     InstanceMethod("add_searcher", &LuaContext::AddSearcher),
     InstanceMethod("release", &LuaContext::Release),
     InstanceMethod("reset", &LuaContext::Reset),
@@ -1011,6 +1013,9 @@ void LuaContext::DetachRuntimeHandlers() const {
   runtime->SetHostFunctionGCCallback(nullptr);
   runtime->SetPropertyHandlers(nullptr, nullptr);
   runtime->SetOutputHandler(nullptr);
+  // lua_close fires __gc metamethods, which run Lua code — a line hook would
+  // otherwise call into a context that is being torn down or repopulated.
+  runtime->RemoveDebugHook();
 }
 
 void LuaContext::RegisterCallbacks(const Napi::Object& callbacks) {
@@ -2832,6 +2837,14 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
     }
   }
 
+  // Re-arm the debug hook on the fresh state. Like the print handler, it is a
+  // JS callback plus a little configuration, so replaying it is straightforward
+  // — and DetachRuntimeHandlers has just removed it from the outgoing runtime.
+  if (!debug_hook_.IsEmpty()) {
+    const Napi::Function hook = debug_hook_.Value();
+    InstallDebugHook(hook, debug_hook_mask_, debug_hook_count_);
+  }
+
   // Re-publish the shared globals. Unlike modules and userdata — whose Lua-side
   // objects die with the old state — a shared table's value lives in JS, so
   // replaying it is just another push. The subscription itself is untouched:
@@ -2873,6 +2886,120 @@ void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
     }
   });
   print_handler_ = Napi::Persistent(fn);
+}
+
+// Arms the runtime-side debug hook to bridge into this context's JS callback.
+// Shared by set_hook and reset(), which must re-arm it on the new state.
+void LuaContext::InstallDebugHook(const Napi::Function& fn, const int mask,
+                                  const int count) {
+  runtime->SetDebugHook(
+    [this](const std::string& event, int line, const std::string& name) {
+      if (debug_hook_.IsEmpty()) return;
+      // This runs inside Lua's execution, between VM instructions. Lua is built
+      // as C, so a C++ exception must not unwind through it — the core contains
+      // whatever escapes, and the per-event handles are scoped so a hot line
+      // hook doesn't accumulate them.
+      Napi::HandleScope scope(env);
+      try {
+        debug_hook_.Call({
+          Napi::String::New(env, event),
+          Napi::Number::New(env, line),
+          Napi::String::New(env, name)
+        });
+      } catch (const Napi::Error&) {
+        // A throwing hook is swallowed rather than corrupting the VM.
+      }
+    }, mask, count);
+
+  debug_hook_ = Napi::Persistent(fn);
+  debug_hook_mask_ = mask;
+  debug_hook_count_ = count;
+}
+
+// set_hook(callback, options) — trace Lua execution via lua_sethook.
+//
+//   { call: true }        -> "call" / "tail call" events
+//   { return: true }      -> "return" events
+//   { line: true }        -> "line" events (one per source line executed)
+//   { count: 1000 }       -> "count" events every N VM instructions
+//
+// The callback receives (event, line, name). At least one event must be
+// requested. The hook shares its lua_sethook installation with `maxInstructions`
+// and `cancel()`, so setting or removing it never disturbs those.
+Napi::Value LuaContext::SetHook(const Napi::CallbackInfo& info) {
+  // A worker thread owns the state during async execution; re-installing the
+  // hook underneath it would mutate state it is actively reading.
+  if (RejectIfBusy()) return env.Undefined();
+
+  if (info.Length() < 1 || !info[0].IsFunction()) {
+    Napi::TypeError::New(env, "set_hook(callback, options) requires a function")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 2 || !info[1].IsObject() || info[1].IsArray() ||
+      info[1].IsFunction()) {
+    Napi::TypeError::New(env,
+      "set_hook(callback, options) requires an options object "
+      "({ call?, return?, line?, count? })")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto options = info[1].As<Napi::Object>();
+  const auto flag = [&options](const char* key) {
+    if (!options.Has(key)) return false;
+    const Napi::Value v = options.Get(key);
+    return !v.IsUndefined() && !v.IsNull() && v.ToBoolean().Value();
+  };
+
+  int mask = 0;
+  if (flag("call")) mask |= LUA_MASKCALL;
+  if (flag("return")) mask |= LUA_MASKRET;
+  if (flag("line")) mask |= LUA_MASKLINE;
+
+  int count = 0;
+  if (options.Has("count")) {
+    const Napi::Value countVal = options.Get("count");
+    if (!countVal.IsUndefined() && !countVal.IsNull()) {
+      if (!countVal.IsNumber()) {
+        Napi::TypeError::New(env, "set_hook(): count must be a number")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      const double raw = countVal.As<Napi::Number>().DoubleValue();
+      if (!(raw >= 1) || raw != std::trunc(raw) ||
+          raw > static_cast<double>(std::numeric_limits<int>::max())) {
+        Napi::RangeError::New(env,
+          "set_hook(): count must be a positive integer")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      count = static_cast<int>(raw);
+      mask |= LUA_MASKCOUNT;
+    }
+  }
+
+  if (mask == 0) {
+    Napi::TypeError::New(env,
+      "set_hook(): at least one of call, return, line, or count must be requested")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  InstallDebugHook(info[0].As<Napi::Function>(), mask, count);
+  return env.Undefined();
+}
+
+// remove_hook() — stop tracing. A no-op when no hook is set. The instruction
+// limit's own use of lua_sethook survives (the core re-installs it).
+Napi::Value LuaContext::RemoveHook(const Napi::CallbackInfo& /*info*/) {
+  if (RejectIfBusy()) return env.Undefined();
+
+  runtime->RemoveDebugHook();
+  debug_hook_.Reset();
+  debug_hook_mask_ = 0;
+  debug_hook_count_ = 0;
+  return env.Undefined();
 }
 
 Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {

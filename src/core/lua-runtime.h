@@ -544,6 +544,35 @@ public:
   void SetMaxInstructions(size_t limit);
   [[nodiscard]] size_t GetMaxInstructions() const { return max_instructions_; }
 
+  // Debug hooks (lua_sethook): line / call / return / count tracing, for
+  // profilers and debugger integrations.
+  //
+  // The callback receives the event name ("call", "tail call", "return",
+  // "line", or "count"), the current line (-1 where Lua has no line info), and
+  // the function's name if Lua can determine one (empty otherwise).
+  using DebugHookCallback = std::function<void(const std::string& event,
+                                               int line,
+                                               const std::string& name)>;
+
+  // `mask` is Lua's own LUA_MASKCALL / LUA_MASKRET / LUA_MASKLINE /
+  // LUA_MASKCOUNT bit set. `count_interval` is the instruction granularity for
+  // LUA_MASKCOUNT and is ignored otherwise; a LUA_MASKCOUNT with no positive
+  // interval is dropped, since a count hook that never fires is not a hook.
+  //
+  // The debug hook shares one lua_sethook installation with the instruction
+  // limit — the masks are OR'd and, when both want the count event, the finer
+  // interval wins and each consumer tallies up to its own granularity. So
+  // installing a debug hook never disables `maxInstructions` or `cancel()`, and
+  // removing one never disables them either.
+  //
+  // Like the instruction limit, this is installed on the main state and
+  // inherited by coroutine threads created *afterwards* (lua_newthread copies
+  // the parent's hook), so set it before creating the coroutines you want
+  // traced.
+  void SetDebugHook(DebugHookCallback cb, int mask, int count_interval = 0);
+  void RemoveDebugHook();
+  [[nodiscard]] bool HasDebugHook() const { return debug_hook_ != nullptr; }
+
   [[nodiscard]] lua_State* RawState() const { return L_; }
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
@@ -637,12 +666,26 @@ private:
   mutable size_t instruction_count_ = 0;    // instructions run this execution
   int instruction_hook_interval_ = 1000;    // count-hook firing granularity
 
+  // Debug hook state (see SetDebugHook). The callback lives behind a shared_ptr
+  // so a dispatch in flight can hold it alive: a hook that calls set_hook or
+  // remove_hook from inside itself — "stop tracing after this event" is the
+  // obvious use — would otherwise destroy the std::function mid-call.
+  std::shared_ptr<DebugHookCallback> debug_hook_;
+  int debug_hook_mask_ = 0;                 // LUA_MASK* bits requested
+  int debug_count_interval_ = 0;            // requested "count" granularity
+  mutable size_t debug_count_tally_ = 0;    // instructions since the last one
+
   void InitState();
-  // Installs or removes the count-hook on L_ to reflect max_instructions_.
-  // Newly created coroutine threads inherit the hook from L_ (lua_newthread
-  // copies the parent's hook), so a single install covers all threads.
+  // Installs or removes the hook on L_ to reflect max_instructions_ and the
+  // debug hook together — see SetDebugHook for how the two share one
+  // installation. Newly created coroutine threads inherit the hook from L_
+  // (lua_newthread copies the parent's hook), so a single install covers every
+  // thread created after it.
   void InstallExecutionHook();
-  static void InstructionCountHook(lua_State* L, lua_Debug* ar);
+  // The single lua_sethook entry point: enforces the instruction budget and
+  // cancellation, then dispatches to the user's debug hook.
+  static void ExecutionHook(lua_State* L, lua_Debug* ar);
+  void DispatchDebugHook(lua_State* L, lua_Debug* ar) const;
   static int LibraryMask(const std::vector<std::string>& libraries);
   bool HasPackageLibrary() const;
   static void* LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize);

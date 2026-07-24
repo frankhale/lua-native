@@ -3481,6 +3481,329 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // DEBUG HOOKS
+  // ============================================
+  describe('debug hooks - lua.set_hook()', () => {
+    /** Collects (event, line, name) triples from a hook. */
+    const recorder = () => {
+      const events: Array<[string, number, string]> = [];
+      const hook = (event: string, line: number, name: string) => {
+        events.push([event, line, name]);
+      };
+      return { events, hook, of: (e: string) => events.filter(([ev]) => ev === e) };
+    };
+
+    describe('line events', () => {
+      it('fires once per source line with the right line numbers', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { line: true });
+
+        lua.execute_script('local a = 1\nlocal b = 2\nlocal c = a + b\nreturn c');
+        lua.remove_hook();
+
+        expect(rec.of('line').map(([, line]) => line)).toEqual([1, 2, 3, 4]);
+      });
+
+      it('does not disturb the script result', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { line: true });
+
+        expect(lua.execute_script('local t = {}\nfor i = 1, 10 do t[i] = i * 2 end\nreturn t[10]'))
+          .toBe(20);
+        expect(rec.events.length).toBeGreaterThan(0);
+        lua.remove_hook();
+      });
+
+      it('leaves script errors intact', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { line: true });
+
+        expect(() => lua.execute_script("error('boom')")).toThrow('boom');
+        lua.remove_hook();
+      });
+    });
+
+    describe('call and return events', () => {
+      it('fires call and return around a function call', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { call: true, return: true });
+
+        lua.execute_script('local function inner() return 1 end\nlocal x = inner()\nreturn x');
+        lua.remove_hook();
+
+        expect(rec.of('call').length).toBeGreaterThan(0);
+        expect(rec.of('return').length).toBeGreaterThan(0);
+      });
+
+      it('reports the function name when Lua can determine one', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { call: true });
+
+        lua.execute_script('function greet() end\nlocal a = greet()\nlocal b = math.floor(1.5)');
+        lua.remove_hook();
+
+        const names = rec.of('call').map(([, , name]) => name);
+        expect(names).toContain('greet');
+        expect(names).toContain('floor');
+      });
+
+      it('reports a tail call as its own event', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { call: true });
+
+        lua.execute_script('local function inner() return 1 end\nlocal function outer() return inner() end\nreturn outer()');
+        lua.remove_hook();
+
+        expect(rec.of('tail call').length).toBeGreaterThan(0);
+      });
+    });
+
+    describe('count events', () => {
+      it('fires at roughly the requested instruction interval', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { count: 100 });
+
+        lua.execute_script('local s = 0 for i = 1, 5000 do s = s + i end');
+        lua.remove_hook();
+
+        // Thousands of instructions at one event per 100. The exact number is a
+        // VM detail, so assert the order of magnitude.
+        expect(rec.of('count').length).toBeGreaterThan(20);
+        expect(rec.of('line').length).toBe(0);  // only the requested mask fires
+      });
+
+      it('rejects a non-positive or non-integer count', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.set_hook(() => {}, { count: 0 })).toThrow('positive integer');
+        expect(() => lua.set_hook(() => {}, { count: -5 })).toThrow('positive integer');
+        expect(() => lua.set_hook(() => {}, { count: 1.5 })).toThrow('positive integer');
+        expect(() => lua.set_hook(() => {}, { count: 'many' as any })).toThrow('must be a number');
+      });
+    });
+
+    describe('remove_hook()', () => {
+      it('stops further events', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { line: true });
+        lua.execute_script('local a = 1');
+        const afterFirst = rec.events.length;
+        expect(afterFirst).toBeGreaterThan(0);
+
+        lua.remove_hook();
+        lua.execute_script('local a = 1\nlocal b = 2\nlocal c = 3');
+
+        expect(rec.events.length).toBe(afterFirst);
+      });
+
+      it('is a no-op when no hook is set', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.remove_hook()).not.toThrow();
+        expect(() => lua.remove_hook()).not.toThrow();
+      });
+
+      it('can be called from inside the hook itself', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        let fired = 0;
+        // The obvious "trace until X" pattern — it must not destroy the
+        // callback that is currently executing.
+        lua.set_hook(() => { fired++; lua.remove_hook(); }, { line: true });
+
+        lua.execute_script('local a = 1\nlocal b = 2\nlocal c = 3\nlocal d = 4');
+
+        expect(fired).toBe(1);
+      });
+    });
+
+    describe('replacing a hook', () => {
+      it('detaches the previous callback', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const first = recorder();
+        const second = recorder();
+
+        lua.set_hook(first.hook, { line: true });
+        lua.execute_script('local a = 1');
+        const afterFirst = first.events.length;
+
+        lua.set_hook(second.hook, { line: true });
+        lua.execute_script('local a = 1\nlocal b = 2');
+
+        expect(first.events.length).toBe(afterFirst);
+        expect(second.events.length).toBeGreaterThan(0);
+        lua.remove_hook();
+      });
+
+      it('can be called from inside the hook itself', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        let firstFired = 0;
+        let secondFired = 0;
+        lua.set_hook(() => {
+          firstFired++;
+          lua.set_hook(() => { secondFired++; }, { line: true });
+        }, { line: true });
+
+        lua.execute_script('local a = 1\nlocal b = 2\nlocal c = 3');
+        lua.remove_hook();
+
+        expect(firstFired).toBe(1);
+        expect(secondFired).toBeGreaterThan(0);
+      });
+    });
+
+    describe('argument validation', () => {
+      it('requires a function callback', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua.set_hook as any)()).toThrow('requires a function');
+        expect(() => (lua.set_hook as any)('not a function', { line: true }))
+          .toThrow('requires a function');
+      });
+
+      it('requires an options object', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => (lua.set_hook as any)(() => {})).toThrow('requires an options object');
+        expect(() => (lua.set_hook as any)(() => {}, 'line')).toThrow('requires an options object');
+        expect(() => (lua.set_hook as any)(() => {}, ['line'])).toThrow('requires an options object');
+      });
+
+      it('requires at least one event', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.set_hook(() => {}, {})).toThrow('at least one of call, return, line, or count');
+        expect(() => lua.set_hook(() => {}, { line: false, call: false }))
+          .toThrow('at least one of call, return, line, or count');
+      });
+    });
+
+    describe('interaction with other features', () => {
+      it('swallows an exception thrown by the hook', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        let fired = 0;
+        lua.set_hook(() => { fired++; throw new Error('boom from hook'); }, { line: true });
+
+        // The hook is a diagnostic channel: a throwing callback must not
+        // corrupt the VM or surface as a script error.
+        expect(lua.execute_script('local a = 1\nreturn a + 1')).toBe(2);
+        expect(fired).toBeGreaterThan(0);
+
+        lua.remove_hook();
+        expect(lua.execute_script('return 7')).toBe(7);
+      });
+
+      it('allows the hook to run Lua re-entrantly', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        let inner: unknown = null;
+        // Lua disables the hook while it runs, so this does not recurse.
+        lua.set_hook(() => { inner = lua.execute_script('return 40 + 2'); }, { line: true });
+
+        expect(lua.execute_script('return 1')).toBe(1);
+        lua.remove_hook();
+        expect(inner).toBe(42);
+      });
+
+      it('keeps maxInstructions enforced', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', maxInstructions: 200_000 });
+        const rec = recorder();
+        // A count interval far finer than the limit's own — the two share one
+        // lua_sethook installation.
+        lua.set_hook(rec.hook, { count: 7 });
+
+        expect(() => lua.execute_script('while true do end')).toThrow(/instruction limit exceeded/);
+        expect(rec.of('count').length).toBeGreaterThan(0);
+
+        // ...and removing the hook leaves the limit intact.
+        lua.remove_hook();
+        expect(() => lua.execute_script('while true do end')).toThrow(/instruction limit exceeded/);
+      });
+
+      it('does not weaken maxInstructions with a line-only mask', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', maxInstructions: 100_000 });
+        lua.set_hook(() => {}, { line: true });
+
+        expect(() => lua.execute_script('while true do end')).toThrow(/instruction limit exceeded/);
+        lua.remove_hook();
+      });
+
+      it('traces coroutines created after the hook is installed', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { line: true });
+
+        const co = lua.create_coroutine('return function() local a = 1 coroutine.yield(a) return a + 1 end');
+        const before = rec.events.length;
+        lua.resume(co);
+        lua.remove_hook();
+
+        expect(rec.events.length).toBeGreaterThan(before);
+      });
+
+      it('does not fire into JS during worker-thread async execution', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        let hits = 0;
+        lua.set_hook(() => hits++, { line: true });
+
+        // execute_script_async runs Lua on a worker thread, where calling into
+        // JavaScript is not permitted.
+        const result = await lua.execute_script_async(
+          'local s = 0 for i = 1, 200000 do s = s + i end return s');
+
+        expect(result).toBe(20000100000);
+        expect(hits).toBe(0);
+
+        // The hook is still live for main-thread execution.
+        lua.execute_script('local a = 1');
+        expect(hits).toBeGreaterThan(0);
+        lua.remove_hook();
+      });
+
+      it('rejects set_hook and remove_hook while an async op is in flight', async () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const pending = lua.execute_script_async(
+          'local s = 0 for i = 1, 3000000 do s = s + i end return s');
+
+        expect(() => lua.set_hook(() => {}, { line: true })).toThrow('busy with an async operation');
+        expect(() => lua.remove_hook()).toThrow('busy with an async operation');
+
+        await pending;
+        expect(() => lua.set_hook(() => {}, { line: true })).not.toThrow();
+        lua.remove_hook();
+      });
+
+      it('re-arms the hook after reset()', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        lua.set_hook(rec.hook, { line: true });
+
+        lua.reset();
+        rec.events.length = 0;
+        lua.execute_script('local a = 1\nlocal b = 2');
+
+        // Like the print handler, the hook is a JS callback plus configuration,
+        // so a reset replays it onto the fresh state.
+        expect(rec.of('line').length).toBe(2);
+        lua.remove_hook();
+      });
+
+      it('traces a script running in an environment table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const rec = recorder();
+        const env = lua.create_environment({ whitelist: ['math'] });
+        lua.set_hook(rec.hook, { line: true });
+
+        lua.execute_script_in(env, 'local a = math.floor(1.5)\nreturn a');
+        lua.remove_hook();
+
+        expect(rec.of('line').length).toBe(2);
+      });
+    });
+  });
+
+  // ============================================
   // STATE INTROSPECTION
   // ============================================
   describe('state introspection - lua.info()', () => {

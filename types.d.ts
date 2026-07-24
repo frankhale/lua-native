@@ -251,6 +251,58 @@ export interface LuaTableHandle {
 }
 
 /**
+ * The kind of event a {@link LuaHookCallback} was fired for.
+ *
+ * - `'call'` — a function was entered
+ * - `'tail call'` — a function was entered by a tail call (`return f()`);
+ *   Lua reports these separately and no matching `'return'` event follows
+ * - `'return'` — a function returned
+ * - `'line'` — a new source line is about to execute
+ * - `'count'` — the requested number of VM instructions has elapsed
+ */
+export type LuaHookEvent = 'call' | 'tail call' | 'return' | 'line' | 'count';
+
+/**
+ * Receives one debug-hook event.
+ *
+ * @param event What happened — see {@link LuaHookEvent}
+ * @param line The current source line, or `-1` where Lua has no line
+ *   information (a C function, or a stripped chunk)
+ * @param name The function's name if Lua can determine one, otherwise `''`.
+ *   Lua infers names from the call site, so an anonymous function, a tail call,
+ *   or a main chunk usually reports `''`.
+ */
+export type LuaHookCallback = (
+  event: LuaHookEvent,
+  line: number,
+  name: string
+) => void;
+
+/**
+ * Which events a debug hook fires on. At least one must be requested.
+ */
+export interface HookOptions {
+  /** Fire on function entry (`'call'` and `'tail call'` events). */
+  call?: boolean;
+
+  /** Fire on function return (`'return'` events). */
+  return?: boolean;
+
+  /** Fire on each new source line (`'line'` events). The most expensive option. */
+  line?: boolean;
+
+  /**
+   * Fire a `'count'` event every N Lua VM instructions. Must be a positive
+   * integer.
+   *
+   * When `maxInstructions` is also set, both share one underlying hook: the
+   * finer interval is installed and each is tallied to its own granularity, so
+   * the event still arrives every N instructions as requested.
+   */
+  count?: number;
+}
+
+/**
  * A diagnostics snapshot of a Lua context, returned by
  * {@link LuaContext.info}.
  */
@@ -799,6 +851,65 @@ export interface LuaContext {
    * lua.set_print_handler(null); // back to stdout
    */
   set_print_handler(handler?: ((text: string) => void) | null): void;
+
+  /**
+   * Installs a debug hook (`lua_sethook`) that reports execution events to a
+   * JavaScript callback — the building block for profilers, tracers, and
+   * debugger integrations.
+   *
+   * Setting a hook replaces any previous one. Call {@link remove_hook} to stop
+   * tracing; calling it from inside the callback itself is safe and is the
+   * usual way to trace only until some condition is met.
+   *
+   * **Cost.** `line` fires for every source line executed and crosses into JS
+   * each time, which slows scripts down by orders of magnitude. Prefer `count`
+   * with a coarse interval for sampling profilers.
+   *
+   * **Coroutines.** The hook is installed on the main state and inherited by
+   * coroutine threads created *afterwards*, so set it before creating the
+   * coroutines you want traced (the same rule as `maxInstructions`).
+   *
+   * **Async.** Hooks do not fire into JS during `execute_script_async` /
+   * `execute_file_async`, which run Lua on a worker thread where calling
+   * JavaScript is not permitted. Use `execute_async` (main thread) if you need
+   * tracing with async.
+   *
+   * **Errors.** An exception thrown by the callback is swallowed rather than
+   * corrupting the VM — the hook is a diagnostic channel, not a control one.
+   * Use `maxInstructions` or `cancel()` to stop a running script.
+   *
+   * Coexists with `maxInstructions` and `cancel()`: they share one underlying
+   * hook, so setting or removing a debug hook never disturbs them.
+   *
+   * @param callback Receives `(event, line, name)` for each event
+   * @param options Which events to fire on — at least one is required
+   * @throws If the callback is not a function, no event is requested, `count`
+   *   is not a positive integer, or an async operation is in flight
+   * @example
+   * lua.set_hook((event, line) => {
+   *   console.log(`${event} at line ${line}`);
+   * }, { call: true, line: true });
+   *
+   * lua.execute_script(myScript);
+   * lua.remove_hook();
+   *
+   * @example
+   * // Sampling profiler: a count event every 10,000 instructions
+   * const samples = new Map<number, number>();
+   * lua.set_hook((_event, line) => {
+   *   samples.set(line, (samples.get(line) ?? 0) + 1);
+   * }, { count: 10_000 });
+   */
+  set_hook(callback: LuaHookCallback, options: HookOptions): void;
+
+  /**
+   * Removes the debug hook installed by {@link set_hook}. Safe to call when no
+   * hook is set, and safe to call from inside the hook callback.
+   *
+   * `maxInstructions` and `cancel()` are unaffected — they use the same
+   * underlying hook and keep working.
+   */
+  remove_hook(): void;
 
   /**
    * Adds a module searcher backed by JavaScript, enabling dynamic/virtual

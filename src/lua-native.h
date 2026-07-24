@@ -191,6 +191,8 @@ public:
     Napi::Value Pcall(const Napi::CallbackInfo& info);
     Napi::Value SetPrintHandler(const Napi::CallbackInfo& info);
     Napi::Value AddSearcher(const Napi::CallbackInfo& info);
+    Napi::Value SetHook(const Napi::CallbackInfo& info);
+    Napi::Value RemoveHook(const Napi::CallbackInfo& info);
     Napi::Value Release(const Napi::CallbackInfo& info);
     Napi::Value Reset(const Napi::CallbackInfo& info);
     Napi::Value GC(const Napi::CallbackInfo& info);
@@ -341,6 +343,14 @@ private:
     // Output redirection (E1): JS handler for print()/io.write().
     Napi::FunctionReference print_handler_;
     void InstallPrintHandler(const Napi::Function& fn);
+
+    // Debug hook (lua_sethook) state. The mask and interval are kept alongside
+    // the JS callback so reset() can re-arm the hook on the replacement state,
+    // the same way the print handler is replayed.
+    Napi::FunctionReference debug_hook_;
+    int debug_hook_mask_ = 0;
+    int debug_hook_count_ = 0;
+    void InstallDebugHook(const Napi::Function& fn, int mask, int count);
 
     // Error fidelity (D1): keeps thrown JS Error objects alive so they can be
     // reconstructed when a Lua error carrying their id surfaces back to JS.

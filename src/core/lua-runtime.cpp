@@ -1,5 +1,6 @@
 #include "lua-runtime.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 
@@ -198,46 +199,152 @@ void LuaRuntime::InitState() {
   InstallExecutionHook();
 }
 
-// Retrieves the LuaRuntime from the registry, tallies instructions, and raises
-// "instruction limit exceeded" (or "execution cancelled") when appropriate.
-// Holds no non-trivial C++ locals, so the luaL_error longjmp skips nothing (see
-// the H1 discussion in CODE-REVIEW-1). Always fires inside a lua_pcall /
-// lua_resume frame, so the raise is protected rather than a panic.
-void LuaRuntime::InstructionCountHook(lua_State* L, lua_Debug* /*ar*/) {
+// The single lua_sethook entry point, shared by the instruction/cancel budget
+// and the user's debug hook.
+//
+// The budget checks run first and hold no non-trivial C++ locals, so the
+// luaL_error longjmp skips nothing (see the H1 discussion in CODE-REVIEW-1).
+// The debug dispatch runs afterwards and never raises, so its C++ locals are
+// never jumped over. Always fires inside a lua_pcall / lua_resume frame, so a
+// raise here is protected rather than a panic.
+void LuaRuntime::ExecutionHook(lua_State* L, lua_Debug* ar) {
   lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
   if (!runtime) return;
 
-  // Cooperative cancellation of a compute-bound loop.
-  if (runtime->cancel_requested_.load(std::memory_order_relaxed)) {
-    luaL_error(L, "execution cancelled");
-    return;  // unreachable: luaL_error longjmps
+  // Cancellation and the instruction budget are both counted in VM
+  // instructions, so they only consult the count event. A debug hook that asks
+  // for line/call/return events alone therefore does not change when a cancel
+  // is observed — matching the behavior before debug hooks existed.
+  if (ar->event == LUA_HOOKCOUNT) {
+    // Cooperative cancellation of a compute-bound loop.
+    if (runtime->cancel_requested_.load(std::memory_order_relaxed)) {
+      luaL_error(L, "execution cancelled");
+      return;  // unreachable: luaL_error longjmps
+    }
+
+    if (runtime->max_instructions_ > 0) {
+      runtime->instruction_count_ +=
+          static_cast<size_t>(runtime->instruction_hook_interval_);
+      if (runtime->instruction_count_ >= runtime->max_instructions_) {
+        luaL_error(L, "instruction limit exceeded");
+        return;  // unreachable
+      }
+    }
   }
 
-  if (runtime->max_instructions_ == 0) return;  // limit removed since install
-  runtime->instruction_count_ +=
-      static_cast<size_t>(runtime->instruction_hook_interval_);
-  if (runtime->instruction_count_ >= runtime->max_instructions_) {
-    luaL_error(L, "instruction limit exceeded");
+  runtime->DispatchDebugHook(L, ar);
+}
+
+// Reports one hook event to the host callback. Never raises: this runs with
+// live C++ locals (the event/name strings, the shared_ptr keeping the callback
+// alive), which a longjmp would skip over.
+void LuaRuntime::DispatchDebugHook(lua_State* L, lua_Debug* ar) const {
+  // Copy the shared owner before calling: a hook that calls remove_hook() (or
+  // set_hook() again) from inside itself would otherwise destroy the
+  // std::function currently executing.
+  const std::shared_ptr<DebugHookCallback> hook = debug_hook_;
+  if (!hook || !*hook) return;
+
+  // A worker thread owns the state during execute_script_async; the host
+  // callback bridges to JS, and off-thread N-API is illegal. Same rule the
+  // userdata / host-function GC callbacks and the output handler follow.
+  if (async_mode_) return;
+
+  const char* event_name;
+  switch (ar->event) {
+    case LUA_HOOKCALL:     event_name = "call"; break;
+    case LUA_HOOKTAILCALL: event_name = "tail call"; break;
+    case LUA_HOOKRET:      event_name = "return"; break;
+    case LUA_HOOKLINE:     event_name = "line"; break;
+    case LUA_HOOKCOUNT:    event_name = "count"; break;
+    default: return;
+  }
+
+  if (ar->event == LUA_HOOKCOUNT) {
+    // The installed interval can be finer than the one the caller asked for
+    // (an instruction limit shares this hook and may need a tighter one), so
+    // tally the firings up to the requested granularity.
+    if (debug_count_interval_ <= 0) return;
+    debug_count_tally_ += static_cast<size_t>(instruction_hook_interval_);
+    if (debug_count_tally_ < static_cast<size_t>(debug_count_interval_)) return;
+    debug_count_tally_ = 0;
+  }
+
+  // "n" fills name/namewhat, "l" fills currentline. Deliberately not "S": the
+  // source fields are not reported, and skipping them keeps a per-line hook off
+  // the more expensive path. Neither pushes onto the stack, so this cannot
+  // raise while the locals below are live.
+  lua_getinfo(L, "nl", ar);
+
+  // Lua is built as C — a C++ exception must not unwind through its frames.
+  // Contain everything, including a std::string allocation failure and anything
+  // the host callback throws, the way the output handler does.
+  try {
+    (*hook)(event_name, ar->currentline, ar->name ? ar->name : "");
+  } catch (...) {
+    // A throwing hook is swallowed rather than corrupting the VM.
   }
 }
 
 void LuaRuntime::InstallExecutionHook() {
+  // One installation serves both consumers: OR the masks, and when both want
+  // the count event use the finer interval (each tallies up to its own).
+  int mask = debug_hook_ ? debug_hook_mask_ : 0;
+  int interval = 0;
+
   if (max_instructions_ > 0) {
     // Fire at least as often as the limit so a small limit is still enforced,
     // capped at 1000 to keep per-instruction overhead negligible for large ones.
-    instruction_hook_interval_ =
+    mask |= LUA_MASKCOUNT;
+    interval =
         max_instructions_ < 1000 ? static_cast<int>(max_instructions_) : 1000;
-    lua_sethook(L_, InstructionCountHook, LUA_MASKCOUNT, instruction_hook_interval_);
-  } else {
+  }
+  if ((mask & LUA_MASKCOUNT) && debug_count_interval_ > 0) {
+    interval = interval > 0 ? std::min(interval, debug_count_interval_)
+                            : debug_count_interval_;
+  }
+  // A count hook with no interval would never fire; drop the bit rather than
+  // hand lua_sethook a zero count.
+  if (interval <= 0) mask &= ~LUA_MASKCOUNT;
+
+  instruction_hook_interval_ = interval;  // instructions each firing represents
+
+  if (mask == 0) {
     lua_sethook(L_, nullptr, 0, 0);
+  } else {
+    lua_sethook(L_, ExecutionHook, mask, interval);
   }
 }
 
 void LuaRuntime::SetMaxInstructions(size_t limit) {
   max_instructions_ = limit;
   config_.max_instructions = limit;  // keep GetConfig() replayable
+  InstallExecutionHook();
+}
+
+void LuaRuntime::SetDebugHook(DebugHookCallback cb, int mask,
+                              int count_interval) {
+  if (!cb || mask == 0) {
+    RemoveDebugHook();
+    return;
+  }
+  debug_hook_ = std::make_shared<DebugHookCallback>(std::move(cb));
+  debug_hook_mask_ = mask;
+  debug_count_interval_ = count_interval;
+  debug_count_tally_ = 0;
+  InstallExecutionHook();
+}
+
+void LuaRuntime::RemoveDebugHook() {
+  // Reset (not just clear) so a dispatch in flight keeps its own owner alive.
+  debug_hook_.reset();
+  debug_hook_mask_ = 0;
+  debug_count_interval_ = 0;
+  debug_count_tally_ = 0;
+  // Re-install rather than unhook outright: an instruction limit may still need
+  // the count hook.
   InstallExecutionHook();
 }
 
