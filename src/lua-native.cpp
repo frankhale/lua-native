@@ -1582,7 +1582,7 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   std::string name;
   if (info.Length() >= 1 && info[0].IsString()) {
     name = info[0].As<Napi::String>().Utf8Value();
-  } else if (info.Length() >= 1 && (targetRef = TableRefDataFrom(info[0]))) {
+  } else if (info.Length() >= 1 && ((targetRef = TableRefDataFrom(info[0])))) {
     if (targetRef->runtime.get() != runtime.get()) {
       Napi::Error::New(env, "table handle belongs to a different Lua context")
         .ThrowAsJavaScriptException();
@@ -3548,9 +3548,9 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
   // match/convert callback may re-enter and register another converter,
   // reallocating the vector and invalidating any reference held across the call
   // (the same discipline as the JS->Lua loop).
-  for (size_t i = 0; i < from_lua_converters_.size(); ++i) {
-    Napi::Function match = from_lua_converters_[i].first.Value();
-    Napi::Function convert = from_lua_converters_[i].second.Value();
+  for (auto &[fst, snd] : from_lua_converters_) {
+    Napi::Function match = fst.Value();
+    const Napi::Function convert = snd.Value();
     if (match.Call({result}).ToBoolean().Value()) {
       return convert.Call({result});
     }
@@ -3754,7 +3754,7 @@ static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  const Napi::Object result = res.As<Napi::Object>();
+  const auto result = res.As<Napi::Object>();
   if (result.Has("error")) {
     state->done = true;
     Napi::Error::New(env, result.Get("error").ToString().Utf8Value())
@@ -3767,7 +3767,7 @@ static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
   const bool dead = result.Get("status").ToString().Utf8Value() == "dead";
   if (dead) state->done = true;
 
-  const Napi::Array values = result.Get("values").As<Napi::Array>();
+  const auto values = result.Get("values").As<Napi::Array>();
   Napi::Value value = env.Undefined();
   if (values.Length() == 1) {
     value = values.Get(static_cast<uint32_t>(0));
