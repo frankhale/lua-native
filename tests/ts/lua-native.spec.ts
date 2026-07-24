@@ -4362,6 +4362,144 @@ describe('lua-native Node adapter', () => {
         expect(() => lua.execute_script('while true do end')).toThrow(/instruction limit/i);
       });
     });
+
+    describe('timeout (wall clock)', () => {
+      it('aborts a runaway script instead of hanging', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        const start = Date.now();
+
+        expect(() => lua.execute_script('while true do end')).toThrow(/execution timeout/i);
+
+        // Generous bound: this asserts the loop was interrupted at all, not
+        // that the deadline is precise.
+        expect(Date.now() - start).toBeLessThan(10_000);
+      });
+
+      it('lets a fast script complete normally', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 30_000 });
+        expect(lua.execute_script('local s = 0 for i = 1, 100000 do s = s + i end return s'))
+          .toBe(5000050000);
+      });
+
+      it('treats 0 and omission as no timeout', () => {
+        const zero = new lua_native.init({}, { libraries: 'all', timeout: 0 });
+        expect(zero.info().timeout).toBe(0);
+        expect(zero.execute_script('local s = 0 for i = 1, 200000 do s = s + i end return s'))
+          .toBeGreaterThan(0);
+
+        expect(new lua_native.init({}, ALL_LIBS).info().timeout).toBe(0);
+      });
+
+      it('reports the configured timeout through info()', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 2500 });
+        expect(lua.info().timeout).toBe(2500);
+      });
+
+      it('leaves the context usable after a timeout', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        expect(() => lua.execute_script('while true do end')).toThrow(/execution timeout/i);
+        expect(lua.execute_script('return 2 + 2')).toBe(4);
+      });
+
+      it('gives each execution its own budget', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 2000 });
+        // Several executions that each fit the budget all succeed, even though
+        // together they may exceed it — the deadline resets at every entry.
+        for (let i = 0; i < 4; i++) {
+          expect(() => lua.execute_script('local s = 0 for i = 1, 300000 do s = s + i end'))
+            .not.toThrow();
+        }
+      });
+
+      it('applies to a coroutine resume', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        const co = lua.create_coroutine('return function() while true do end end');
+
+        const result = lua.resume(co);
+        expect(result.error).toMatch(/execution timeout/i);
+      });
+
+      it('applies to worker-thread async execution', async () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        await expect(lua.execute_script_async('while true do end'))
+          .rejects.toThrow(/execution timeout/i);
+
+        // The worker is released and the context works again.
+        expect(lua.execute_script('return 1')).toBe(1);
+      });
+
+      it('survives a reset()', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        lua.reset();
+
+        expect(lua.info().timeout).toBe(100);
+        expect(() => lua.execute_script('while true do end')).toThrow(/execution timeout/i);
+      });
+
+      it('is catchable by a Lua pcall', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        // Raised as a normal Lua error, so a script's own pcall sees it. The
+        // budget is not refreshed by that, so the script still terminates.
+        const [ok, err] = lua.execute_script<[boolean, string]>(
+          'local ok, err = pcall(function() while true do end end)\nreturn ok, tostring(err)');
+        expect(ok).toBe(false);
+        expect(err).toMatch(/execution timeout/i);
+      });
+
+      it('rejects a negative or non-numeric timeout', () => {
+        expect(() => new lua_native.init({}, { libraries: 'all', timeout: -1 }))
+          .toThrow('timeout must be a non-negative number');
+        expect(() => new lua_native.init({}, { libraries: 'all', timeout: 'soon' as any }))
+          .toThrow('timeout must be a number');
+      });
+    });
+
+    describe('timeout and maxInstructions together', () => {
+      it('aborts on instructions when that limit is tighter', () => {
+        const lua = new lua_native.init({}, {
+          libraries: 'all', timeout: 60_000, maxInstructions: 50_000,
+        });
+        expect(() => lua.execute_script('while true do end'))
+          .toThrow(/instruction limit exceeded/i);
+      });
+
+      it('aborts on time when the timeout is tighter', () => {
+        const lua = new lua_native.init({}, {
+          libraries: 'all', timeout: 100, maxInstructions: 4_000_000_000,
+        });
+        expect(() => lua.execute_script('while true do end')).toThrow(/execution timeout/i);
+      });
+
+      it('reports both through info()', () => {
+        const lua = new lua_native.init({}, {
+          libraries: 'all', timeout: 5000, maxInstructions: 1_000_000,
+        });
+        const info = lua.info();
+        expect(info.timeout).toBe(5000);
+        expect(info.maxInstructions).toBe(1_000_000);
+      });
+
+      it('keeps working with a debug hook installed and removed', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 100 });
+        let hookEvents = 0;
+        // A line-only mask must not displace the count hook the timeout needs.
+        lua.set_hook(() => hookEvents++, { line: true });
+
+        expect(() => lua.execute_script('while true do end')).toThrow(/execution timeout/i);
+        expect(hookEvents).toBeGreaterThan(0);
+
+        lua.remove_hook();
+        expect(() => lua.execute_script('while true do end')).toThrow(/execution timeout/i);
+      });
+
+      it('still honors cancel() during async execution', async () => {
+        const lua = new lua_native.init({}, { libraries: 'all', timeout: 60_000 });
+        const pending = lua.execute_script_async('while true do end');
+        setTimeout(() => lua.cancel(), 50);
+
+        await expect(pending).rejects.toThrow(/execution cancelled/i);
+      });
+    });
   });
 
   // ============================================

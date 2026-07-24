@@ -821,6 +821,25 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
       }
     }
 
+    // Check for timeout option (wall-clock execution limit, milliseconds)
+    size_t timeout_ms = 0;
+    bool has_timeout = false;
+    if (options.Has("timeout")) {
+      auto timeoutVal = options.Get("timeout");
+      if (timeoutVal.IsNumber()) {
+        double timeoutNum = timeoutVal.As<Napi::Number>().DoubleValue();
+        if (timeoutNum < 0) {
+          Napi::RangeError::New(env, "timeout must be a non-negative number").ThrowAsJavaScriptException();
+          return;
+        }
+        timeout_ms = static_cast<size_t>(timeoutNum);
+        has_timeout = true;
+      } else if (!timeoutVal.IsUndefined() && !timeoutVal.IsNull()) {
+        Napi::TypeError::New(env, "timeout must be a number").ThrowAsJavaScriptException();
+        return;
+      }
+    }
+
     // Parse libraries
     std::vector<std::string> libraries;
     bool has_libraries = false;
@@ -856,11 +875,12 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
 
     // Create runtime with appropriate constructor
     try {
-      if (has_max_memory || has_max_instructions) {
+      if (has_max_memory || has_max_instructions || has_timeout) {
         lua_core::RuntimeConfig config;
         config.libraries = std::move(libraries);
         config.max_memory = max_memory;
         config.max_instructions = max_instructions;
+        config.timeout_ms = timeout_ms;
         runtime = std::make_shared<lua_core::LuaRuntime>(config);
       } else if (has_libraries) {
         runtime = std::make_shared<lua_core::LuaRuntime>(libraries);
@@ -1919,6 +1939,8 @@ Napi::Value LuaContext::Info(const Napi::CallbackInfo& /*info*/) {
     Napi::Number::New(env, static_cast<double>(runtime->GetMemoryLimit())));
   (void)result.Set("maxInstructions",
     Napi::Number::New(env, static_cast<double>(runtime->GetMaxInstructions())));
+  (void)result.Set("timeout",
+    Napi::Number::New(env, static_cast<double>(runtime->GetTimeout())));
 
   // The libraries this state was opened with, verbatim from the config the
   // runtime kept — so a preset ('all'/'safe') reads back as the names it

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -2951,6 +2952,172 @@ TEST(LuaRuntimeTableAPI, TableIPairsEmptyTable) {
   auto ipairs = rt.TableIPairs(ref);
   EXPECT_TRUE(ipairs.empty());
   rt.ReleaseTableRef(ref);
+}
+
+// --- Wall-Clock Timeout Tests ---
+
+namespace {
+// A runtime with a wall-clock timeout and, optionally, an instruction limit.
+LuaRuntime MakeTimedRuntime(size_t timeout_ms, size_t max_instructions = 0) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.timeout_ms = timeout_ms;
+  config.max_instructions = max_instructions;
+  return LuaRuntime(config);
+}
+
+// Elapsed wall time of `fn`, in milliseconds.
+template <typename Fn>
+long long ElapsedMs(Fn&& fn) {
+  const auto start = std::chrono::steady_clock::now();
+  fn();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start).count();
+}
+}  // namespace
+
+TEST(LuaRuntimeTimeout, AbortsARunawayScript) {
+  LuaRuntime rt = MakeTimedRuntime(100);
+
+  ScriptResult res;
+  const long long elapsed = ElapsedMs([&] { res = rt.ExecuteScript("while true do end"); });
+
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("execution timeout"), std::string::npos);
+  // Generous upper bound: this asserts the loop was interrupted rather than
+  // running forever, not that the deadline is precise.
+  EXPECT_LT(elapsed, 10000);
+}
+
+TEST(LuaRuntimeTimeout, FastScriptsCompleteNormally) {
+  LuaRuntime rt = MakeTimedRuntime(30000);
+
+  auto res = rt.ExecuteScript("local s = 0 for i = 1, 100000 do s = s + i end return s");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value),
+            5000050000LL);
+}
+
+TEST(LuaRuntimeTimeout, ZeroMeansNoTimeout) {
+  LuaRuntime rt = MakeTimedRuntime(0);
+  EXPECT_EQ(rt.GetTimeout(), 0u);
+
+  auto res = rt.ExecuteScript("local s = 0 for i = 1, 200000 do s = s + i end return s");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+}
+
+TEST(LuaRuntimeTimeout, ContextStaysUsableAfterATimeout) {
+  LuaRuntime rt = MakeTimedRuntime(100);
+
+  auto aborted = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(aborted));
+
+  auto after = rt.ExecuteScript("return 2 + 2");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(after));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(after)[0]->value), 4);
+}
+
+TEST(LuaRuntimeTimeout, BudgetIsPerExecutionNotCumulative) {
+  LuaRuntime rt = MakeTimedRuntime(2000);
+
+  // Several executions that each fit inside the budget must all succeed, even
+  // though together they may exceed it — the deadline resets at every entry.
+  for (int i = 0; i < 4; ++i) {
+    auto res = rt.ExecuteScript("local s = 0 for i = 1, 300000 do s = s + i end");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res)) << "iteration " << i;
+  }
+}
+
+TEST(LuaRuntimeTimeout, AppliesToCoroutineResumes) {
+  LuaRuntime rt = MakeTimedRuntime(100);
+
+  auto fn = rt.ExecuteScript("return function() while true do end end");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fn));
+  const auto& funcRef =
+      std::get<LuaFunctionRef>(std::get<std::vector<LuaPtr>>(fn)[0]->value);
+
+  auto co = rt.CreateCoroutine(funcRef);
+  ASSERT_TRUE(std::holds_alternative<LuaThreadRef>(co));
+
+  auto result = rt.ResumeCoroutine(std::get<LuaThreadRef>(co), {});
+  EXPECT_EQ(result.status, CoroutineStatus::Dead);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_NE(result.error->find("execution timeout"), std::string::npos);
+}
+
+TEST(LuaRuntimeTimeout, TighterOfTimeoutAndInstructionLimitWins) {
+  // A tiny instruction limit under a long timeout: instructions abort first.
+  LuaRuntime instructions_first = MakeTimedRuntime(60000, /*max_instructions=*/50000);
+  auto by_instructions = instructions_first.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(by_instructions));
+  EXPECT_NE(std::get<std::string>(by_instructions).find("instruction limit exceeded"),
+            std::string::npos);
+
+  // A short timeout under an effectively unreachable instruction limit: the
+  // clock aborts first. Both share one count-hook installation.
+  LuaRuntime timeout_first = MakeTimedRuntime(100, /*max_instructions=*/4000000000ULL);
+  auto by_time = timeout_first.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(by_time));
+  EXPECT_NE(std::get<std::string>(by_time).find("execution timeout"), std::string::npos);
+}
+
+TEST(LuaRuntimeTimeout, SurvivesDebugHookInstallAndRemoval) {
+  LuaRuntime rt = MakeTimedRuntime(100);
+  int hook_events = 0;
+  const auto counting_hook = [&hook_events](const std::string&, int, const std::string&) {
+    ++hook_events;
+  };
+
+  // A line-only mask must not displace the count hook the timeout relies on.
+  rt.SetDebugHook(counting_hook, LUA_MASKLINE);
+  auto with_hook = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(with_hook));
+  EXPECT_NE(std::get<std::string>(with_hook).find("execution timeout"), std::string::npos);
+
+  EXPECT_GT(hook_events, 0);
+
+  rt.RemoveDebugHook();
+  auto without_hook = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(without_hook));
+  EXPECT_NE(std::get<std::string>(without_hook).find("execution timeout"),
+            std::string::npos);
+}
+
+TEST(LuaRuntimeTimeout, SetTimeoutAppliesAndIsReplayable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_EQ(rt.GetTimeout(), 0u);
+
+  rt.SetTimeout(100);
+  EXPECT_EQ(rt.GetTimeout(), 100u);
+  // Recorded in the config so a replacement state (reset()) inherits it.
+  EXPECT_EQ(rt.GetConfig().timeout_ms, 100u);
+
+  auto res = rt.ExecuteScript("while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("execution timeout"), std::string::npos);
+
+  // Clearing it lets a long script run again.
+  rt.SetTimeout(0);
+  EXPECT_EQ(rt.GetTimeout(), 0u);
+  auto after = rt.ExecuteScript("local s = 0 for i = 1, 200000 do s = s + i end return s");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(after));
+}
+
+TEST(LuaRuntimeTimeout, ErrorIsCatchableFromLuaPcall) {
+  LuaRuntime rt = MakeTimedRuntime(100);
+
+  // The timeout is raised as a normal Lua error, so a script's own pcall sees
+  // it. The budget is not refreshed by that, so the next loop aborts at once
+  // and the script still terminates.
+  auto res = rt.ExecuteScript(
+    "local ok, err = pcall(function() while true do end end)\n"
+    "return ok, tostring(err)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 2u);
+  EXPECT_FALSE(std::get<bool>(vals[0]->value));
+  EXPECT_NE(std::get<std::string>(vals[1]->value).find("execution timeout"),
+            std::string::npos);
 }
 
 // --- Debug Hook Tests ---

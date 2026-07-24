@@ -1292,6 +1292,38 @@ The environment is returned as an ordinary `LuaTableHandle`, not a distinct opaq
 
 ---
 
+## Execution Timeout (Wall Clock) — `timeout` (July 2026)
+
+### Overview
+
+`timeout` caps the real elapsed time a single execution may run, in milliseconds, aborting it with `"execution timeout"`. It is the intuitive counterpart to `maxInstructions`: instruction counts are deterministic and reproducible, wall time is what a user actually has an opinion about. Both may be set, and whichever is reached first aborts the script.
+
+### Architecture
+
+**Core layer:**
+- `RuntimeConfig::timeout_ms`, mirrored into `timeout_ms_`, with `deadline_` (a `steady_clock::time_point`) holding the instant the current execution must finish by. `SetTimeout(ms)` writes both the member and the config (so `reset()` inherits it) and re-runs `InstallExecutionHook()`.
+- `BeginExecutionBudget()` — new helper — clears `instruction_count_` and, when a timeout is set, stamps `deadline_ = now() + timeout_ms_`. The three sites that previously reset the instruction tally by hand (`ProtectedCall`, `ResumeCoroutine`, `ResumeAsyncStep`) now call it, so the two budgets can't drift apart.
+- `InstallExecutionHook()` installs `LUA_MASKCOUNT` when *either* limit is set; with a timeout alone the interval is 1000 instructions.
+- `ExecutionHook` checks the deadline in the same count-event branch as cancellation and the instruction budget.
+
+**N-API layer:** the `LuaContext` constructor reads `options.timeout` (non-negative number, milliseconds) alongside `maxMemory` / `maxInstructions` and routes into the `RuntimeConfig` branch. `info()` reports it.
+
+### Design Decisions
+
+**One helper resets both budgets.** The instruction tally was reset at three call sites by direct assignment. Adding a second, parallel reset at each would have been three chances to update one and forget the other — a bug that shows up as a timeout that silently never fires from coroutines. `BeginExecutionBudget()` makes "start one execution" a single named operation, and the new limit inherits every existing entry point for free.
+
+**Per-execution-call, matching `maxInstructions`.** The deadline resets at each entry point rather than bounding a context's lifetime. That keeps one rule to document for both limits, and it makes the interaction with `execute_async` sane: time spent suspended awaiting a JS Promise is not charged to the script, because each resume starts a fresh deadline. A whole-session budget would need a different mechanism and is a different feature.
+
+**`steady_clock`, not `system_clock`.** A monotonic clock means an NTP correction or a user changing the system time mid-script cannot shorten a deadline (aborting valid work) or extend it indefinitely.
+
+**Checked only on the count event, alongside the other budget checks.** The timeout could also be checked on line/call events when a debug hook happens to be installed, which would tighten granularity — but then timeout precision would depend on whether someone attached a profiler. The count hook is the feature's own mechanism; the interval is 1000 instructions when a timeout is the only reason for the hook, which is frequent enough for millisecond-scale deadlines without the clock read mattering.
+
+**The hook-driven limitation is documented, not worked around.** Because the deadline is only examined between VM instructions, a single long-running C call — a huge `string.rep`, a blocking host callback — is not interrupted. Interrupting those would need a watchdog thread that can't safely touch the `lua_State`, or signal-based interruption; both are out of proportion to a Tier 3 convenience over an existing limit that already prevents true hangs.
+
+**Raised as an ordinary Lua error.** Like the instruction limit, `luaL_error` from the hook means a script's own `pcall` can observe the timeout. That is intentional: the budget is not refreshed by being caught, so the next loop aborts immediately and the script still terminates.
+
+---
+
 ## Debug Hooks — `set_hook()` (July 2026)
 
 ### Overview
@@ -1427,3 +1459,4 @@ Lua states cannot share memory — two `lua_State*`s have no common heap, and th
 | Shared state between contexts (`createSharedTable()` + `shared` option) | Moderate | July 2026 |
 | State introspection (`info()` — version, memory, limits, libraries) | Low | July 2026 |
 | Debug hooks (`set_hook()` — line/call/return/count tracing) | Moderate | July 2026 |
+| Execution timeout (`timeout` — wall-clock limit per execution) | Low | July 2026 |

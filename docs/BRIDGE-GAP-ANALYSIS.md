@@ -71,10 +71,10 @@ from **full** parity.
 These real gaps are already tracked and should not be duplicated. Cross-referenced
 so this document stands alone:
 
-- ~~Execution time / instruction limits (Tier 1)~~ — **done** (July 2026:
-  `maxInstructions`, whose count-hook also polls the cancel flag, so a
-  compute-bound Lua loop is now cancellable — closing A3b). The optional
-  wall-clock timeout (Tier 3) is still open
+- ~~Execution time / instruction limits (Tier 1) + wall-clock timeout
+  (Tier 3)~~ — **done** (July 2026: `maxInstructions`, whose count-hook also
+  polls the cancel flag, so a compute-bound Lua loop is now cancellable —
+  closing A3b; July 24, 2026: `timeout`, enforced from the same hook)
 - ~~Error **stack traces** via `debug.traceback` (Tier 2)~~ — **done** (July
   2026, shipped with D2 via a `luaL_traceback` message handler in
   `lua-runtime.cpp`)
@@ -424,7 +424,7 @@ binding) are **complete**. What remains, in order:
    shipped together, closing the last no-workaround hole in the untrusted-code
    story (`safe` preset + memory limits + instruction limits +
    `allowBytecode: false` are all in place). The optional wall-clock timeout
-   remains a `FUTURE.md` Tier 3 nicety.
+   followed on July 24, 2026 (`timeout`), sharing the same hook.
 2. **Operational control (`FUTURE.md` Tier 2):** GC control, context reset.
    Small, low-risk, natural follow-ons to the sandboxing theme. ~~Extend
    `release()` from table handles to function/coroutine refs while in the area

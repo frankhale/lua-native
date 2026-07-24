@@ -2,6 +2,7 @@
 
 #include <lua.hpp>
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -186,6 +187,7 @@ struct RuntimeConfig {
   std::vector<std::string> libraries;
   size_t max_memory = 0;        // 0 = unlimited
   size_t max_instructions = 0;  // 0 = unlimited (VM instructions per execution)
+  size_t timeout_ms = 0;        // 0 = no wall-clock timeout (per execution)
 };
 
 struct MetatableEntry {
@@ -544,6 +546,23 @@ public:
   void SetMaxInstructions(size_t limit);
   [[nodiscard]] size_t GetMaxInstructions() const { return max_instructions_; }
 
+  // Wall-clock execution timeout: abort an execution that has been running for
+  // more than `ms` real milliseconds with "execution timeout". 0 = no timeout.
+  //
+  // Enforced from the same count-hook as the instruction limit, and with the
+  // same per-execution-call budget: the deadline is reset at each entry point
+  // (execute_script/file, load_bytecode, a Lua-function call, each coroutine
+  // resume), so it bounds one execution rather than a context's total lifetime.
+  //
+  // Two consequences of being hook-driven: the check happens between VM
+  // instructions, so a single long-running C call (a huge string.rep, a host
+  // callback that blocks) is not interrupted; and granularity is the hook's
+  // sampling interval. It is a complement to maxInstructions, not a
+  // replacement — real time is the more intuitive budget, instruction counts
+  // the more deterministic one.
+  void SetTimeout(size_t ms);
+  [[nodiscard]] size_t GetTimeout() const { return timeout_ms_; }
+
   // Debug hooks (lua_sethook): line / call / return / count tracing, for
   // profilers and debugger integrations.
   //
@@ -666,6 +685,11 @@ private:
   mutable size_t instruction_count_ = 0;    // instructions run this execution
   int instruction_hook_interval_ = 1000;    // count-hook firing granularity
 
+  // Wall-clock timeout (see SetTimeout). deadline_ is the instant the current
+  // execution must finish by; it is only read when timeout_ms_ > 0.
+  size_t timeout_ms_ = 0;                   // 0 = no timeout
+  mutable std::chrono::steady_clock::time_point deadline_{};
+
   // Debug hook state (see SetDebugHook). The callback lives behind a shared_ptr
   // so a dispatch in flight can hold it alive: a hook that calls set_hook or
   // remove_hook from inside itself — "stop tracing after this event" is the
@@ -676,6 +700,10 @@ private:
   mutable size_t debug_count_tally_ = 0;    // instructions since the last one
 
   void InitState();
+  // Starts a fresh per-execution budget: clears the instruction tally and, when
+  // a timeout is configured, sets the wall-clock deadline. Called from every
+  // entry point that begins one execution, so the two limits stay in lockstep.
+  void BeginExecutionBudget() const;
   // Installs or removes the hook on L_ to reflect max_instructions_ and the
   // debug hook together — see SetDebugHook for how the two share one
   // installation. Newly created coroutine threads inherit the hook from L_

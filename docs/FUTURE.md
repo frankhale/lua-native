@@ -24,7 +24,7 @@ workarounds rank lowest.
 | — | ~~Table Reference API~~ | Completed | Universal in bridges (7/7); workaround: `execute_script` |
 | 3 | ~~Environment Tables~~ | Completed | `create_environment()` / `execute_script_in()` give each script its own `_ENV` (July 24, 2026) |
 | 3 | ~~Debug Hooks~~ | Completed | `set_hook()` / `remove_hook()`, sharing one `lua_sethook` with the instruction limit (July 24, 2026) |
-| 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
+| 3 | ~~Execution Timeout (Wall Clock)~~ | Completed | `timeout` option, enforced from the same hook as `maxInstructions` (July 24, 2026) |
 | 3 | ~~State Introspection~~ | Completed | `info()` reports version, memory, limits, and loaded libraries (July 24, 2026) |
 | 3 | ~~Reference Lifecycle Management~~ | Completed | `LuaTableHandle.release()` (July 2026) plus context-level `release(value)` for function, coroutine, and table refs (July 23, 2026) |
 | 4 | ~~Dotted Path Globals~~ | Completed | `set_global`/`get_global` accept dotted paths (July 23, 2026) |
@@ -455,7 +455,36 @@ Useful for profiling Lua scripts or building debugger integrations. The hook fir
 
 ---
 
-### Execution Timeout (Wall Clock)
+### ~~Execution Timeout (Wall Clock)~~ (Completed — July 24, 2026)
+
+Implemented exactly as sketched: `LUA_MASKCOUNT` with a `steady_clock` deadline
+checked inside the hook that already serves `maxInstructions` and `cancel()`.
+
+**As built:**
+- `timeout` in `LuaInitOptions` (milliseconds; 0 = none), plus
+  `RuntimeConfig::timeout_ms` / `LuaRuntime::SetTimeout` in the core. A script
+  over budget aborts with `"execution timeout"` and the context stays usable.
+- **Per execution call**, the same rule as `maxInstructions`: the deadline is
+  reset at every entry point. The three sites that reset the instruction tally
+  by hand now share one `BeginExecutionBudget()` helper, so a new entry point
+  cannot pick up one budget and miss the other. Under `execute_async`, time
+  suspended awaiting a JS Promise is not charged to the script — each resume
+  starts a fresh deadline.
+- **Both limits coexist**; whichever is reached first aborts. `maxInstructions`
+  picks the hook interval when set, otherwise a timeout alone installs the
+  count hook at 1000 instructions.
+- `steady_clock`, so a system clock change cannot shorten or extend a running
+  script.
+- Reported by `info().timeout`, and replayed by `reset()` (it travels in
+  `RuntimeConfig`).
+- Raised as an ordinary Lua error, so a script's own `pcall` can see it — and
+  since catching it does not refresh the budget, the script still terminates.
+- **Documented limitation:** the deadline is only checked between VM
+  instructions, so a single long-running C call (a huge `string.rep`, a
+  blocking host callback) is not interrupted. See `FEATURES.md` for why that is
+  left as-is rather than solved with a watchdog thread.
+
+The original design notes follow for reference.
 
 The instruction limit from tier 1 is approximate — different instructions take
 different amounts of real time. A wall-clock timeout is more intuitive:

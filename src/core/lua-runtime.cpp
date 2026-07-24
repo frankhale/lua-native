@@ -232,6 +232,14 @@ void LuaRuntime::ExecutionHook(lua_State* L, lua_Debug* ar) {
         return;  // unreachable
       }
     }
+
+    // Wall-clock deadline for this execution. steady_clock is monotonic, so a
+    // system clock adjustment can't shorten or extend a running script.
+    if (runtime->timeout_ms_ > 0 &&
+        std::chrono::steady_clock::now() >= runtime->deadline_) {
+      luaL_error(L, "execution timeout");
+      return;  // unreachable
+    }
   }
 
   runtime->DispatchDebugHook(L, ar);
@@ -289,8 +297,8 @@ void LuaRuntime::DispatchDebugHook(lua_State* L, lua_Debug* ar) const {
 }
 
 void LuaRuntime::InstallExecutionHook() {
-  // One installation serves both consumers: OR the masks, and when both want
-  // the count event use the finer interval (each tallies up to its own).
+  // One installation serves every consumer: OR the masks, and when more than
+  // one wants the count event use the finest interval (each tallies to its own).
   int mask = debug_hook_ ? debug_hook_mask_ : 0;
   int interval = 0;
 
@@ -300,6 +308,11 @@ void LuaRuntime::InstallExecutionHook() {
     mask |= LUA_MASKCOUNT;
     interval =
         max_instructions_ < 1000 ? static_cast<int>(max_instructions_) : 1000;
+  } else if (timeout_ms_ > 0) {
+    // Timeout only: 1000 instructions is frequent enough for millisecond-scale
+    // granularity without the clock read dominating.
+    mask |= LUA_MASKCOUNT;
+    interval = 1000;
   }
   if ((mask & LUA_MASKCOUNT) && debug_count_interval_ > 0) {
     interval = interval > 0 ? std::min(interval, debug_count_interval_)
@@ -322,6 +335,25 @@ void LuaRuntime::SetMaxInstructions(size_t limit) {
   max_instructions_ = limit;
   config_.max_instructions = limit;  // keep GetConfig() replayable
   InstallExecutionHook();
+}
+
+void LuaRuntime::SetTimeout(size_t ms) {
+  timeout_ms_ = ms;
+  config_.timeout_ms = ms;  // keep GetConfig() replayable
+  // Start the clock now as well: a timeout armed while something is already
+  // running would otherwise be judged against a stale deadline and fire at once.
+  if (ms > 0) {
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+  }
+  InstallExecutionHook();
+}
+
+void LuaRuntime::BeginExecutionBudget() const {
+  instruction_count_ = 0;
+  if (timeout_ms_ > 0) {
+    deadline_ =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
+  }
 }
 
 void LuaRuntime::SetDebugHook(DebugHookCallback cb, int mask,
@@ -467,6 +499,7 @@ LuaRuntime::LuaRuntime(const std::vector<std::string>& libraries)
 LuaRuntime::LuaRuntime(const RuntimeConfig& config) : config_(config) {
   allocator_.limit = config.max_memory;
   max_instructions_ = config.max_instructions;  // installed by InitState()
+  timeout_ms_ = config.timeout_ms;              // ditto
   L_ = lua_newstate(LuaAllocator, &allocator_, 0);
   if (!L_) {
     throw std::runtime_error("Failed to create Lua state");
@@ -1746,11 +1779,12 @@ int LuaRuntime::MessageHandler(lua_State* L) {
 // Calls a function already on the stack (with nargs args above it) under the
 // traceback message handler.
 int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
-  // Fresh instruction budget per top-level execution (execute_script/file,
-  // load_bytecode, a Lua function call). Nested Lua→host→Lua calls re-enter
-  // here and legitimately get their own budget; a plain Lua loop that never
-  // re-enters keeps accumulating and is caught. No-op when unlimited.
-  instruction_count_ = 0;
+  // Fresh instruction + wall-clock budget per top-level execution
+  // (execute_script/file, load_bytecode, a Lua function call). Nested
+  // Lua→host→Lua calls re-enter here and legitimately get their own budget; a
+  // plain Lua loop that never re-enters keeps accumulating and is caught.
+  // No-op when both limits are unset.
+  BeginExecutionBudget();
   const int base = lua_gettop(L_) - nargs;  // index of the function
   lua_pushcfunction(L_, MessageHandler);
   lua_insert(L_, base);  // move handler below the function
@@ -2960,8 +2994,8 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     return result;
   }
 
-  // Resume the coroutine (fresh instruction budget for this resume step).
-  instruction_count_ = 0;
+  // Resume the coroutine (fresh instruction + wall-clock budget for this step).
+  BeginExecutionBudget();
   int nresults = 0;
   int resumeStatus = lua_resume(threadRef.thread, L_, static_cast<int>(args.size()), &nresults);
 
@@ -3111,7 +3145,10 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   }
 
   last_error_value_.reset();
-  instruction_count_ = 0;  // fresh instruction budget for this resume step
+  // Fresh instruction + wall-clock budget for this resume step. Time spent
+  // suspended awaiting a JS promise therefore does not count against the
+  // timeout — it bounds Lua compute per step, not the round trip.
+  BeginExecutionBudget();
   await_is_error_ = arg_is_error;
 
   if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {

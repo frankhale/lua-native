@@ -38,7 +38,7 @@ data structures.
 - State introspection — `info()` returns a diagnostics snapshot: Lua version, current memory, configured limits, and loaded libraries
 - Debug hooks — trace Lua execution from JavaScript with `set_hook()` (line, call, return, and instruction-count events) for profilers and debugger integrations
 - GC control — trigger, pause, step, and tune Lua's collector from JavaScript with `gc()`, using Lua's own `collectgarbage` command vocabulary
-- Execution limits — cap Lua VM instructions with `maxInstructions` option so infinite loops abort instead of hanging
+- Execution limits — cap Lua VM instructions with `maxInstructions`, or wall-clock time with `timeout`, so infinite loops abort instead of hanging
 - Coroutine support with yield/resume semantics
 - Error fidelity — Lua errors carry stack tracebacks, thrown JS `Error` objects round-trip with full fidelity (type, message, stack, custom props), and `pcall()` runs a function protected, returning `{ ok, value/error }`
 - Cross-platform support (Windows, macOS)
@@ -591,6 +591,7 @@ console.log(lua.info());
 //   memoryKB: 14.669921875,
 //   memoryLimit: 10485760,
 //   maxInstructions: 1000000,
+//   timeout: 0,
 //   libraries: ['base', 'package', 'coroutine', 'table', 'string', 'math', 'utf8']
 // }
 ```
@@ -659,15 +660,49 @@ without accumulating across unrelated calls. Coroutines created inside a script
 to within ~1000 instructions (the sampling granularity of the hook). Set to `0`
 or omit for unlimited execution.
 
-For a tight sandbox, combine both limits:
+#### Wall-Clock Timeout
+
+`maxInstructions` is deterministic but abstract — how many instructions is "two
+seconds"? `timeout` caps real elapsed time instead, in milliseconds:
+
+```javascript
+const lua = new lua_native.init({}, {
+  libraries: "safe",
+  timeout: 5000, // abort any execution running longer than 5 seconds
+});
+
+try {
+  lua.execute_script("while true do end");
+} catch (error) {
+  console.error(error.message); // "execution timeout"
+}
+
+lua.execute_script("return 1 + 1"); // 2 — the context is still usable
+```
+
+The two limits are complements, not alternatives. Set both and whichever is
+reached first aborts the script:
 
 ```javascript
 const sandbox = new lua_native.init({}, {
   libraries: "safe",
   maxMemory: 256 * 1024,
   maxInstructions: 1_000_000,
+  timeout: 1000,
 });
 ```
+
+`timeout` follows the same per-execution-call rule as `maxInstructions`: each
+`execute_script`, `execute_file`, `load_bytecode`, Lua-function call, and each
+coroutine `resume` starts a fresh deadline. Under `execute_async`, time spent
+suspended awaiting a JS Promise doesn't count — the timeout bounds Lua compute
+per step, not the whole round trip.
+
+Both limits are enforced from the same instruction hook, which means the
+deadline is checked *between VM instructions*. A single long-running C call — a
+huge `string.rep`, or a host callback that blocks — is not interrupted. The
+clock is monotonic, so changing the system time can't shorten or extend a
+running script.
 
 ### Debug Hooks
 
@@ -2206,6 +2241,11 @@ creates a bare Lua state with no callbacks and no standard libraries.
     budget applies per execution call (each `execute_script`/`execute_file`/
     `load_bytecode`, Lua-function call, and coroutine `resume`). `0` or omitted
     means unlimited. Enforcement is approximate to within ~1000 instructions.
+  - `timeout` (optional): Maximum wall-clock milliseconds a single execution may
+    run before it is aborted with an `"execution timeout"` error. Same
+    per-execution-call rule as `maxInstructions`; set both and whichever is
+    reached first wins. `0` or omitted means no timeout. Checked between VM
+    instructions, so a single long-running C call is not interrupted.
   - `print` (optional): Handler receiving `print()`/`io.write()` output as
     formatted text (see `set_print_handler`). Takes precedence over a `print`
     in the callbacks object.
@@ -2374,6 +2414,7 @@ to call on a monitoring timer.
 | `memoryKB` | `number` | `memoryBytes / 1024` (fractional) |
 | `memoryLimit` | `number` | The `maxMemory` this context was created with, in bytes. `0` = unlimited |
 | `maxInstructions` | `number` | The `maxInstructions` limit in force. `0` = unlimited |
+| `timeout` | `number` | The `timeout` in force, in milliseconds. `0` = no timeout |
 | `libraries` | `string[]` | Standard libraries loaded, by name. A preset reads back as the names it expanded to; a bare state as `[]` |
 
 **Throws:** Error if the context is busy with an async operation (the allocator

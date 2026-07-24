@@ -328,6 +328,9 @@ export interface LuaStateInfo {
   /** The `maxInstructions` limit in force. `0` means unlimited. */
   maxInstructions: number;
 
+  /** The `timeout` in force, in milliseconds. `0` means no timeout. */
+  timeout: number;
+
   /**
    * Standard libraries loaded into this state, by name. A preset reads back as
    * the names it expanded to (`'all'` → all ten), and a bare state as `[]`.
@@ -1173,6 +1176,39 @@ export interface LuaInitOptions {
    * { libraries: 'safe', maxMemory: 256 * 1024, maxInstructions: 1_000_000 }
    */
   maxInstructions?: number;
+
+  /**
+   * Maximum wall-clock time, in milliseconds, that a single execution may run
+   * before it is aborted with an `"execution timeout"` error. Set to 0 or omit
+   * for no timeout.
+   *
+   * Real time is the more intuitive budget; `maxInstructions` is the more
+   * deterministic one. They are complements, not alternatives — set both and
+   * whichever is reached first aborts the script.
+   *
+   * Like `maxInstructions`, the budget applies **per execution call**: each
+   * `execute_script`, `execute_file`, `load_bytecode`, Lua-function call from
+   * JS, and each coroutine `resume` starts a fresh deadline. Time a script
+   * spends suspended awaiting a JS Promise under `execute_async` is therefore
+   * not counted — the timeout bounds Lua compute per step, not the round trip.
+   *
+   * Enforcement is hook-driven, with two consequences: the deadline is checked
+   * between VM instructions (so a single long-running C call — a huge
+   * `string.rep`, or a host callback that blocks — is not interrupted), and
+   * granularity is the hook's sampling interval, so expect overshoot on the
+   * order of a few hundred microseconds rather than exactness.
+   *
+   * The clock is monotonic, so a system time change cannot shorten or extend a
+   * running script.
+   *
+   * @example
+   * // Abort any script that runs longer than 5 seconds
+   * { timeout: 5000 }
+   *
+   * // Belt and braces for untrusted code
+   * { libraries: 'safe', maxMemory: 256 * 1024, maxInstructions: 1_000_000, timeout: 1000 }
+   */
+  timeout?: number;
 
   /**
    * Redirects Lua `print()` and `io.write()` to this handler (see
