@@ -2953,6 +2953,227 @@ TEST(LuaRuntimeTableAPI, TableIPairsEmptyTable) {
   rt.ReleaseTableRef(ref);
 }
 
+// --- Environment Tables Tests ---
+
+// Runs a script in `env_ref` and returns its single string result, or the error
+// message prefixed with "ERROR: " so a failure is legible in the assertion.
+static std::string RunInEnvString(const LuaRuntime& rt, int env_ref,
+                                  const std::string& script) {
+  auto res = rt.ExecuteScriptInEnvironment(env_ref, script);
+  if (std::holds_alternative<std::string>(res)) {
+    return "ERROR: " + std::get<std::string>(res);
+  }
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  if (vals.size() != 1) return "ERROR: expected exactly one result";
+  if (const auto* s = std::get_if<std::string>(&vals[0]->value)) return *s;
+  return "ERROR: result is not a string";
+}
+
+TEST(LuaRuntimeEnvironment, CreateEnvironmentReturnsValidRef) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({});
+  EXPECT_NE(ref, LUA_NOREF);
+  EXPECT_NE(ref, LUA_REFNIL);
+  EXPECT_TRUE(rt.TablePairs(ref).empty());
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, WhitelistedGlobalsAreReachable) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({"math", "tostring"});
+
+  EXPECT_EQ(RunInEnvString(rt, ref, "return tostring(math.floor(3.7))"), "3");
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, UnlistedGlobalsAreNil) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({"math"});
+
+  auto res = rt.ExecuteScriptInEnvironment(ref, "return string == nil");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 1u);
+  EXPECT_TRUE(std::get<bool>(vals[0]->value));
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, UnsetWhitelistNameIsSkipped) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({"math", "no_such_global"});
+  EXPECT_TRUE(rt.HasTableField(ref, "math"));
+  EXPECT_FALSE(rt.HasTableField(ref, "no_such_global"));
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, AssignmentsLandInTheEnvironmentNotGlobals) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("counter = 1");
+  const int ref = rt.CreateEnvironment({});
+
+  auto res = rt.ExecuteScriptInEnvironment(ref, "counter = 99");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+
+  // The environment captured it; the real global is untouched.
+  EXPECT_EQ(std::get<int64_t>(rt.GetTableField(ref, "counter")->value), 99);
+  EXPECT_EQ(std::get<int64_t>(rt.GetGlobal("counter")->value), 1);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, TwoEnvironmentsAreIsolated) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int a = rt.CreateEnvironment({});
+  const int b = rt.CreateEnvironment({});
+
+  (void)rt.ExecuteScriptInEnvironment(a, "tenant = 'a'");
+  (void)rt.ExecuteScriptInEnvironment(b, "tenant = 'b'");
+
+  EXPECT_EQ(RunInEnvString(rt, a, "return tenant"), "a");
+  EXPECT_EQ(RunInEnvString(rt, b, "return tenant"), "b");
+
+  rt.ReleaseTableRef(a);
+  rt.ReleaseTableRef(b);
+}
+
+TEST(LuaRuntimeEnvironment, WhitelistCopiesTheSameTableNotACopy) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("shared = { n = 1 }");
+  const int ref = rt.CreateEnvironment({"shared"});
+
+  (void)rt.ExecuteScriptInEnvironment(ref, "shared.n = 99");
+
+  // Same table object, so the mutation is visible globally.
+  auto res = rt.ExecuteScript("return shared.n");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 99);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, InheritReadsFallThroughToGlobals) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("app_name = 'demo'");
+  const int ref = rt.CreateEnvironment({}, /*inherit=*/true);
+
+  EXPECT_EQ(RunInEnvString(rt, ref, "return app_name"), "demo");
+  EXPECT_EQ(RunInEnvString(rt, ref, "return string.upper('hi')"), "HI");
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, InheritWritesShadowRatherThanOverwrite) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("app_name = 'demo'");
+  const int ref = rt.CreateEnvironment({}, /*inherit=*/true);
+
+  (void)rt.ExecuteScriptInEnvironment(ref, "app_name = 'sandboxed'");
+
+  EXPECT_EQ(RunInEnvString(rt, ref, "return app_name"), "sandboxed");
+  EXPECT_EQ(std::get<std::string>(rt.GetGlobal("app_name")->value), "demo");
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, InheritSeesGlobalsAddedAfterCreation) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({}, /*inherit=*/true);
+  (void)rt.ExecuteScript("added_later = 'yes'");
+  // __index is a live link to _G, unlike the whitelist's one-time copy.
+  EXPECT_EQ(RunInEnvString(rt, ref, "return added_later"), "yes");
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, ReturnsMultipleValues) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({});
+
+  auto res = rt.ExecuteScriptInEnvironment(ref, "return 1, 2, 3");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  const auto& vals = std::get<std::vector<LuaPtr>>(res);
+  ASSERT_EQ(vals.size(), 3u);
+  EXPECT_EQ(std::get<int64_t>(vals[2]->value), 3);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, SyntaxAndRuntimeErrorsAreReported) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({"error"});
+
+  auto syntax = rt.ExecuteScriptInEnvironment(ref, "this is not lua");
+  EXPECT_TRUE(std::holds_alternative<std::string>(syntax));
+
+  auto runtime_err = rt.ExecuteScriptInEnvironment(ref, "error('boom')");
+  ASSERT_TRUE(std::holds_alternative<std::string>(runtime_err));
+  EXPECT_NE(std::get<std::string>(runtime_err).find("boom"), std::string::npos);
+
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, RejectsInvalidEnvironmentRef) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+
+  auto noref = rt.ExecuteScriptInEnvironment(LUA_NOREF, "return 1");
+  ASSERT_TRUE(std::holds_alternative<std::string>(noref));
+  EXPECT_NE(std::get<std::string>(noref).find("invalid environment reference"),
+            std::string::npos);
+
+  // An unused registry slot reads back as nil, which is not a table.
+  auto bad = rt.ExecuteScriptInEnvironment(999999, "return 1");
+  ASSERT_TRUE(std::holds_alternative<std::string>(bad));
+  EXPECT_NE(std::get<std::string>(bad).find("not a table"), std::string::npos);
+}
+
+TEST(LuaRuntimeEnvironment, StackIsBalancedAcrossManyRuns) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({"math"});
+  const int before = lua_gettop(rt.RawState());
+
+  for (int i = 0; i < 50; ++i) {
+    (void)rt.ExecuteScriptInEnvironment(ref, "return math.pi");
+    (void)rt.ExecuteScriptInEnvironment(ref, "bad syntax here");
+    (void)rt.ExecuteScriptInEnvironment(ref, "local x = 1");
+  }
+
+  EXPECT_EQ(lua_gettop(rt.RawState()), before);
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, HonorsInstructionLimit) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 100000;
+  LuaRuntime rt(config);
+
+  const int ref = rt.CreateEnvironment({});
+  auto res = rt.ExecuteScriptInEnvironment(ref, "while true do end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"),
+            std::string::npos);
+
+  // The state is still usable afterwards.
+  EXPECT_EQ(RunInEnvString(rt, ref, "return 'ok'"), "ok");
+  rt.ReleaseTableRef(ref);
+}
+
+TEST(LuaRuntimeEnvironment, EnvironmentTableIsAnOrdinaryTableRef) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int ref = rt.CreateEnvironment({"tostring"});
+
+  // Seed a value from C++ and read it back from the script.
+  rt.SetTableField(ref, "answer",
+    std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(42))));
+  EXPECT_EQ(RunInEnvString(rt, ref, "return tostring(answer)"), "42");
+
+  // And read back what the script defined.
+  (void)rt.ExecuteScriptInEnvironment(ref, "defined_by_script = 7");
+  EXPECT_EQ(std::get<int64_t>(rt.GetTableField(ref, "defined_by_script")->value), 7);
+
+  rt.ReleaseTableRef(ref);
+}
+
 // --- Memory Limits Tests ---
 
 TEST(LuaRuntimeMemory, MemoryUsageTracking) {

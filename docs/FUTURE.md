@@ -4,7 +4,7 @@ Potential enhancements for lua-native, organized by priority.
 
 > Statuses in this document were verified against the source
 > (`src/lua-native.cpp`, `src/core/lua-runtime.cpp`, `types.d.ts`) on
-> July 23, 2026.
+> July 24, 2026.
 
 ## Priority Assessment
 
@@ -22,7 +22,7 @@ workarounds rank lowest.
 | 2 | ~~GC Control~~ | Completed | `lua.gc()` covers collect/stop/restart/count/step/isrunning/mode/param (July 23, 2026) |
 | 2 | ~~Context Reset~~ | Completed | `lua.reset()` replaces the state and replays callbacks, print handler, `allowBytecode`, and search paths (July 23, 2026) |
 | — | ~~Table Reference API~~ | Completed | Universal in bridges (7/7); workaround: `execute_script` |
-| 3 | Environment Tables | Not started | Common in bridges (5/7); enables per-script sandboxing |
+| 3 | ~~Environment Tables~~ | Completed | `create_environment()` / `execute_script_in()` give each script its own `_ENV` (July 24, 2026) |
 | 3 | Debug Hooks | Not started | Niche audience; shares `lua_sethook` with tier 1 |
 | 3 | Execution Timeout (Wall Clock) | Not started | More intuitive than instruction count for users |
 | 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
@@ -54,12 +54,13 @@ numbering:
 | F1 | Metatables on non-global tables (table handles / `create_table`) | 3 |
 | C4 | Class inheritance / `__index` chaining | 4 |
 | F2 | Call a Lua global by name (`lua.call('fn', ...args)`) | 4 |
-| F3 | Per-call environment table on `execute_script` | 4 |
 | A5 | Worker pool / true parallelism | 4 (by design) |
 
 Everything else in that survey (Promise await, cancellation incl. A3b,
 type fidelity, converter registry, class binding, error fidelity/`pcall`,
-print redirection, JS searchers, `allowBytecode`) is implemented.
+print redirection, JS searchers, `allowBytecode`) is implemented — including
+F3 (per-call environment), which `execute_script_in` closed alongside
+Environment Tables on July 24, 2026.
 
 ---
 
@@ -487,7 +488,32 @@ build-time constant. Low implementation effort.
 
 ---
 
-### Environment Tables
+### ~~Environment Tables~~ (Completed — July 24, 2026)
+
+Implemented as designed, with one deliberate deviation: the environment is
+returned as an ordinary `LuaTableHandle` rather than a new opaque type.
+
+**As built:**
+- `lua.create_environment({ whitelist, inherit })` builds a table seeded with
+  the named globals (copied by value from `_G`), optionally with a metatable
+  whose `__index` is the globals table.
+- `lua.execute_script_in(env, script)` loads the chunk and installs `env` as
+  upvalue 1 (`_ENV`) via `lua_setupvalue`, then runs it through the same
+  `ProtectedCall` tail as `execute_script` — so instruction limits, memory
+  limits, tracebacks, and JS-error round-tripping all apply unchanged.
+- The environment is a table handle, so seeding (`env.set('log', fn)`),
+  inspection (`env.pairs()`), and lifecycle (`env.release()` /
+  `lua.release(env)`) come from the existing table-reference API. Any live
+  table reference from the same context is accepted as an environment,
+  including one from `create_table()` or `get_global_ref()`.
+- `inherit` attaches `__index` only, never `__newindex`: reads fall through to
+  `_G`, writes always land in the environment and shadow the global.
+- Core layer: `LuaRuntime::CreateEnvironment` and
+  `LuaRuntime::ExecuteScriptInEnvironment`. See `FEATURES.md` for the design
+  decisions (why by-value copies, why no `__newindex`, why no restriction
+  beyond the namespace).
+
+The original design notes follow for reference.
 
 Provide per-script or per-function environment isolation using Lua's `_ENV`
 mechanism. This goes beyond the `libraries` preset by allowing different scripts

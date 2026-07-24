@@ -23,6 +23,7 @@ data structures.
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
+- Environment tables — give each script its own global namespace with `create_environment()` / `execute_script_in()`, so scripts in one context can run at different permission levels
 - Reference lifecycle — explicitly free the registry reference behind a returned Lua function, coroutine, or table reference with `release()`, so long-lived contexts don't accumulate Lua-side memory
 - Context reset — `reset()` swaps in a fresh Lua state with the same options and replays your callbacks, so a long-lived process can drop accumulated global state without rebuilding the context
 - Module / require integration — register JS modules, add search paths, or resolve modules dynamically with a JS searcher (`add_searcher`) for Lua's `require()`
@@ -1608,6 +1609,111 @@ t.release();
 // t.release(); // safe — double release is a no-op
 ```
 
+### Environment Tables
+
+The `libraries` option sets one permission level for a whole context.
+Environment tables go a step further: they give each *script* its own global
+namespace, so scripts running in the same context can see different globals.
+
+An environment is a plain Lua table installed as a chunk's `_ENV` — the table
+Lua resolves free variables against. Anything not in it simply reads as `nil`.
+
+```javascript
+import lua_native from "lua-native";
+
+const lua = new lua_native.init({}, { libraries: "all" });
+
+// Only math and print are reachable
+const env = lua.create_environment({ whitelist: ["math", "print"] });
+
+lua.execute_script_in(env, 'print(math.sqrt(16))'); // 4.0
+lua.execute_script_in(env, 'return io.open("/etc/passwd")');
+// Error: attempt to index a nil value (global 'io')
+```
+
+#### Environments Are Table Handles
+
+`create_environment()` returns an ordinary [table handle](#luatablehandle), so
+you can seed it with helpers, read back what a script defined, and release it
+the same way:
+
+```javascript
+const env = lua.create_environment({ whitelist: ["math"] });
+
+env.set("answer", 42);
+lua.execute_script_in(env, "result = math.floor(answer / 5)");
+
+console.log(env.get("result")); // 8
+console.log(env.pairs().map(([k]) => k)); // ['math', 'answer', 'result']
+
+env.release();
+```
+
+Globals a script assigns land in the environment, never in the real globals:
+
+```javascript
+lua.execute_script("counter = 1");
+lua.execute_script_in(env, "counter = 99");
+
+console.log(lua.get_global("counter")); // 1 — untouched
+console.log(env.get("counter")); // 99
+```
+
+Two environments are fully isolated from each other, which is what makes this
+useful for multi-tenant scripting:
+
+```javascript
+const a = lua.create_environment({ whitelist: ["print"] });
+const b = lua.create_environment({ whitelist: ["print"] });
+
+lua.execute_script_in(a, 'tenant = "a"');
+lua.execute_script_in(b, 'tenant = "b"');
+
+lua.execute_script_in(a, "return tenant"); // 'a'
+lua.execute_script_in(b, "return tenant"); // 'b'
+```
+
+#### Inheriting from the Real Globals
+
+With `inherit: true`, names the environment doesn't define fall through to `_G`
+via an `__index` metatable. Reads fall through; writes never do — so an
+assignment shadows the global instead of overwriting it:
+
+```javascript
+lua.execute_script('app_name = "demo"');
+
+const env = lua.create_environment({ inherit: true });
+
+lua.execute_script_in(env, "return app_name"); // 'demo' — read through
+lua.execute_script_in(env, 'app_name = "sandboxed"');
+
+lua.execute_script_in(env, "return app_name"); // 'sandboxed'
+lua.get_global("app_name"); // 'demo' — the global is untouched
+```
+
+Use `inherit: true` for scoping (keeping a script's globals out of the shared
+namespace) and `inherit: false` — the default — for sandboxing.
+
+#### What an Environment Does and Doesn't Restrict
+
+- Whitelisted globals are copied **by value**. `math` in the environment is the
+  same table `_G.math` names, so a script that does `math.floor = nil` breaks it
+  for everyone. Give untrusted scripts their own copies if that matters.
+- Whitelisting `'_G'` hands the script the real globals table and defeats the
+  isolation entirely.
+- An environment restricts the global **namespace**, not the VM. Pair it with
+  `maxMemory` and `maxInstructions` for resource limits, and with the
+  `libraries` option to keep dangerous libraries out of the context to begin
+  with — a library that was never loaded can't be whitelisted by mistake.
+
+Any table reference works as an environment, not just one from
+`create_environment()`:
+
+```javascript
+lua.execute_script("sandbox = { limit = 3 }");
+lua.execute_script_in(lua.get_global_ref("sandbox"), "return limit"); // 3
+```
+
 ## TypeScript Support
 
 The module includes comprehensive TypeScript definitions:
@@ -1619,7 +1725,9 @@ import type {
   LuaContext,
   ClassDefinition,
   CompileOptions,
+  EnvironmentOptions,
   LuaCoroutine,
+  LuaEnvironment,
   LuaInitOptions,
   LuaLibraryPreset,
   CoroutineResult,
@@ -2288,6 +2396,50 @@ Lua table in place.
 
 **Throws:** Error if the global does not exist or is not a table
 
+### `LuaContext.create_environment(options?)`
+
+Creates an environment table — a private global namespace for scripts run with
+`execute_script_in()`. Returns an ordinary table handle, so the environment can
+be seeded, inspected, and released like any other table reference.
+
+**Parameters:**
+
+- `options` (optional):
+  - `whitelist`: Global names to seed the environment with, copied from `_G` by
+    value (e.g. `['math', 'print']`). A name unset in `_G` is skipped. Default:
+    none — an empty environment.
+  - `inherit`: Fall back to the real globals for names the environment doesn't
+    define, via an `__index` metatable pointing at `_G`. Reads fall through;
+    writes never do. Default: `false`.
+
+**Returns:** `LuaEnvironment` (a `LuaTableHandle`) — a live reference to the
+environment table
+
+**Note:** This restricts the global namespace, not the VM. Use `maxMemory` /
+`maxInstructions` for resource limits. Whitelisting `'_G'` defeats the
+isolation.
+
+### `LuaContext.execute_script_in(env, script)`
+
+Executes a script with `env` installed as its `_ENV`, so the script's global
+reads and writes resolve against that table instead of `_G`. Globals the script
+assigns land in `env`, leaving the context's real globals untouched — even with
+`inherit: true`.
+
+**Parameters:**
+
+- `env`: The environment to run against. Any table reference from this context
+  works: an environment from `create_environment()`, a handle from
+  `create_table()` / `get_global_ref()`, or a metatabled-table Proxy.
+- `script`: The Lua script to execute
+
+**Returns:** The result of the script execution (same marshalling as
+`execute_script`: `undefined` for no results, the value for one, an array for
+many)
+
+**Throws:** Error if the script fails, or if `env` is not a live table
+reference from this context
+
 ### `LuaContext.release(value)`
 
 Releases the Lua registry reference held by a value that crossed the boundary: a
@@ -2366,6 +2518,13 @@ and vice versa. Call `release()` when done to free the registry slot.
 - `pairs(): Array<[string | number, LuaValue]>` — Get all key-value pairs (like Lua `pairs()`).
 - `ipairs(): Array<[number, LuaValue]>` — Get integer-keyed sequence entries (like Lua `ipairs()`). Iterates from index 1 until the first nil.
 - `release(): void` — Release the registry reference. After calling `release()`, all other methods throw. Safe to call multiple times.
+
+### `LuaEnvironment`
+
+An environment table returned by `create_environment()` — a private global
+namespace for scripts run with `execute_script_in()`. It is a `LuaTableHandle`,
+so the full handle surface applies: `get`/`set` to seed helpers or read back
+what a script defined, `pairs()` to inspect it, `release()` when done.
 
 ## Data Type Conversion
 

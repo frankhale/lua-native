@@ -461,6 +461,30 @@ public:
   [[nodiscard]] std::vector<std::pair<int64_t, LuaPtr>> TableIPairs(int registry_ref) const;
   void ReleaseTableRef(int registry_ref);
 
+  // Environment tables — per-script global isolation via Lua's `_ENV`.
+  //
+  // CreateEnvironment builds a fresh table seeded with the named globals, refs
+  // it in the registry, and returns the ref (the same kind of ref the table
+  // reference API hands out, so it is read/written and released the same way).
+  // Each whitelisted name is copied by *value*: `math` in the environment is
+  // the very table `_G.math` names, not a copy of it, so a script that mutates
+  // it mutates the shared one. A name that is nil in `_G` is simply absent.
+  //
+  // With `inherit`, the environment gets a metatable whose `__index` is the
+  // globals table, so unlisted globals stay *readable*. Writes never have a
+  // `__newindex` to follow, so an assignment always lands in the environment
+  // and shadows the global rather than overwriting it.
+  [[nodiscard]] int CreateEnvironment(const std::vector<std::string>& whitelist,
+                                      bool inherit = false) const;
+
+  // Loads `script` and runs it with the registry table `env_ref` installed as
+  // its `_ENV` — upvalue 1 of every Lua chunk — so the chunk's free-variable
+  // reads and writes resolve against that table instead of `_G`. Same result /
+  // error contract as ExecuteScript, and subject to the same memory and
+  // instruction limits.
+  [[nodiscard]] ScriptResult ExecuteScriptInEnvironment(
+      int env_ref, const std::string& script) const;
+
   [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
   [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
 

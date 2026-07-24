@@ -329,9 +329,12 @@ exists despite the sandboxing emphasis.
   into `execute_script`. Natural extension of the table-handle API.
 - **F2. Call a Lua global by name directly** — `lua.call('fn', ...args)` without a
   `get_global` round-trip. Trivial convenience present in most bridges.
-- **F3. Per-call environment on `execute_script`** — run one script against a
-  supplied environment table without the full `create_environment` machinery
-  (overlaps `FUTURE.md` Environment Tables; call out as the lighter-weight form).
+- ~~**F3. Per-call environment on `execute_script`**~~ — **done (July 24,
+  2026):** `execute_script_in(env, script)` runs one script against a supplied
+  environment table, and accepts any live table reference — a `create_table()`
+  handle or a `get_global_ref()` reference works, so the lighter-weight form
+  needs none of the `create_environment` machinery. Shipped together with
+  `FUTURE.md` Environment Tables.
 
 ---
 
@@ -399,7 +402,8 @@ with no reasonable JS-side workaround and broad demand.
 | A4 | Coroutine as (async) iterator + coroutine-from-`LuaFunction` | Low-med | Manual `resume` loop | **3** |
 | F1 | Metatables on non-global tables (table handles / `create_table`) | Low-med | `execute_script` | **3** |
 | C4 | Class inheritance / `__index` chaining | Low-med | Flatten methods in JS | **4** |
-| F2/F3 | call-by-name, per-call env | Low | `get_global`, `execute_script` | **4** |
+| F2 | Call a Lua global by name (`lua.call('fn', ...)`) | Low | `get_global` | **4** |
+| ~~F3~~ | ~~Per-call environment on `execute_script`~~ | — | Done — `execute_script_in` (July 24, 2026) | — |
 | A5 | Worker pool / true parallelism | Low | Multiple contexts | **4** (by design) |
 
 ---
@@ -422,8 +426,9 @@ binding) are **complete**. What remains, in order:
 3. **Interop polish, by demand:** B3 (Lua→JS converters), A4 (iterators +
    coroutine-from-function), F1 (metatables on handles). Each is small and
    independent.
-4. **Defer until requested:** C4 (inheritance), F2/F3, A5, environment tables,
-   debug hooks, and the `FUTURE.md` Tier 4 items.
+4. **Defer until requested:** C4 (inheritance), F2, A5, debug hooks, and the
+   `FUTURE.md` Tier 4 items. ~~Environment tables / F3~~ *(Done — July 24,
+   2026: `create_environment()` + `execute_script_in()`.)*
 
 ---
 

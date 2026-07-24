@@ -2686,6 +2686,94 @@ void LuaRuntime::ReleaseTableRef(int registry_ref) {
   }
 }
 
+// --- Environment tables ---
+
+int LuaRuntime::CreateEnvironment(const std::vector<std::string>& whitelist,
+                                  const bool inherit) const {
+  // One protected frame covers the whole build: the table and metatable
+  // allocations can hit an exhausted maxMemory (M5), and the whitelist lookups
+  // go through lua_gettable, which can fire a hostile __index on _G (M4).
+  // Either way the pcall unwinds the half-built table, so no StackGuard is
+  // needed — nothing is committed until luaL_ref succeeds.
+  int ref = LUA_NOREF;
+  RunProtected([&]() {
+    lua_createtable(L_, 0, static_cast<int>(whitelist.size()));  // [env]
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);        // [env, _G]
+
+    for (const auto& name : whitelist) {
+      lua_pushlstring(L_, name.data(), name.size());  // [env, _G, key]
+      lua_pushvalue(L_, -1);                          // [env, _G, key, key]
+      lua_gettable(L_, -3);                           // [env, _G, key, _G[key]]
+      // rawset: the environment has no metatable yet, so this is only about not
+      // paying for a lookup that cannot fire anything. A nil value (an unset
+      // global) stores nothing, which is exactly the intent.
+      lua_rawset(L_, -4);                             // env[key] = value
+    }
+
+    if (inherit) {
+      lua_createtable(L_, 0, 1);      // [env, _G, mt]
+      lua_pushvalue(L_, -2);          // [env, _G, mt, _G]
+      lua_setfield(L_, -2, "__index");
+      lua_setmetatable(L_, -3);       // setmetatable(env, mt) -> [env, _G]
+    }
+
+    lua_pop(L_, 1);                              // [env]
+    ref = luaL_ref(L_, LUA_REGISTRYINDEX);       // pops env
+  });
+  return ref;
+}
+
+ScriptResult LuaRuntime::ExecuteScriptInEnvironment(const int env_ref,
+                                                    const std::string& script) const {
+  if (env_ref == LUA_NOREF || env_ref == LUA_REFNIL) {
+    return std::string("invalid environment reference");
+  }
+
+  last_error_value_.reset();
+  const int stackBefore = lua_gettop(L_);
+
+  // Size-aware load so scripts with embedded NULs aren't silently truncated
+  // (mirrors ExecuteScript, chunk name included).
+  if (luaL_loadbuffer(L_, script.data(), script.size(), script.c_str()) != LUA_OK) {
+    std::string error = CaptureError(L_);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, env_ref);  // [chunk, env]
+  if (!lua_istable(L_, -1)) {
+    lua_pop(L_, 2);
+    return std::string("environment reference is not a table");
+  }
+  // Upvalue 1 of a Lua chunk is always _ENV. lua_setupvalue pops the value on
+  // success and pops *nothing* when the index is out of range, so the failure
+  // branch drops both slots itself.
+  if (lua_setupvalue(L_, -2, 1) == nullptr) {
+    lua_pop(L_, 2);
+    return std::string("chunk has no _ENV upvalue");
+  }
+
+  if (ProtectedCall(0, LUA_MULTRET) != LUA_OK) {
+    std::string error = CaptureError(L_);
+    lua_pop(L_, 1);
+    return error;
+  }
+
+  const int nresults = lua_gettop(L_) - stackBefore;
+  std::vector<LuaPtr> results;
+  results.reserve(nresults);
+  try {
+    for (int i = 0; i < nresults; ++i) {
+      results.push_back(ToLuaValueProtected(L_, stackBefore + 1 + i));
+    }
+  } catch (const std::exception& e) {
+    lua_pop(L_, nresults);
+    return std::string(e.what());
+  }
+  lua_pop(L_, nresults);
+  return results;
+}
+
 // --- Coroutine support ---
 
 std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFunctionRef& funcRef) const {

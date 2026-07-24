@@ -3481,6 +3481,240 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // ENVIRONMENT TABLES
+  // ============================================
+  describe('environment tables', () => {
+    describe('create_environment()', () => {
+      it('seeds the environment with whitelisted globals only', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['math'] });
+        expect(lua.execute_script_in(env, 'return math.sqrt(16)')).toBe(4);
+        // Not even `type` is reachable — the environment holds exactly what was
+        // whitelisted, so the checks compare against nil directly.
+        expect(lua.execute_script_in(env, 'return string == nil')).toBe(true);
+        expect(lua.execute_script_in(env, 'return io == nil')).toBe(true);
+      });
+
+      it('creates an empty environment with no options', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment();
+        expect(env.pairs()).toEqual([]);
+        expect(lua.execute_script_in(env, 'return print == nil')).toBe(true);
+      });
+
+      it('treats an empty whitelist as an empty environment', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: [] });
+        expect(env.pairs()).toEqual([]);
+      });
+
+      it('skips whitelisted names that are unset in _G', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['math', 'no_such_global'] });
+        expect(env.has('math')).toBe(true);
+        expect(env.has('no_such_global')).toBe(false);
+      });
+
+      it('returns a usable table handle', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['math'] });
+        env.set('answer', 42);
+        expect(env.get('answer')).toBe(42);
+        expect(lua.execute_script_in(env, 'return answer * 2')).toBe(84);
+        expect(env.pairs().map(([k]) => k).sort()).toEqual(['answer', 'math']);
+      });
+
+      it('copies globals by reference, not by value', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['shared'] });
+        lua.execute_script('shared = { n = 1 }');
+        // Seeded before `shared` existed, so the environment has nothing.
+        expect(env.has('shared')).toBe(false);
+
+        const env2 = lua.create_environment({ whitelist: ['shared'] });
+        lua.execute_script_in(env2, 'shared.n = 99');
+        // The environment holds the same table _G.shared names.
+        expect(lua.execute_script('return shared.n')).toBe(99);
+      });
+
+      it('rejects non-object options', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.create_environment('math' as any)).toThrow('must be an object');
+        expect(() => lua.create_environment(['math'] as any)).toThrow('must be an object');
+      });
+
+      it('rejects a non-array whitelist and non-string entries', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.create_environment({ whitelist: 'math' as any }))
+          .toThrow('must be an array of strings');
+        expect(() => lua.create_environment({ whitelist: [1] as any }))
+          .toThrow('entries must be strings');
+      });
+    });
+
+    describe('execute_script_in()', () => {
+      it('leaves the context globals untouched', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('counter = 1');
+        lua.execute_script_in(lua.create_environment(), 'counter = 99');
+        expect(lua.get_global('counter')).toBe(1);
+      });
+
+      it('captures globals the script assigns in the environment', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment();
+        lua.execute_script_in(env, 'greeting = "hello"');
+        expect(env.get('greeting')).toBe('hello');
+        expect(lua.get_global('greeting')).toBeNull();
+      });
+
+      it('isolates two environments from each other', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const a = lua.create_environment();
+        const b = lua.create_environment();
+        lua.execute_script_in(a, 'tenant = "a"');
+        lua.execute_script_in(b, 'tenant = "b"');
+        expect(lua.execute_script_in(a, 'return tenant')).toBe('a');
+        expect(lua.execute_script_in(b, 'return tenant')).toBe('b');
+      });
+
+      it('errors when calling a global the environment does not expose', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['math'] });
+        expect(() => lua.execute_script_in(env, 'return io.open("/etc/passwd")'))
+          .toThrow(/attempt to index a nil value/);
+      });
+
+      it('returns multiple values like execute_script', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment();
+        expect(lua.execute_script_in(env, 'return 1, 2, 3')).toEqual([1, 2, 3]);
+        expect(lua.execute_script_in(env, 'local x = 1')).toBeUndefined();
+      });
+
+      it('surfaces syntax and runtime errors', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['error'] });
+        expect(() => lua.execute_script_in(env, 'this is not lua')).toThrow();
+        expect(() => lua.execute_script_in(env, 'error("boom")')).toThrow('boom');
+      });
+
+      it('reaches JS callbacks seeded into the environment', () => {
+        const seen: number[] = [];
+        const lua = new lua_native.init({ report: (n: any) => { seen.push(n as number); } }, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['report'] });
+        lua.execute_script_in(env, 'report(7)');
+        expect(seen).toEqual([7]);
+      });
+
+      it('honors maxInstructions inside an environment', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', maxInstructions: 100_000 });
+        const env = lua.create_environment();
+        expect(() => lua.execute_script_in(env, 'while true do end'))
+          .toThrow(/instruction limit exceeded/);
+      });
+
+      it('accepts a plain table handle as an environment', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ base: 10 });
+        expect(lua.execute_script_in(t, 'return base + 5')).toBe(15);
+        lua.execute_script_in(t, 'derived = base * 2');
+        expect(t.get('derived')).toBe(20);
+      });
+
+      it('accepts a global table reference as an environment', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('sandbox = { limit = 3 }');
+        const ref = lua.get_global_ref('sandbox');
+        expect(lua.execute_script_in(ref, 'return limit')).toBe(3);
+      });
+
+      it('rejects a non-reference first argument', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.execute_script_in({} as any, 'return 1'))
+          .toThrow('must be an environment or table reference');
+        expect(() => lua.execute_script_in(null as any, 'return 1'))
+          .toThrow('must be an environment or table reference');
+      });
+
+      it('requires a script string', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment();
+        expect(() => (lua.execute_script_in as any)(env))
+          .toThrow('requires an environment and a script string');
+        expect(() => (lua.execute_script_in as any)(env, 42))
+          .toThrow('requires an environment and a script string');
+      });
+
+      it('rejects an environment from a different context', () => {
+        const luaA = new lua_native.init({}, ALL_LIBS);
+        const luaB = new lua_native.init({}, ALL_LIBS);
+        const env = luaA.create_environment({ whitelist: ['math'] });
+        expect(() => luaB.execute_script_in(env, 'return 1'))
+          .toThrow('different Lua context');
+      });
+
+      it('rejects a released environment', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['math'] });
+        env.release();
+        expect(() => lua.execute_script_in(env, 'return math.pi'))
+          .toThrow('table handle has been released');
+      });
+
+      it('releases via lua.release(env) too', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment();
+        lua.release(env);
+        expect(() => lua.execute_script_in(env, 'return 1'))
+          .toThrow('table handle has been released');
+      });
+    });
+
+    describe('inherit', () => {
+      it('reads unlisted globals through _G when inherit is true', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('app_name = "demo"');
+        const env = lua.create_environment({ inherit: true });
+        expect(lua.execute_script_in(env, 'return app_name')).toBe('demo');
+        expect(lua.execute_script_in(env, 'return string.upper("hi")')).toBe('HI');
+      });
+
+      it('does not read unlisted globals when inherit is false', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('app_name = "demo"');
+        const env = lua.create_environment({ inherit: false });
+        expect(lua.execute_script_in(env, 'return app_name')).toBeNull();
+      });
+
+      it('shadows rather than overwrites globals on assignment', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('app_name = "demo"');
+        const env = lua.create_environment({ inherit: true });
+        lua.execute_script_in(env, 'app_name = "sandboxed"');
+        expect(lua.execute_script_in(env, 'return app_name')).toBe('sandboxed');
+        expect(lua.get_global('app_name')).toBe('demo');
+      });
+
+      it('sees globals added to _G after the environment was created', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ inherit: true });
+        lua.execute_script('added_later = 5');
+        // __index is a live link to _G, unlike the whitelist's one-time copy.
+        expect(lua.execute_script_in(env, 'return added_later')).toBe(5);
+      });
+
+      it('lets a whitelisted name shadow the inherited one', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['print'], inherit: true });
+        env.set('print', 'not-a-function');
+        expect(lua.execute_script_in(env, 'return print')).toBe('not-a-function');
+        expect(typeof lua.get_global('print')).toBe('function');
+      });
+    });
+  });
+
+  // ============================================
   // MEMORY LIMITS
   // ============================================
   describe('memory limits', () => {

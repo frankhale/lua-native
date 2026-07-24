@@ -251,6 +251,36 @@ export interface LuaTableHandle {
 }
 
 /**
+ * An environment table: a private global namespace for scripts run with
+ * {@link LuaContext.execute_script_in}.
+ *
+ * It is an ordinary table reference, so the full handle surface applies —
+ * `get`/`set` to seed helpers or read back what a script defined, `pairs()` to
+ * inspect it, `release()` when done.
+ */
+export interface LuaEnvironment extends LuaTableHandle {}
+
+/**
+ * Options for {@link LuaContext.create_environment}.
+ */
+export interface EnvironmentOptions {
+  /**
+   * Global names to seed the environment with, copied from `_G` by value
+   * (e.g. `['math', 'print']`). A name that is unset in `_G` is skipped.
+   * Default: none — an empty environment.
+   */
+  whitelist?: string[];
+
+  /**
+   * Fall back to the real globals for names the environment doesn't define,
+   * via an `__index` metatable pointing at `_G`. Reads fall through; writes
+   * never do, so an assignment shadows the global instead of overwriting it.
+   * Default: false.
+   */
+  inherit?: boolean;
+}
+
+/**
  * Represents a Lua execution context
  */
 export interface LuaContext {
@@ -548,6 +578,65 @@ export interface LuaContext {
    * ref.release();
    */
   get_global_ref(name: string): LuaTableHandle;
+
+  /**
+   * Create an environment table — a private global namespace a script can be
+   * run in, so different scripts in the same context see different globals.
+   *
+   * The environment is an ordinary table reference: read and write it with the
+   * handle methods to seed helpers or inspect what a script left behind, pass
+   * it to {@link execute_script_in} to run code against it, and `release()` it
+   * (or `lua.release(env)`) when done.
+   *
+   * Whitelisted names are copied by *value* — `math` in the environment is the
+   * same table `_G.math` names, so a script that does `math.floor = nil`
+   * changes it for everyone. Whitelist a name that is unset in `_G` and it is
+   * simply absent. Whitelisting `'_G'` hands the script the real globals table
+   * and defeats the isolation entirely.
+   *
+   * This restricts the global *namespace*, not the VM: use `maxMemory` and
+   * `maxInstructions` for resource limits, and the `libraries` option to keep
+   * dangerous libraries out of the context in the first place.
+   *
+   * @param options Which globals to seed, and whether to fall back to `_G`
+   * @returns A live handle to the environment table
+   * @example
+   * const env = lua.create_environment({ whitelist: ['math', 'print'] });
+   * env.set('answer', 42);
+   * lua.execute_script_in(env, 'print(math.sqrt(16) + answer)');  // 46
+   * lua.execute_script_in(env, 'return string.rep("x", 3)');      // throws: string is nil
+   * env.release();
+   */
+  create_environment(options?: EnvironmentOptions): LuaEnvironment;
+
+  /**
+   * Execute a script with `env` installed as its `_ENV`, so the script's
+   * global reads and writes resolve against that table instead of `_G`.
+   *
+   * Globals the script assigns land in `env` (visible via `env.get(...)`),
+   * leaving the context's real globals untouched — even with
+   * `inherit: true`, where reads fall through to `_G` but writes never do.
+   *
+   * Any table reference from this context works as an environment: an
+   * environment from {@link create_environment}, a handle from
+   * {@link create_table} or {@link get_global_ref}, or a metatabled-table
+   * Proxy.
+   *
+   * @param env The environment (or any table reference) to run against
+   * @param script The Lua script to execute
+   * @returns The result of the script execution
+   * @throws If the script errors, or if `env` is not a live table reference
+   *   from this context
+   * @example
+   * const env = lua.create_environment({ whitelist: ['print'] });
+   * lua.execute_script_in(env, 'counter = 1');
+   * env.get('counter');            // 1
+   * lua.get_global('counter');     // null — the real globals are untouched
+   */
+  execute_script_in<T extends LuaValue | LuaValue[] = LuaValue>(
+    env: LuaEnvironment | LuaTableHandle,
+    script: string
+  ): T;
 
   /**
    * Registers a custom JS→Lua converter for values crossing into Lua.

@@ -118,6 +118,8 @@ public:
     Napi::Value LoadBytecode(const Napi::CallbackInfo& info);
     Napi::Value CreateTableMethod(const Napi::CallbackInfo& info);
     Napi::Value GetGlobalRef(const Napi::CallbackInfo& info);
+    Napi::Value CreateEnvironment(const Napi::CallbackInfo& info);
+    Napi::Value ExecuteScriptIn(const Napi::CallbackInfo& info);
     Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
     Napi::Value RegisterTypeConverter(const Napi::CallbackInfo& info);
     Napi::Value RegisterClass(const Napi::CallbackInfo& info);

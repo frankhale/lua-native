@@ -1258,6 +1258,40 @@ rebuilding that graph, so they are documented as the caller's job instead.
 
 ---
 
+## Environment Tables (July 2026)
+
+### Overview
+
+`create_environment()` builds a Lua table intended as a script's global namespace, and `execute_script_in(env, script)` runs a chunk with that table installed as its `_ENV`. Since Lua 5.2, a chunk's free variables are sugar for fields of the `_ENV` upvalue — `print(x)` compiles to `_ENV.print(_ENV.x)` — so swapping upvalue 1 of a freshly loaded chunk redirects every global read and write into the environment table. This gives per-script permission levels within a single context, where the `libraries` option only gives one level per context.
+
+The environment is returned as an ordinary `LuaTableHandle`, not a distinct opaque type: an environment *is* a table, and the whole handle surface (`get`, `set`, `pairs`, `release`) is exactly what a caller wants for seeding helpers and reading back what a script defined.
+
+### Architecture
+
+**Core layer:**
+- `CreateEnvironment(whitelist, inherit)`: Creates a table inside a `RunProtected` frame, seeds it by reading each whitelisted name from `_G` with `lua_gettable` (metamethod-capable) and storing it with `lua_rawset`, optionally attaches a metatable whose `__index` is the globals table, then `luaL_ref`s the result and returns the registry reference. The whole build is in one protected frame: the table and metatable allocations can hit an exhausted `maxMemory` (M5) and a whitelist read can fire a hostile `__index` on `_G` (M4). On any failure the pcall unwinds the half-built table, so nothing needs a `StackGuard` — nothing is committed until `luaL_ref` succeeds.
+- `ExecuteScriptInEnvironment(env_ref, script)`: `luaL_loadbuffer`s the chunk (size-aware, same as `ExecuteScript`), pushes the environment from the registry, and installs it with `lua_setupvalue(L_, -2, 1)`. Then the identical `ProtectedCall` / result-conversion / error-capture tail as `ExecuteScript`, so instruction limits, memory limits, tracebacks, and structured JS-error round-tripping all apply unchanged.
+
+**N-API layer:**
+- `CreateEnvironment`: Validates the options object (`whitelist` must be an array of strings; `inherit` is coerced to boolean), calls the core, and wraps the ref with the existing `CreateTableHandle` — so environments get the table-handle methods, the `_tableRef` round-trip marker, and the finalizer-owned `LuaTableRefData` for free.
+- `ExecuteScriptIn`: Resolves the first argument through `TableRefDataFrom`, a small accessor that reads the `_tableRef` External off either a table handle or a metatabled-table Proxy (the Proxy's `has`/`get` traps answer for that key explicitly), then applies the standard guards — busy check, runtime-identity check, released-handle check — before delegating to the core.
+
+### Design Decisions
+
+**An environment is a table handle, not a new opaque type.** The original plan called for an opaque `LuaEnvironment`. Reusing the table-reference machinery is strictly more useful and adds no code: seeding an environment with a host helper is `env.set('log', fn)`, inspecting what a sandboxed script left behind is `env.pairs()`, and lifecycle is the `release()` that already exists (both `env.release()` and `lua.release(env)`). `LuaEnvironment` is declared as an interface extending `LuaTableHandle` purely for documentation.
+
+**Any table reference is accepted as an environment.** `execute_script_in` takes anything carrying a live `_tableRef` from this context — including a `create_table()` handle or a `get_global_ref()` reference. There is no reason to reject them: an environment is only "the table a chunk resolves globals against", and running a chunk against an existing config table is a legitimate use.
+
+**Whitelisted globals are copied by value, not deep-copied.** `env.math` is the very table `_G.math` names. Deep-copying would be expensive, would break identity comparisons, and would silently diverge from a library the host later patches. The sharing hazard (a sandboxed script doing `math.floor = nil` affects everyone) is documented rather than engineered around, because the caller is better placed to decide whether to hand out private copies.
+
+**`inherit` uses `__index` only, never `__newindex`.** Reads fall through to `_G`; writes have no metamethod to follow, so an assignment always lands in the environment and shadows the global instead of overwriting it. That asymmetry is the useful one: `inherit: true` becomes "scope this script's globals" without becoming an escape hatch. It also means `__index` is a live link — a global added to `_G` after the environment was built is visible through it, unlike the whitelist's one-time copy.
+
+**A missing whitelist entry is skipped, not an error.** `env[name] = nil` stores nothing, so whitelisting a name that is unset in `_G` (a library that wasn't loaded, say) yields an environment simply lacking it. Erroring would make a whitelist shared across contexts with different `libraries` presets unusable.
+
+**No extra restriction beyond the namespace.** `ExecuteScriptInEnvironment` deliberately mirrors `ExecuteScript`, including its use of `luaL_loadbuffer` in default (`"bt"`) mode. An environment restricts which globals a chunk can name; it is not a second implementation of the sandbox. Resource exhaustion stays the job of `maxMemory` / `maxInstructions`, and keeping a dangerous library out of the state entirely stays the job of the `libraries` preset — a library that was never loaded cannot be whitelisted by mistake.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1285,3 +1319,4 @@ rebuilding that graph, so they are documented as the caller's job instead.
 | Dotted path globals (`set_global`/`get_global` nested field access) | Low | July 2026 |
 | Context reset (`reset()` — fresh state, replayed configuration) | Moderate | July 2026 |
 | GC control (`gc()` — collect, stop/restart, step, count, mode, params) | Low | July 2026 |
+| Environment tables (`create_environment()` / `execute_script_in()`) | Moderate | July 2026 |

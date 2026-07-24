@@ -603,6 +603,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("load_bytecode", &LuaContext::LoadBytecode),
     InstanceMethod("create_table", &LuaContext::CreateTableMethod),
     InstanceMethod("get_global_ref", &LuaContext::GetGlobalRef),
+    InstanceMethod("create_environment", &LuaContext::CreateEnvironment),
+    InstanceMethod("execute_script_in", &LuaContext::ExecuteScriptIn),
     InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage),
     InstanceMethod("register_type_converter", &LuaContext::RegisterTypeConverter),
     InstanceMethod("register_class", &LuaContext::RegisterClass),
@@ -1548,6 +1550,129 @@ Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
 
   int ref = std::get<int>(result);
   return CreateTableHandle(env, ref);
+}
+
+// Extracts the LuaTableRefData behind a table handle or a metatabled-table
+// Proxy. Both carry the same `_tableRef` External — the Proxy's has/get traps
+// answer for it explicitly — so one accessor serves both surfaces. Returns
+// nullptr for anything else, leaving the caller to raise its own error.
+static LuaTableRefData* TableRefDataFrom(const Napi::Value& value) {
+  if (!value.IsObject()) return nullptr;
+  const auto obj = value.As<Napi::Object>();
+  if (!obj.Has("_tableRef")) return nullptr;
+  const auto marker = obj.Get("_tableRef");
+  if (!marker.IsExternal()) return nullptr;
+  return marker.As<Napi::External<LuaTableRefData>>().Data();
+}
+
+// Builds an environment table: a fresh Lua table seeded with the whitelisted
+// globals, handed back as an ordinary table handle so it can be inspected,
+// extended (`env.set('helper', fn)`) and released like any other.
+//
+//   create_environment()                                  -> empty environment
+//   create_environment({ whitelist: ['math', 'print'] })   -> only those names
+//   create_environment({ whitelist: [...], inherit: true }) -> + _G fallback
+Napi::Value LuaContext::CreateEnvironment(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+
+  std::vector<std::string> whitelist;
+  bool inherit = false;
+
+  if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
+    if (!info[0].IsObject() || info[0].IsArray() || info[0].IsFunction()) {
+      Napi::TypeError::New(env, "create_environment() options must be an object")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const auto options = info[0].As<Napi::Object>();
+
+    if (options.Has("whitelist")) {
+      const Napi::Value list = options.Get("whitelist");
+      if (!list.IsUndefined() && !list.IsNull()) {
+        if (!list.IsArray()) {
+          Napi::TypeError::New(env,
+            "create_environment(): whitelist must be an array of strings")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        const auto arr = list.As<Napi::Array>();
+        whitelist.reserve(arr.Length());
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+          const Napi::Value entry = arr.Get(i);
+          if (!entry.IsString()) {
+            Napi::TypeError::New(env,
+              "create_environment(): whitelist entries must be strings")
+              .ThrowAsJavaScriptException();
+            return env.Undefined();
+          }
+          whitelist.push_back(entry.As<Napi::String>().Utf8Value());
+        }
+      }
+    }
+
+    if (options.Has("inherit")) {
+      const Napi::Value v = options.Get("inherit");
+      if (!v.IsUndefined() && !v.IsNull()) inherit = v.ToBoolean().Value();
+    }
+  }
+
+  int ref;
+  try {
+    // Reading a whitelisted name can fire an __index on _G that re-enters JS,
+    // so scope the build like any other metamethod-capable operation.
+    CallScope _cs(this);
+    ref = runtime->CreateEnvironment(whitelist, inherit);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  return CreateTableHandle(env, ref);
+}
+
+// Runs a script with `env` as its _ENV. `env` is any table reference minted by
+// this context — an environment from create_environment, or any table handle /
+// metatabled-table Proxy, since an environment is nothing more than the table a
+// chunk resolves its globals against.
+Napi::Value LuaContext::ExecuteScriptIn(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 2 || !info[1].IsString()) {
+    Napi::TypeError::New(env,
+      "execute_script_in(env, script) requires an environment and a script string")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto* data = TableRefDataFrom(info[0]);
+  if (!data) {
+    Napi::TypeError::New(env,
+      "execute_script_in(): the first argument must be an environment or table reference")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  // Same policy as release() and the round-trip markers: a ref index minted by
+  // another context (or by this one before a reset()) addresses an unrelated
+  // slot in the current registry.
+  if (data->runtime.get() != runtime.get()) {
+    Napi::Error::New(env, "environment belongs to a different Lua context")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string script = info[1].As<Napi::String>().Utf8Value();
+
+  CallScope _cs(this);
+  const auto res = runtime->ExecuteScriptInEnvironment(data->tableRef.ref, script);
+  if (std::holds_alternative<std::string>(res)) {
+    ThrowLuaError(std::get<std::string>(res));
+    return env.Undefined();
+  }
+  return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(res));
 }
 
 Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& /*info*/) {
