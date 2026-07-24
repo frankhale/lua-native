@@ -28,7 +28,7 @@ workarounds rank lowest.
 | 3 | State Introspection | Not started | Useful for diagnostics and monitoring |
 | 3 | ~~Reference Lifecycle Management~~ | Completed | `LuaTableHandle.release()` (July 2026) plus context-level `release(value)` for function, coroutine, and table refs (July 23, 2026) |
 | 4 | ~~Dotted Path Globals~~ | Completed | `set_global`/`get_global` accept dotted paths (July 23, 2026) |
-| 4 | Shared State Between Contexts | Not started | Workaround: `set_global` on each context |
+| 4 | ~~Shared State Between Contexts~~ | Completed | `createSharedTable()` + the `shared` init option (July 24, 2026) |
 | — | ~~File Execution~~ | Completed | |
 | — | ~~Selective Standard Library Loading~~ | Completed | |
 | — | ~~Module / Require Integration~~ | Completed | |
@@ -691,7 +691,45 @@ over the workaround.
 
 ---
 
-### Shared State Between Contexts
+### ~~Shared State Between Contexts~~ (Completed — July 24, 2026)
+
+Implemented along the lines the plan sketched, with the "simpler alternative"
+resolved in favour of eager propagation plus an explicit `sync()`.
+
+**As built:**
+- `lua_native.createSharedTable(initial?)` returns a `SharedTable` holding the
+  JS object (not a deep copy — mutating the object and calling `sync()` is a
+  supported workflow, and the plan's own `sync()` method only makes sense that
+  way).
+- `new lua_native.init(cb, { shared: { settings: sharedTable } })` subscribes a
+  context and publishes the current value as that global. The key is the global
+  name, so one shared table can appear under different names in different
+  contexts, and a context can subscribe to several.
+- `set(key, value)` updates the JS object and immediately re-pushes the whole
+  value to every subscriber; `sync()` re-pushes on demand; `get(key)` reads the
+  JS-side value.
+- Propagation goes through each context's own public `set_global`, so a shared
+  value gets the registered type converters, nested-callback handling, busy
+  guard, and protected write that any other JS value crossing into that state
+  would.
+- **One-way (JS → Lua), by design.** A Lua-side assignment into the shared
+  global changes only that context's copy and is overwritten by the next
+  publish. Change notification back from Lua was the part the plan called
+  "complex to implement safely"; it stays unimplemented and is documented
+  instead.
+- A subscriber that rejects an update (busy with an async op) is reported in an
+  aggregate error *after* every other context has been updated — one
+  unavailable context must not silently skip the rest. `sync()` retries.
+- Subscriptions are weak: a garbage-collected context is pruned. `reset()`
+  re-publishes the shared globals, since their value lives in JS.
+- **N-API only** — the core layer is untouched, exactly as the plan predicted.
+  `SharedTable` is a `Napi::ObjectWrap` in `lua-native.cpp`; its constructor is
+  not exported, so `createSharedTable` is the only way to mint one and an
+  `InstanceOf` check is a sound identity test for `shared` entries.
+
+See `FEATURES.md` for the design decisions (weak-vs-strong reference direction,
+whole-value pushes, aggregated failures). The original design notes follow for
+reference.
 
 Currently each `new lua_native.init()` is fully isolated. Allow multiple contexts to share specific tables or values:
 

@@ -1020,6 +1020,82 @@ export interface LuaInitOptions {
    * untrusted scripts. Default: `true`.
    */
   allowBytecode?: boolean;
+
+  /**
+   * Shared tables to publish as globals in this context, keyed by the global
+   * name each should take. Every subscribing context receives the shared
+   * table's current value at construction and every subsequent update.
+   *
+   * @example
+   * const shared = lua_native.createSharedTable({ debug: true });
+   * const lua1 = new lua_native.init({}, { shared: { settings: shared } });
+   * const lua2 = new lua_native.init({}, { shared: { settings: shared } });
+   * shared.set('debug', false);  // both contexts see settings.debug === false
+   *
+   * @see {@link SharedTable} for the propagation model and its limits
+   */
+  shared?: Record<string, SharedTable>;
+}
+
+/**
+ * A JS-side value mirrored as a global in one or more Lua contexts.
+ *
+ * Lua states cannot share memory, so "shared" here means **synchronized
+ * copies**: the shared table holds one JavaScript object and pushes it into
+ * every subscribed context's global namespace. Subscribe a context by passing
+ * the shared table in the `shared` init option.
+ *
+ * Propagation has two properties worth knowing:
+ *
+ * - **One-way (JS → Lua).** A Lua script that assigns into the shared global
+ *   changes only its own context's copy; that edit is not seen by the other
+ *   contexts and does not update the JS-side value. Read a context's own view
+ *   back with `get_global()` if you need it.
+ * - **Whole-value.** Each update re-pushes the entire value into every
+ *   subscriber, so a large shared table costs proportionally on every `set()`
+ *   or `sync()`.
+ *
+ * A context that rejects an update (one busy with an async operation, say) is
+ * reported in the error thrown by `set()`/`sync()` — after every other context
+ * has been updated. The JS-side value is always updated; `sync()` retries.
+ *
+ * Subscriptions do not keep a context alive: once a context is garbage
+ * collected it is dropped from the subscriber list.
+ *
+ * @example
+ * const shared = lua_native.createSharedTable({ mode: 'dev' });
+ * const lua1 = new lua_native.init({}, { shared: { settings: shared } });
+ * const lua2 = new lua_native.init({}, { shared: { settings: shared } });
+ *
+ * shared.set('mode', 'prod');
+ * lua1.execute_script("return settings.mode");  // 'prod'
+ * lua2.execute_script("return settings.mode");  // 'prod'
+ */
+export interface SharedTable {
+  /**
+   * Read a top-level field of the shared value. This reads the JavaScript-side
+   * object, not any one context's copy — so a Lua-side edit is not reflected
+   * here.
+   */
+  get(key: string): LuaValue;
+
+  /**
+   * Set a top-level field and immediately publish the whole value to every
+   * subscribed context.
+   *
+   * @throws If a subscriber rejects the update. The JS-side value is still
+   *   updated and the other contexts still receive it; call `sync()` to retry.
+   */
+  set(key: string, value: LuaInput): void;
+
+  /**
+   * Re-publish the current value to every subscribed context. Use it after
+   * mutating the shared object directly (including through a nested object
+   * returned by `get()`), or to retry a `set()` that a busy context rejected.
+   *
+   * @throws If a subscriber rejects the update.
+   */
+  sync(): void;
 }
 
 /**
@@ -1032,4 +1108,20 @@ export interface LuaNative {
    * @param options Optional configuration for the Lua context
    */
   init: new (callbacks?: LuaCallbacks, options?: LuaInitOptions) => LuaContext;
+
+  /**
+   * Creates a shared table: a JavaScript object that can be published as a
+   * global in several Lua contexts and kept in step across them.
+   *
+   * The object is held, not copied — mutating the object you passed in and
+   * calling `sync()` publishes the change, and `get()` returns live nested
+   * objects.
+   *
+   * @param initial The object to share. Defaults to an empty object.
+   * @example
+   * const shared = lua_native.createSharedTable({ config: { debug: true } });
+   * const lua = new lua_native.init({}, { shared: { settings: shared } });
+   * lua.execute_script('return settings.config.debug');  // true
+   */
+  createSharedTable(initial?: Record<string, LuaInput> | LuaInput[]): SharedTable;
 }

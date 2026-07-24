@@ -581,6 +581,155 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   return data->context->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result));
 }
 
+// --- SharedTable: JS-side state mirrored into several contexts ---
+
+Napi::Function SharedTable::DefineSharedTable(const Napi::Env env) {
+  return DefineClass(env, "SharedTable", {
+    InstanceMethod("get", &SharedTable::Get),
+    InstanceMethod("set", &SharedTable::Set),
+    InstanceMethod("sync", &SharedTable::Sync)
+  });
+}
+
+SharedTable::SharedTable(const Napi::CallbackInfo& info) : ObjectWrap(info) {
+  const Napi::Env env_ = info.Env();
+
+  if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
+    // IsObject() is true for functions too, so exclude them explicitly.
+    if (!info[0].IsObject() || info[0].IsFunction()) {
+      Napi::TypeError::New(env_,
+        "createSharedTable(initial) requires an object")
+        .ThrowAsJavaScriptException();
+      return;
+    }
+    // Held, not copied: the caller keeps a usable handle on the shared state,
+    // so mutating it directly and calling sync() is a supported workflow.
+    value_ = Napi::Persistent(info[0].As<Napi::Object>());
+  } else {
+    value_ = Napi::Persistent(Napi::Object::New(env_));
+  }
+}
+
+void SharedTable::PushValue(const Napi::Object& context, const std::string& name,
+                            const Napi::Value& value) {
+  const Napi::Env env_ = context.Env();
+  const Napi::Value setter = context.Get("set_global");
+  if (!setter.IsFunction()) {
+    throw Napi::Error::New(env_,
+      "shared table subscriber is not a Lua context");
+  }
+  // Routed through the context's own public set_global so a shared value gets
+  // exactly the same treatment as any other JS value crossing into that state:
+  // registered type converters, nested-callback handling, the busy guard, and
+  // the protected write that turns an OOM into a JS error.
+  (void)setter.As<Napi::Function>().Call(context,
+    {Napi::String::New(env_, name), value});
+}
+
+void SharedTable::PushTo(const Napi::Object& context, const std::string& name) const {
+  PushValue(context, name, value_.Value());
+}
+
+void SharedTable::Subscribe(const Napi::Object& context, const std::string& name) {
+  // Push before recording, so a context whose initial push failed (and whose
+  // construction is therefore about to fail) is never left in the subscriber
+  // list as a target for later updates.
+  PushValue(context, name, value_.Value());
+
+  Subscriber sub;
+  sub.context = Napi::Weak(context);
+  sub.name = name;
+  subscribers_.push_back(std::move(sub));
+}
+
+void SharedTable::Propagate(const Napi::Env env_) {
+  // Snapshot the live subscribers first. Pushing runs user JS (type converters,
+  // a __newindex host callback on the target global), which could construct
+  // another context that subscribes to this table — mutating subscribers_ while
+  // it is being iterated. Pruning collected entries happens here too, before
+  // any JS runs.
+  struct Target {
+    Napi::Object context;
+    std::string name;
+  };
+  std::vector<Target> targets;
+  targets.reserve(subscribers_.size());
+
+  auto live = subscribers_.begin();
+  for (auto it = subscribers_.begin(); it != subscribers_.end(); ++it) {
+    const Napi::Object ctx = it->context.Value();  // weak: empty once collected
+    if (ctx.IsEmpty()) continue;                   // drop the dead entry
+    targets.push_back({ctx, it->name});
+    if (live != it) *live = std::move(*it);
+    ++live;
+  }
+  subscribers_.erase(live, subscribers_.end());
+
+  const Napi::Value value = value_.Value();
+  std::string failures;
+  size_t failed = 0;
+  for (const auto& target : targets) {
+    try {
+      PushValue(target.context, target.name, value);
+    } catch (const Napi::Error& e) {
+      // Keep going: one unavailable context (busy with an async op, say) must
+      // not silently skip the updates the others can still receive.
+      ++failed;
+      if (!failures.empty()) failures += "; ";
+      failures += target.name;
+      failures += ": ";
+      failures += e.Message();
+    }
+  }
+
+  if (failed > 0) {
+    throw Napi::Error::New(env_,
+      "shared table update failed for " + std::to_string(failed) + " of " +
+      std::to_string(targets.size()) + " contexts (" + failures +
+      "). The JS-side value was updated; call sync() to retry.");
+  }
+}
+
+Napi::Value SharedTable::Get(const Napi::CallbackInfo& info) {
+  const Napi::Env env_ = info.Env();
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env_, "get(key) requires a string key")
+      .ThrowAsJavaScriptException();
+    return env_.Undefined();
+  }
+  return value_.Value().Get(info[0].As<Napi::String>());
+}
+
+Napi::Value SharedTable::Set(const Napi::CallbackInfo& info) {
+  const Napi::Env env_ = info.Env();
+  if (info.Length() < 2 || !info[0].IsString()) {
+    Napi::TypeError::New(env_, "set(key, value) requires a string key and a value")
+      .ThrowAsJavaScriptException();
+    return env_.Undefined();
+  }
+  (void)value_.Value().Set(info[0].As<Napi::String>(), info[1]);
+  Propagate(env_);  // a failed push throws after every other context is updated
+  return env_.Undefined();
+}
+
+Napi::Value SharedTable::Sync(const Napi::CallbackInfo& info) {
+  const Napi::Env env_ = info.Env();
+  Propagate(env_);
+  return env_.Undefined();
+}
+
+// Resolves a `shared` option entry to its SharedTable, or nullptr if the value
+// wasn't minted by createSharedTable(). The InstanceOf check matters: Unwrap on
+// an arbitrary object would read a garbage pointer out of it.
+static SharedTable* AsSharedTable(const Napi::Env env, const Napi::Value& value) {
+  if (!value.IsObject() || value.IsFunction()) return nullptr;
+  const auto* data = env.GetInstanceData<AddonData>();
+  if (!data || data->sharedTableConstructor.IsEmpty()) return nullptr;
+  const Napi::Object obj = value.As<Napi::Object>();
+  if (!obj.InstanceOf(data->sharedTableConstructor.Value())) return nullptr;
+  return SharedTable::Unwrap(obj);
+}
+
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   const Napi::Function func = DefineClass(env, "LuaContext", {
     InstanceMethod("execute_script", &LuaContext::ExecuteScript),
@@ -753,6 +902,62 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     } catch (const std::exception& e) {
       Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
       return;
+    }
+  }
+
+  // Shared state: subscribe to each SharedTable and publish its current value
+  // as a global. Done last, because subscribing pushes the value through this
+  // context's own set_global — which needs the runtime, the handlers, and the
+  // type converters all in place. A failure here throws from `new`, so it must
+  // be reported the way every other constructor failure is (a pending JS
+  // exception, never a C++ throw unwinding out of a partially-built ObjectWrap).
+  if (info.Length() > 1 && info[1].IsObject()) {
+    const auto options = info[1].As<Napi::Object>();
+    if (options.Has("shared")) {
+      const Napi::Value sharedVal = options.Get("shared");
+      if (!sharedVal.IsUndefined() && !sharedVal.IsNull()) {
+        if (!sharedVal.IsObject() || sharedVal.IsArray() || sharedVal.IsFunction()) {
+          Napi::TypeError::New(env,
+            "shared must be an object mapping global names to shared tables")
+            .ThrowAsJavaScriptException();
+          return;
+        }
+        // A shared table handed over directly has no own enumerable keys, so it
+        // would otherwise subscribe nothing at all — silently. Name the mistake.
+        if (AsSharedTable(env, sharedVal)) {
+          Napi::TypeError::New(env,
+            "shared must be an object mapping global names to shared tables "
+            "(e.g. { settings: sharedTable }), not a shared table itself")
+            .ThrowAsJavaScriptException();
+          return;
+        }
+        const auto sharedObj = sharedVal.As<Napi::Object>();
+        const Napi::Array names = sharedObj.GetPropertyNames();
+        for (uint32_t i = 0; i < names.Length(); ++i) {
+          const std::string name = names.Get(i).As<Napi::String>().Utf8Value();
+          const Napi::Value entry = sharedObj.Get(name);
+          SharedTable* table = AsSharedTable(env, entry);
+          if (!table) {
+            Napi::TypeError::New(env,
+              "shared." + name +
+              " must be a shared table created with createSharedTable()")
+              .ThrowAsJavaScriptException();
+            return;
+          }
+          try {
+            table->Subscribe(info.This().As<Napi::Object>(), name);
+          } catch (const Napi::Error& e) {
+            e.ThrowAsJavaScriptException();
+            return;
+          } catch (const std::exception& e) {
+            Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+            return;
+          }
+          // Retained so reset() can re-publish it onto the fresh state.
+          shared_tables_.emplace_back(
+            Napi::Persistent(entry.As<Napi::Object>()), name);
+        }
+      }
     }
   }
 }
@@ -2586,6 +2791,25 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
     }
   }
 
+  // Re-publish the shared globals. Unlike modules and userdata — whose Lua-side
+  // objects die with the old state — a shared table's value lives in JS, so
+  // replaying it is just another push. The subscription itself is untouched:
+  // this context is still in each SharedTable's list, and its weak reference is
+  // to the JS wrapper, which the reset did not replace.
+  for (const auto& [table_ref, name] : shared_tables_) {
+    SharedTable* table = AsSharedTable(env, table_ref.Value());
+    if (!table) continue;  // defensive; the entry was validated at subscribe time
+    try {
+      table->PushTo(Value(), name);
+    } catch (const Napi::Error& e) {
+      e.ThrowAsJavaScriptException();
+      return env.Undefined();
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+
   return env.Undefined();
 }
 
@@ -2706,10 +2930,33 @@ void LuaFileAsyncWorker::OnError(const Napi::Error& error) {
   deferred_.Reject(error.Value());
 }
 
+// createSharedTable(initial?) — the only way to mint a SharedTable. The class
+// constructor itself stays unexported so `shared` entries can be identified by
+// an InstanceOf check that no user object can satisfy.
+static Napi::Value CreateSharedTable(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  const auto* data = env.GetInstanceData<AddonData>();
+  if (!data || data->sharedTableConstructor.IsEmpty()) {
+    Napi::Error::New(env, "SharedTable class is not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const Napi::Function ctor = data->sharedTableConstructor.Value();
+  if (info.Length() > 0) return ctor.New({info[0]});
+  return ctor.New({});
+}
+
 Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
   const auto result = LuaContext::Init(env, exports);
-  env.SetInstanceData<Napi::FunctionReference>(
-    new Napi::FunctionReference(Napi::Persistent(exports.Get("init").As<Napi::Function>())));
+  const Napi::Function sharedCtor = SharedTable::DefineSharedTable(env);
+  // Both constructors are kept alive here for the life of the addon instance;
+  // the SharedTable one is also what AsSharedTable checks against.
+  env.SetInstanceData(new AddonData{
+    Napi::Persistent(exports.Get("init").As<Napi::Function>()),
+    Napi::Persistent(sharedCtor)
+  });
+  (void)result.Set("createSharedTable",
+    Napi::Function::New(env, CreateSharedTable, "createSharedTable"));
   return result;
 }
 

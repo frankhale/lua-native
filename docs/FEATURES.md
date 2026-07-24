@@ -1292,6 +1292,46 @@ The environment is returned as an ordinary `LuaTableHandle`, not a distinct opaq
 
 ---
 
+## Shared State Between Contexts (July 2026)
+
+### Overview
+
+`lua_native.createSharedTable(initial)` returns a `SharedTable`: a JavaScript object plus a subscriber list. Contexts subscribe through the `shared` init option (`{ shared: { settings: sharedTable } }`), which publishes the value as that global. `set(key, value)` updates the object and immediately re-pushes it to every subscriber; `sync()` re-pushes after a direct mutation.
+
+Lua states cannot share memory — two `lua_State*`s have no common heap, and there is no cross-state reference a table could live in. So this is not shared memory but **synchronized copies**: one authoritative JS-side value, pushed into each state's global namespace. That framing is what the whole design follows from, and the docs say it plainly rather than maintaining an illusion.
+
+### Architecture
+
+**Core layer:** unchanged. Each `LuaRuntime` remains fully independent — nothing about sharing reaches below the binding layer.
+
+**N-API layer:**
+- `SharedTable` (`Napi::ObjectWrap`): holds `value_` (a strong `Napi::ObjectReference` to the shared object) and `subscribers_` — a vector of (weak `Napi::ObjectReference` to a context's JS wrapper, global name).
+- `Subscribe(context, name)` pushes the value, *then* records the subscriber, so a context whose initial push failed is never left in the list.
+- `PushValue(context, name, value)` calls the target context's own public `set_global` through JS rather than reaching into `LuaContext` internals.
+- `Propagate()` snapshots the live subscribers, prunes collected ones, then pushes to each; failures are collected and thrown as one aggregate error afterwards.
+- `AddonData` (instance data) holds persistent references to both class constructors. The `SharedTable` constructor is deliberately *not* exported — `createSharedTable` is the only way to mint one, which makes `InstanceOf` against the stored constructor a sound identity check for `shared` entries.
+- `LuaContext`'s constructor parses `shared` last (subscribing pushes through this context's own `set_global`, which needs the runtime, handlers and converters all in place) and retains each SharedTable in `shared_tables_` so `Reset()` can re-publish.
+
+### Design Decisions
+
+**Propagation reuses the target context's `set_global`, called through JS.** `PushValue` does `context.Get("set_global").Call(...)` instead of calling a C++ method. One extra JS hop buys a shared value exactly the same treatment as any other JS value crossing into that state: registered type converters, nested-callback materialization, the async busy guard, and the protected write that turns an OOM into a catchable error. Reaching into `LuaContext` directly would mean duplicating (and then maintaining) all of it.
+
+**Subscribers are weak references; the context's reference to the SharedTable is strong.** A SharedTable must not keep a context alive — that would turn a module-level shared config into a leak of every context that ever used it. The reverse direction is strong, because the subscription is context configuration and a SharedTable is a small JS object. Weak one way, strong the other: no cycle, and a collected context is pruned at the next propagation.
+
+**Propagation snapshots the subscriber list before pushing.** A push runs user JS (a type converter, a `__newindex` host callback on the target global), which can construct another context that subscribes to the same table — mutating `subscribers_` mid-iteration. Snapshotting the targets first (and pruning in the same pass, before any JS runs) makes that reentrancy harmless.
+
+**A failed push is aggregated, not fatal to the rest.** If one subscriber is busy with an async operation, its `set_global` throws. Aborting there would leave the remaining contexts silently un-updated, which is worse than the failure itself. Every context is attempted, then one error names the ones that failed and says the JS value was still updated and `sync()` retries. The alternative — skipping busy contexts silently — would let contexts drift apart with no signal.
+
+**The initial object is held, not deep-copied.** The original plan called for a deep copy on construction. But `sync()` only earns its place if the object can be mutated outside `set()`, and the natural way to do that is to mutate the object you passed in (or a nested one from `get()`). Copying would break exactly that workflow while preventing nothing — a caller can reach the state through `get()` regardless.
+
+**Whole-value pushes, not per-key.** `set('n', 1)` re-pushes the entire table rather than issuing a targeted `set_global('settings.n', 1)`. The dotted-path form would be cheaper but silently wrong for a key containing a dot, and it would fail if a script replaced the global with a non-table. Whole-value is predictable and self-healing — it restores the global no matter what the script did to it. The cost on large tables is real and documented.
+
+**`reset()` re-publishes shared globals.** Everything else `reset()` declines to replay (modules, classes, metatables, userdata) is bound to Lua-side objects that die with the state. A shared table's value lives in JS, so replaying it is just another push — and leaving it out would silently break sharing until the next `set()`. The subscription itself needs nothing: the SharedTable's weak reference is to the JS wrapper, which `reset()` does not replace.
+
+**Passing a SharedTable directly as `shared` is rejected.** `{ shared: sharedTable }` (instead of `{ shared: { name: sharedTable } }`) is a plausible mistake, and a SharedTable has no own enumerable keys — so it would subscribe nothing, silently. The constructor detects that shape and names the error.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1320,3 +1360,4 @@ The environment is returned as an ordinary `LuaTableHandle`, not a distinct opaq
 | Context reset (`reset()` — fresh state, replayed configuration) | Moderate | July 2026 |
 | GC control (`gc()` — collect, stop/restart, step, count, mode, params) | Low | July 2026 |
 | Environment tables (`create_environment()` / `execute_script_in()`) | Moderate | July 2026 |
+| Shared state between contexts (`createSharedTable()` + `shared` option) | Moderate | July 2026 |

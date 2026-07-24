@@ -6510,4 +6510,263 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // SHARED STATE BETWEEN CONTEXTS
+  // ============================================
+  describe('shared state between contexts', () => {
+    describe('createSharedTable()', () => {
+      it('publishes the initial value to every subscribing context', () => {
+        const shared = lua_native.createSharedTable({ mode: 'dev', retries: 3 });
+        const lua1 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        const lua2 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        expect(lua1.execute_script('return settings.mode')).toBe('dev');
+        expect(lua2.execute_script('return settings.retries')).toBe(3);
+      });
+
+      it('publishes nested objects', () => {
+        const shared = lua_native.createSharedTable({ config: { debug: true, level: 2 } });
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        expect(lua.execute_script('return settings.config.debug')).toBe(true);
+        expect(lua.execute_script('return settings.config.level')).toBe(2);
+      });
+
+      it('defaults to an empty table', () => {
+        const shared = lua_native.createSharedTable();
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        expect(lua.execute_script('return type(settings)')).toBe('table');
+        expect(lua.execute_script('return next(settings) == nil')).toBe(true);
+      });
+
+      it('accepts an array as the shared value', () => {
+        const shared = lua_native.createSharedTable([10, 20, 30]);
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { list: shared } });
+
+        expect(lua.execute_script('return #list')).toBe(3);
+        expect(lua.execute_script('return list[2]')).toBe(20);
+      });
+
+      it('rejects a non-object initial value', () => {
+        expect(() => lua_native.createSharedTable(5 as any)).toThrow('requires an object');
+        expect(() => lua_native.createSharedTable('x' as any)).toThrow('requires an object');
+        expect(() => lua_native.createSharedTable((() => 1) as any)).toThrow('requires an object');
+      });
+
+      it('holds the caller\'s object rather than a copy', () => {
+        const initial = { n: 1 };
+        const shared = lua_native.createSharedTable(initial);
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        initial.n = 99;
+        shared.sync();
+        expect(lua.execute_script('return settings.n')).toBe(99);
+      });
+    });
+
+    describe('set() and get()', () => {
+      it('propagates a set to every subscribed context', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const lua1 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        const lua2 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        shared.set('n', 42);
+
+        expect(lua1.execute_script('return settings.n')).toBe(42);
+        expect(lua2.execute_script('return settings.n')).toBe(42);
+      });
+
+      it('adds new keys, not just updates', () => {
+        const shared = lua_native.createSharedTable({ a: 1 });
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        shared.set('b', 2);
+        expect(lua.execute_script('return settings.a + settings.b')).toBe(3);
+      });
+
+      it('reads the JS-side value back', () => {
+        const shared = lua_native.createSharedTable({ n: 1, nested: { x: 5 } });
+        expect(shared.get('n')).toBe(1);
+        expect((shared.get('nested') as any).x).toBe(5);
+        expect(shared.get('missing')).toBeUndefined();
+
+        shared.set('n', 7);
+        expect(shared.get('n')).toBe(7);
+      });
+
+      it('propagates a function value as a callable global', () => {
+        const shared = lua_native.createSharedTable({});
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { helpers: shared } });
+
+        shared.set('double', ((n: number) => n * 2) as any);
+        expect(lua.execute_script('return helpers.double(21)')).toBe(42);
+      });
+
+      it('rejects a non-string key', () => {
+        const shared = lua_native.createSharedTable({});
+        expect(() => shared.set(1 as any, 'v')).toThrow('requires a string key');
+        expect(() => (shared.set as any)('only-key')).toThrow('requires a string key');
+        expect(() => shared.get(1 as any)).toThrow('requires a string key');
+        expect(() => (shared.get as any)()).toThrow('requires a string key');
+      });
+    });
+
+    describe('sync()', () => {
+      it('publishes a direct mutation of the shared object', () => {
+        const shared = lua_native.createSharedTable({ config: { debug: true } });
+        const lua1 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        const lua2 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        // Mutating through a nested object returned by get() needs an explicit
+        // sync — set() is the only self-publishing path.
+        (shared.get('config') as any).debug = false;
+        expect(lua1.execute_script('return settings.config.debug')).toBe(true);
+
+        shared.sync();
+        expect(lua1.execute_script('return settings.config.debug')).toBe(false);
+        expect(lua2.execute_script('return settings.config.debug')).toBe(false);
+      });
+
+      it('is a no-op with no subscribers', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        expect(() => shared.sync()).not.toThrow();
+      });
+    });
+
+    describe('isolation', () => {
+      it('leaves non-shared globals independent', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const lua1 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        const lua2 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        lua1.execute_script('private_value = "only-lua1"');
+        expect(lua2.get_global('private_value')).toBeNull();
+      });
+
+      it('keeps Lua-side edits local to their context', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const lua1 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        const lua2 = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        // Propagation is one-way: a script's assignment changes only its own
+        // context's copy and never travels back to JS.
+        lua1.execute_script('settings.n = 999');
+        expect(lua1.execute_script('return settings.n')).toBe(999);
+        expect(lua2.execute_script('return settings.n')).toBe(1);
+        expect(shared.get('n')).toBe(1);
+
+        // ...and the next publish overwrites the local edit.
+        shared.set('n', 5);
+        expect(lua1.execute_script('return settings.n')).toBe(5);
+      });
+
+      it('publishes the current value to a context that subscribes later', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const early = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        shared.set('n', 2);
+        const late = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        expect(late.execute_script('return settings.n')).toBe(2);
+        expect(early.execute_script('return settings.n')).toBe(2);
+      });
+
+      it('supports different global names per context', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const lua1 = new lua_native.init({}, { ...ALL_LIBS, shared: { alpha: shared } });
+        const lua2 = new lua_native.init({}, { ...ALL_LIBS, shared: { beta: shared } });
+
+        shared.set('n', 3);
+        expect(lua1.execute_script('return alpha.n')).toBe(3);
+        expect(lua2.execute_script('return beta.n')).toBe(3);
+      });
+
+      it('supports several shared tables on one context', () => {
+        const a = lua_native.createSharedTable({ v: 'a' });
+        const b = lua_native.createSharedTable({ v: 'b' });
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { first: a, second: b } });
+
+        expect(lua.execute_script('return first.v .. second.v')).toBe('ab');
+        a.set('v', 'A');
+        expect(lua.execute_script('return first.v .. second.v')).toBe('Ab');
+      });
+    });
+
+    describe('option validation', () => {
+      it('rejects a non-object shared option', () => {
+        const shared = lua_native.createSharedTable({});
+        expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: shared as any }))
+          .toThrow('must be an object mapping global names to shared tables');
+        expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: [shared] as any }))
+          .toThrow('must be an object mapping global names to shared tables');
+      });
+
+      it('rejects an entry that is not a shared table', () => {
+        expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { settings: {} as any } }))
+          .toThrow('shared.settings must be a shared table created with createSharedTable()');
+        expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { settings: 5 as any } }))
+          .toThrow('must be a shared table created with createSharedTable()');
+      });
+
+      it('ignores an undefined shared option', () => {
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: undefined });
+        expect(lua.execute_script('return 1')).toBe(1);
+      });
+    });
+
+    describe('interaction with other features', () => {
+      it('re-publishes the shared globals after reset()', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        lua.execute_script('other = "gone after reset"');
+        lua.reset();
+
+        // The shared value lives in JS, so unlike modules or userdata it can be
+        // replayed onto the fresh state.
+        expect(lua.execute_script('return settings.n')).toBe(1);
+        expect(lua.get_global('other')).toBeNull();
+
+        // ...and the context is still subscribed afterwards.
+        shared.set('n', 8);
+        expect(lua.execute_script('return settings.n')).toBe(8);
+      });
+
+      it('reports a context that cannot accept the update, after updating the rest', async () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const busy = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+        const idle = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        const pending = busy.execute_script_async(
+          'local s = 0 for i = 1, 3000000 do s = s + i end return s');
+
+        expect(() => shared.set('n', 7)).toThrow(/shared table update failed for 1 of 2 contexts/);
+        // The reachable context still got the update, and the JS value stands.
+        expect(idle.execute_script('return settings.n')).toBe(7);
+        expect(shared.get('n')).toBe(7);
+
+        await pending;
+
+        // sync() brings the straggler back in line.
+        shared.sync();
+        expect(busy.execute_script('return settings.n')).toBe(7);
+      });
+
+      it('works with a shared table read through a table reference', () => {
+        const shared = lua_native.createSharedTable({ n: 1 });
+        const lua = new lua_native.init({}, { ...ALL_LIBS, shared: { settings: shared } });
+
+        const ref = lua.get_global_ref('settings');
+        expect(ref.get('n')).toBe(1);
+
+        // Each publish replaces the global with a fresh table, so a handle taken
+        // beforehand keeps pointing at the previous one.
+        shared.set('n', 2);
+        expect(ref.get('n')).toBe(1);
+        expect(lua.execute_script('return settings.n')).toBe(2);
+        ref.release();
+      });
+    });
+  });
 });

@@ -71,20 +71,24 @@ from **full** parity.
 These real gaps are already tracked and should not be duplicated. Cross-referenced
 so this document stands alone:
 
-- Execution time / instruction limits + wall-clock timeout (Tier 1/3) — **still
-  open**, and now more urgent: `cancel()` is only observed at host-call/await
-  boundaries, so a compute-bound Lua loop cannot be cancelled until the
-  `lua_sethook` infrastructure lands (see audit note under A3)
+- ~~Execution time / instruction limits (Tier 1)~~ — **done** (July 2026:
+  `maxInstructions`, whose count-hook also polls the cancel flag, so a
+  compute-bound Lua loop is now cancellable — closing A3b). The optional
+  wall-clock timeout (Tier 3) is still open
 - ~~Error **stack traces** via `debug.traceback` (Tier 2)~~ — **done** (July
   2026, shipped with D2 via a `luaL_traceback` message handler in
   `lua-runtime.cpp`)
-- GC control, context reset, state introspection (Tier 2/3) — still open
+- ~~GC control, context reset (Tier 2)~~ — **done** (July 23, 2026: `gc()` and
+  `reset()`). State introspection (Tier 3) is still open
 - Debug hooks (`lua_sethook`) (Tier 3) — still open
-- Environment tables / per-script `_ENV` sandboxing (Tier 3) — still open
-- Reference lifecycle management / explicit `release()` (Tier 3) — **partially
-  done**: `LuaTableHandle.release()` exists; function and coroutine refs still
-  have no explicit release
-- Dotted-path globals, shared state between contexts (Tier 4) — still open
+- ~~Environment tables / per-script `_ENV` sandboxing (Tier 3)~~ — **done**
+  (July 24, 2026: `create_environment()` / `execute_script_in()`)
+- ~~Reference lifecycle management / explicit `release()` (Tier 3)~~ — **done**
+  (July 23, 2026): `LuaTableHandle.release()` plus context-level
+  `release(value)` for function, coroutine, and table refs
+- ~~Dotted-path globals (Tier 4)~~ — **done** (July 23, 2026).
+  ~~Shared state between contexts (Tier 4)~~ — **done** (July 24, 2026:
+  `createSharedTable()` + the `shared` init option)
 
 The remainder of this document covers **gaps that are NOT in `FUTURE.md`** — the
 net-new findings.

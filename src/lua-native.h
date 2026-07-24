@@ -92,6 +92,70 @@ struct UserdataEntry {
   bool writable;
 };
 
+// A JS-side value that several LuaContexts mirror as a global — the backing
+// object for `lua_native.createSharedTable()` and the `shared` init option.
+//
+// Lua states cannot share memory, so "shared" here means *synchronized copies*:
+// one JS object is held here and pushed into each subscribed context's global
+// namespace with that context's own `set_global`. Propagation is one-way
+// (JS -> Lua) and eager — `set()` updates the object and immediately re-pushes
+// it everywhere; `sync()` re-pushes after the object was mutated directly.
+// Lua-side edits stay local to their context; read them back with that
+// context's `get_global`.
+class SharedTable final : public Napi::ObjectWrap<SharedTable> {
+public:
+    // Builds the class. The constructor is not exported — `createSharedTable`
+    // is the only way to mint one, so an object reaching the `shared` option
+    // can be identified by an InstanceOf check against the stored constructor.
+    static Napi::Function DefineSharedTable(Napi::Env env);
+
+    explicit SharedTable(const Napi::CallbackInfo& info);
+
+    Napi::Value Get(const Napi::CallbackInfo& info);
+    Napi::Value Set(const Napi::CallbackInfo& info);
+    Napi::Value Sync(const Napi::CallbackInfo& info);
+
+    // Pushes the current value into `context` under `name`, then records the
+    // context as a subscriber. Pushing first means a context whose initial push
+    // failed is never recorded. Throws Napi::Error if the push fails.
+    void Subscribe(const Napi::Object& context, const std::string& name);
+
+    // Pushes the current value into one already-subscribed context without
+    // recording it again. Used by LuaContext::Reset to re-establish the shared
+    // globals the retired state took with it.
+    void PushTo(const Napi::Object& context, const std::string& name) const;
+
+private:
+    // The shared object itself, held (not copied) so a caller that mutates the
+    // object it passed to createSharedTable can publish the change with sync().
+    Napi::ObjectReference value_;
+
+    struct Subscriber {
+      // Weak: a SharedTable must not keep a context alive. A collected context
+      // reads back empty and is pruned on the next propagation.
+      Napi::ObjectReference context;
+      std::string name;
+    };
+    std::vector<Subscriber> subscribers_;
+
+    // Re-pushes the value into every live subscriber and prunes collected ones.
+    // Contexts that reject the push (e.g. one busy with an async operation) are
+    // collected and reported together, after every other context has been
+    // updated — one unavailable context must not silently skip the rest.
+    void Propagate(Napi::Env env);
+
+    static void PushValue(const Napi::Object& context, const std::string& name,
+                          const Napi::Value& value);
+};
+
+// Per-addon-instance data. Keeps the exported class constructors alive for the
+// life of the addon instance, and gives the `shared` option a way to recognize
+// a genuine SharedTable (whose constructor is deliberately not exported).
+struct AddonData {
+  Napi::FunctionReference contextConstructor;
+  Napi::FunctionReference sharedTableConstructor;
+};
+
 class LuaContext final : public Napi::ObjectWrap<LuaContext> {
 public:
     static Napi::Object Init(Napi::Env env, Napi::Object exports);
@@ -319,6 +383,12 @@ private:
     bool allow_bytecode_ = true;
     // Search paths added via add_search_path, in the order they were added.
     std::vector<std::string> search_paths_;
+    // SharedTables this context subscribed to via the `shared` init option,
+    // paired with the global name each is published under. Held strongly (the
+    // subscription is context configuration, and a SharedTable is a small JS
+    // object); the SharedTable's own reference back to this context is weak, so
+    // there is no cycle. reset() replays these onto the fresh state.
+    std::vector<std::pair<Napi::ObjectReference, std::string>> shared_tables_;
 
     // Installs the runtime-side handlers that bridge back into this context
     // (userdata GC, host-function GC, proxy property access). Shared by the

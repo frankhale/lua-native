@@ -24,6 +24,7 @@ data structures.
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
 - Environment tables — give each script its own global namespace with `create_environment()` / `execute_script_in()`, so scripts in one context can run at different permission levels
+- Shared state between contexts — publish one JS object as a global in several contexts with `createSharedTable()` and keep them in step with `set()` / `sync()`
 - Reference lifecycle — explicitly free the registry reference behind a returned Lua function, coroutine, or table reference with `release()`, so long-lived contexts don't accumulate Lua-side memory
 - Context reset — `reset()` swaps in a fresh Lua state with the same options and replays your callbacks, so a long-lived process can drop accumulated global state without rebuilding the context
 - Module / require integration — register JS modules, add search paths, or resolve modules dynamically with a JS searcher (`add_searcher`) for Lua's `require()`
@@ -1714,6 +1715,116 @@ lua.execute_script("sandbox = { limit = 3 }");
 lua.execute_script_in(lua.get_global_ref("sandbox"), "return limit"); // 3
 ```
 
+### Shared State Between Contexts
+
+Each `new lua_native.init()` is a fully independent Lua state, and Lua states
+cannot share memory. A **shared table** gives you the next best thing:
+synchronized copies. One JavaScript object is published as a global in every
+context that subscribes to it, and every update is pushed to all of them.
+
+```javascript
+import lua_native from "lua-native";
+
+const settings = lua_native.createSharedTable({ mode: "dev", retries: 3 });
+
+const lua1 = new lua_native.init({}, { libraries: "all", shared: { settings } });
+const lua2 = new lua_native.init({}, { libraries: "all", shared: { settings } });
+
+console.log(lua1.execute_script("return settings.mode")); // 'dev'
+console.log(lua2.execute_script("return settings.retries")); // 3
+
+// One update, both contexts
+settings.set("mode", "prod");
+console.log(lua1.execute_script("return settings.mode")); // 'prod'
+console.log(lua2.execute_script("return settings.mode")); // 'prod'
+```
+
+The key in the `shared` option is the global name, so the same shared table can
+appear under different names in different contexts, and a context can subscribe
+to several shared tables at once:
+
+```javascript
+const lua = new lua_native.init({}, {
+  libraries: "all",
+  shared: { config: configTable, cache: cacheTable },
+});
+```
+
+#### Reading and Updating
+
+`get()` and `set()` operate on the JavaScript-side value. `set()` publishes
+immediately; `sync()` publishes after you mutate the object directly:
+
+```javascript
+const shared = lua_native.createSharedTable({ config: { debug: true } });
+const lua = new lua_native.init({}, { libraries: "all", shared: { settings: shared } });
+
+shared.set("retries", 5); // published right away
+shared.get("retries"); // 5
+
+// Mutating a nested object (or the object you passed to createSharedTable)
+// is not self-publishing — call sync() when you're done.
+shared.get("config").debug = false;
+shared.sync();
+
+lua.execute_script("return settings.config.debug"); // false
+```
+
+A context that subscribes later gets the current value, not the initial one:
+
+```javascript
+const shared = lua_native.createSharedTable({ n: 1 });
+const early = new lua_native.init({}, { shared: { s: shared } });
+shared.set("n", 2);
+const late = new lua_native.init({}, { shared: { s: shared } }); // sees n = 2
+```
+
+#### What "Shared" Means Here
+
+Since Lua states cannot share memory, the sharing is maintained by copying.
+That has three consequences worth knowing:
+
+- **Propagation is one-way (JS → Lua).** A Lua script that assigns into the
+  shared global changes only its own context's copy. That edit does not reach
+  the other contexts, does not update the JS-side value, and is overwritten by
+  the next `set()` / `sync()`. Read a context's own view back with
+  `get_global()` if you need it.
+
+  ```javascript
+  lua1.execute_script("settings.n = 999");
+  lua1.execute_script("return settings.n"); // 999 — local only
+  lua2.execute_script("return settings.n"); // unchanged
+  shared.get("n"); // unchanged
+  ```
+
+- **Every update re-pushes the whole value.** A large shared table costs
+  proportionally on every `set()` and `sync()`. Shared tables are meant for
+  configuration-sized state, not bulk data.
+
+- **A context that can't accept the update is reported, not skipped silently.**
+  If a subscriber is busy with an async operation, `set()` still updates the JS
+  value and every other context, then throws naming the ones that failed. Call
+  `sync()` to retry once they're free.
+
+Subscriptions don't keep contexts alive — a garbage-collected context is
+dropped from the subscriber list. And because the value lives in JS, `reset()`
+re-publishes the shared globals onto the fresh state automatically.
+
+#### Alternative: `set_global` on Each Context
+
+Sharing is copy-and-sync either way, so for a one-off value there's nothing
+wrong with the manual form:
+
+```javascript
+const config = { mode: "prod" };
+lua1.set_global("settings", config);
+lua2.set_global("settings", config);
+```
+
+A shared table is worth it once you have several contexts, updates over time,
+or contexts created at different points — it keeps the subscriber list and the
+"publish to everyone" step in one place.
+
 ## TypeScript Support
 
 The module includes comprehensive TypeScript definitions:
@@ -1736,6 +1847,7 @@ import type {
   LuaTableRef,
   MetatableDefinition,
   PcallResult,
+  SharedTable,
   UserdataMethod,
   UserdataOptions,
 } from "lua-native";
@@ -1942,10 +2054,48 @@ creates a bare Lua state with no callbacks and no standard libraries.
     in the callbacks object.
   - `allowBytecode` (optional): When `false`, refuses binary chunks —
     `load_bytecode()` throws and `load()` is forced to text-only. Default `true`.
+  - `shared` (optional): Object mapping global names to `SharedTable` instances
+    (see `createSharedTable`). Each one's current value is published as that
+    global at construction, and the context receives every later update.
 
 **Returns:** `LuaContext` instance
 
-**Throws:** Error if an unknown library name is provided
+**Throws:** Error if an unknown library name is provided, or if a `shared` entry
+is not a shared table created with `createSharedTable()`
+
+### `lua_native.createSharedTable(initial?)`
+
+Creates a shared table — a JavaScript object that can be published as a global
+in several Lua contexts and kept in step across them. Subscribe a context by
+passing the shared table in the `shared` init option.
+
+**Parameters:**
+
+- `initial` (optional): The object to share. Held, not copied — mutating it and
+  calling `sync()` publishes the change. Defaults to an empty object.
+
+**Returns:** `SharedTable`
+
+**Throws:** `TypeError` if `initial` is not an object
+
+### `SharedTable`
+
+A JavaScript value mirrored as a global in one or more Lua contexts. Because Lua
+states cannot share memory, "shared" means synchronized copies: propagation is
+one-way (JS → Lua) and re-pushes the whole value on every update. See
+[Shared State Between Contexts](#shared-state-between-contexts) for the full
+model.
+
+**Methods:**
+
+- `get(key: string): LuaValue` — Read a top-level field of the JavaScript-side
+  value. Lua-side edits are not reflected here.
+- `set(key: string, value: LuaInput): void` — Set a top-level field and
+  immediately publish the whole value to every subscribed context. Throws if a
+  subscriber rejects the update (e.g. one busy with an async operation) — the JS
+  value is still updated and the other contexts still receive it.
+- `sync(): void` — Re-publish the current value to every subscribed context. Use
+  after mutating the shared object directly, or to retry a rejected `set()`.
 
 ### `LuaContext.execute_script(script)`
 

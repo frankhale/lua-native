@@ -23,6 +23,7 @@ export type {
   LuaValue,
   MetatableDefinition,
   PcallResult,
+  SharedTable,
   UserdataMethod,
   UserdataOptions,
 } from './types.js';
