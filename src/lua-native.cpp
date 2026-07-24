@@ -725,7 +725,7 @@ static SharedTable* AsSharedTable(const Napi::Env env, const Napi::Value& value)
   if (!value.IsObject() || value.IsFunction()) return nullptr;
   const auto* data = env.GetInstanceData<AddonData>();
   if (!data || data->sharedTableConstructor.IsEmpty()) return nullptr;
-  const Napi::Object obj = value.As<Napi::Object>();
+  const auto obj = value.As<Napi::Object>();
   if (!obj.InstanceOf(data->sharedTableConstructor.Value())) return nullptr;
   return SharedTable::Unwrap(obj);
 }
