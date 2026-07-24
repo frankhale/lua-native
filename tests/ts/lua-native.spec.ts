@@ -3662,6 +3662,24 @@ describe('lua-native Node adapter', () => {
           .toThrow('table handle has been released');
       });
 
+      it('rejects an environment created before a reset()', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment({ whitelist: ['math'] });
+        lua.reset();
+        // reset() retires the state; the handle's runtime no longer matches, so
+        // it is rejected the same way a foreign context's handle is.
+        expect(() => lua.execute_script_in(env, 'return math.pi'))
+          .toThrow('different Lua context');
+      });
+
+      it('round-trips an environment into Lua as an ordinary table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const env = lua.create_environment();
+        lua.execute_script_in(env, 'value = 5');
+        lua.set_global('sandbox', env);
+        expect(lua.execute_script('return sandbox.value')).toBe(5);
+      });
+
       it('releases via lua.release(env) too', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         const env = lua.create_environment();
