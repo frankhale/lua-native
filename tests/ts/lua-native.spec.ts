@@ -7529,6 +7529,132 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // LIVE REFERENCES TO NESTED TABLES
+  // ============================================
+  describe('LuaTableHandle.get_ref()', () => {
+    it('returns a live handle where get() would return a copy', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('outer = { inner = { v = 1 } }');
+      const outer = lua.get_global_ref('outer');
+
+      // get() on a metatable-less nested table is a detached copy.
+      const copy = outer.get('inner') as any;
+      copy.v = 99;
+      expect(lua.execute_script('return outer.inner.v')).toBe(1);
+
+      // get_ref() reaches the real table.
+      const inner = outer.get_ref('inner');
+      inner.set('v', 99);
+      expect(lua.execute_script('return outer.inner.v')).toBe(99);
+      inner.release();
+    });
+
+    it('makes a plain nested table reachable for set_metatable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('outer = { inner = {} }');
+      const inner = lua.get_global_ref('outer').get_ref('inner');
+      lua.set_metatable(inner, { __index: (_s: unknown, k: string) => `<${k}>` });
+      expect(lua.execute_script('return outer.inner.zzz')).toBe('<zzz>');
+    });
+
+    it('composes to any depth', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('a = { b = { c = { d = 7 } } }');
+      const c = lua.get_global_ref('a').get_ref('b').get_ref('c');
+      expect(c.get('d')).toBe(7);
+      c.set('d', 8);
+      expect(lua.execute_script('return a.b.c.d')).toBe(8);
+    });
+
+    it('distinguishes an integer key from a string key', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        t = {}
+        t[1] = { tag = 'int-key' }
+        t["1"] = { tag = 'string-key' }
+      `);
+      const t = lua.get_global_ref('t');
+      expect(t.get_ref(1).get('tag')).toBe('int-key');
+      expect(t.get_ref('1').get('tag')).toBe('string-key');
+    });
+
+    it('addresses array elements by index', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('rows = { { n = 1 }, { n = 2 } }');
+      const rows = lua.get_global_ref('rows');
+      expect(rows.get_ref(2).get('n')).toBe(2);
+      rows.get_ref(1).set('n', 10);
+      expect(lua.execute_script('return rows[1].n')).toBe(10);
+    });
+
+    it('triggers __index like get()', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        backing = { hidden = { v = 'from __index' } }
+        front = setmetatable({}, { __index = backing })
+      `);
+      expect(lua.get_global_ref('front').get_ref('hidden').get('v'))
+        .toBe('from __index');
+    });
+
+    it('returns an independent handle that outlives its parent', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('p = { c = { v = 3 } }');
+      const parent = lua.get_global_ref('p');
+      const child = parent.get_ref('c');
+      parent.release();
+      expect(child.get('v')).toBe(3);
+      child.release();
+    });
+
+    it('aliases the same Lua table across separate refs', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('q = { c = { v = 1 } }');
+      const a = lua.get_global_ref('q').get_ref('c');
+      const b = lua.get_global_ref('q').get_ref('c');
+      a.set('v', 42);
+      expect(b.get('v')).toBe(42);
+    });
+
+    it('throws when the field is not a table', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('t = { n = 5, s = "x" }');
+      const t = lua.get_global_ref('t');
+      expect(() => t.get_ref('n')).toThrow(/'n' is not a table \(got number\)/);
+      expect(() => t.get_ref('s')).toThrow(/'s' is not a table \(got string\)/);
+      expect(() => t.get_ref('missing')).toThrow(/'missing' is not a table \(got nil\)/);
+    });
+
+    it('validates its argument and the handle', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('t = { c = {} }');
+      const t = lua.get_global_ref('t');
+      expect(() => (t as any).get_ref()).toThrow(/requires a key argument/);
+      expect(() => (t as any).get_ref(Symbol('x'))).toThrow(/must be a string or number/);
+
+      t.release();
+      expect(() => t.get_ref('c')).toThrow(/has been released/);
+    });
+
+    it('catches a raising __index and leaves the context usable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(
+        'bad = setmetatable({}, { __index = function() error("boom") end })');
+      const bad = lua.get_global_ref('bad');
+      expect(() => bad.get_ref('x')).toThrow(/boom/);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('works with the context-level release()', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('r = { c = {} }');
+      const c = lua.get_global_ref('r').get_ref('c');
+      lua.release(c);
+      expect(() => c.get('x')).toThrow(/has been released/);
+    });
+  });
+
+  // ============================================
   // COROUTINES AS ITERATORS (A4)
   // ============================================
   describe('coroutine iteration', () => {

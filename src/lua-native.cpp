@@ -363,6 +363,47 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
   }
 }
 
+// get_ref(key) — the explicit opt-in to a *reference* where get() would hand
+// back a deep copy. A plain (metatable-less) nested table is otherwise
+// unreachable from JS: it converts to a detached object, so mutating it does
+// nothing to Lua and set_metatable has nothing to attach to.
+static Napi::Value TableHandleGetRef(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1) {
+    Napi::TypeError::New(env, "get_ref() requires a key argument").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  lua_core::TableKey key;
+  if (!NapiToTableKey(info[0], key)) {
+    Napi::TypeError::New(env, "get_ref() key must be a string or number").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::variant<int, std::string> result;
+  try {
+    // The read runs __index, so it carries the same CallScope discipline as
+    // get() (CR-8 F5).
+    LuaContext::CallScope scope(data->context);
+    result = data->runtime->GetTableFieldRef(data->tableRef.ref, key);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (const auto* error = std::get_if<std::string>(&result)) {
+    Napi::Error::New(env, *error).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  return data->context->CreateTableHandle(env, std::get<int>(result));
+}
+
 static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* data = static_cast<LuaTableRefData*>(info.Data());
@@ -1830,6 +1871,7 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
     (void)handle.Set(name, fn);
   };
   addMethod("get", TableHandleGet);
+  addMethod("get_ref", TableHandleGetRef);
   addMethod("set", TableHandleSet);
   addMethod("has", TableHandleHas);
   addMethod("length", TableHandleLength);

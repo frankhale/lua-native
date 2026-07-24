@@ -1029,6 +1029,19 @@ behavior.
 
 ### Nested tables
 
+> **Resolved (July 24, 2026).** The deferred `get_field_ref` below shipped as
+> **`handle.get_ref(key)`**, so the awkward navigation is no longer necessary:
+>
+> ```typescript
+> const nested = lua.get_global_ref('parent').get_ref('child');
+> ```
+>
+> It composes to any depth and keeps the key's JS type, so integer keys and
+> array elements work — which is why it became a handle method rather than the
+> dotted `get_global_ref('parent.child')` sketched (and rejected) below. See
+> "Live References to Nested Tables" in [`FEATURES.md`](./FEATURES.md). The
+> original analysis is retained.
+
 When `handle.get('nested_key')` returns a table value:
 
 - If the nested table has a metatable → returns a Proxy (existing behavior)
@@ -1134,8 +1147,9 @@ detection logic.
 
 These are not part of the initial implementation but are natural follow-ups:
 
-- **`get_field_ref(handle, key)`** — Get a handle to a nested table without
-  going through `execute_script`. Avoids the nested table awkwardness.
+- ~~**`get_field_ref(handle, key)`**~~ — **done (July 24, 2026)** as
+  `handle.get_ref(key)`: a handle to a nested table without going through
+  `execute_script`. Core: `LuaRuntime::GetTableFieldRef`.
 - **`table_remove(handle, key)`** — Delete a key from a table (set to nil).
   Currently achievable via `handle.set(key, null)`.
 - **`pairs_iter()` / `ipairs_iter()`** — Lazy iterators for large tables

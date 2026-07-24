@@ -311,7 +311,7 @@ All standard Lua metamethods work: `__tostring`, `__add`, `__sub`, `__mul`, `__d
 
 **`set_metatable()` only works for global tables.** To set metatables on non-global tables, use `setmetatable()` in Lua code directly. This is a deliberate simplification — the API takes a global name string, which is unambiguous. Supporting arbitrary table references would require the Proxy-based table ref system (which was built later).
 
-> **Superseded (July 24, 2026).** The table-reference system this decision was waiting on has existed since February 2026, so `set_metatable` now takes a global name *or* a live table reference — see "Metatables on non-global tables (F1)" under [Interop Completeness](#interop-completeness-july-2026). The caveat that remains is narrower, and is no longer about `set_metatable` at all — it is the *table-reference API's* reach. `set_metatable` can target anything you can hold a live reference to; you simply cannot obtain a live reference to a plain (metatable-less) table that is not a global, because `ToLuaValue` deep-copies those. So `outer.inner` is out of reach at one level down, while a *metatabled* `outer.tagged` is reachable, since it arrives as a live Proxy. Note the resulting circularity: the way to make a plain nested table reachable from JS is to give it a metatable from Lua first.
+> **Superseded (July 24, 2026).** The table-reference system this decision was waiting on has existed since February 2026, so `set_metatable` now takes a global name *or* a live table reference — see "Metatables on non-global tables (F1)" under [Interop Completeness](#interop-completeness-july-2026). The caveat that remained after F1 was narrower, and was no longer about `set_metatable` at all — it was the *table-reference API's* reach. `set_metatable` can target anything you can hold a live reference to, but there was no way to obtain a live reference to a plain (metatable-less) table that is not a global, because `ToLuaValue` deep-copies those. `outer.inner` was out of reach one level down, while a *metatabled* `outer.tagged` was reachable, arriving as a live Proxy — a circularity in which the way to make a plain nested table reachable from JS was to give it a metatable from Lua first. `LuaTableHandle.get_ref()` closes that; see [Live References to Nested Tables](#live-references-to-nested-tables-july-2026).
 
 ---
 
@@ -1579,6 +1579,45 @@ which only bounds a registry someone edited from Lua via `debug.getregistry()`.
 
 ---
 
+## Live References to Nested Tables (July 2026)
+
+### Overview
+
+`LuaTableHandle.get_ref(key)` returns a live handle to the table stored at `key`, where `get(key)` would return a detached deep copy. It is `get_global_ref()` one level down, and it composes: `a.get_ref('b').get_ref('c')` reaches any depth.
+
+### Why it was needed
+
+`ToLuaValue` preserves a table by reference only when it has a metatable; a plain table becomes a deep copy. That policy is deliberate and worth keeping — it is what makes "return a config table to JS" ergonomic — but it left plain *nested* tables unreachable. Concretely, after F1 made `set_metatable` accept a table reference, this was still impossible:
+
+```javascript
+lua.execute_script('outer = { inner = { v = 1 } }');
+const inner = lua.get_global_ref('outer').get('inner');  // a copy
+inner.v = 99;                       // does nothing to Lua
+lua.set_metatable(inner, { ... });  // rejected — not a table reference
+```
+
+The result was a circularity: **to attach a metatable to a plain nested table from JS you needed a live reference to it, and to get a live reference to it, it needed a metatable.** The only exit was `setmetatable()` in Lua, after which the table was reachable from JS forever.
+
+### Architecture
+
+**Core layer:** `GetTableFieldRef(registry_ref, key)` mirrors `GetGlobalRef` — read the field and `luaL_ref` it in a single `RunProtected` frame, so a raising `__index` (M4) and an OOM in the `lua_gettable`/`luaL_ref` allocation (M5) both surface as caught errors rather than a panic. Returns `variant<int, string>` on the same contract as `GetGlobalRef`: the new ref, or a message when the field is not a table. The message is built after the frame unwinds, so no `std::string` local is live across a possible longjmp (N2).
+
+**N-API layer:** `TableHandleGetRef` validates the key with the existing `NapiToTableKey`, calls the core under a `CallScope` (the read runs `__index`, so it carries the same discipline as `get()`), and wraps the result with `CreateTableHandle` — which moved from private to public so this free function can reach it.
+
+### Design Decisions
+
+**A method on the handle, not dotted paths on `get_global_ref`.** Dotted paths were the obvious alternative and would have matched `set_global` / `get_global` / `call`. Two things decided against it. A dotted string path cannot distinguish `t[1]` from `t["1"]` — a distinction this codebase takes seriously enough to carry a `TableKey` variant and a whole `*Keyed` family of table operations — nor can it address an array element at all. And a handle method composes to arbitrary depth for free, where a path parser would be a second traversal implementation to keep correct. The dotted-path forms elsewhere accept that ambiguity because their keys are conventionally identifiers; a table-reference API should not.
+
+**It throws rather than returning null for a non-table field.** `get_ref` exists to hand back something you can write through, so "the field is a number" is a caller error, not a value. The message mirrors `GetGlobalRef`'s (`field 'n' is not a table (got number)`) including for nil, so a typo'd key reads the same as a wrongly-typed one.
+
+**The returned handle is independent of its parent.** It owns its own registry slot and needs its own `release()`; releasing the parent does not invalidate it. Anything else would mean tracking a parent/child graph in the binding layer to answer a question — "is my ancestor still alive?" — that the registry already answers per-slot.
+
+**The read honors `__index`.** `get_ref` is the reference-returning form of `get`, so it resolves the key the same way. A table reached through an `__index` fallback is a real table and referencing it is well-defined; making `get_ref` raw would have been a second, silently different lookup rule on the same object.
+
+**Not added to the Proxy surface.** A metatabled table's Proxy answers arbitrary keys from Lua, so a `get_ref` trap would shadow any Lua table with a `get_ref` field — a real hazard, unlike the two names the traps already special-case (`_tableRef`, `then`), which are internal or protocol. A Proxy is already a live reference; to descend from one, `set_global` it and take a `get_global_ref`, or reach the nested table from a handle instead.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1616,3 +1655,4 @@ which only bounds a registry someone edited from Lua via `debug.getregistry()`.
 | Coroutines as iterators, and from an existing `LuaFunction` | Moderate | July 2026 |
 | Lua → JS type converters (`register_from_lua_converter()`) | Low | July 2026 |
 | Class inheritance (`register_class({ extends })`) | Moderate | July 2026 |
+| Live references to nested tables (`LuaTableHandle.get_ref()`) | Low | July 2026 |

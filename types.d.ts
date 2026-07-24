@@ -277,6 +277,36 @@ export interface LuaTableHandle {
    */
   get(key: string | number): LuaValue;
 
+  /**
+   * Get a nested table field as a live handle rather than a copy.
+   *
+   * `get()` follows the library's usual conversion rule: a Lua table **without**
+   * a metatable comes back as a detached deep copy, so mutating it does nothing
+   * to Lua and `set_metatable()` has nothing to attach to. `get_ref()` is the
+   * explicit opt-in to the real table — `get_global_ref()` one level down.
+   *
+   * Handles compose, so any depth is reachable, and because the key keeps its JS
+   * type (see {@link get}) an integer key and array element are addressable too
+   * — neither of which a dotted string path could express.
+   *
+   * The read triggers `__index` like `get()`. The returned handle is independent
+   * of the one it came from: it stays valid after the parent is released, and
+   * needs its own `release()`.
+   *
+   * @param key The field to reference
+   * @returns A handle to the table stored at `key`
+   * @throws If the field is not a table (including nil), or this handle has been
+   *   released
+   * @example
+   * lua.execute_script('config = { db = { host = "localhost" } }');
+   *
+   * const db = lua.get_global_ref('config').get_ref('db');
+   * db.set('port', 5432);                       // reaches the real Lua table
+   * lua.set_metatable(db, { __index: () => null });
+   * db.release();
+   */
+  get_ref(key: string | number): LuaTableHandle;
+
   /** Set a field by key. Triggers __newindex if the table has a metatable. See {@link get} for how the key's JS type maps to the Lua key type. */
   set(key: string | number, value: LuaInput): void;
 

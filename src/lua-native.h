@@ -238,6 +238,11 @@ public:
     Napi::Value ResumeCoroutineObject(const Napi::Object& coro,
                                       const std::vector<Napi::Value>& args);
 
+    // Wraps a registry table reference as a `LuaTableHandle` JS object. Public
+    // so the handle's own `get_ref` free function can mint the nested handle it
+    // returns.
+    Napi::Object CreateTableHandle(Napi::Env env_, int registry_ref);
+
     // Wraps `dataPtr` (whose ownership passes to the returned object's
     // finalizer) as the JS coroutine object: the `_coroutine` marker, a `status`
     // string, and the `Symbol.iterator` factory that makes it usable with
@@ -458,5 +463,4 @@ private:
     lua_core::LuaRuntime::Function CreateConstructorWrapper(
         const std::string& name, const std::string& class_name,
         bool readable, bool writable);
-    Napi::Object CreateTableHandle(Napi::Env env_, int registry_ref);
 };

@@ -483,6 +483,20 @@ public:
   [[nodiscard]] int CreateTableFrom(const LuaTable& initial);
   [[nodiscard]] int CreateTableFrom(const LuaArray& initial) const;
   [[nodiscard]] std::variant<int, std::string> GetGlobalRef(const std::string& name) const;
+
+  // Takes a live reference to the table at `key` inside the table `registry_ref`
+  // names — GetGlobalRef one level down, and the explicit opt-in to a reference
+  // where GetTableField would hand back a deep copy.
+  //
+  // It exists because ToLuaValue only preserves a table by reference when it has
+  // a metatable; a plain nested table otherwise reads back as a copy, leaving it
+  // unreachable for anything that needs the real table (SetTableRefMetatable,
+  // in-place mutation). The read honors `__index`, like GetTableField.
+  //
+  // Returns the new registry ref, or an error message if the field is not a
+  // table (including nil), matching GetGlobalRef's contract.
+  [[nodiscard]] std::variant<int, std::string> GetTableFieldRef(
+      int registry_ref, const TableKey& key) const;
   [[nodiscard]] std::vector<std::pair<LuaPtr, LuaPtr>> TablePairs(int registry_ref) const;
   [[nodiscard]] std::vector<std::pair<int64_t, LuaPtr>> TableIPairs(int registry_ref) const;
   void ReleaseTableRef(int registry_ref);

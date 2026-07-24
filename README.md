@@ -23,7 +23,7 @@ data structures.
 - Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, use overloaded operators, and inherit from another registered class with `extends`
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more, on a global name or any live table reference
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
-- Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
+- Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`, descending into nested tables by reference with `get_ref()`
 - Environment tables — give each script its own global namespace with `create_environment()` / `execute_script_in()`, so scripts in one context can run at different permission levels
 - Shared state between contexts — publish one JS object as a global in several contexts with `createSharedTable()` and keep them in step with `set()` / `sync()`
 - Reference lifecycle — explicitly free the registry reference behind a returned Lua function, coroutine, or table reference with `release()`, so long-lived contexts don't accumulate Lua-side memory
@@ -1988,6 +1988,52 @@ console.log(config.get("port")); // 3306
 config.release(); // free the registry reference when done
 ```
 
+#### Live References to Nested Tables
+
+`get()` follows the library's usual conversion rule: a Lua table **without** a
+metatable comes back as a detached deep copy. That's convenient for reading, but
+it means a nested table isn't something you can write through:
+
+```javascript
+lua.execute_script('outer = { inner = { v = 1 } }');
+
+const copy = lua.get_global_ref("outer").get("inner");
+copy.v = 99;
+lua.execute_script("return outer.inner.v"); // still 1 — it was a copy
+```
+
+`get_ref()` is the explicit opt-in to the real table — `get_global_ref()` one
+level down:
+
+```javascript
+const inner = lua.get_global_ref("outer").get_ref("inner");
+
+inner.set("v", 99);
+lua.execute_script("return outer.inner.v"); // 99
+
+// ...and now it can carry a metatable, which a copy could not
+lua.set_metatable(inner, { __index: (t, k) => `<${k}>` });
+lua.execute_script("return outer.inner.missing"); // '<missing>'
+
+inner.release();
+```
+
+Handles compose, so any depth is reachable — and because the key keeps its
+JavaScript type, integer keys and array elements work too, which a dotted string
+path could not express:
+
+```javascript
+lua.execute_script("a = { b = { c = { d = 7 } } }");
+lua.get_global_ref("a").get_ref("b").get_ref("c").get("d"); // 7
+
+lua.execute_script("rows = { { n = 1 }, { n = 2 } }");
+lua.get_global_ref("rows").get_ref(2).get("n"); // 2
+```
+
+The returned handle is independent of the one it came from: it stays valid after
+the parent is released, and needs its own `release()`. `get_ref()` throws if the
+field is not a table (including nil).
+
 #### Setting Tables as Globals
 
 Table handles can be passed to `set_global()` to make them accessible from Lua:
@@ -3302,6 +3348,7 @@ and vice versa. Call `release()` when done to free the registry slot.
 **Methods:**
 
 - `get(key: string | number): LuaValue` — Get a field by key. Triggers `__index` if the table has a metatable.
+- `get_ref(key: string | number): LuaTableHandle` — Get a nested table field as a **live handle** instead of the deep copy `get()` returns for a metatable-less table. Composes to any depth (`a.get_ref('b').get_ref('c')`). Triggers `__index`. Throws if the field is not a table (including nil). The returned handle is independent — it survives its parent's `release()` and needs its own.
 - `set(key: string | number, value: LuaValue): void` — Set a field by key. Triggers `__newindex` if the table has a metatable.
 - `has(key: string | number): boolean` — Check if a key exists in the table.
 - `length(): number` — Get the table length (`#` operator). Triggers `__len` metamethod.
@@ -3339,7 +3386,7 @@ For the reverse direction — how JavaScript built-in types (`BigInt`, `Date`,
 ## Limitations
 
 - **Nesting depth limit** — Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
-- **`set_metatable()` needs a name or a handle** — the target is either a global name or a live table reference (`create_table()`, `get_global_ref()`, `create_environment()`, or a metatabled-table Proxy). What it cannot reach is any table you cannot hold a live reference to, which today means a **plain (metatable-less) table that is not a global** — including a nested field like `outer.inner`, which reads back as a deep copy rather than a reference. A metatabled nested table _is_ reachable, because it arrives as a live Proxy. For the rest, use `setmetatable()` in Lua code.
+- **`set_metatable()` needs a name or a handle** — the target is either a global name or a live table reference (`create_table()`, `get_global_ref()`, `create_environment()`, `get_ref()`, or a metatabled-table Proxy). Nested tables are reachable via `get_ref()`, which composes to any depth. What remains out of reach is a table you can't name or navigate to at all — a Lua local, or one only ever held in a local variable — for which `setmetatable()` in Lua is the answer.
 - **Plain tables are copied, not referenced** — When Lua tables _without metatables_ are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Tables _with metatables_ are returned as live Proxy objects that maintain a reference to the original Lua table. Use `create_table()` or `get_global_ref()` to get live handles to plain tables.
 
 ## Development

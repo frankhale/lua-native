@@ -2891,6 +2891,47 @@ std::variant<int, std::string> LuaRuntime::GetGlobalRef(const std::string& name)
   return ref;
 }
 
+// Human-readable form of a table key, for error messages only.
+static std::string DescribeTableKey(const TableKey& key) {
+  return std::visit([](const auto& k) -> std::string {
+    using T = std::decay_t<decltype(k)>;
+    if constexpr (std::is_same_v<T, std::string>) return k;
+    else return std::to_string(k);
+  }, key);
+}
+
+std::variant<int, std::string> LuaRuntime::GetTableFieldRef(
+    const int registry_ref, const TableKey& key) const {
+  // Same shape as GetGlobalRef, one level down: the read and the ref happen in
+  // one protected frame, so a raising __index (M4) and an OOM in the
+  // lua_gettable/luaL_ref allocation (M5) both surface as caught errors rather
+  // than a panic. The message is built after the frame unwinds, so no
+  // std::string local is live across a possible longjmp (N2).
+  int ref = LUA_NOREF;
+  int got_type = LUA_TNIL;
+  RunProtected([&]() {
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    PushTableKey(L_, key);                             // key
+    lua_gettable(L_, -2);                              // may trigger __index
+    lua_remove(L_, -2);                                // drop the table
+    got_type = lua_type(L_, -1);
+    if (got_type == LUA_TTABLE) {
+      ref = luaL_ref(L_, LUA_REGISTRYINDEX);           // pops the value
+    } else {
+      lua_pop(L_, 1);
+    }
+  });
+  if (got_type != LUA_TTABLE) {
+    std::string msg = "field '";
+    msg += DescribeTableKey(key);
+    msg += "' is not a table (got ";
+    msg += lua_typename(L_, got_type);
+    msg += ')';
+    return msg;
+  }
+  return ref;
+}
+
 std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(const int registry_ref) const {
   StackGuard guard(L_);
   std::vector<std::pair<LuaPtr, LuaPtr>> result;
