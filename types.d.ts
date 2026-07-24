@@ -62,13 +62,40 @@ export interface LuaFunction {
 }
 
 /**
- * Represents a Lua coroutine that can be resumed from JavaScript
+ * Represents a Lua coroutine that can be resumed from JavaScript.
+ *
+ * A coroutine is also iterable: each `yield` is one iteration step, so
+ * `for (const v of coro)` drives it to completion without a hand-written
+ * `resume()` loop. A yield of several values arrives as an array, matching the
+ * rest of the API. The coroutine's final `return` value arrives with
+ * `done: true`, which `for..of` discards — exactly the JS generator contract.
+ *
+ * Iteration and `resume()` advance the same underlying Lua thread, so a loop
+ * that exits early leaves the coroutine suspended where it stopped and a later
+ * loop (or `resume()`) picks up from there. An already-dead coroutine yields
+ * nothing rather than raising "cannot resume dead coroutine".
+ *
+ * `for await (const v of coro)` also works, via JS's sync-iterable fallback —
+ * the resume itself is synchronous.
+ *
+ * @example
+ * const co = lua.create_coroutine(`
+ *   return function()
+ *     for i = 1, 3 do coroutine.yield(i) end
+ *   end
+ * `);
+ * for (const n of co) console.log(n);  // 1, 2, 3
  */
-export interface LuaCoroutine {
+export interface LuaCoroutine extends Iterable<LuaValue> {
   /** The current status of the coroutine */
   status: 'suspended' | 'running' | 'dead';
   /** Internal reference - do not modify */
   _coroutine: unknown;
+  /**
+   * Returns a fresh iteration cursor. `next(...args)` forwards its arguments as
+   * the resume values, so a generator-style coroutine can be fed from JS.
+   */
+  [Symbol.iterator](): Iterator<LuaValue, LuaValue | undefined, LuaInput>;
 }
 
 /**
@@ -178,6 +205,35 @@ export interface ClassDefinition {
    * object by reference (as userdata), not a copy.
    */
   construct: (...args: LuaValue[]) => object;
+
+  /**
+   * Name of a class registered earlier on this context to inherit from.
+   *
+   * A method missing from this class is looked up along the base chain, and the
+   * base's metamethods (`__add`, `__tostring`, …) apply to instances of this
+   * class unless it defines its own. `readable` / `writable` are per-instance
+   * and set by the constructor, so they are not inherited — state them here too
+   * if this class needs them.
+   *
+   * Each class still supplies its own `construct`: the JS class hierarchy is
+   * what decides how an instance is built, and `extends` only describes how Lua
+   * resolves names on it.
+   *
+   * @example
+   * lua.register_class('Animal', {
+   *   construct: (name) => new Animal(name),
+   *   readable: true,
+   *   methods: { describe: (self) => `a ${self.species}` },
+   * });
+   * lua.register_class('Dog', {
+   *   extends: 'Animal',
+   *   construct: (name) => new Dog(name),
+   *   readable: true,
+   *   methods: { speak: () => 'woof' },
+   * });
+   * // Lua: local d = Dog.new('rex'); d:speak(); d:describe()
+   */
+  extends?: string;
 
   /**
    * Instance methods callable from Lua via `instance:method(args)`. Each method
@@ -425,6 +481,31 @@ export interface LuaContext {
   get_global(name: string): LuaValue;
 
   /**
+   * Calls a Lua function by global name, returning its result (an array when
+   * the function returned several values, `undefined` when it returned none).
+   *
+   * Convenience over `get_global(name)` followed by calling the returned
+   * wrapper — but it never mints that wrapper, so a hot call loop doesn't leave
+   * a JS function object and its Lua registry slot behind on each iteration.
+   *
+   * `name` accepts a dotted path, like `get_global`. The target must be a Lua
+   * function; a callable table (one with `__call`) is not accepted here — reach
+   * it through `get_global` instead. A Lua error propagates as a thrown JS
+   * error, with the original `Error` preserved when the failure came from a JS
+   * callback.
+   *
+   * @param name The global name of a Lua function, or a dotted path to one
+   * @param args Arguments to pass to the function
+   * @example
+   * lua.execute_script('function greet(name) return "hello " .. name end');
+   * lua.call('greet', 'world');  // 'hello world'
+   *
+   * lua.execute_script('handlers = { onTick = function(n) return n * 2 end }');
+   * lua.call('handlers.onTick', 21);  // 42
+   */
+  call<T extends LuaValue | LuaValue[] = LuaValue>(name: string, ...args: LuaInput[]): T;
+
+  /**
    * Sets a JavaScript object as userdata in the Lua environment.
    * The object is passed by reference - Lua holds a handle to the original object,
    * not a copy. When the userdata flows back to JS (via callbacks or return values),
@@ -446,10 +527,19 @@ export interface LuaContext {
   set_userdata(name: string, value: object, options?: UserdataOptions): void;
 
   /**
-   * Sets a metatable on an existing global Lua table, enabling operator
-   * overloading, custom indexing, __tostring, __call, and other metamethods.
+   * Sets a metatable on a Lua table, enabling operator overloading, custom
+   * indexing, __tostring, __call, and other metamethods.
    *
-   * @param name The name of an existing global table
+   * The target is either the name of an existing global table, or a live table
+   * reference — a `create_table()` / `get_global_ref()` / `create_environment()`
+   * handle, or the Proxy a metatabled table round-trips as. The table need not
+   * have a global name.
+   *
+   * Any metatable the table already had is replaced, matching Lua's
+   * `setmetatable`. A handle from another context, or one that has been
+   * released, is rejected.
+   *
+   * @param target The name of an existing global table, or a table reference
    * @param metatable An object whose keys are metamethod names (e.g. __add, __tostring)
    *   and values are either callback functions or static Lua values
    * @example
@@ -458,8 +548,16 @@ export interface LuaContext {
    *   __tostring: (t) => `(${t.x}, ${t.y})`,
    *   __add: (a, b) => { ... }
    * });
+   *
+   * // On a table that has no global name:
+   * const defaults = lua.create_table();
+   * lua.set_metatable(defaults, { __index: (t, k) => `<${k}>` });
+   * defaults.get('missing');  // '<missing>'
    */
-  set_metatable(name: string, metatable: MetatableDefinition): void;
+  set_metatable(
+    target: string | LuaTableHandle | LuaTableRef,
+    metatable: MetatableDefinition
+  ): void;
 
   /**
    * Appends a search path to Lua's `package.path` for module resolution.
@@ -492,9 +590,19 @@ export interface LuaContext {
   register_module(name: string, module: LuaTable | LuaCallbacks): void;
 
   /**
-   * Creates a coroutine from a Lua script that returns a function.
-   * @param script A Lua script that returns a function to be used as the coroutine body
-   * @returns A coroutine object that can be resumed
+   * Creates a coroutine from a Lua script that returns a function, or from a
+   * Lua function already held on the JS side.
+   *
+   * The function form takes any `LuaFunction` this context produced — from
+   * `execute_script`, `get_global`, a callback argument — so a function you
+   * already have need not be re-sourced as text. A plain JavaScript function is
+   * rejected: a coroutine body has to be a Lua function. A function belonging to
+   * another context, or one passed to `release()`, is rejected too.
+   *
+   * The returned coroutine is iterable — see {@link LuaCoroutine}.
+   *
+   * @param body A Lua script that returns a function, or a Lua function
+   * @returns A coroutine object that can be resumed or iterated
    * @example
    * const coro = lua.create_coroutine(`
    *   return function(x)
@@ -503,8 +611,12 @@ export interface LuaContext {
    *     return x * 4
    *   end
    * `);
+   *
+   * // From a function you already hold:
+   * const fn = lua.get_global('producer') as LuaFunction;
+   * for (const item of lua.create_coroutine(fn)) console.log(item);
    */
-  create_coroutine(script: string): LuaCoroutine;
+  create_coroutine(body: string | LuaFunction): LuaCoroutine;
 
   /**
    * Resumes a suspended coroutine with optional arguments.
@@ -785,6 +897,53 @@ export interface LuaContext {
   register_type_converter(
     match: (value: unknown) => boolean,
     convert: (value: any) => LuaValue
+  ): void;
+
+  /**
+   * Registers a converter for the Lua → JS direction: the mirror of
+   * `register_type_converter`, for rebuilding application types out of the Lua
+   * values that carry them.
+   *
+   * `match` is called with the value the built-in conversion produced — a plain
+   * object for a Lua table, a Proxy for a metatabled one, the handle for opaque
+   * userdata. If it returns a truthy value, `convert` is called and its return
+   * value is used **verbatim**: the result is already a JS value, so unlike the
+   * JS → Lua direction it is not converted again (which also means a converter
+   * cannot loop by matching its own output).
+   *
+   * Converters are consulted at every level of the conversion, so they reach
+   * values nested inside tables and arrays, and values arriving as callback
+   * arguments — not just top-level results. They see only object-valued
+   * results, mirroring how the JS → Lua direction skips primitives, which keeps
+   * the common path free of a JS call per number and string. Registration order
+   * decides precedence; the first match wins.
+   *
+   * Performance note: every registered `match` runs for every object-valued
+   * result crossing Lua → JS, in registration order, until one matches. Keep
+   * `match` cheap. Matching against a Proxy is not free either — each property
+   * read runs the Lua `__index` path.
+   *
+   * @param match Predicate deciding whether this converter applies
+   * @param convert Maps a matched value to the JS value the caller should see
+   * @example
+   * class Money { constructor(public cents: number) {} }
+   *
+   * // Lua -> JS
+   * lua.register_from_lua_converter(
+   *   (v: any) => v?.__type === 'Money',
+   *   (v: any) => new Money(v.cents)
+   * );
+   * // JS -> Lua (the other half of the round trip)
+   * lua.register_type_converter(
+   *   (v) => v instanceof Money,
+   *   (v: Money) => ({ __type: 'Money', cents: v.cents })
+   * );
+   *
+   * lua.execute_script(`return { __type = 'Money', cents = 1299 }`);  // Money(1299)
+   */
+  register_from_lua_converter(
+    match: (value: unknown) => boolean,
+    convert: (value: any) => unknown
   ): void;
 
   /**

@@ -958,11 +958,19 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
 
 // --- Class / usertype support ---
 
+bool LuaRuntime::HasClass(const std::string& class_name) const {
+  StackGuard guard(L_);
+  const std::string mt_name = kClassMetaPrefix + class_name;
+  lua_getfield(L_, LUA_REGISTRYINDEX, mt_name.c_str());
+  return lua_istable(L_, -1);
+}
+
 void LuaRuntime::RegisterClass(
     const std::string& class_name,
     const std::string& constructor_func_name,
     const std::unordered_map<std::string, std::string>& method_map,
-    const std::vector<MetatableEntry>& metamethods) {
+    const std::vector<MetatableEntry>& metamethods,
+    const std::string& parent_class_name) {
   // The whole build (metatable, method table, class global) runs in one
   // protected frame so an OOM under maxMemory, or a raising __newindex on a _G
   // metatable at the final lua_setglobal, throws instead of aborting (M3). Every
@@ -972,9 +980,25 @@ void LuaRuntime::RegisterClass(
   // the pcall skips destructors of thunk-local C++ objects (N2).
   const std::string mt_name = kClassMetaPrefix + class_name;
   const std::string methods_key = kClassMethodsPrefix + class_name;
+  const std::string parent_mt_name =
+    parent_class_name.empty() ? std::string() : kClassMetaPrefix + parent_class_name;
+  const std::string parent_key = kClassParentPrefix + class_name;
   RunProtected([&]() {
+  // 0. A base class must already exist: the method chain and the metamethod
+  // copy below both read its registry entries.
+  if (!parent_class_name.empty()) {
+    lua_getfield(L_, LUA_REGISTRYINDEX, parent_mt_name.c_str());
+    const bool ok = lua_istable(L_, -1);
+    lua_pop(L_, 1);
+    if (!ok) {
+      throw std::runtime_error(
+        "base class '" + parent_class_name + "' is not registered");
+    }
+  }
+
   // 1. Create the shared per-class instance metatable.
   luaL_newmetatable(L_, mt_name.c_str());
+  const int mt_idx = lua_gettop(L_);
 
   lua_pushcfunction(L_, UserdataGC);
   lua_setfield(L_, -2, "__gc");
@@ -1002,9 +1026,43 @@ void LuaRuntime::RegisterClass(
   for (const auto& mm : metamethods) {
     lua_pushstring(L_, mm.func_name.c_str());
     lua_pushcclosure(L_, LuaCallHostFunction, 1);
-    lua_setfield(L_, -2, mm.key.c_str());
+    lua_setfield(L_, mt_idx, mm.key.c_str());
   }
-  lua_pop(L_, 1);  // pop metatable
+
+  // Inherit the base class's metamethods (C4). Anything this class set above —
+  // its own metamethods and every reserved key (__gc, __index, __newindex,
+  // __name, the class marker) — is already present, so the "absent here" test
+  // is all the filtering the copy needs. The values are plain Lua closures over
+  // a host-function name, so copying the reference is enough; the parent's
+  // registered callbacks stay the ones that run.
+  if (!parent_class_name.empty()) {
+    lua_getfield(L_, LUA_REGISTRYINDEX, parent_mt_name.c_str());
+    const int parent_idx = lua_gettop(L_);
+    lua_pushnil(L_);
+    while (lua_next(L_, parent_idx) != 0) {
+      // [.., parent_mt, key, value]. Only string keys are metamethod names, and
+      // testing the type first keeps lua_tostring from rewriting a numeric key
+      // in place (which would break lua_next).
+      if (lua_type(L_, -2) == LUA_TSTRING) {
+        const char* mm_key = lua_tostring(L_, -2);
+        lua_getfield(L_, mt_idx, mm_key);
+        const bool already_set = !lua_isnil(L_, -1);
+        lua_pop(L_, 1);
+        if (!already_set) {
+          lua_pushvalue(L_, -1);
+          lua_setfield(L_, mt_idx, mm_key);
+        }
+      }
+      lua_pop(L_, 1);  // pop value, keep key for the next lua_next
+    }
+    lua_pop(L_, 1);  // pop parent metatable
+
+    // Record the link so ClassIndex can chain method lookups.
+    lua_pushstring(L_, parent_class_name.c_str());
+    lua_setfield(L_, LUA_REGISTRYINDEX, parent_key.c_str());
+  }
+
+  lua_settop(L_, mt_idx - 1);  // pop metatable
 
   // 2. Store the shared method table in the registry: { name = host_func_name }.
   lua_newtable(L_);
@@ -1042,33 +1100,68 @@ int LuaRuntime::ClassIndex(lua_State* L) {
   bool raise = false;
   bool have_result = false;
   {
-    // 1. Look up the key in the shared class method table.
+    // 1. Look up the key in the shared class method table, walking up the
+    // inheritance chain (C4) until it is found or the chain ends.
     bool has_methods = false;
-    std::string methods_key = kClassMethodsPrefix;
-    if (class_name) methods_key += class_name;
-    lua_getfield(L, LUA_REGISTRYINDEX, methods_key.c_str());
-    if (lua_istable(L, -1)) {
-      has_methods = true;
-      lua_getfield(L, -1, key);
-      if (lua_isfunction(L, -1)) {
-        // Cached closure (shared across instances of this class): return it.
-        lua_remove(L, -2);  // remove method table
-        have_result = true;
-      } else if (lua_isstring(L, -1)) {
-        // First access: value is the host function name. Build a bound method
-        // closure, cache it back into the shared method table, and return it.
-        lua_pushcclosure(L, UserdataMethodCall, 1);  // consumes name as upvalue 1
-        lua_pushvalue(L, -1);       // dup the closure
-        lua_setfield(L, -3, key);   // method_table[key] = closure
-        lua_remove(L, -2);          // remove method table
-        have_result = true;
-      } else {
-        lua_pop(L, 1);  // pop nil (key not a method)
+    std::string scratch_key;  // registry key for the class being examined
+    std::string current = class_name ? class_name : "";
+
+    // The class's own method table stays at a fixed slot: it is the cache an
+    // inherited method is memoized into, so the walk happens once per class
+    // rather than once per call.
+    scratch_key = kClassMethodsPrefix;
+    scratch_key += current;
+    lua_getfield(L, LUA_REGISTRYINDEX, scratch_key.c_str());
+    const int own_idx = lua_gettop(L);
+
+    // Depth cap: a chain is acyclic by construction (a base class must already
+    // be registered, and a name cannot be registered twice), so this only bounds
+    // a registry someone tampered with from Lua.
+    constexpr int kMaxClassDepth = 32;
+    for (int depth = 0; depth < kMaxClassDepth && !current.empty(); ++depth) {
+      scratch_key = kClassMethodsPrefix;
+      scratch_key += current;
+      lua_getfield(L, LUA_REGISTRYINDEX, scratch_key.c_str());
+      const int methods_idx = lua_gettop(L);
+      if (lua_istable(L, methods_idx)) {
+        has_methods = true;
+        lua_getfield(L, methods_idx, key);
+        if (const int found = lua_type(L, -1); found == LUA_TFUNCTION) {
+          // Cached closure (shared across instances of this class).
+          have_result = true;
+        } else if (found == LUA_TSTRING) {
+          // First access: the value is the host function name. Build a bound
+          // method closure from it.
+          lua_pushcclosure(L, UserdataMethodCall, 1);  // consumes name as upvalue 1
+          have_result = true;
+        } else {
+          lua_pop(L, 1);  // pop nil (key not a method of this class)
+        }
+        if (have_result) {
+          if (lua_istable(L, own_idx)) {
+            lua_pushvalue(L, -1);        // dup the closure
+            lua_setfield(L, own_idx, key);  // own_methods[key] = closure
+          }
+          break;  // [.., own, methods, closure]
+        }
       }
+      lua_pop(L, 1);  // pop this class's method table (or nil)
+
+      // Step to the base class, if this one has any.
+      scratch_key = kClassParentPrefix;
+      scratch_key += current;
+      lua_getfield(L, LUA_REGISTRYINDEX, scratch_key.c_str());
+      const char* parent = lua_tostring(L, -1);
+      current = parent ? parent : "";
+      lua_pop(L, 1);
     }
 
-    if (!have_result) {
-      lua_pop(L, 1);  // pop method table (or nil)
+    if (have_result) {
+      // Collapse [.., own, methods, closure] down to just the closure.
+      lua_remove(L, own_idx + 1);
+      lua_remove(L, own_idx);
+    } else {
+      lua_pop(L, 1);  // pop the own method table (or nil)
 
       // 2. Fall through to property access.
       if (runtime->property_getter_) {
@@ -1107,7 +1200,7 @@ int LuaRuntime::ClassIndex(lua_State* L) {
         }
       }
     }
-  }  // methods_key destroyed here, before any longjmp
+  }  // scratch_key / current destroyed here, before any longjmp
 
   if (raise) return lua_error(L);
   if (have_result) return 1;
@@ -1216,6 +1309,35 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
     }
 
     // Set the metatable on the target table (pops metatable)
+    lua_setmetatable(L_, -2);
+  });
+}
+
+void LuaRuntime::SetTableRefMetatable(const int registry_ref,
+                                      const std::vector<MetatableEntry>& entries) const {
+  // Same shape as SetGlobalMetatable, minus the global lookup: the target comes
+  // out of the registry with a rawget, which cannot run a metamethod and cannot
+  // allocate. Everything after it — the metatable table, each entry's closure or
+  // pushed value, and lua_setmetatable — allocates, so the whole build stays in
+  // one protected frame (M3).
+  RunProtected([&]() {
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+    if (!lua_istable(L_, -1)) {
+      throw std::runtime_error("table reference does not name a table");
+    }
+
+    lua_newtable(L_);
+
+    for (const auto& entry : entries) {
+      if (entry.is_function) {
+        lua_pushstring(L_, entry.func_name.c_str());
+        lua_pushcclosure(L_, LuaCallHostFunction, 1);
+      } else {
+        PushLuaValue(L_, entry.value);
+      }
+      lua_setfield(L_, -2, entry.key.c_str());
+    }
+
     lua_setmetatable(L_, -2);
   });
 }

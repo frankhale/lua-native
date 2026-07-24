@@ -16,11 +16,12 @@ data structures.
 - Execute Lua scripts and files from Node.js, Bun or Deno
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
-- Type-system fidelity — `BigInt`, `Date`, `Map`, `Set`, `Buffer`/`TypedArray`, and `RegExp` convert to natural Lua representations, with 64-bit integer precision preserved in both directions; register app-specific converters with `register_type_converter()`
+- Type-system fidelity — `BigInt`, `Date`, `Map`, `Set`, `Buffer`/`TypedArray`, and `RegExp` convert to natural Lua representations, with 64-bit integer precision preserved in both directions; register app-specific converters in both directions with `register_type_converter()` and `register_from_lua_converter()`
 - Global variable management (get and set), including dotted paths (`set_global('config.db.host', v)`) that read and auto-create nested table fields
+- Call Lua functions by name with `call('greet', 'world')` — dotted paths included — without a `get_global` round-trip
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access and method binding
-- Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, and use overloaded operators
-- Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more
+- Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, use overloaded operators, and inherit from another registered class with `extends`
+- Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more, on a global name or any live table reference
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`
 - Environment tables — give each script its own global namespace with `create_environment()` / `execute_script_in()`, so scripts in one context can run at different permission levels
@@ -39,7 +40,7 @@ data structures.
 - Debug hooks — trace Lua execution from JavaScript with `set_hook()` (line, call, return, and instruction-count events) for profilers and debugger integrations
 - GC control — trigger, pause, step, and tune Lua's collector from JavaScript with `gc()`, using Lua's own `collectgarbage` command vocabulary
 - Execution limits — cap Lua VM instructions with `maxInstructions`, or wall-clock time with `timeout`, so infinite loops abort instead of hanging
-- Coroutine support with yield/resume semantics
+- Coroutine support with yield/resume semantics — created from a script or an existing Lua function, and iterable with `for..of` / `for await`
 - Error fidelity — Lua errors carry stack tracebacks, thrown JS `Error` objects round-trip with full fidelity (type, message, stack, custom props), and `pcall()` runs a function protected, returning `{ ok, value/error }`
 - Cross-platform support (Windows, macOS)
 - TypeScript support with full type definitions
@@ -215,6 +216,30 @@ console.log(lua.get_global("config.db.port")); // null (missing leaf)
 console.log(lua.get_global("missing.a.b")); // null (nil intermediate, no error)
 ```
 
+#### Calling Lua Functions by Name
+
+`call(name, ...args)` invokes a Lua function directly, accepting a dotted path
+just like `get_global`:
+
+```javascript
+lua.execute_script(`
+  function greet(name) return "hello " .. name end
+  handlers = { on = { tick = function(n) return n * 2 end } }
+`);
+
+console.log(lua.call("greet", "world")); // 'hello world'
+console.log(lua.call("handlers.on.tick", 21)); // 42
+```
+
+This is more than shorthand for `get_global(name)(...)`. `get_global` on a
+function mints a JavaScript wrapper backed by its own Lua registry slot, freed
+only when that wrapper is garbage-collected — one per call in a per-frame or
+per-request loop. `call()` keeps the function on the Lua side, so the steady
+state is flat.
+
+The target must be a genuine Lua function; a callable table (one with `__call`)
+is rejected with a clear message — reach it through `get_global` instead.
+
 ### Complex Data Structures
 
 The module supports converting complex Lua tables to JavaScript objects:
@@ -340,6 +365,62 @@ lua.execute_script("return now"); // "2026-07-10T00:00:00.000Z"
 
 Converters apply only to object values — plain primitives, functions, `BigInt`,
 and `Symbol` bypass them.
+
+#### The Other Direction — `register_from_lua_converter`
+
+`register_from_lua_converter(match, convert)` is the mirror: it rebuilds
+application types out of the Lua values that encode them. Together the two make a
+round trip:
+
+```javascript
+class Money {
+  constructor(cents) {
+    this.cents = cents;
+  }
+}
+
+// JS -> Lua
+lua.register_type_converter(
+  (v) => v instanceof Money,
+  (v) => ({ __type: "Money", cents: v.cents }),
+);
+
+// Lua -> JS
+lua.register_from_lua_converter(
+  (v) => v?.__type === "Money",
+  (v) => new Money(v.cents),
+);
+
+lua.set_global("price", new Money(1299));
+const back = lua.get_global("price");
+console.log(back instanceof Money, back.cents); // true 1299
+
+// Values Lua builds itself convert too
+const total = lua.execute_script(`return { __type = 'Money', cents = 250 }`);
+console.log(total instanceof Money); // true
+```
+
+`match` sees the value the built-in conversion produced — a plain object for a
+Lua table, a Proxy for a metatabled one — since that is the only shape a
+JavaScript predicate can inspect. `convert`'s return value is used **verbatim**:
+it is already a JavaScript value, so unlike the JS→Lua direction it is not
+converted again (which also means a converter matching its own output cannot
+loop).
+
+Converters are consulted at every level of the conversion, so they reach values
+nested inside tables and arrays, and values arriving as callback arguments — not
+just top-level results:
+
+```javascript
+lua.set_global("charge", (m) => console.log(m instanceof Money)); // true
+lua.execute_script(`
+  local order = { items = { { __type = 'Money', cents = 100 } } }
+  charge(order.items[1])
+`);
+```
+
+As with the JS→Lua direction, only object-valued results are offered — every
+number and string crossing out of Lua stays on the fast path.
 
 ### Returning Lua Functions
 
@@ -1229,6 +1310,63 @@ while (result.status === "suspended") {
 console.log(values); // [1, 4, 9, 16, 25]
 ```
 
+#### Iterating a coroutine
+
+That hand-written resume loop isn't necessary — a coroutine is iterable, with one
+iteration per `yield`:
+
+```javascript
+const squares = lua.create_coroutine(`
+  return function()
+    for i = 1, 5 do
+      coroutine.yield(i * i)
+    end
+  end
+`);
+
+console.log([...squares]); // [1, 4, 9, 16, 25]
+```
+
+Iteration and `resume()` drive the same Lua thread, so a loop that exits early
+leaves the coroutine suspended where it stopped:
+
+```javascript
+const co = lua.create_coroutine(`
+  return function()
+    for i = 1, 5 do coroutine.yield(i) end
+  end
+`);
+
+for (const n of co) {
+  if (n === 3) break;
+}
+
+console.log([...co]); // [4, 5] — picks up where the loop stopped
+```
+
+The coroutine's final `return` value arrives with `done: true`, which `for..of`
+discards — the same contract as a JS generator. `for await (const v of co)` works
+too, through JS's sync-iterable fallback.
+
+#### Coroutines from an existing function
+
+`create_coroutine` also takes a Lua function you already hold, so a function
+obtained from `execute_script`, `get_global`, or a callback argument doesn't have
+to be re-sourced as text:
+
+```javascript
+lua.execute_script(`
+  function walk(dir)
+    for _, name in ipairs(dir) do coroutine.yield(name) end
+  end
+`);
+
+const walk = lua.get_global("walk");
+const co = lua.create_coroutine(walk);
+
+console.log(lua.resume(co, ["a", "b"]).values); // ['a']
+```
+
 ### Userdata
 
 JavaScript objects can be passed into Lua as userdata — Lua holds a reference to
@@ -1463,10 +1601,60 @@ method/operator, mutate and return `self` (as `scale` does above), or construct
 the instance in Lua via `ClassName.new`. This mirrors the userdata round-trip
 model described above.
 
+#### Inheritance
+
+A class can extend another class registered earlier on the same context. A method
+missing from the derived class is looked up along the base chain, and the base's
+metamethods apply to derived instances unless the derived class defines its own:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all" });
+
+lua.register_class("Animal", {
+  construct: (name) => ({ name, legs: 4 }),
+  readable: true,
+  methods: {
+    speak: (self) => `${self.name} makes a sound`,
+    describe: (self) => `${self.name} has ${self.legs} legs`,
+  },
+  metamethods: {
+    __tostring: (self) => `Animal(${self.name})`,
+  },
+});
+
+lua.register_class("Dog", {
+  extends: "Animal",
+  construct: (name) => ({ name, legs: 4 }),
+  readable: true,
+  methods: {
+    speak: (self) => `${self.name} barks`, // overrides Animal's
+  },
+});
+
+lua.execute_script(`
+  local d = Dog.new('rex')
+  print(d:speak())       -- rex barks       (Dog's own)
+  print(d:describe())    -- rex has 4 legs  (inherited from Animal)
+  print(tostring(d))     -- Animal(rex)     (inherited metamethod)
+`);
+```
+
+Two things are deliberately **not** inherited:
+
+- **`construct`.** Each class supplies its own. The JavaScript class hierarchy
+  already decides how an instance is built; `extends` only describes how Lua
+  resolves names on it.
+- **`readable` / `writable`.** These are per-instance flags set by the
+  constructor, not metatable state, so state them on each class that needs them.
+
+The base class must already be registered — a forward reference is rejected,
+which also makes inheritance cycles impossible.
+
 ### Metatables
 
-You can attach Lua metatables to global tables from JavaScript, enabling operator
-overloading, custom `tostring`, callable tables, custom indexing, and more.
+You can attach Lua metatables to Lua tables from JavaScript, enabling operator
+overloading, custom `tostring`, callable tables, custom indexing, and more. The
+target is either a global name or a live table reference.
 
 #### Basic Usage — `__tostring` and `__add`
 
@@ -1566,6 +1754,32 @@ console.log(lua.execute_script("return protected.y")); // null (write was interc
 | `__call`     | `t(args)`           | Calling table as function           |
 | `__index`    | `t.key` (missing)   | Custom read (function or table)     |
 | `__newindex` | `t.key = val` (new) | Custom write interception           |
+
+#### Tables Without a Global Name
+
+`set_metatable` also takes a live table reference — a `create_table()`,
+`get_global_ref()`, or `create_environment()` handle, or the Proxy a metatabled
+table round-trips as. The table doesn't need a global name:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all" });
+
+const settings = lua.create_table({ theme: "dark" });
+lua.set_metatable(settings, {
+  __index: (t, key) => `<unset:${key}>`,
+});
+
+console.log(settings.get("theme")); // 'dark'
+console.log(settings.get("font")); // '<unset:font>'
+
+// The metatable travels with the table into Lua
+lua.set_global("settings", settings);
+console.log(lua.execute_script("return settings.font")); // '<unset:font>'
+```
+
+The handle's own `get`/`set` go through the metatable, so `__newindex` is visible
+from JavaScript exactly as it is from Lua. Any metatable the table already had is
+replaced, matching Lua's `setmetatable`.
 
 ### Reference-Based Tables
 
@@ -2069,6 +2283,12 @@ const res: CoroutineResult = lua.resume(coro, 10);
 console.log(res.status); // 'suspended' | 'dead'
 console.log(res.values); // LuaValue[]
 
+// ...or iterate it, one step per yield
+const counter: LuaCoroutine = lua.create_coroutine(`
+  return function() for i = 1, 3 do coroutine.yield(i) end end
+`);
+const seen: LuaValue[] = [...counter]; // [1, 2, 3]
+
 // Type-safe Lua function return
 const fn = lua.execute_script<LuaFunction>(
   "return function(a, b) return a + b end",
@@ -2150,6 +2370,18 @@ lua.register_type_converter(
 );
 lua.set_global("temp", new Temperature(20));
 const fahrenheit = lua.execute_script("return temp.fahrenheit"); // 68
+
+// ...and the Lua -> JS direction, completing the round trip
+lua.register_from_lua_converter(
+  (v: any) => v?.__type === "Temperature",
+  (v: any) => new Temperature(v.celsius),
+);
+const t = lua.execute_script(`return { __type = 'Temperature', celsius = 20 }`);
+// t instanceof Temperature
+
+// Type-safe call by name
+lua.execute_script("function scale(n, by) return n * by end");
+const scaled: number = lua.call<number>("scale", 21, 2); // 42
 
 // 64-bit integers round-trip as bigint when they exceed Number.MAX_SAFE_INTEGER
 lua.set_global("big", 9007199254740993n);
@@ -2605,6 +2837,35 @@ It throws only if a non-nil intermediate is a non-indexable value (e.g.
 
 **Returns:** The value of the global (converted to JavaScript), or `null` if not set
 
+### `LuaContext.call(name, ...args)`
+
+Calls a Lua function by global name.
+
+Convenience over `get_global(name)` followed by calling the returned wrapper —
+but it never mints that wrapper, so a hot call loop doesn't leave a JS function
+object and its Lua registry slot behind on each iteration.
+
+```javascript
+lua.execute_script('function greet(name) return "hello " .. name end');
+lua.call('greet', 'world'); // 'hello world'
+
+lua.execute_script('handlers = { on = { tick = function(n) return n * 2 end } }');
+lua.call('handlers.on.tick', 21); // 42
+```
+
+**Parameters:**
+
+- `name`: Global name of a Lua function, or a dotted path to one
+- `...args`: Arguments to pass to the function
+
+**Returns:** The function's return value — `undefined` for no returns, the value
+itself for one, an array for several
+
+**Throws:** `TypeError` if `name` is not a string, the path is malformed, or the
+target is not a Lua function (a callable table with `__call` is not accepted —
+reach it through `get_global`). A Lua error propagates as a thrown JS error, with
+the original `Error` preserved when the failure came from a JS callback.
+
 ### `LuaContext.register_type_converter(match, convert)`
 
 Registers a custom JS→Lua converter for values crossing into Lua. Converters are
@@ -2622,6 +2883,56 @@ built-in conversion of types like `Date` or typed arrays.
   functions, `BigInt`, or `Symbol` values.
 
 **Throws:** `TypeError` if either argument is not a function.
+
+### `LuaContext.register_from_lua_converter(match, convert)`
+
+Registers a custom Lua→JS converter — the mirror of
+`register_type_converter()`, for rebuilding application types out of the Lua
+values that encode them.
+
+```javascript
+class Money {
+  constructor(cents) { this.cents = cents; }
+}
+
+// Lua -> JS
+lua.register_from_lua_converter(
+  (v) => v?.__type === 'Money',
+  (v) => new Money(v.cents),
+);
+// JS -> Lua (the other half of the round trip)
+lua.register_type_converter(
+  (v) => v instanceof Money,
+  (v) => ({ __type: 'Money', cents: v.cents }),
+);
+
+lua.execute_script(`return { __type = 'Money', cents = 1299 }`); // Money { cents: 1299 }
+```
+
+Converters are consulted at every level of the conversion, so they reach values
+nested inside tables and arrays, and values arriving as callback arguments — not
+just top-level results.
+
+**Parameters:**
+
+- `match`: Predicate `(value) => boolean` called with the value the built-in
+  conversion produced — a plain object for a Lua table, a Proxy for a metatabled
+  one, the handle for opaque userdata. Only object-valued results are offered
+  (primitives and functions are skipped), mirroring the JS→Lua direction.
+  Returning truthy selects this converter.
+- `convert`: `(value) => unknown` mapping a matched value to what the caller
+  should see. Its return value is used **verbatim** — unlike the JS→Lua
+  direction, it is not converted again, so a converter cannot loop by matching
+  its own output.
+
+Registration order decides precedence; the first match wins.
+
+**Throws:** `TypeError` if either argument is not a function.
+
+**Performance:** every registered `match` runs for every object-valued result
+crossing Lua→JS, in registration order, until one matches. Keep `match` cheap.
+Matching against a Proxy is not free either — each property read runs the Lua
+`__index` path.
 
 ### `LuaContext.set_userdata(name, value, options?)`
 
@@ -2641,16 +2952,34 @@ passed by reference — Lua holds a handle to the original object, not a copy.
 
 ### `LuaContext.set_metatable(name, metatable)`
 
-Sets a metatable on an existing global Lua table, enabling operator overloading,
-custom indexing, `__tostring`, `__call`, and other metamethods.
+Sets a metatable on a Lua table, enabling operator overloading, custom indexing,
+`__tostring`, `__call`, and other metamethods.
+
+The target is either the name of an existing global table, or a live table
+reference — a `create_table()` / `get_global_ref()` / `create_environment()`
+handle, or the Proxy a metatabled table round-trips as. The table need not have a
+global name:
+
+```javascript
+const defaults = lua.create_table();
+lua.set_metatable(defaults, { __index: (t, k) => `<${k}>` });
+defaults.get('missing'); // '<missing>'
+```
+
+The handle's own `get`/`set` go through the metatable too, so a `__newindex` that
+swallows writes is visible from JS exactly as it is from Lua.
 
 **Parameters:**
 
-- `name`: The name of an existing global table
+- `target`: The name of an existing global table, or a table reference
 - `metatable`: Object whose keys are metamethod names (e.g. `__add`, `__tostring`)
   and values are either callback functions or static Lua values
 
-**Throws:** Error if the global does not exist or is not a table
+Any metatable the table already had is replaced, matching Lua's `setmetatable`.
+
+**Throws:** `TypeError` if `target` is neither a string nor a table reference, or
+if `metatable` is not an object. An `Error` if a named global does not exist or is
+not a table, or if a handle has been released or belongs to another context.
 
 ### `LuaContext.register_class(name, definition)`
 
@@ -2670,14 +2999,24 @@ instances. Creates a global table `name` with a `new(...)` constructor.
   - `metamethods` (optional): Map of metamethod name → function for operator
     overloads and hooks (`__add`, `__eq`, `__lt`, `__le`, `__len`, `__concat`,
     `__unm`, `__tostring`, `__call`, etc.)
+  - `extends` (optional): Name of a class registered earlier on this context to
+    inherit from. A method missing from this class is looked up along the base
+    chain, and the base's metamethods apply unless this class defines its own
   - `readable` (optional): Allow Lua to read instance properties (default:
     `false`)
   - `writable` (optional): Allow Lua to write instance properties (default:
     `false`)
 
 **Throws:** `TypeError` if `name` is not a string, `definition` is not an
-object, or `definition.construct` is not a function. A runtime error is raised
-if the constructor returns a non-object.
+object, `definition.construct` is not a function, or `extends` is not a string.
+An `Error` if `extends` names a class that is not registered on this context. A
+runtime error is raised if the constructor returns a non-object.
+
+**Note on inheritance:** each class supplies its own `construct` — the JS class
+hierarchy already decides how an instance is built, and `extends` only describes
+how Lua resolves names on it. `readable` / `writable` are per-instance flags set
+by the constructor, so they are not inherited either; state them on each class
+that needs them.
 
 **Note:** Instances created via `name.new(...)` keep their identity across the
 JS boundary. An object a JS handler constructs itself and returns (e.g.
@@ -2702,17 +3041,62 @@ traceback.
 
 **Throws:** `TypeError` if `fn` is not a function.
 
-### `LuaContext.create_coroutine(script)`
+### `LuaContext.create_coroutine(body)`
 
-Creates a coroutine from a Lua script that returns a function.
+Creates a coroutine from a Lua script that returns a function, or from a Lua
+function you already hold.
+
+```javascript
+// From a script
+const a = lua.create_coroutine('return function() coroutine.yield(1) end');
+
+// From a function this context produced
+const fn = lua.get_global('producer');
+const b = lua.create_coroutine(fn);
+```
 
 **Parameters:**
 
-- `script`: String containing Lua code that returns a function to be used as the
-  coroutine body
+- `body`: A string of Lua code that returns a function to be used as the
+  coroutine body, or a `LuaFunction` this context produced (from
+  `execute_script`, `get_global`, a callback argument, …)
 
-**Returns:** `LuaCoroutine` object with `status` property (`'suspended'`,
-`'running'`, or `'dead'`)
+**Returns:** `LuaCoroutine` object with a `status` property (`'suspended'`,
+`'running'`, or `'dead'`). It is also iterable — see
+[`LuaCoroutine`](#luacoroutine).
+
+**Throws:** `TypeError` if `body` is neither a string nor a Lua function, if a
+script does not return a function, or if a plain JavaScript function is passed (a
+coroutine body has to be a Lua function). An `Error` if the function has been
+released or belongs to another context.
+
+### `LuaCoroutine`
+
+A coroutine object is iterable: each `yield` is one iteration step, so `for..of`
+drives it to completion without a hand-written `resume()` loop.
+
+```javascript
+const co = lua.create_coroutine(`
+  return function()
+    for i = 1, 3 do coroutine.yield(i) end
+  end
+`);
+
+for (const n of co) console.log(n); // 1, 2, 3
+```
+
+- A yield of several values arrives as an array, matching the rest of the API.
+- The coroutine's final `return` value arrives with `done: true`, which `for..of`
+  discards — the same contract as a JS generator.
+- Iteration and `resume()` advance the **same** Lua thread. A loop that exits
+  early leaves the coroutine suspended where it stopped, and a later loop (or
+  `resume()`) picks up from there.
+- An already-dead coroutine iterates empty rather than raising "cannot resume
+  dead coroutine".
+- `next(...args)` forwards its arguments as the resume values, so a
+  generator-style coroutine can be fed from JS.
+- `for await (const v of co)` also works, via JS's sync-iterable fallback — the
+  resume itself is synchronous.
 
 ### `LuaContext.resume(coroutine, ...args)`
 
@@ -2955,7 +3339,7 @@ For the reverse direction — how JavaScript built-in types (`BigInt`, `Date`,
 ## Limitations
 
 - **Nesting depth limit** — Nested data structures (tables, arrays, objects) are limited to 100 levels deep. Exceeding this limit throws an error.
-- **`set_metatable()` only for globals** — `set_metatable()` works on global tables only. To set metatables on non-global tables, use `setmetatable()` in Lua code.
+- **`set_metatable()` needs a name or a handle** — the target is either a global name or a live table reference (`create_table()`, `get_global_ref()`, `create_environment()`, or a metatabled-table Proxy). What it cannot reach is any table you cannot hold a live reference to, which today means a **plain (metatable-less) table that is not a global** — including a nested field like `outer.inner`, which reads back as a deep copy rather than a reference. A metatabled nested table _is_ reachable, because it arrives as a live Proxy. For the rest, use `setmetatable()` in Lua code.
 - **Plain tables are copied, not referenced** — When Lua tables _without metatables_ are returned to JavaScript, they are converted to plain objects/arrays (deep copy). Changes to the JavaScript object do not affect the Lua table. Tables _with metatables_ are returned as live Proxy objects that maintain a reference to the original Lua table. Use `create_table()` or `get_global_ref()` to get live handles to plain tables.
 
 ## Development

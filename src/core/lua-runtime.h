@@ -386,6 +386,16 @@ public:
   void SetHostFunctionGCCallback(HostFunctionGCCallback cb);
   void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
 
+  // Same, for a table that has no global name: `registry_ref` is a table
+  // reference minted by CreateTable/CreateTableFrom/GetGlobalRef/CreateEnvironment
+  // (F1). The target is read straight out of the registry, so it needs neither a
+  // name nor a protected _G read — but the metatable build and lua_setmetatable
+  // are protected exactly as the global variant's are.
+  //
+  // Replaces any metatable the table already had, matching setmetatable() and
+  // the global variant. Throws if the reference does not name a table.
+  void SetTableRefMetatable(int registry_ref, const std::vector<MetatableEntry>& entries) const;
+
   // Error fidelity: a host wrapper stages a structured error value (a plain
   // Lua table describing the JS error) that LuaCallHostFunction raises instead
   // of a string. The last captured error value is exposed so the binding layer
@@ -435,10 +445,24 @@ public:
   ///   returns a class-bound LuaUserdataRef.
   /// method_map: instance method name -> host function name (obj:method()).
   /// metamethods: operator/metamethod entries (all is_function == true).
+  /// parent_class_name: optional base class (C4). It must already be registered
+  ///   on this state. Two things follow from it:
+  ///   * method lookup chains — a key missing from this class's method table is
+  ///     searched up the parent chain by ClassIndex, and memoized on the derived
+  ///     class once found;
+  ///   * the parent's metamethods are copied into this class's metatable unless
+  ///     this definition supplies its own, so an inherited `__tostring` or
+  ///     `__add` keeps working on derived instances.
+  ///   Property access (readable/writable) is per-instance and set by the
+  ///   constructor, so it is not inherited — each class states its own.
   void RegisterClass(const std::string& class_name,
       const std::string& constructor_func_name,
       const std::unordered_map<std::string, std::string>& method_map,
-      const std::vector<MetatableEntry>& metamethods);
+      const std::vector<MetatableEntry>& metamethods,
+      const std::string& parent_class_name = "");
+
+  /// True if `class_name` has a registered per-class metatable on this state.
+  [[nodiscard]] bool HasClass(const std::string& class_name) const;
 
   // Table reference operations (for metatabled tables preserved as refs).
   // The plain-string variants coerce a numeric-looking key to an integer key
@@ -611,6 +635,7 @@ public:
   static constexpr const char* kUserdataMethodsPrefix = "_ud_methods_";
   static constexpr const char* kClassMetaPrefix = "_class_mt_";
   static constexpr const char* kClassMethodsPrefix = "_class_methods_";
+  static constexpr const char* kClassParentPrefix = "_class_parent_";
   static constexpr const char* kClassMarkerField = "__lua_native_class";
   static constexpr const char* kJsErrorIdField = "__jsErrorId";
 

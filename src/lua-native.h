@@ -52,6 +52,19 @@ struct LuaThreadData {
   }
 };
 
+// The context half of a bound C function that isn't tied to one Lua reference —
+// currently the coroutine `[Symbol.iterator]` factory (A4). Mirrors the
+// `context` + `contextAlive` pair the *Data structs carry, so a callback
+// invoked after its LuaContext was collected fails cleanly.
+struct LuaContextBinding {
+  LuaContext* context;
+  std::shared_ptr<std::atomic<bool>> contextAlive;
+
+  [[nodiscard]] bool ContextLive() const {
+    return context && contextAlive && contextAlive->load();
+  }
+};
+
 struct LuaUserdataData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
   lua_core::LuaUserdataRef userdataRef;
@@ -171,6 +184,7 @@ public:
     Napi::Value IsBusyMethod(const Napi::CallbackInfo& info);
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
     Napi::Value GetGlobal(const Napi::CallbackInfo& info);
+    Napi::Value Call(const Napi::CallbackInfo& info);
     Napi::Value SetUserdata(const Napi::CallbackInfo& info);
     Napi::Value SetMetatable(const Napi::CallbackInfo& info);
     Napi::Value CreateCoroutine(const Napi::CallbackInfo& info);
@@ -187,6 +201,7 @@ public:
     Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
     Napi::Value Info(const Napi::CallbackInfo& info);
     Napi::Value RegisterTypeConverter(const Napi::CallbackInfo& info);
+    Napi::Value RegisterFromLuaConverter(const Napi::CallbackInfo& info);
     Napi::Value RegisterClass(const Napi::CallbackInfo& info);
     Napi::Value Pcall(const Napi::CallbackInfo& info);
     Napi::Value SetPrintHandler(const Napi::CallbackInfo& info);
@@ -213,6 +228,22 @@ public:
     // itself for one, an array for many. Public so the async workers and the
     // Lua-function trampoline can share it.
     Napi::Value ResultsToJs(const std::vector<lua_core::LuaPtr>& values);
+
+    // Resumes `coro` with `args` and returns the CoroutineResult object
+    // ({ status, values, error? }), or throws a JS exception and returns
+    // undefined. The body of resume(), factored out so the iterator protocol
+    // (A4) drives a coroutine through exactly the same path. The caller is
+    // responsible for the busy guard and the outermost CallScope. Public so the
+    // iterator's free-function `next` can reach it.
+    Napi::Value ResumeCoroutineObject(const Napi::Object& coro,
+                                      const std::vector<Napi::Value>& args);
+
+    // Wraps `dataPtr` (whose ownership passes to the returned object's
+    // finalizer) as the JS coroutine object: the `_coroutine` marker, a `status`
+    // string, and the `Symbol.iterator` factory that makes it usable with
+    // for..of / for await (A4).
+    Napi::Object CreateCoroutineObject(LuaThreadData* dataPtr,
+                                       const std::string& status);
 
     // Reconstructs the original JS error for a surfaced Lua error (or a plain
     // Error from the string) and throws it. Public so LuaFunctionCallbackStatic
@@ -328,6 +359,18 @@ private:
     // order) before built-in type handling. Each entry is a {match, convert}
     // pair of JS functions.
     std::vector<std::pair<Napi::FunctionReference, Napi::FunctionReference>> type_converters_;
+
+    // The other direction (B3): Lua->JS converters, consulted (in registration
+    // order) on the *result* of the built-in conversion, so a Lua table that
+    // encodes an application type can be rebuilt as that type on the way out.
+    // Only object-valued results are offered, mirroring how the JS->Lua
+    // converters above skip primitives.
+    std::vector<std::pair<Napi::FunctionReference, Napi::FunctionReference>> from_lua_converters_;
+
+    // The built-in half of CoreToNapi. CoreToNapi is this plus the from-Lua
+    // converter pass, and it is what every recursive call goes through, so a
+    // converter reaches values nested inside tables and arrays too.
+    Napi::Value CoreToNapiBuiltin(const lua_core::LuaValue& value);
 
     // Userdata reference tracking. next_userdata_id_ keys the int-based userdata
     // maps and the in-userdata-block storage, so it stays int; the remaining

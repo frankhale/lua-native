@@ -7347,4 +7347,621 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // ============================================
+  // CALLING LUA FUNCTIONS BY NAME (F2)
+  // ============================================
+  describe('call()', () => {
+    it('calls a Lua global function by name', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('function add(a, b) return a + b end');
+      expect(lua.call('add', 2, 3)).toBe(5);
+    });
+
+    it('returns undefined, a value, or an array to match the return count', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        function none() end
+        function one() return 'x' end
+        function many() return 1, 2, 3 end
+      `);
+      expect(lua.call('none')).toBeUndefined();
+      expect(lua.call('one')).toBe('x');
+      expect(lua.call('many')).toEqual([1, 2, 3]);
+    });
+
+    it('accepts a dotted path to a nested function', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('handlers = { on = { tick = function(n) return n * 2 end } }');
+      expect(lua.call('handlers.on.tick', 21)).toBe(42);
+    });
+
+    it('converts arguments like every other JS -> Lua crossing', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        function apply(f, x) return f(x) end
+        function total(t) local s = 0 for _, v in ipairs(t) do s = s + v end return s end
+      `);
+      expect(lua.call('apply', (n: number) => n * 2, 21)).toBe(42);
+      expect(lua.call('total', [1, 2, 3])).toBe(6);
+    });
+
+    it('rejects a name that is not a function', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('x = 5; t = {}');
+      expect(() => lua.call('x')).toThrow(/'x' is not a function/);
+      expect(() => lua.call('t')).toThrow(/'t' is not a function/);
+      expect(() => lua.call('missing')).toThrow(/'missing' is not a function/);
+    });
+
+    it('rejects a malformed dotted path', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.call('a..b')).toThrow(/segments must be non-empty/);
+    });
+
+    it('propagates a Lua error, and the original Error from a JS callback', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('function boom() error("kaboom") end');
+      expect(() => lua.call('boom')).toThrow(/kaboom/);
+
+      const sentinel = new Error('from JS');
+      lua.set_global('thrower', () => { throw sentinel; });
+      lua.execute_script('function relay() return thrower() end');
+      expect(() => lua.call('relay')).toThrow(sentinel);
+    });
+
+    it('does not leave a JS function wrapper behind on each call', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('function id(x) return x end');
+      for (let i = 0; i < 200; i++) expect(lua.call('id', i)).toBe(i);
+      // A get_global round-trip would have minted 200 registry refs; this path
+      // mints none, so the state stays small.
+      expect(lua.call('id', 'still working')).toBe('still working');
+    });
+  });
+
+  // ============================================
+  // METATABLES ON NON-GLOBAL TABLES (F1)
+  // ============================================
+  describe('set_metatable() on table references', () => {
+    it('attaches a metatable to a create_table() handle', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const t = lua.create_table({ a: 1 });
+      lua.set_metatable(t, { __index: (_self: unknown, k: string) => `default:${k}` });
+
+      expect(t.get('a')).toBe(1);
+      expect(t.get('missing')).toBe('default:missing');
+    });
+
+    it('is visible from Lua once the table is reachable there', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const t = lua.create_table();
+      lua.set_metatable(t, { __index: (_self: unknown, k: string) => `mm:${k}` });
+      lua.set_global('T', t);
+      expect(lua.execute_script('return T.anything')).toBe('mm:anything');
+    });
+
+    it('attaches a metatable to a get_global_ref() handle', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('G = {}');
+      const g = lua.get_global_ref('G');
+      lua.set_metatable(g, { __call: () => 42 });
+      expect(lua.execute_script('return G()')).toBe(42);
+    });
+
+    it('attaches a metatable to an environment table', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const env = lua.create_environment({ whitelist: [] });
+      lua.set_metatable(env, {
+        __index: (_self: unknown, k: string) => (k === 'answer' ? 42 : null),
+      });
+      expect(lua.execute_script_in(env, 'return answer')).toBe(42);
+    });
+
+    it('routes handle get/set through __index and __newindex', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const t = lua.create_table();
+      const writes: Array<[string, unknown]> = [];
+      lua.set_metatable(t, {
+        __index: (_self: unknown, k: string) => `idx:${k}`,
+        __newindex: (_self: unknown, k: string, v: unknown) => { writes.push([k, v]); },
+      });
+
+      expect(t.get('a')).toBe('idx:a');
+      t.set('b', 2);
+      expect(writes).toEqual([['b', 2]]);
+      // __newindex swallowed the write, so the read still falls through.
+      expect(t.get('b')).toBe('idx:b');
+    });
+
+    it('replaces an existing metatable, like setmetatable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const t = lua.create_table();
+      lua.set_metatable(t, { __index: () => 'first' });
+      expect(t.get('x')).toBe('first');
+      lua.set_metatable(t, { __index: () => 'second' });
+      expect(t.get('x')).toBe('second');
+    });
+
+    it('works on the Proxy a metatabled table round-trips as', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const proxy = lua.execute_script(
+        'return setmetatable({}, { __index = function() return "old" end })') as any;
+      expect(proxy.k).toBe('old');
+      lua.set_metatable(proxy, { __index: () => 'new' });
+      expect(proxy.k).toBe('new');
+    });
+
+    it('still accepts a global name', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('S = {}');
+      lua.set_metatable('S', { __index: () => 'str' });
+      expect(lua.execute_script('return S.x')).toBe('str');
+    });
+
+    it('rejects a target that is neither a name nor a table reference', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => (lua as any).set_metatable(123, {}))
+        .toThrow(/global name or a table handle/);
+      expect(() => (lua as any).set_metatable({}, {}))
+        .toThrow(/global name or a table handle/);
+    });
+
+    it('rejects a released handle and one from another context', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const other = new lua_native.init({}, ALL_LIBS);
+
+      const released = lua.create_table();
+      released.release();
+      expect(() => lua.set_metatable(released, {})).toThrow(/has been released/);
+
+      const foreign = other.create_table();
+      expect(() => lua.set_metatable(foreign, {}))
+        .toThrow(/different Lua context/);
+    });
+
+    it('rejects a non-object metatable', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const t = lua.create_table();
+      expect(() => (lua as any).set_metatable(t, 'nope'))
+        .toThrow(/metatable must be an object/);
+    });
+  });
+
+  // ============================================
+  // COROUTINES AS ITERATORS (A4)
+  // ============================================
+  describe('coroutine iteration', () => {
+    const producer = (lua: any) => lua.create_coroutine(`
+      return function()
+        coroutine.yield(1)
+        coroutine.yield(2)
+        coroutine.yield(3)
+        return 'done'
+      end
+    `);
+
+    it('drives a coroutine with for..of, one iteration per yield', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect([...producer(lua)]).toEqual([1, 2, 3]);
+    });
+
+    it('discards the coroutine\'s final return value, like a generator', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = producer(lua);
+      const it = co[Symbol.iterator]();
+      expect(it.next()).toEqual({ value: 1, done: false });
+      it.next();
+      it.next();
+      // The `return 'done'` arrives with done: true, which for..of drops.
+      expect(it.next()).toEqual({ value: 'done', done: true });
+      expect(it.next()).toEqual({ value: undefined, done: true });
+    });
+
+    it('yields nothing for an already-dead coroutine', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = producer(lua);
+      expect([...co]).toEqual([1, 2, 3]);
+      expect([...co]).toEqual([]);
+    });
+
+    it('leaves the coroutine suspended when a loop exits early', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = producer(lua);
+      const seen: unknown[] = [];
+      for (const v of co) { seen.push(v); if (v === 2) break; }
+      expect(seen).toEqual([1, 2]);
+      // A later loop picks up where the first stopped.
+      expect([...co]).toEqual([3]);
+    });
+
+    it('surfaces a multi-value yield as an array', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = lua.create_coroutine('return function() coroutine.yield(1, 2) end');
+      expect([...co]).toEqual([[1, 2]]);
+    });
+
+    it('forwards next() arguments as the resume values', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = lua.create_coroutine(`
+        return function()
+          local got = coroutine.yield('ready')
+          coroutine.yield('got ' .. tostring(got))
+        end
+      `);
+      const it = co[Symbol.iterator]();
+      expect(it.next().value).toBe('ready');
+      expect(it.next('hello').value).toBe('got hello');
+    });
+
+    it('throws when the coroutine body errors, and ends the cursor', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = lua.create_coroutine('return function() error("bad") end');
+      const it = co[Symbol.iterator]();
+      expect(() => it.next()).toThrow(/bad/);
+      expect(it.next()).toEqual({ value: undefined, done: true });
+    });
+
+    it('works with for await, via the sync-iterable fallback', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const seen: unknown[] = [];
+      for await (const v of producer(lua)) seen.push(v);
+      expect(seen).toEqual([1, 2, 3]);
+    });
+
+    it('gives each [Symbol.iterator]() call a cursor over the same thread', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = producer(lua);
+      const a = co[Symbol.iterator]();
+      const b = co[Symbol.iterator]();
+      expect(a.next().value).toBe(1);
+      expect(b.next().value).toBe(2);
+      expect(a.next().value).toBe(3);
+    });
+
+    it('interoperates with resume()', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = producer(lua);
+      expect(lua.resume(co).values).toEqual([1]);
+      expect([...co]).toEqual([2, 3]);
+    });
+
+    it('iterates a coroutine created inside Lua', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = lua.execute_script(
+        'return coroutine.create(function() coroutine.yield("z") end)') as any;
+      expect([...co]).toEqual(['z']);
+    });
+
+    it('throws when the coroutine has been released', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = producer(lua);
+      lua.release(co);
+      expect(() => [...co]).toThrow(/has been released/);
+    });
+  });
+
+  // ============================================
+  // COROUTINES FROM AN EXISTING LUA FUNCTION (A4)
+  // ============================================
+  describe('create_coroutine() from a Lua function', () => {
+    it('accepts a function returned by execute_script', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const fn = lua.execute_script(`
+        return function()
+          coroutine.yield('x')
+          coroutine.yield('y')
+        end
+      `) as any;
+      expect([...lua.create_coroutine(fn)]).toEqual(['x', 'y']);
+      // The function itself is still usable afterwards.
+      expect(typeof fn).toBe('function');
+    });
+
+    it('accepts a function read back with get_global', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('function gen() coroutine.yield(1) coroutine.yield(2) end');
+      const fn = lua.get_global('gen') as any;
+      expect([...lua.create_coroutine(fn)]).toEqual([1, 2]);
+    });
+
+    it('passes resume arguments to the function on the first resume', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const fn = lua.execute_script(
+        'return function(a, b) coroutine.yield(a + b) end') as any;
+      const co = lua.create_coroutine(fn);
+      expect(lua.resume(co, 2, 3).values).toEqual([5]);
+    });
+
+    it('rejects a plain JavaScript function', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.create_coroutine((() => {}) as any))
+        .toThrow(/plain JavaScript function/);
+    });
+
+    it('rejects a released function and one from another context', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const other = new lua_native.init({}, ALL_LIBS);
+
+      const released = lua.execute_script('return function() end') as any;
+      lua.release(released);
+      expect(() => lua.create_coroutine(released)).toThrow(/has been released/);
+
+      const foreign = other.execute_script('return function() end') as any;
+      expect(() => lua.create_coroutine(foreign)).toThrow(/different Lua context/);
+    });
+
+    it('still accepts the original script form', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const co = lua.create_coroutine('return function() coroutine.yield(1) end');
+      expect(lua.resume(co).values).toEqual([1]);
+      expect(() => (lua as any).create_coroutine(42))
+        .toThrow(/script string that returns a function/);
+    });
+  });
+
+  // ============================================
+  // LUA -> JS TYPE CONVERTERS (B3)
+  // ============================================
+  describe('register_from_lua_converter()', () => {
+    class Money {
+      constructor(public cents: number) {}
+    }
+    const withMoney = () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_from_lua_converter(
+        (v: any) => !!v && v.__type === 'Money',
+        (v: any) => new Money(v.cents),
+      );
+      return lua;
+    };
+
+    it('rebuilds an application type from a Lua table', () => {
+      const lua = withMoney();
+      const m = lua.execute_script(`return { __type = 'Money', cents = 1299 }`) as any;
+      expect(m).toBeInstanceOf(Money);
+      expect(m.cents).toBe(1299);
+    });
+
+    it('reaches values nested inside tables and arrays', () => {
+      const lua = withMoney();
+      const nested = lua.execute_script(
+        `return { price = { __type = 'Money', cents = 50 } }`) as any;
+      expect(nested.price).toBeInstanceOf(Money);
+      expect(nested.price.cents).toBe(50);
+
+      const arr = lua.execute_script(
+        `return { { __type = 'Money', cents = 1 }, { __type = 'Money', cents = 2 } }`) as any;
+      expect(arr[0]).toBeInstanceOf(Money);
+      expect(arr[1].cents).toBe(2);
+    });
+
+    it('reaches callback arguments', () => {
+      const lua = withMoney();
+      let got: any = null;
+      lua.set_global('sink', (v: unknown) => { got = v; });
+      lua.execute_script(`sink({ __type = 'Money', cents = 7 })`);
+      expect(got).toBeInstanceOf(Money);
+      expect(got.cents).toBe(7);
+    });
+
+    it('reaches values read through a table handle', () => {
+      const lua = withMoney();
+      lua.execute_script(`box = { item = { __type = 'Money', cents = 3 } }`);
+      const ref = lua.get_global_ref('box');
+      expect(ref.get('item')).toBeInstanceOf(Money);
+      ref.release();
+    });
+
+    it('leaves primitives alone', () => {
+      const lua = withMoney();
+      expect(lua.execute_script('return 42')).toBe(42);
+      expect(lua.execute_script('return "hi"')).toBe('hi');
+      expect(lua.execute_script('return true')).toBe(true);
+      expect(lua.execute_script('return nil')).toBeNull();
+    });
+
+    it('sees metatabled tables as the Proxy they convert to', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_from_lua_converter(
+        (v: any) => { try { return v.__type === 'Tagged'; } catch { return false; } },
+        (v: any) => ({ tagged: true, n: v.n }),
+      );
+      const r = lua.execute_script(`
+        local t = setmetatable({ __type = 'Tagged', n = 3 }, { __index = function() return nil end })
+        return t
+      `) as any;
+      expect(r).toEqual({ tagged: true, n: 3 });
+    });
+
+    it('leaves non-matching values as the natural conversion', () => {
+      const lua = withMoney();
+      const proxy = lua.execute_script(
+        `return setmetatable({ v = 1 }, { __index = function(_, k) return 'mm:' .. k end })`) as any;
+      expect(proxy.v).toBe(1);
+      expect(proxy.zzz).toBe('mm:zzz');
+    });
+
+    it('uses the converter result verbatim, without re-converting it', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let calls = 0;
+      lua.register_from_lua_converter(
+        (v: any) => { calls++; return !!v && v.wrap === true; },
+        () => ({ wrap: true, marker: 'converted' }),
+      );
+      // The result matches the predicate itself; if it were re-converted this
+      // would not terminate.
+      const r = lua.execute_script('return { wrap = true }') as any;
+      expect(r.marker).toBe('converted');
+      expect(calls).toBe(1);
+    });
+
+    it('consults converters in registration order, first match wins', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_from_lua_converter((v: any) => v.k === 1, () => 'first');
+      lua.register_from_lua_converter((v: any) => v.k === 1, () => 'second');
+      expect(lua.execute_script('return { k = 1 }')).toBe('first');
+    });
+
+    it('round-trips with register_type_converter', () => {
+      const lua = withMoney();
+      lua.register_type_converter(
+        (v) => v instanceof Money,
+        (v: Money) => ({ __type: 'Money', cents: v.cents }),
+      );
+      lua.set_global('price', new Money(500));
+      const back = lua.get_global('price') as any;
+      expect(back).toBeInstanceOf(Money);
+      expect(back.cents).toBe(500);
+    });
+
+    it('survives reset() — converters are context configuration', () => {
+      const lua = withMoney();
+      lua.reset();
+      const m = lua.execute_script(`return { __type = 'Money', cents = 1 }`);
+      expect(m).toBeInstanceOf(Money);
+    });
+
+    it('surfaces an error thrown by the predicate', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_from_lua_converter(
+        () => { throw new Error('match blew up'); },
+        (v: any) => v,
+      );
+      expect(() => lua.execute_script('return {1}')).toThrow(/match blew up/);
+    });
+
+    it('requires two functions', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => (lua as any).register_from_lua_converter(1, 2))
+        .toThrow(/requires two functions/);
+    });
+  });
+
+  // ============================================
+  // CLASS INHERITANCE (C4)
+  // ============================================
+  describe('register_class() inheritance', () => {
+    const animals = () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_class('Animal', {
+        construct: (name: any) => ({ name, species: 'animal' }),
+        readable: true,
+        methods: {
+          speak: (self: any) => `${self.name} makes a sound`,
+          name_of: (self: any) => self.name,
+        },
+        metamethods: { __tostring: (self: any) => `Animal(${self.name})` },
+      });
+      lua.register_class('Dog', {
+        extends: 'Animal',
+        construct: (name: any) => ({ name, species: 'dog' }),
+        readable: true,
+        methods: { speak: (self: any) => `${self.name} barks` },
+      });
+      return lua;
+    };
+
+    it('inherits methods from the base class', () => {
+      const lua = animals();
+      expect(lua.execute_script(`return Dog.new('rex'):name_of()`)).toBe('rex');
+    });
+
+    it('lets a derived method override the base one', () => {
+      const lua = animals();
+      expect(lua.execute_script(`return Dog.new('rex'):speak()`)).toBe('rex barks');
+      expect(lua.execute_script(`return Animal.new('cat'):speak()`)).toBe('cat makes a sound');
+    });
+
+    it('inherits metamethods unless the derived class defines its own', () => {
+      const lua = animals();
+      expect(lua.execute_script(`return tostring(Dog.new('rex'))`)).toBe('Animal(rex)');
+
+      lua.register_class('Cat', {
+        extends: 'Animal',
+        construct: (name: any) => ({ name }),
+        readable: true,
+        metamethods: { __tostring: (self: any) => `Cat(${self.name})` },
+      });
+      expect(lua.execute_script(`return tostring(Cat.new('tom'))`)).toBe('Cat(tom)');
+      // The base's own metamethod is untouched.
+      expect(lua.execute_script(`return tostring(Animal.new('a'))`)).toBe('Animal(a)');
+    });
+
+    it('inherits operator overloads', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.register_class('Base', {
+        construct: (v: any) => ({ v }),
+        readable: true,
+        metamethods: { __add: (a: any, b: any) => ({ v: a.v + b.v }) },
+      });
+      lua.register_class('Derived', {
+        extends: 'Base',
+        construct: (v: any) => ({ v }),
+        readable: true,
+      });
+      expect(lua.execute_script('return (Derived.new(1) + Derived.new(2)).v')).toBe(3);
+    });
+
+    it('keeps property access per class', () => {
+      const lua = animals();
+      expect(lua.execute_script(`return Dog.new('rex').species`)).toBe('dog');
+    });
+
+    it('chains through more than one level, nearest override winning', () => {
+      const lua = animals();
+      lua.register_class('Puppy', {
+        extends: 'Dog',
+        construct: (name: any) => ({ name, species: 'puppy' }),
+        readable: true,
+      });
+      expect(lua.execute_script(`return Puppy.new('p'):name_of()`)).toBe('p');   // Animal
+      expect(lua.execute_script(`return Puppy.new('p'):speak()`)).toBe('p barks'); // Dog
+    });
+
+    it('memoizes an inherited method without changing later lookups', () => {
+      const lua = animals();
+      expect(lua.execute_script(`
+        local a = Dog.new('a'):name_of()
+        local b = Dog.new('b'):name_of()
+        return a .. ',' .. b
+      `)).toBe('a,b');
+    });
+
+    it('rejects an unregistered or self-referential base class', () => {
+      const lua = animals();
+      expect(() => lua.register_class('X', { extends: 'Nope', construct: () => ({}) }))
+        .toThrow(/'Nope' is not registered/);
+      expect(() => lua.register_class('Y', { extends: 'Y', construct: () => ({}) }))
+        .toThrow(/'Y' is not registered/);
+      // The rejected names are not reserved by the failed attempt.
+      lua.register_class('X', { construct: () => ({ v: 1 }), readable: true });
+      expect(lua.execute_script('return X.new().v')).toBe(1);
+    });
+
+    it('rejects a non-string extends', () => {
+      const lua = animals();
+      expect(() => lua.register_class('Z', { extends: 42 as any, construct: () => ({}) }))
+        .toThrow(/'extends' must be the name of a registered class/);
+    });
+
+    it('needs the chain re-registered after reset()', () => {
+      const lua = animals();
+      expect(lua.execute_script(`return Dog.new('rex'):name_of()`)).toBe('rex');
+      lua.reset();
+      expect(lua.get_global('Dog')).toBeNull();
+
+      lua.register_class('Animal', {
+        construct: (name: any) => ({ name }),
+        readable: true,
+        methods: { name_of: (self: any) => `re:${self.name}` },
+      });
+      lua.register_class('Dog', {
+        extends: 'Animal',
+        construct: (name: any) => ({ name }),
+        readable: true,
+      });
+      expect(lua.execute_script(`return Dog.new('rex'):name_of()`)).toBe('re:rex');
+    });
+  });
 });

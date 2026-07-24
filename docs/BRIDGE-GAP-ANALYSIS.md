@@ -1,9 +1,11 @@
 # Modern Lua Bridge — Competitive Gap Analysis
 
-**Status:** Assessment / planning document
+**Status:** Complete — every gap this survey identified is implemented
 **Date:** July 2026
-**Last source audit:** July 14, 2026 — every "implemented" claim below was
-re-verified against `src/` (see [Verification audit](#verification-audit-july-14-2026))
+**Last source audit:** July 24, 2026 — every "implemented" claim below was
+re-verified against `src/` (see [Verification audit](#verification-audit-july-14-2026)
+for the July 14 pass and [Closing the remainder](#closing-the-remainder-july-24-2026)
+for the final five)
 **Purpose:** Identify the features that mature Lua bridges provide but `lua-native`
 does not yet cover — including gaps *not* already tracked in [`FUTURE.md`](./FUTURE.md).
 
@@ -52,17 +54,19 @@ For context, the following are implemented and competitive:
 | Script/file execution (sync + async), multiple returns | ✅ |
 | Bidirectional value conversion (primitives, arrays, plain tables) | ✅ |
 | Host functions (JS callable from Lua) and Lua functions callable from JS | ✅ |
-| Coroutines (create/resume) | ✅ |
+| Coroutines (create/resume, from a script or a `LuaFunction`, JS-iterable) | ✅ |
 | Userdata: opaque, property-proxy, and **method binding** on instances | ✅ |
-| Metatables on global tables (all standard metamethods) | ✅ |
+| Metatables on any Lua table — global name or live table reference | ✅ |
 | Reference-preserving tables (Proxy) and live table handles | ✅ |
 | Selective stdlib loading + `safe`/`all` presets | ✅ |
 | `require` integration: search paths + JS-object module preload | ✅ |
 | Bytecode: compile / compile_file / load_bytecode | ✅ |
 | Memory limits + usage reporting | ✅ |
 
-This is already broader than most JS bridges. The gaps below are what separates it
-from **full** parity.
+This is already broader than most JS bridges. The sections below record the gaps
+that separated it from **full** parity — all of which are now closed, except A5
+(worker pool), which is deferred by design. The original analysis is retained so
+each decision can be read against the problem it was answering.
 
 ---
 
@@ -157,7 +161,16 @@ checks.
 > worker-thread `execute_script_async`/`execute_file_async` — whenever
 > `maxInstructions` is set (the hook only exists then).
 
-#### A4. Coroutine ↔ JS async iterator ergonomics
+#### A4. Coroutine ↔ JS async iterator ergonomics — ✅ done (July 24, 2026)
+
+> **Status:** implemented. A coroutine object carries `Symbol.iterator`, so
+> `for (const v of coro)` drives it one iteration per `yield` (and `for await`
+> works through JS's sync-iterable fallback — the resume is synchronous, so a
+> separate async iterator would only add a Promise per step). Each
+> `[Symbol.iterator]()` is a *cursor* over the one Lua thread, so a loop that
+> `break`s leaves the coroutine suspended where it stopped. `create_coroutine()`
+> now also accepts a `LuaFunction` this context produced, closing the related
+> ergonomic gap. See "Interop Completeness" in [`FEATURES.md`](./FEATURES.md).
 
 Bridges commonly expose a Lua coroutine as a JS `Iterator`/`AsyncIterator` so
 `for (const v of coro)` / `for await` works. Today the consumer must hand-loop
@@ -187,6 +200,15 @@ no pooling/scheduling abstraction. (Lower priority — userland can build it.)
 > counterpart, so app-specific reconstruction of Lua values into JS types
 > (the second half of wasmoon's `TypeExtension` design) is not possible.
 > Tracked below as **B3**.
+>
+> **Update (July 24, 2026): B3 is closed.** `register_from_lua_converter(match,
+> convert)` is the mirror direction. It is consulted inside `CoreToNapi`, which
+> every recursive conversion goes through, so a converter reaches values nested
+> in tables and arrays and values arriving as callback arguments — not only
+> top-level results. `match` sees the natural conversion result (a plain object,
+> or a Proxy for a metatabled table), since that is the only shape a JS predicate
+> can inspect; `convert`'s return value is used verbatim rather than
+> re-converted.
 
 Verified against `NapiToCoreInstance` (`src/lua-native.cpp:1157`): only
 `function`, `undefined/null`, `boolean`, `number`, `string`, `Array`, and plain
@@ -222,13 +244,19 @@ the built-in fallback.
 
 ---
 
-### C. Class / usertype binding — ✅ C1–C3 implemented (July 2026)
+### C. Class / usertype binding — ✅ C1–C4 implemented (July 2026)
 
 > **Status:** C1 (constructor binding), C2 (shared per-class metatable with
 > methods + property access), and C3 (operator overloading) are implemented via
-> `register_class()`. C4 (inheritance) remains deferred. See the
-> "Class / Usertype Binding" section in [`FEATURES.md`](./FEATURES.md) and
-> `register_class()` in the API. The original gap analysis is retained below.
+> `register_class()`. C4 (inheritance) followed on July 24, 2026:
+> `register_class(name, { extends: 'Base', ... })` chains method lookup through
+> the base class (memoizing what it finds onto the derived class) and copies the
+> base's metamethods into the derived metatable unless overridden. Each class
+> still supplies its own `construct`, and `readable`/`writable` stay per-class,
+> since both are instance-construction concerns rather than name resolution. See
+> the "Class / Usertype Binding" and "Interop Completeness" sections in
+> [`FEATURES.md`](./FEATURES.md) and `register_class()` in the API. The original
+> gap analysis is retained below.
 
 `set_userdata` binds an **existing instance**. There is no way to register a JS
 **class/constructor** so Lua can *construct new instances*:
@@ -256,6 +284,7 @@ Sub-capabilities, roughly in dependency order:
   `__concat`, `__tostring` for a class so Lua operators dispatch to JS. `set_metatable`
   already proves the metamethod bridge works; this generalizes it to types.
 - **C4. Inheritance / `__index` chaining** — optional, sol2-level; defer until C1–C3 land.
+  *(Done — July 24, 2026.)*
 
 ---
 
@@ -327,14 +356,26 @@ exists despite the sandboxing emphasis.
 
 ---
 
-### F. Ergonomics / smaller parity items
+### F. Ergonomics / smaller parity items — ✅ all implemented (July 2026)
 
-- **F1. Metatables on non-global tables.** `set_metatable` only works on global
-  names (documented limitation in `FEATURES.md`). No way to attach a metatable to
-  a table *handle* or a freshly `create_table()`'d table from JS without dropping
-  into `execute_script`. Natural extension of the table-handle API.
-- **F2. Call a Lua global by name directly** — `lua.call('fn', ...args)` without a
-  `get_global` round-trip. Trivial convenience present in most bridges.
+- ~~**F1. Metatables on non-global tables.**~~ — **done (July 24, 2026):**
+  `set_metatable(target, metatable)` takes either a global name or a live table
+  reference — a `create_table()` / `get_global_ref()` / `create_environment()`
+  handle, or the Proxy a metatabled table round-trips as. Core:
+  `LuaRuntime::SetTableRefMetatable`. The reference form validates its target up
+  front (identity, released-ness), so a bad handle is rejected before any
+  callback name is minted; the global form still validates inside the core call.
+  A metatable on a handle is a metatable on the table, so `handle.get`/`.set`
+  trigger `__index`/`__newindex` like any Lua access.
+  *(Original text: `set_metatable` only worked on global names, with no way to
+  attach a metatable to a table handle without dropping into `execute_script`.)*
+- ~~**F2. Call a Lua global by name directly**~~ — **done (July 24, 2026):**
+  `lua.call('fn', ...args)`, accepting a dotted path like `get_global`. It is not
+  only convenience: the `get_global` workaround mints a JS function wrapper and a
+  Lua registry slot per call, while `call()` keeps the function a core
+  `LuaFunctionRef` that is used and dropped. A callable table (`__call`) is
+  rejected with a clear message rather than silently half-supported — reach it
+  through `get_global`.
 - ~~**F3. Per-call environment on `execute_script`**~~ — **done (July 24,
   2026):** `execute_script_in(env, script)` runs one script against a supplied
   environment table, and accepts any live table reference — a `create_table()`
@@ -368,8 +409,10 @@ matrix below:
   *(Since closed — see the update note under A3 and the completed matrix.)*
 - **B3 — no Lua→JS custom conversion.** The converter registry only covers
   JS→Lua. wasmoon's `TypeExtension` is bidirectional.
+  *(Since closed — July 24, 2026: `register_from_lua_converter()`.)*
 - **A4 (extended) — coroutines only from source strings.** `create_coroutine()`
   cannot take an existing `LuaFunction` ref.
+  *(Since closed — July 24, 2026: `create_coroutine(fn)`.)*
 
 Also noted while auditing (already tracked in `FUTURE.md`, status updated
 there): stack traces are done; reference lifecycle is partially done
@@ -399,43 +442,69 @@ with no reasonable JS-side workaround and broad demand.
 | B2 | ✅ Pluggable type-converter registry (JS→Lua; see B3) | Medium |
 | E2 | ✅ Dynamic `require` via JS searcher | Medium |
 | A3b | ✅ Hook-based cancellation of compute-bound loops (via the `maxInstructions` count-hook; requires `maxInstructions` to be set) | High (sandboxing) |
+| B3 | ✅ Lua→JS direction of the type-converter registry (`register_from_lua_converter()`) | Medium |
+| A4 | ✅ Coroutine as iterator + coroutine-from-`LuaFunction` | Low-med |
+| F1 | ✅ Metatables on non-global tables (`set_metatable` on a table reference) | Low-med |
+| C4 | ✅ Class inheritance / `__index` chaining (`register_class({ extends })`) | Low-med |
+| F2 | ✅ Call a Lua global by name (`lua.call('fn', ...)`) | Low |
+| F3 | ✅ Per-call environment on `execute_script` (`execute_script_in`) | Low-med |
 
 ### Remaining
 
 | # | Gap | Impact | Workaround exists? | Rec. tier |
 |---|---|---|---|---|
-| B3 | Lua→JS direction of the type-converter registry | Medium | Manual post-processing of results | **3** |
-| A4 | Coroutine as (async) iterator + coroutine-from-`LuaFunction` | Low-med | Manual `resume` loop | **3** |
-| F1 | Metatables on non-global tables (table handles / `create_table`) | Low-med | `execute_script` | **3** |
-| C4 | Class inheritance / `__index` chaining | Low-med | Flatten methods in JS | **4** |
-| F2 | Call a Lua global by name (`lua.call('fn', ...)`) | Low | `get_global` | **4** |
-| ~~F3~~ | ~~Per-call environment on `execute_script`~~ | — | Done — `execute_script_in` (July 24, 2026) | — |
 | A5 | Worker pool / true parallelism | Low | Multiple contexts | **4** (by design) |
+
+**A5 is deferred deliberately, not pending.** A `LuaRuntime` is single-threaded
+by construction and the async model assumes one owner at a time, so "true
+parallelism" means N independent contexts plus a scheduler — which is exactly
+what userland can build over `execute_script_async` without any native support.
+Nothing in the binding blocks it, and adding a pool in C++ would move policy
+(sizing, queueing, fairness, backpressure) into the addon where it is hardest to
+tune. It stays out until a concrete workload argues otherwise.
 
 ---
 
-## Recommended sequencing (updated July 14, 2026)
+## Closing the remainder (July 24, 2026)
 
-The original three phases (correctness quick-wins → async overhaul → class
-binding) are **complete**. What remains, in order:
+The five open interop gaps — B3, A4, F1, C4, F2 — were implemented together and
+verified against `src/`:
 
-1. ~~**Sandboxing completion (A3b + `FUTURE.md` Tier 1)**~~ — **done (July
+| # | Surface | Core | Binding |
+|---|---|---|---|
+| F2 | `call(name, ...args)` | — (reuses `GetGlobal`/`GetGlobalPath` + `CallFunction`) | `LuaContext::Call` |
+| F1 | `set_metatable(handle, mt)` | `SetTableRefMetatable` | `SetMetatable` (target dispatch) |
+| A4 | `coro[Symbol.iterator]`, `create_coroutine(fn)` | — (reuses `CreateCoroutine(LuaFunctionRef)`) | `CreateCoroutineObject`, `ResumeCoroutineObject`, `CoroSymbolIterator` |
+| B3 | `register_from_lua_converter(match, convert)` | — | `CoreToNapi` / `CoreToNapiBuiltin` split |
+| C4 | `register_class({ extends })` | `RegisterClass(..., parent)`, `ClassIndex` chain walk, `HasClass` | `RegisterClass` (`extends` validation) |
+
+Four of the five needed no core change at all — the interop surface was already
+there and only the binding layer had to reach it. Covered by 60 new tests in
+`tests/ts/lua-native.spec.ts`; the full suite (725 tests) is clean under
+ASan+UBSan via `npm run test-ts-asan`, and the C++ suite (250 tests) under
+`npm run test-cpp-asan`.
+
+---
+
+## Recommended sequencing (updated July 24, 2026)
+
+Every phase is **complete**:
+
+1. ~~**Correctness quick-wins → async overhaul → class binding**~~ — done
+   (July 2026).
+2. ~~**Sandboxing completion (A3b + `FUTURE.md` Tier 1)**~~ — **done (July
    2026):** instruction limits (`maxInstructions`) and hook-based cancellation
    shipped together, closing the last no-workaround hole in the untrusted-code
    story (`safe` preset + memory limits + instruction limits +
    `allowBytecode: false` are all in place). The optional wall-clock timeout
    followed on July 24, 2026 (`timeout`), sharing the same hook.
-2. **Operational control (`FUTURE.md` Tier 2):** GC control, context reset.
-   Small, low-risk, natural follow-ons to the sandboxing theme. ~~Extend
-   `release()` from table handles to function/coroutine refs while in the area
-   (Tier 3 ref lifecycle).~~ *(Done — July 23, 2026: `lua.release(value)`.)*
-3. **Interop polish, by demand:** B3 (Lua→JS converters), A4 (iterators +
-   coroutine-from-function), F1 (metatables on handles). Each is small and
-   independent.
-4. **Defer until requested:** C4 (inheritance), F2, A5, and the `FUTURE.md`
-   Tier 4 items. ~~Environment tables / F3~~ *(Done — July 24, 2026:
-   `create_environment()` + `execute_script_in()`.)* ~~Debug hooks~~ *(Done —
-   July 24, 2026: `set_hook()`.)*
+3. ~~**Operational control (`FUTURE.md` Tier 2):** GC control, context reset,
+   plus extending `release()` from table handles to function/coroutine refs.~~
+   *(Done — July 23, 2026.)*
+4. ~~**Interop polish:** B3, A4, F1, C4, F2.~~ *(Done — July 24, 2026; see
+   "Closing the remainder" above.)* ~~Environment tables / F3~~ *(Done — July 24,
+   2026.)* ~~Debug hooks~~ *(Done — July 24, 2026.)*
+5. **Deferred by design:** A5 (worker pool) — see the note under the matrix.
 
 ---
 
@@ -445,4 +514,9 @@ binding) are **complete**. What remains, in order:
 features it lists (limits, traces, GC, reset, hooks, environments, ref lifecycle).
 This document adds the **interop-completeness** dimension those items don't
 address: async, type fidelity, class binding, error fidelity, and I/O hooks. The
-two together describe full parity with a best-in-class modern Lua bridge.
+two together describe full parity with a best-in-class modern Lua bridge — and as
+of July 24, 2026 both are fully implemented, apart from A5 (worker pool), which
+is out of scope by design rather than pending.
+
+Both documents are now records rather than plans. New work should start from a
+concrete need, not from this survey.

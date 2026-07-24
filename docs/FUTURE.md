@@ -5,6 +5,11 @@ Potential enhancements for lua-native, organized by priority.
 > Statuses in this document were verified against the source
 > (`src/lua-native.cpp`, `src/core/lua-runtime.cpp`, `types.d.ts`) on
 > July 24, 2026.
+>
+> **Every feature in this document is implemented**, as is every interop gap in
+> `BRIDGE-GAP-ANALYSIS.md` apart from A5 (worker pool), which is deferred by
+> design. The document is kept as a record of what each feature was for and how
+> the as-built design differed from the plan — not as a backlog.
 
 ## Priority Assessment
 
@@ -44,22 +49,22 @@ Tier 3 and 4 can be driven by actual user requests.
 
 The bridge-parity survey in `BRIDGE-GAP-ANALYSIS.md` tracks the interop
 dimension this document doesn't (async, type fidelity, class binding, error
-fidelity, I/O). Its remaining items as of July 2026, in that document's
-numbering:
+fidelity, I/O). **Every item in it is now implemented**, except A5, which is
+deferred by design. In that document's numbering:
 
-| # | Gap | Rec. tier |
+| # | Gap | Status |
 |---|---|---|
-| B3 | Lua→JS direction of the type-converter registry | 3 |
-| A4 | Coroutine as (async) iterator; coroutine from a `LuaFunction` ref | 3 |
-| F1 | Metatables on non-global tables (table handles / `create_table`) | 3 |
-| C4 | Class inheritance / `__index` chaining | 4 |
-| F2 | Call a Lua global by name (`lua.call('fn', ...args)`) | 4 |
-| A5 | Worker pool / true parallelism | 4 (by design) |
+| B3 | Lua→JS direction of the type-converter registry | Completed — `register_from_lua_converter()` (July 24, 2026) |
+| A4 | Coroutine as iterator; coroutine from a `LuaFunction` ref | Completed — `Symbol.iterator` on coroutines, `create_coroutine(fn)` (July 24, 2026) |
+| F1 | Metatables on non-global tables (table handles / `create_table`) | Completed — `set_metatable(handle, mt)` (July 24, 2026) |
+| C4 | Class inheritance / `__index` chaining | Completed — `register_class({ extends })` (July 24, 2026) |
+| F2 | Call a Lua global by name (`lua.call('fn', ...args)`) | Completed — `call()` (July 24, 2026) |
+| A5 | Worker pool / true parallelism | Deferred by design — a pool over N independent contexts belongs in userland |
 
 Everything else in that survey (Promise await, cancellation incl. A3b,
 type fidelity, converter registry, class binding, error fidelity/`pcall`,
-print redirection, JS searchers, `allowBytecode`) is implemented — including
-F3 (per-call environment), which `execute_script_in` closed alongside
+print redirection, JS searchers, `allowBytecode`) was already implemented —
+including F3 (per-call environment), which `execute_script_in` closed alongside
 Environment Tables on July 24, 2026.
 
 ---

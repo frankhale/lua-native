@@ -736,6 +736,7 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("execute_file", &LuaContext::ExecuteFile),
     InstanceMethod("set_global", &LuaContext::SetGlobal),
     InstanceMethod("get_global", &LuaContext::GetGlobal),
+    InstanceMethod("call", &LuaContext::Call),
     InstanceMethod("set_userdata", &LuaContext::SetUserdata),
     InstanceMethod("set_metatable", &LuaContext::SetMetatable),
     InstanceMethod("create_coroutine", &LuaContext::CreateCoroutine),
@@ -757,6 +758,7 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("get_memory_usage", &LuaContext::GetMemoryUsage),
     InstanceMethod("info", &LuaContext::Info),
     InstanceMethod("register_type_converter", &LuaContext::RegisterTypeConverter),
+    InstanceMethod("register_from_lua_converter", &LuaContext::RegisterFromLuaConverter),
     InstanceMethod("register_class", &LuaContext::RegisterClass),
     InstanceMethod("pcall", &LuaContext::Pcall),
     InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
@@ -1173,6 +1175,75 @@ Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
   }
 }
 
+// call(name, ...args) — invoke a Lua function by global name (F2).
+//
+// Sugar over get_global() + calling the returned wrapper, but it never mints
+// that wrapper: the function stays a core LuaFunctionRef that is called and
+// dropped, so a hot call loop doesn't leave a JS function object (and its
+// registry slot) behind on every iteration. `name` accepts a dotted path, the
+// same as get_global.
+Napi::Value LuaContext::Call(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "call(name, ...args) requires a string name")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const std::string name = info[0].As<Napi::String>().Utf8Value();
+
+  lua_core::LuaPtr target;
+  try {
+    if (name.find('.') != std::string::npos) {
+      std::vector<std::string> path;
+      if (!SplitGlobalPath(name, path)) {
+        Napi::TypeError::New(env, "Invalid global path '" + name +
+          "': path segments must be non-empty (no leading, trailing, or doubled dots)")
+          .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      target = runtime->GetGlobalPath(path);
+    } else {
+      target = runtime->GetGlobal(name);
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Only a genuine Lua function is accepted. A callable table (one with __call)
+  // arrives as a LuaTableRef, not a function ref, and calling it would need a
+  // different core entry point — get_global() still returns a Proxy for it.
+  if (!target || !std::holds_alternative<lua_core::LuaFunctionRef>(target->value)) {
+    Napi::TypeError::New(env,
+      "Lua global '" + name + "' is not a function").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // One collector spans every argument so a later argument's conversion failure
+  // sweeps the reclaimable callbacks minted by the earlier ones (CR-8 F1).
+  JsCallbackCollectorScope collector(this);
+  std::vector<lua_core::LuaPtr> args;
+  args.reserve(info.Length() > 0 ? info.Length() - 1 : 0);
+  try {
+    for (size_t i = 1; i < info.Length(); ++i) {
+      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  CallScope scope(this);
+  const auto result =
+    runtime->CallFunction(std::get<lua_core::LuaFunctionRef>(target->value), args);
+  if (std::holds_alternative<std::string>(result)) {
+    ThrowLuaError(std::get<std::string>(result));
+    return env.Undefined();
+  }
+  return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result));
+}
+
 Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
@@ -1326,6 +1397,28 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   }
   auto constructFn = constructVal.As<Napi::Function>();
 
+  // Inheritance (C4). The base must already be registered on THIS context: the
+  // core chains method lookups through its registry entries, and a name this
+  // context never registered would either be missing or — worse — belong to
+  // whatever else happens to sit at that registry key.
+  std::string parent_class;
+  if (const Napi::Value extendsVal = def.Get("extends"); !extendsVal.IsUndefined() &&
+      !extendsVal.IsNull()) {
+    if (!extendsVal.IsString()) {
+      Napi::TypeError::New(env,
+        "register_class(): 'extends' must be the name of a registered class")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    parent_class = extendsVal.As<Napi::String>().Utf8Value();
+    if (parent_class == class_name || !registered_classes_.count(parent_class)) {
+      Napi::Error::New(env,
+        "register_class(): base class '" + parent_class + "' is not registered")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+
   // Validate reserved metamethods up front, before anything is registered, so a
   // rejected definition doesn't strand the constructor/method callbacks in
   // js_callbacks_/host_functions_ (L4). The property, its key list, and each
@@ -1409,7 +1502,7 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   // write. Surface that as a JS error: letting a std::runtime_error unwind
   // across the N-API boundary terminates the process (the H1 class).
   try {
-    runtime->RegisterClass(class_name, ctor_name, method_map, metamethods);
+    runtime->RegisterClass(class_name, ctor_name, method_map, metamethods, parent_class);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     // The reservation guard releases the name; nothing was registered, so
@@ -1429,24 +1522,59 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// Defined further down, next to the table-reference API it belongs to.
+static LuaTableRefData* TableRefDataFrom(const Napi::Value& value);
+
+// set_metatable(target, metatable)
+//
+// `target` is either a global name (the original form) or a live table
+// reference — a `create_table()` / `get_global_ref()` / `create_environment()`
+// handle, or the Proxy a metatabled table round-trips as (F1). The metatable is
+// built identically either way; only the final attach differs, so both forms get
+// the same deferred host-function registration and the same rollback on failure.
 Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
-  if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
-    Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
+
+  // Resolve the target before touching the metatable definition, so a bad target
+  // is rejected without minting any callback names.
+  LuaTableRefData* targetRef = nullptr;
+  std::string name;
+  if (info.Length() >= 1 && info[0].IsString()) {
+    name = info[0].As<Napi::String>().Utf8Value();
+  } else if (info.Length() >= 1 && (targetRef = TableRefDataFrom(info[0]))) {
+    if (targetRef->runtime.get() != runtime.get()) {
+      Napi::Error::New(env, "table handle belongs to a different Lua context")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    if (targetRef->tableRef.ref == LUA_NOREF) {
+      Napi::Error::New(env, "table handle has been released")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  } else {
+    Napi::TypeError::New(env,
+      "set_metatable(target, metatable) requires a global name or a table handle")
+      .ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
-  const std::string name = info[0].As<Napi::String>().Utf8Value();
+  if (info.Length() < 2 || !info[1].IsObject() || info[1].IsFunction()) {
+    Napi::TypeError::New(env, "set_metatable(): metatable must be an object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
   const auto mt = info[1].As<Napi::Object>();
   const Napi::Array keys = mt.GetPropertyNames();
 
   uint64_t mt_id = next_metatable_id_++;
   std::vector<lua_core::MetatableEntry> entries;
 
-  // One collector spans the whole entry build and the core call: SetGlobalMetatable
-  // validates the target global only after every entry has been converted, so a
+  // One collector spans the whole entry build and the core call: the global form
+  // validates its target only after every entry has been converted, so a
   // missing/non-table global discards them all. The destructor sweeps any
-  // reclaimable callback that never reached Lua (F1).
+  // reclaimable callback that never reached Lua (CR-8 F1).
   JsCallbackCollectorScope collector(this);
 
   // Function-valued entries are collected here and registered only AFTER the
@@ -1485,7 +1613,11 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   }
 
   try {
-    runtime->SetGlobalMetatable(name, entries);
+    if (targetRef) {
+      runtime->SetTableRefMetatable(targetRef->tableRef.ref, entries);
+    } else {
+      runtime->SetGlobalMetatable(name, entries);
+    }
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();  // nothing registered, nothing stranded (CR-8 F3)
@@ -2061,6 +2193,22 @@ Napi::Value LuaContext::RegisterTypeConverter(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   type_converters_.emplace_back(
+    Napi::Persistent(info[0].As<Napi::Function>()),
+    Napi::Persistent(info[1].As<Napi::Function>()));
+  return env.Undefined();
+}
+
+// B3 — the Lua->JS half of the converter registry. See CoreToNapi for where the
+// pair is consulted and why the converter's return value is used verbatim.
+Napi::Value LuaContext::RegisterFromLuaConverter(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 2 || !info[0].IsFunction() || !info[1].IsFunction()) {
+    Napi::TypeError::New(env,
+      "register_from_lua_converter(match, convert) requires two functions")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  from_lua_converters_.emplace_back(
     Napi::Persistent(info[0].As<Napi::Function>()),
     Napi::Persistent(info[1].As<Napi::Function>()));
   return env.Undefined();
@@ -3337,7 +3485,38 @@ Napi::Value LuaContext::ResultsToJs(const std::vector<lua_core::LuaPtr>& values)
   return array;
 }
 
+// Converts a Lua value to JS, then gives the registered Lua->JS converters
+// (B3) a chance to replace the result with an application type.
+//
+// The converter sees the natural conversion — a plain object for a Lua table, a
+// Proxy for a metatabled one — because that is the only shape expressible to a
+// JS predicate. Its return value is used verbatim rather than re-converted: the
+// result is already a JS value, and re-running the converters over it would
+// invite a converter that matches its own output to loop forever.
+//
+// Only object-valued results are offered, mirroring the JS->Lua direction's
+// "converters do not see primitives" rule — and keeping the common path (every
+// number and string crossing out of Lua) free of a JS call per value.
 Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
+  Napi::Value result = CoreToNapiBuiltin(value);
+  if (from_lua_converters_.empty()) return result;
+  if (!result.IsObject() || result.IsFunction()) return result;
+
+  // Index the vector and pull both handles out BEFORE calling match(): a
+  // match/convert callback may re-enter and register another converter,
+  // reallocating the vector and invalidating any reference held across the call
+  // (the same discipline as the JS->Lua loop).
+  for (size_t i = 0; i < from_lua_converters_.size(); ++i) {
+    Napi::Function match = from_lua_converters_[i].first.Value();
+    Napi::Function convert = from_lua_converters_[i].second.Value();
+    if (match.Call({result}).ToBoolean().Value()) {
+      return convert.Call({result});
+    }
+  }
+  return result;
+}
+
+Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
   return std::visit(
       [&](const auto& v) -> Napi::Value {
         using T = std::decay_t<decltype(v)>;
@@ -3386,15 +3565,10 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
         } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
           // Return a coroutine object with the thread reference (data owned by the
           // External's finalizer).
-          auto* dataPtr = new LuaThreadData(runtime, v);
-          Napi::Object coro = Napi::Object::New(env);
-          coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr,
-            [](Napi::Env, LuaThreadData* d) { delete d; }));
           const lua_core::CoroutineStatus status = lua_core::LuaRuntime::GetCoroutineStatus(v);
-          coro.Set("status", Napi::String::New(env,
+          return CreateCoroutineObject(new LuaThreadData(runtime, v),
             status == lua_core::CoroutineStatus::Suspended ? "suspended" :
-            status == lua_core::CoroutineStatus::Running ? "running" : "dead"));
-          return coro;
+            status == lua_core::CoroutineStatus::Running ? "running" : "dead");
         } else if constexpr (std::is_same_v<T, lua_core::LuaUserdataRef>) {
           if (!v.opaque) {
             // JS-created userdata - return the original JS object
@@ -3463,45 +3637,260 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
       value.value);
 }
 
+// --- A4: coroutines as JS iterators ---
+
+// The realm's well-known Symbol.iterator.
+static Napi::Value SymbolIteratorKey(const Napi::Env env) {
+  return env.Global().Get("Symbol").As<Napi::Object>().Get("iterator");
+}
+
+// One iteration cursor over a coroutine. Each `[Symbol.iterator]()` call mints
+// a fresh one, so two loops over the same coroutine are independent cursors
+// advancing one shared Lua thread. The coroutine object is held strongly:
+// nothing on the coroutine points back at the iterator, so there is no cycle.
+struct LuaCoroIterState {
+  LuaContext* context = nullptr;
+  std::shared_ptr<std::atomic<bool>> contextAlive;
+  Napi::ObjectReference coro;
+  bool done = false;
+
+  [[nodiscard]] bool ContextLive() const {
+    return context && contextAlive && contextAlive->load();
+  }
+};
+
+static Napi::Value CoroIterResult(const Napi::Env env, const Napi::Value& value,
+                                  const bool done) {
+  const Napi::Object result = Napi::Object::New(env);
+  (void)result.Set("value", value);
+  (void)result.Set("done", Napi::Boolean::New(env, done));
+  return result;
+}
+
+static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  auto* state = static_cast<LuaCoroIterState*>(info.Data());
+  if (!state || !state->ContextLive()) {
+    Napi::Error::New(env, "Lua coroutine's context has been destroyed")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (state->done) return CoroIterResult(env, env.Undefined(), true);
+
+  const Napi::Object coro = state->coro.Value();
+
+  // A coroutine that is already dead — exhausted by an earlier loop, or driven
+  // to completion by hand — simply ends the iteration, rather than surfacing
+  // Lua's "cannot resume dead coroutine" as a thrown error.
+  if (const Napi::Value marker = coro.Get("_coroutine"); marker.IsExternal()) {
+    if (const auto* threadData = marker.As<Napi::External<LuaThreadData>>().Data();
+        threadData && threadData->threadRef.ref != LUA_NOREF &&
+        lua_core::LuaRuntime::GetCoroutineStatus(threadData->threadRef) ==
+          lua_core::CoroutineStatus::Dead) {
+      state->done = true;
+      return CoroIterResult(env, env.Undefined(), true);
+    }
+  }
+
+  if (state->context->IsBusy()) {
+    Napi::Error::New(env, "Lua context is busy with an async operation")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // `next(v)` forwards its arguments as the resume values, so a caller can feed
+  // a generator-style coroutine from JS.
+  std::vector<Napi::Value> args;
+  args.reserve(info.Length());
+  for (size_t i = 0; i < info.Length(); ++i) args.push_back(info[i]);
+
+  // Same outermost-entry bookkeeping resume() does (L7).
+  LuaContext::CallScope scope(state->context);
+  const Napi::Value res = state->context->ResumeCoroutineObject(coro, args);
+  if (env.IsExceptionPending() || !res.IsObject()) {
+    state->done = true;  // a broken cursor must not be resumable
+    return env.Undefined();
+  }
+
+  const Napi::Object result = res.As<Napi::Object>();
+  if (result.Has("error")) {
+    state->done = true;
+    Napi::Error::New(env, result.Get("error").ToString().Utf8Value())
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // A yield is an iteration step; the coroutine's final `return` arrives with
+  // done=true, which for..of discards — exactly the JS generator contract.
+  const bool dead = result.Get("status").ToString().Utf8Value() == "dead";
+  if (dead) state->done = true;
+
+  const Napi::Array values = result.Get("values").As<Napi::Array>();
+  Napi::Value value = env.Undefined();
+  if (values.Length() == 1) {
+    value = values.Get(static_cast<uint32_t>(0));
+  } else if (values.Length() > 1) {
+    value = values;  // multiple yielded values arrive as an array, as elsewhere
+  }
+  return CoroIterResult(env, value, dead);
+}
+
+// Called when a for..of loop exits early (`break`, `return`, a throw). Ends
+// this cursor only — the underlying coroutine keeps its suspension point, so a
+// later loop resumes where this one stopped.
+static Napi::Value CoroIteratorReturn(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  if (auto* state = static_cast<LuaCoroIterState*>(info.Data())) state->done = true;
+  return CoroIterResult(env, info.Length() > 0 ? info[0] : env.Undefined(), true);
+}
+
+static Napi::Value CoroIteratorSelf(const Napi::CallbackInfo& info) {
+  return info.This();
+}
+
+// The coroutine object's `[Symbol.iterator]`. `info.Data()` is the context
+// binding minted alongside the coroutine; `info.This()` is the coroutine.
+static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  const auto* binding = static_cast<LuaContextBinding*>(info.Data());
+  if (!binding || !binding->ContextLive()) {
+    Napi::Error::New(env, "Lua coroutine's context has been destroyed")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (!info.This().IsObject()) {
+    Napi::TypeError::New(env,
+      "coroutine[Symbol.iterator]() must be called on a coroutine object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto* state = new LuaCoroIterState();
+  state->context = binding->context;
+  state->contextAlive = binding->contextAlive;
+  state->coro = Napi::Persistent(info.This().As<Napi::Object>());
+
+  const Napi::Object iterator = Napi::Object::New(env);
+  // The External's finalizer solely owns `state`. Rooted on the iterator AND on
+  // each bound method, so a method destructured off the iterator keeps the state
+  // alive — the same ownership discipline as the table handles (H3 / L6).
+  const auto owner = Napi::External<LuaCoroIterState>::New(env, state,
+    [](Napi::Env, const LuaCoroIterState* s) { delete s; });
+  DefineHiddenProp(env, iterator, "__coroIterOwner", owner, /*writable=*/false);
+
+  auto addMethod = [&](const char* name,
+                       Napi::Value (*cb)(const Napi::CallbackInfo&)) {
+    const Napi::Function fn = Napi::Function::New(env, cb, name, state);
+    DefineHiddenProp(env, fn, "__coroIterOwner", owner, /*writable=*/false);
+    (void)iterator.Set(name, fn);
+  };
+  addMethod("next", CoroIteratorNext);
+  addMethod("return", CoroIteratorReturn);
+  (void)iterator.Set(SymbolIteratorKey(env),
+    Napi::Function::New(env, CoroIteratorSelf, "[Symbol.iterator]"));
+  return iterator;
+}
+
+Napi::Object LuaContext::CreateCoroutineObject(LuaThreadData* dataPtr,
+                                               const std::string& status) {
+  const Napi::Object coro = Napi::Object::New(env);
+  // The External's finalizer owns dataPtr — freed when the coroutine object is
+  // garbage-collected.
+  (void)coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr,
+    [](Napi::Env, const LuaThreadData* d) { delete d; }));
+  (void)coro.Set("status", Napi::String::New(env, status));
+
+  auto* binding = new LuaContextBinding{this, alive_};
+  const Napi::Function iterFn =
+    Napi::Function::New(env, CoroSymbolIterator, "[Symbol.iterator]", binding);
+  DefineHiddenProp(env, iterFn, "__coroBindingOwner",
+    Napi::External<LuaContextBinding>::New(env, binding,
+      [](Napi::Env, const LuaContextBinding* b) { delete b; }),
+    /*writable=*/false);
+  (void)coro.Set(SymbolIteratorKey(env), iterFn);
+  return coro;
+}
+
+// Extracts the LuaFunctionData behind a Lua function handed back to JS (the
+// wrapper CoreToNapi mints for a LuaFunctionRef). Returns nullptr for a plain
+// JS function, leaving the caller to raise its own error.
+static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value) {
+  if (!value.IsFunction()) return nullptr;
+  const auto fn = value.As<Napi::Object>();
+  if (!fn.Has("__luaFnOwner")) return nullptr;
+  const auto marker = fn.Get("__luaFnOwner");
+  if (!marker.IsExternal()) return nullptr;
+  return marker.As<Napi::External<LuaFunctionData>>().Data();
+}
+
+// create_coroutine(scriptOrFunction)
+//
+// The original form takes a script string that *returns* a function. It also
+// accepts a Lua function already held on the JS side (A4), so a function
+// obtained from execute_script / get_global can be turned into a coroutine
+// without being re-sourced as text.
 Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
-  if (info.Length() < 1 || !info[0].IsString()) {
-    Napi::TypeError::New(env, "Expected a script string that returns a function").ThrowAsJavaScriptException();
-    return env.Undefined();
+
+  std::optional<lua_core::LuaFunctionRef> funcRef;
+
+  if (info.Length() >= 1 && info[0].IsFunction()) {
+    auto* fnData = LuaFunctionDataFrom(info[0]);
+    if (!fnData) {
+      Napi::TypeError::New(env,
+        "create_coroutine() accepts a script string or a Lua function; a plain "
+        "JavaScript function cannot be a coroutine body")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    // A function from another context refs a slot in an unrelated registry; a
+    // released one refs nothing. Same identity checks resume() applies (M1).
+    if (fnData->runtime.get() != runtime.get()) {
+      Napi::Error::New(env, "Lua function belongs to a different Lua context")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    if (fnData->funcRef.ref == LUA_NOREF) {
+      Napi::Error::New(env, "Lua function has been released")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    // Copying shares the registry slot's ownership rather than minting a second
+    // owner for it, so the coroutine body outlives the JS wrapper.
+    funcRef = fnData->funcRef;
+  } else {
+    if (info.Length() < 1 || !info[0].IsString()) {
+      Napi::TypeError::New(env,
+        "Expected a script string that returns a function, or a Lua function")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+
+    // Execute script and get function
+    const std::string script = info[0].As<Napi::String>().Utf8Value();
+    CallScope _cs(this);
+    const auto res = runtime->ExecuteScript(script);
+    if (std::holds_alternative<std::string>(res)) {
+      ThrowLuaError(std::get<std::string>(res));
+      return env.Undefined();
+    }
+
+    const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
+    if (values.empty() || !std::holds_alternative<lua_core::LuaFunctionRef>(values[0]->value)) {
+      Napi::TypeError::New(env, "Script must return a function").ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    funcRef = std::get<lua_core::LuaFunctionRef>(values[0]->value);
   }
 
-  // Execute script and get function
-  const std::string script = info[0].As<Napi::String>().Utf8Value();
-  CallScope _cs(this);
-  const auto res = runtime->ExecuteScript(script);
-  if (std::holds_alternative<std::string>(res)) {
-    ThrowLuaError(std::get<std::string>(res));
-    return env.Undefined();
-  }
-
-  const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
-  if (values.empty() || !std::holds_alternative<lua_core::LuaFunctionRef>(values[0]->value)) {
-    Napi::TypeError::New(env, "Script must return a function").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-
-  const auto& funcRef = std::get<lua_core::LuaFunctionRef>(values[0]->value);
-  auto result = runtime->CreateCoroutine(funcRef);
+  auto result = runtime->CreateCoroutine(*funcRef);
   if (std::holds_alternative<std::string>(result)) {
     Napi::Error::New(env, std::get<std::string>(result)).ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
   const auto& threadRef = std::get<lua_core::LuaThreadRef>(result);
-  // Data owned by the External's finalizer, freed when the coroutine object is
-  // garbage-collected.
-  auto* threadDataPtr = new LuaThreadData(runtime, threadRef);
-
-  Napi::Object coro = Napi::Object::New(env);
-  coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, threadDataPtr,
-    [](Napi::Env, LuaThreadData* d) { delete d; }));
-  coro.Set("status", Napi::String::New(env, "suspended"));
-  return coro;
+  return CreateCoroutineObject(new LuaThreadData(runtime, threadRef), "suspended");
 }
 
 Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
@@ -3515,7 +3904,14 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  const auto coroObj = info[0].As<Napi::Object>();
+  std::vector<Napi::Value> args;
+  args.reserve(info.Length() > 0 ? info.Length() - 1 : 0);
+  for (size_t i = 1; i < info.Length(); ++i) args.push_back(info[i]);
+  return ResumeCoroutineObject(info[0].As<Napi::Object>(), args);
+}
+
+Napi::Value LuaContext::ResumeCoroutineObject(const Napi::Object& coroObj,
+                                              const std::vector<Napi::Value>& args_js) {
   if (!coroObj.Has("_coroutine")) {
     Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -3549,14 +3945,15 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  // Collect arguments (skip the first one which is the coroutine object). One
-  // collector spans every argument so a later argument's conversion failure
-  // sweeps the callbacks minted by the earlier ones (F1).
+  // Convert the resume arguments. One collector spans every argument so a later
+  // argument's conversion failure sweeps the callbacks minted by the earlier
+  // ones (CR-8 F1).
   JsCallbackCollectorScope collector(this);
   std::vector<lua_core::LuaPtr> args;
+  args.reserve(args_js.size());
   try {
-    for (size_t i = 1; i < info.Length(); ++i) {
-      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
+    for (const auto& arg : args_js) {
+      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(arg)));
     }
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();

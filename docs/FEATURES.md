@@ -311,6 +311,8 @@ All standard Lua metamethods work: `__tostring`, `__add`, `__sub`, `__mul`, `__d
 
 **`set_metatable()` only works for global tables.** To set metatables on non-global tables, use `setmetatable()` in Lua code directly. This is a deliberate simplification — the API takes a global name string, which is unambiguous. Supporting arbitrary table references would require the Proxy-based table ref system (which was built later).
 
+> **Superseded (July 24, 2026).** The table-reference system this decision was waiting on has existed since February 2026, so `set_metatable` now takes a global name *or* a live table reference — see "Metatables on non-global tables (F1)" under [Interop Completeness](#interop-completeness-july-2026). The caveat that remains is narrower, and is no longer about `set_metatable` at all — it is the *table-reference API's* reach. `set_metatable` can target anything you can hold a live reference to; you simply cannot obtain a live reference to a plain (metatable-less) table that is not a global, because `ToLuaValue` deep-copies those. So `outer.inner` is out of reach at one level down, while a *metatabled* `outer.tagged` is reachable, since it arrives as a live Proxy. Note the resulting circularity: the way to make a plain nested table reachable from JS is to give it a metatable from Lua first.
+
 ---
 
 ## Reference-Based Tables with Proxy (February 2026)
@@ -1428,6 +1430,155 @@ Lua states cannot share memory — two `lua_State*`s have no common heap, and th
 
 ---
 
+## Interop Completeness (July 2026)
+
+The five items below closed the last of the interop gaps tracked in
+`BRIDGE-GAP-ANALYSIS.md`. They are small and independent, and each removes a
+place where the API forced a round-trip through `execute_script`.
+
+### Calling a Lua global by name — `call()` (F2)
+
+`lua.call('greet', 'world')` invokes a Lua function by global name, accepting a
+dotted path (`lua.call('handlers.on.tick', 21)`) exactly as `get_global` does.
+
+**Architecture:** binding layer only. `LuaContext::Call` resolves the name
+through `GetGlobal`/`GetGlobalPath`, checks that the result is a
+`LuaFunctionRef`, and hands it to the existing `CallFunction`.
+
+**Why not just `get_global(name)(...)`?** That is the documented workaround, and
+it works — but `get_global` on a function mints a JS wrapper backed by its own
+Lua registry slot, freed only when the wrapper is collected. In a per-frame or
+per-request call loop that is one wrapper and one registry slot per iteration.
+`call()` keeps the function a core `LuaFunctionRef` that is used and dropped, so
+the steady state is flat.
+
+**A callable table is not accepted.** A table with `__call` arrives as a
+`LuaTableRef`, not a function ref, and calling it would need a different core
+entry point. Rather than silently handling one and not the other, `call()`
+requires a genuine function and says so; `get_global` still returns the Proxy for
+the callable-table case.
+
+### Metatables on non-global tables (F1)
+
+`set_metatable` now takes either a global name or a live table reference — a
+`create_table()` / `get_global_ref()` / `create_environment()` handle, or the
+Proxy a metatabled table round-trips as.
+
+**Architecture:** `LuaRuntime::SetTableRefMetatable(registry_ref, entries)`
+mirrors `SetGlobalMetatable` minus the global lookup — the target comes out of
+the registry with a `lua_rawgeti`, which cannot run a metamethod and cannot
+allocate. Everything after it stays inside the same `RunProtected` frame. The
+binding layer resolves the target first and then runs the *same* entry-building,
+deferred-registration and rollback path for both forms.
+
+**The target is resolved before any callback name is minted.** The global form
+can only validate its target inside the core call (after every entry has been
+converted), so a bad name discards the whole build — that is what the
+`JsCallbackCollectorScope` is there to sweep. The reference form can check
+identity and released-ness up front, so a bad handle is rejected without minting
+anything at all.
+
+**A metatable on a handle is a metatable on the table.** The handle's own
+`get`/`set` go through `lua_gettable`/`lua_settable`, so they trigger
+`__index`/`__newindex` like any Lua access — `t.get('missing')` returns what
+`__index` says. That is the point: the handle is a view of a Lua table, not a
+JS-side dictionary.
+
+### Coroutines as iterators, and from an existing function (A4)
+
+A coroutine object is now iterable: `for (const v of coro)` drives it, one
+iteration per `yield`. `create_coroutine` also accepts a `LuaFunction` the JS
+side already holds, not only a script string that returns one.
+
+**Architecture:** `CreateCoroutineObject` is the single place a coroutine object
+is built (both `create_coroutine` and `CoreToNapi`'s thread branch go through
+it), and it attaches a `[Symbol.iterator]` factory carrying a
+`LuaContextBinding` — the `context` + `contextAlive` pair the `*Data` structs
+use, so a callback surviving its context fails cleanly. Each factory call mints a
+`LuaCoroIterState` holding the coroutine object and delegating to
+`ResumeCoroutineObject`, the body of `resume()` factored out so both paths drive
+a coroutine identically. `create_coroutine`'s function form reads the
+`__luaFnOwner` External off the wrapper and *copies* the `LuaFunctionRef`, which
+shares the registry slot's ownership rather than minting a second owner for it.
+
+**A yield is an iteration step; the final `return` is not.** It arrives with
+`done: true`, which `for..of` discards — the JS generator contract, and the right
+reading of Lua's own distinction between yielding and returning.
+
+**An exhausted coroutine iterates empty rather than raising.** `next()` checks
+`GetCoroutineStatus` before resuming, so a second loop over a dead coroutine
+yields nothing instead of surfacing Lua's "cannot resume dead coroutine". A
+for..of over a finished sequence should be empty, not an exception.
+
+**Each `[Symbol.iterator]()` is a cursor, not a copy.** There is one Lua thread;
+two cursors over it interleave, and a loop that `break`s leaves the coroutine
+suspended where it stopped so a later loop resumes from there. Snapshotting was
+never an option — a coroutine has no copy operation — so the semantics are
+stated rather than hidden.
+
+**`for await` needs nothing extra.** JS wraps a sync iterable when
+`Symbol.asyncIterator` is absent, and the resume itself is synchronous, so a
+separate async iterator would only add a Promise per step and a second code path
+to keep correct.
+
+### Lua → JS type converters (B3)
+
+`register_from_lua_converter(match, convert)` is the mirror of
+`register_type_converter`: it rebuilds application types out of the Lua values
+that encode them, completing the bidirectional converter registry.
+
+**Architecture:** `CoreToNapi` is now the built-in conversion
+(`CoreToNapiBuiltin`) plus a converter pass. Because every recursive conversion
+goes through `CoreToNapi`, converters reach values nested inside tables and
+arrays, and values arriving as callback arguments — not only top-level results.
+
+**The converter sees the natural conversion result, not the `LuaValue`.** A JS
+predicate cannot inspect a `std::variant`, so matching has to happen on
+something expressible in JS: a plain object for a Lua table, a Proxy for a
+metatabled one. Matching against a Proxy runs the Lua `__index` path, which is
+documented rather than prevented — a predicate is free to be defensive.
+
+**The converter's return value is used verbatim.** The JS → Lua direction
+re-converts its result because that result still has to *become* a Lua value.
+Here it is already a JS value, so re-running the converters would buy nothing and
+would let a converter matching its own output loop forever.
+
+**Only object-valued results are offered.** This mirrors the JS → Lua rule that
+converters do not see primitives, and it keeps the common path — every number and
+string crossing out of Lua — free of a JS call per value.
+
+### Class inheritance (C4)
+
+`register_class(name, { extends: 'Base', ... })` chains method lookup through the
+base class and inherits its metamethods.
+
+**Architecture:** the base's name is recorded in the registry under
+`_class_parent_<class>`. `ClassIndex` walks that chain when a key is absent from
+the class's own method table, and memoizes what it finds back into the derived
+class's table — so an inherited method costs one chain walk per class, not one
+per call. At registration, the base's metamethods are copied into the derived
+metatable; everything the derived class set for itself (its own metamethods and
+every reserved key — `__gc`, `__index`, `__newindex`, `__name`, the class marker)
+is already present, so "absent here" is all the filtering the copy needs.
+
+**Each class supplies its own `construct`.** The JS class hierarchy already
+decides how an instance is built; `extends` only describes how Lua resolves names
+on it. Inheriting the constructor would mean a derived class silently
+constructing base instances.
+
+**Property access is not inherited.** `readable`/`writable` are per-instance
+flags set by the constructor wrapper, not metatable state, so each class states
+its own. Making them inherit would have meant a derived class widening its base's
+access surface by accident.
+
+**The base must already be registered.** Both the method chain and the metamethod
+copy read the base's registry entries, so a forward reference cannot work — and
+since a class name cannot be registered twice, requiring the base first makes
+cycles impossible by construction. `ClassIndex` still caps the walk at 32 levels,
+which only bounds a registry someone edited from Lua via `debug.getregistry()`.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1460,3 +1611,8 @@ Lua states cannot share memory — two `lua_State*`s have no common heap, and th
 | State introspection (`info()` — version, memory, limits, libraries) | Low | July 2026 |
 | Debug hooks (`set_hook()` — line/call/return/count tracing) | Moderate | July 2026 |
 | Execution timeout (`timeout` — wall-clock limit per execution) | Low | July 2026 |
+| Call a Lua global by name (`call()`) | Low | July 2026 |
+| Metatables on non-global tables (`set_metatable` on a table reference) | Low | July 2026 |
+| Coroutines as iterators, and from an existing `LuaFunction` | Moderate | July 2026 |
+| Lua → JS type converters (`register_from_lua_converter()`) | Low | July 2026 |
+| Class inheritance (`register_class({ extends })`) | Moderate | July 2026 |
