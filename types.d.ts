@@ -1153,13 +1153,15 @@ export interface LuaContext {
    * global state (and memory) indefinitely.
    *
    * **Replayed automatically** onto the new state: the callbacks object passed
-   * to `init()`, the print handler, the `allowBytecode` guard, and every path
-   * added with `add_search_path`. Registered type converters are pure
-   * JavaScript-side policy and are unaffected.
+   * to `init()`, the print handler, the debug hook, the `allowBytecode` guard,
+   * every path added with `add_search_path`, every searcher added with
+   * `add_searcher`, and the globals published from any `shared` table.
+   * Registered type converters are pure JavaScript-side policy and are
+   * unaffected.
    *
    * **Not replayed** — these bind to Lua-side objects that die with the old
    * state and must be re-applied after a reset: `set_global`, `set_userdata`,
-   * `set_metatable`, `register_module`, `register_class`, and `add_searcher`.
+   * `set_metatable`, `register_module`, and `register_class`.
    *
    * Values that previously crossed into JavaScript (Lua functions, coroutines,
    * table references, opaque userdata) belong to the old state and are
@@ -1169,8 +1171,11 @@ export interface LuaContext {
    * `release()` them first to reclaim it immediately.
    *
    * Throws if an async operation is in flight (`is_busy()`), or if called while
-   * Lua is executing — from inside a host callback, metamethod, or table trap —
-   * since the state being retired is the one those frames are running on.
+   * Lua is executing — from inside a host callback, metamethod, table trap,
+   * debug hook, or `__gc` finalizer — since the state being retired is the one
+   * those frames are running on. That includes a finalizer reached from
+   * `gc('collect')`, and a re-entrant `reset()` from a finalizer of the state
+   * a `reset()` is already retiring.
    *
    * @example
    * const lua = new lua_native.init({ log: console.log }, { libraries: 'safe' });
@@ -1345,14 +1350,14 @@ export interface LuaInitOptions {
    *
    * The limit applies **per execution call**: each `execute_script`,
    * `execute_file`, `load_bytecode`, Lua-function call from JS, and each
-   * coroutine `resume` gets a fresh budget. Enforcement is approximate to within
-   * ~1000 instructions (the hook's sampling granularity).
+   * coroutine `resume` gets a fresh budget — as does any other operation that
+   * runs Lua, including a metamethod fired by a table handle, a Proxy read, or
+   * access to a metatabled `_G`. Enforcement is approximate to within ~1000
+   * instructions (the hook's sampling granularity).
    *
-   * Because the budget resets on every entry, it bounds **pure-Lua** compute
-   * only: a Lua loop whose body calls a JS callback that re-enters Lua (via a
-   * returned function handle or another execution) restarts the counter each
-   * re-entry. `maxInstructions` is not a wall-clock or total-work ceiling once
-   * host callbacks re-enter the VM.
+   * **Nested entries share the enclosing budget.** A Lua loop whose body calls
+   * a JS callback that re-enters Lua does not restart the counter, so the limit
+   * bounds the whole call tree rather than each re-entry separately.
    *
    * Best set at construction so every coroutine created afterward inherits the
    * limit.
@@ -1377,9 +1382,12 @@ export interface LuaInitOptions {
    *
    * Like `maxInstructions`, the budget applies **per execution call**: each
    * `execute_script`, `execute_file`, `load_bytecode`, Lua-function call from
-   * JS, and each coroutine `resume` starts a fresh deadline. Time a script
-   * spends suspended awaiting a JS Promise under `execute_async` is therefore
-   * not counted — the timeout bounds Lua compute per step, not the round trip.
+   * JS, and each coroutine `resume` starts a fresh deadline — as does any other
+   * operation that runs Lua, including a metamethod fired by a table handle, a
+   * Proxy read, or access to a metatabled `_G`. Nested entries share the
+   * enclosing deadline rather than starting a new one. Time a script spends
+   * suspended awaiting a JS Promise under `execute_async` is not counted — the
+   * timeout bounds Lua compute per step, not the round trip.
    *
    * Enforcement is hook-driven, with two consequences: the deadline is checked
    * between VM instructions (so a single long-running C call — a huge

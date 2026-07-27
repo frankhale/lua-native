@@ -736,10 +736,14 @@ lua.execute_script("return 1 + 1"); // 2
 The budget applies **per execution call** — each `execute_script`,
 `execute_file`, `load_bytecode`, Lua-function call from JS, and each coroutine
 `resume` gets a fresh budget, so the limit catches a single runaway execution
-without accumulating across unrelated calls. Coroutines created inside a script
-(including via `coroutine.create`) inherit the limit. Enforcement is approximate
-to within ~1000 instructions (the sampling granularity of the hook). Set to `0`
-or omit for unlimited execution.
+without accumulating across unrelated calls. So does any other operation that
+runs Lua: a metamethod fired by a table handle, a Proxy read, or access to a
+metatabled `_G`. Nested entries — a Lua loop calling a JS callback that
+re-enters Lua — share the enclosing budget rather than restarting it, so the
+limit bounds the whole call tree. Coroutines created inside a script (including
+via `coroutine.create`) inherit the limit. Enforcement is approximate to within
+~1000 instructions (the sampling granularity of the hook). Set to `0` or omit
+for unlimited execution.
 
 #### Wall-Clock Timeout
 
@@ -774,10 +778,12 @@ const sandbox = new lua_native.init({}, {
 ```
 
 `timeout` follows the same per-execution-call rule as `maxInstructions`: each
-`execute_script`, `execute_file`, `load_bytecode`, Lua-function call, and each
-coroutine `resume` starts a fresh deadline. Under `execute_async`, time spent
-suspended awaiting a JS Promise doesn't count — the timeout bounds Lua compute
-per step, not the whole round trip.
+`execute_script`, `execute_file`, `load_bytecode`, Lua-function call, coroutine
+`resume`, and every other operation that runs Lua (a table-handle metamethod, a
+Proxy read, metatabled `_G` access) starts a fresh deadline, and nested entries
+share the enclosing one. Under `execute_async`, time spent suspended awaiting a
+JS Promise doesn't count — the timeout bounds Lua compute per step, not the
+whole round trip.
 
 Both limits are enforced from the same instruction hook, which means the
 deadline is checked *between VM instructions*. A single long-running C call — a
@@ -2517,8 +2523,10 @@ creates a bare Lua state with no callbacks and no standard libraries.
     execution may run before it is aborted with an `"instruction limit
     exceeded"` error, preventing infinite loops from hanging the process. The
     budget applies per execution call (each `execute_script`/`execute_file`/
-    `load_bytecode`, Lua-function call, and coroutine `resume`). `0` or omitted
-    means unlimited. Enforcement is approximate to within ~1000 instructions.
+    `load_bytecode`, Lua-function call, coroutine `resume`, and any other
+    operation that runs Lua, such as a metamethod fired by a table handle);
+    nested entries share the enclosing budget. `0` or omitted means unlimited.
+    Enforcement is approximate to within ~1000 instructions.
   - `timeout` (optional): Maximum wall-clock milliseconds a single execution may
     run before it is aborted with an `"execution timeout"` error. Same
     per-execution-call rule as `maxInstructions`; set both and whichever is
@@ -3321,13 +3329,15 @@ lua.execute_script('log("hi")'); // callbacks still work
 ```
 
 **Replayed automatically:** the callbacks object passed to `init()`, the print
-handler, the `allowBytecode` guard, every path added with `add_search_path`, and
-the constructor options (`libraries`, `maxMemory`, `maxInstructions`).
-Registered type converters are pure JavaScript-side policy and are unaffected.
+handler, the debug hook, the `allowBytecode` guard, every path added with
+`add_search_path`, every searcher added with `add_searcher`, the globals
+published from any `shared` table, and the constructor options (`libraries`,
+`maxMemory`, `maxInstructions`, `timeout`). Registered type converters are pure
+JavaScript-side policy and are unaffected.
 
 **Not replayed** — these bind to Lua-side objects that die with the old state
 and must be re-applied after a reset: `set_global`, `set_userdata`,
-`set_metatable`, `register_module`, `register_class`, and `add_searcher`.
+`set_metatable`, `register_module`, and `register_class`.
 
 Values that previously crossed into JavaScript (Lua functions, coroutines, table
 references, opaque userdata) belong to the old state and are invalidated: using
@@ -3336,8 +3346,11 @@ kept alive until the last such wrapper is garbage-collected, so `release()` them
 first if you need its memory reclaimed immediately.
 
 **Throws:** Error if an async operation is in flight (`is_busy()`), or if called
-while Lua is executing — from inside a host callback, metamethod, or table trap
-— since the state being retired is the one those frames are running on
+while Lua is executing — from inside a host callback, metamethod, table trap,
+debug hook, or `__gc` finalizer (including one reached from `gc('collect')`) —
+since the state being retired is the one those frames are running on. A
+re-entrant `reset()` from a finalizer of the state already being retired throws
+for the same reason
 
 ### `LuaTableHandle`
 

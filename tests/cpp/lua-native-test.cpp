@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <thread>
 
 #include "core/lua-runtime.h"
 
@@ -4344,6 +4345,196 @@ TEST(LuaRuntimeWorkerUnref, ImmediateUnrefWhenNoWorkerActive) {
   const int reused = luaL_ref(L, LUA_REGISTRYINDEX);
   EXPECT_EQ(reused, ref);  // Lua's registry free-list reclaims the freed slot
   luaL_unref(L, LUA_REGISTRYINDEX, reused);
+}
+
+// ---- CODE-REVIEW-9 regressions ----
+
+// F1: the core now owns the "Lua is executing on this state" fact, so a caller
+// that would free or replace the lua_State (the binding layer's reset()) can
+// consult it instead of relying on a binding-side counter that only eight of
+// the thirty-six entry points maintained.
+TEST(LuaRuntimeExecuting, FalseWhenIdle) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  EXPECT_FALSE(rt.IsExecuting());
+  (void)rt.ExecuteScript("return 1");
+  EXPECT_FALSE(rt.IsExecuting());  // and again once the execution has returned
+}
+
+TEST(LuaRuntimeExecuting, TrueInsideAHostCallback) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  bool observed = false;
+  rt.RegisterFunction("probe", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    observed = rt.IsExecuting();
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  (void)rt.ExecuteScript("probe()");
+  EXPECT_TRUE(observed);
+}
+
+// The paths CR-9 F1 found unguarded: a metamethod reached through the
+// protected-global path and through the table-reference API. Both run Lua, and
+// before the fix neither marked the state as executing.
+TEST(LuaRuntimeExecuting, TrueInsideAGlobalsMetamethod) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  bool observed = false;
+  rt.RegisterFunction("probe", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    observed = rt.IsExecuting();
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  (void)rt.ExecuteScript(
+    "setmetatable(_G, { __index = function(t, k) probe() return 7 end })");
+  observed = false;
+  (void)rt.GetGlobal("no_such_global");   // fires __index via PushProtectedGlobal
+  EXPECT_TRUE(observed);
+  EXPECT_FALSE(rt.IsExecuting());         // and is cleared on the way out
+}
+
+TEST(LuaRuntimeExecuting, TrueInsideATableRefMetamethod) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  bool observed = false;
+  rt.RegisterFunction("probe", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    observed = rt.IsExecuting();
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  (void)rt.ExecuteScript(
+    "t = setmetatable({}, { __index = function(tbl, k) probe() return 7 end })");
+  const auto ref = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(ref));
+  observed = false;
+  (void)rt.GetTableField(std::get<int>(ref), "missing");  // RunProtected path
+  EXPECT_TRUE(observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// The vector that needed no metatable at all: an ordinary __gc finalizer
+// reached from lua_gc, which is the one path into user Lua that goes through no
+// lua_pcall of ours.
+TEST(LuaRuntimeExecuting, TrueInsideAGcFinalizer) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  bool observed = false;
+  bool ran = false;
+  rt.RegisterFunction("probe", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    ran = true;
+    observed = rt.IsExecuting();
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  (void)rt.ExecuteScript(
+    "do local t = setmetatable({}, { __gc = function() probe() end }) end");
+  (void)rt.GarbageCollect("collect");
+  ASSERT_TRUE(ran) << "the finalizer never ran; the test proves nothing";
+  EXPECT_TRUE(observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// F2: the per-execution budget is started by the same scope, so a metamethod
+// reached through the table-reference API gets a fresh budget instead of
+// inheriting whatever the previous execution left behind.
+TEST(LuaRuntimeTimeout, TableRefMetamethodGetsAFreshDeadline) {
+  LuaRuntime rt = MakeTimedRuntime(200);
+  (void)rt.ExecuteScript(
+    "t = setmetatable({}, { __index = function(tbl, k)"
+    "  local s = 0 for i = 1, 20000 do s = s + i end return s end })");
+  const auto ref = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(ref));
+
+  // Idle past the deadline the execute_script above set. Before the fix the
+  // read below was judged against it and aborted with "execution timeout".
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  const LuaPtr value = rt.GetTableField(std::get<int>(ref), "anything");
+  ASSERT_TRUE(std::holds_alternative<int64_t>(value->value));
+  EXPECT_EQ(std::get<int64_t>(value->value), 200010000);
+}
+
+TEST(LuaRuntimeInstructions, TableRefMetamethodBudgetDoesNotAccumulate) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 200000;
+  LuaRuntime rt(config);
+  (void)rt.ExecuteScript(
+    "t = setmetatable({}, { __index = function(tbl, k)"
+    "  local s = 0 for i = 1, 20000 do s = s + i end return s end })");
+  const auto ref = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(ref));
+
+  // Each read costs ~20k instructions, an order of magnitude inside the limit.
+  // Before the fix the tally carried across reads and the fifth one raised.
+  for (int i = 0; i < 30; ++i) {
+    const LuaPtr value = rt.GetTableField(std::get<int>(ref), "k");
+    ASSERT_TRUE(std::holds_alternative<int64_t>(value->value))
+      << "read " << i << " did not return a number (budget exhausted?)";
+    EXPECT_EQ(std::get<int64_t>(value->value), 200010000);
+  }
+}
+
+// The limits must still bind on those paths — the defect was mistimed
+// enforcement, never an escape.
+TEST(LuaRuntimeTimeout, EndlessTableRefMetamethodStillAborts) {
+  LuaRuntime rt = MakeTimedRuntime(200);
+  (void)rt.ExecuteScript(
+    "t = setmetatable({}, { __index = function() while true do end end })");
+  const auto ref = rt.GetGlobalRef("t");
+  ASSERT_TRUE(std::holds_alternative<int>(ref));
+  EXPECT_THROW((void)rt.GetTableField(std::get<int>(ref), "x"), std::runtime_error);
+}
+
+// A nested entry shares the enclosing budget rather than refreshing it, so
+// re-entering Lua from a host callback can no longer extend a limit the outer
+// execution is already spending.
+TEST(LuaRuntimeInstructions, NestedExecutionDoesNotRefreshTheBudget) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 300000;
+  LuaRuntime rt(config);
+  rt.RegisterFunction("reenter", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    (void)rt.ExecuteScript("return 1");  // nested: must not reset the tally
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  const auto res = rt.ExecuteScript("while true do reenter() end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"),
+            std::string::npos);
+}
+
+// F4: the output handler is invoked through a copied owner, so a handler that
+// clears itself mid-call cannot destroy the std::function it is running on.
+TEST(LuaRuntimeOutput, HandlerMayClearItselfMidCall) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  std::vector<std::string> seen;
+  rt.SetOutputHandler([&](const std::string& text) {
+    seen.push_back(text);
+    if (seen.size() == 2) rt.SetOutputHandler(nullptr);
+  });
+  (void)rt.ExecuteScript(R"(print("a") print("b") print("c"))");
+  EXPECT_EQ(seen.size(), 2u);
+  const auto res = rt.ExecuteScript("return 1 + 1");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
+}
+
+TEST(LuaRuntimeOutput, HandlerMayReplaceItselfMidCall) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  std::vector<std::string> seen;
+  rt.SetOutputHandler([&](const std::string& text) {
+    seen.push_back("1:" + text);
+    if (seen.size() == 2) {
+      rt.SetOutputHandler([&](const std::string& t) { seen.push_back("2:" + t); });
+    }
+  });
+  (void)rt.ExecuteScript(R"(print("a") print("b") print("c"))");
+  ASSERT_EQ(seen.size(), 3u);
+  EXPECT_EQ(seen[2].substr(0, 2), "2:");
+}
+
+// Lua is built as C: an exception from the handler must not unwind through the
+// print C frame.
+TEST(LuaRuntimeOutput, ThrowingHandlerIsContained) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.SetOutputHandler([](const std::string&) {
+    throw std::runtime_error("handler blew up");
+  });
+  const auto res = rt.ExecuteScript(R"(print("x") return 1 + 1)");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
 }
 
 int main(int argc, char **argv) {

@@ -1,7 +1,7 @@
 # CODE-REVIEW-DEFERRED
 
 Consolidated tracker for findings across **all code reviews (CODE-REVIEW-1
-through CODE-REVIEW-8)** that were **deferred, only partially resolved,
+through CODE-REVIEW-9)** that were **deferred, only partially resolved,
 deliberately not applied, or resolved by documentation** — the standing
 backlog the reviews' priority lists point at. Items are grouped by their source
 review and tagged with the original finding ID so they can be traced back.
@@ -10,7 +10,9 @@ Severity labels are carried over from the originating review.
 **Last audited: July 22, 2026** (tree at the CODE-REVIEW-8 remediation; every
 "still current" claim below was re-checked against it). **Updated July 23,
 2026**: the CR-8 F6 main class was closed by code (`PushLuaValueProtected`);
-see its entry for the two narrowed residuals that replace it.
+see its entry for the two narrowed residuals that replace it. **Updated July 27,
+2026**: CODE-REVIEW-9 added; all four of its findings were resolved in the same
+pass, so it contributes nothing to the backlog.
 
 ## Ledger
 
@@ -24,6 +26,7 @@ see its entry for the two narrowed residuals that replace it.
 | CODE-REVIEW-6 | `08f4560` | none |
 | CODE-REVIEW-7 | `5f7b8f6` | none (its audit annotated the CR-2 M5 residual, since closed) |
 | CODE-REVIEW-8 | `330cc30` | F6 ✅ main restructure done July 23, 2026 (bridge value pushes now protected); two narrow residuals remain documented (error-message staging allocations; the stranded constructor `js_userdata_` entry) |
+| CODE-REVIEW-9 | `6839145` | none — all four findings (F1–F4) resolved in the remediation pass |
 
 ---
 
@@ -420,9 +423,31 @@ that was found and fixed as CODE-REVIEW-8 F2, and the guard now fails loudly.)
 
 ---
 
+## From CODE-REVIEW-9 (commit `6839145`)
+
+**Nothing deferred.** All four findings (F1–F4) fully resolved. Two of them
+carry a note worth keeping, since neither is a residual but both shape how the
+next pass should read the code:
+
+- **F1's fix relocated an invariant rather than adding guards.** The "Lua is
+  executing on this state" fact now lives in the core
+  (`LuaRuntime::ExecutionScope` / `IsExecuting()`), not in the binding layer's
+  `call_depth_`. Any future API that frees or replaces the `lua_State` must
+  consult `IsExecuting()`; any future *core* path that can run Lua must open an
+  `ExecutionScope`. That second obligation is the one to watch — it is now the
+  single place the class can regress.
+- **F4's output-handler item was never reproducible** and its tests pass both
+  with and without the fix. They are guards, not regression pins: the hazard
+  (a handler destroying the `std::function` it is executing on) was benign only
+  because the capture list fits libc++'s small-buffer optimization, which is an
+  implementation detail. If the handler ever grows a larger capture list, the
+  `shared_ptr` indirection added here is what keeps it safe.
+
+---
+
 ## Suggested order for a future hardening pass
 
-Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-8 is resolved.
+Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-9 is resolved.
 What remains, in the order it should be acted on:
 
 1. **Before the first publish for outside consumers** (release blockers, both

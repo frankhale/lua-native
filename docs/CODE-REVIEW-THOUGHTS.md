@@ -199,3 +199,59 @@ adding each new binding method to the H1 matrix, and running `test-ts-asan` (wit
 a GC stress pass for lifetime changes) before shipping. CR-6 remains the
 cautionary tale for why the discipline matters: a fix that names a class but
 sweeps only one site leaves the next site for the next pass, at higher severity.
+
+---
+
+## Addendum (July 27, 2026, after CODE-REVIEW-9)
+
+CR-9 is the first pass to invert the arc above, and the inversion is worth
+recording because it changes how a low-severity finding should be triaged.
+
+Nothing regressed. Every CR-8 fix was intact, and the fourteen feature commits
+reviewed were visibly written with the prior reviews in hand — `create_environment`
+opens a `CallScope` and says why; the debug hook copies its callback owner before
+dispatch so a hook that removes itself mid-call cannot destroy the running
+`std::function`. The high-severity finding was not introduced by careless new
+code. **It was created by careful new code landing next to an old, unswept gap.**
+
+`reset()` — new in this window, and the first API that can free the `lua_State`
+while the context survives — correctly refused to run when `call_depth_ > 0`.
+But `call_depth_` is raised by `CallScope`, which only eight of thirty-six
+binding methods opened. Before `reset()` existed, a missing `CallScope` cost one
+leaked `js_error_registry_` entry: CR-8 F5, correctly triaged **low**. After
+`reset()` existed, the same omission meant the reentrancy guard was simply not
+armed, and nine entry points were reproduced crashing the process with an
+ASan-confirmed use-after-free. One of them, `gc('collect')` reaching an ordinary
+Lua `__gc` finalizer, needed no hostile input at all.
+
+So the thesis of this document — *fix classes, not sites* — needs a second
+clause:
+
+> **An unswept gap is not merely a known low-severity residual; it is a hazard
+> whose severity is set by code that has not been written yet.**
+
+CR-8 F5 was not mis-triaged. The reason to have swept it anyway was never its
+severity — it was that a partially-held invariant is a trap for the next
+feature, and the next feature does not know the invariant is only partially
+held.
+
+The remediation drew the corresponding process lesson. Both CR-9 findings had
+the same root shape: the binding layer knew it was about to run Lua, and the
+core — which owns both the reentrancy question and the execution budget — was
+not told. The fix therefore did not add twelve `CallScope`s and hope the next
+author remembers the thirteenth. It moved the invariant into the core, where a
+single RAII scope (`LuaRuntime::ExecutionScope`) brackets every path that can
+run Lua and maintains both facts at once. A new binding method is now safe by
+construction rather than by review, because it never has to know the invariant
+exists. That is what "enforce the class mechanically" looks like when the class
+is a *precondition* rather than a memory error — the sanitizers cannot see it,
+and a behavioral matrix would only cover the entry points someone remembered to
+enumerate.
+
+One data point on the harness, in its favour: the CR-8 F2 plumbing held (the
+`global.gc` assertion is present and the GC-lifetime pins really ran), and the
+ASan harness identified F1 on the first instrumented run *once a reproduction
+drove the path* — again confirming that its value is bounded entirely by the
+adversarial coverage of the suite it runs. The eleven new guard tests crash the
+vitest worker outright without the fix, which is the loudest possible form of
+the "regression pins must not rot" lesson from CR-8.

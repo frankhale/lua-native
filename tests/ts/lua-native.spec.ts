@@ -8090,4 +8090,369 @@ describe('lua-native Node adapter', () => {
       expect(lua.execute_script(`return Dog.new('rex'):name_of()`)).toBe('re:rex');
     });
   });
+
+  // ============================================
+  // CODE REVIEW 9 REGRESSIONS
+  // ============================================
+  describe('code-review-9 regressions', () => {
+    /** See the CR-8 block: two GC passes with settle gaps, asserting the
+     *  harness provides gc so a lifetime pin fails loudly rather than
+     *  self-skipping (CR-8 F2). */
+    const gcSettle = async () => {
+      expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc!();
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc!();
+    };
+
+    // --- F1: reset() refuses to retire the Lua state while Lua frames are
+    // live, but its guard consulted call_depth_, which only the eight
+    // CallScope-bearing binding methods maintained. Every other Lua-running
+    // method ran with the guard disarmed, and reset() then freed the
+    // lua_State those frames were executing on: an ASan-confirmed
+    // heap-use-after-free, reproduced at nine entry points. The core now owns
+    // the "Lua is executing" fact (LuaRuntime::IsExecuting), so a binding
+    // method cannot fail to arm it by omission.
+    describe('F1: reset() cannot retire the state while Lua is executing', () => {
+      /** Builds a context whose `doreset` callback tries to reset mid-Lua and
+       *  reports whether the guard fired. `arm` installs the metamethod (or
+       *  finalizer) that reaches the callback. */
+      const guarded = (arm: string) => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({
+          doreset: () => {
+            try { lua.reset(); seen.push('RESET RAN'); }
+            catch (e: any) { seen.push(e.message); }
+            return 1;
+          },
+        }, ALL_LIBS);
+        lua.execute_script(arm);
+        return { lua, seen };
+      };
+      const GUARD = /reset\(\) cannot be called while Lua is executing/;
+      const G_INDEX = `setmetatable(_G, { __index = function(t, k) return doreset() end })`;
+      const G_NEWINDEX = `setmetatable(_G, { __newindex = function(t, k, v) doreset() end })`;
+
+      it('rejects a reset from a _G __index reached by get_global', () => {
+        const { lua, seen } = guarded(G_INDEX);
+        lua.get_global('missing');
+        expect(seen).toHaveLength(1);
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);   // process survived
+      });
+
+      it('rejects a reset from a _G __newindex reached by set_global', () => {
+        const { lua, seen } = guarded(G_NEWINDEX);
+        lua.set_global('brand_new_name', 1);
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('rejects a reset from a _G __index reached by get_global_ref', () => {
+        const { lua, seen } = guarded(G_INDEX);
+        try { lua.get_global_ref('missing'); } catch { /* not a table */ }
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it("rejects a reset from a _G __index reached by call()'s lookup", () => {
+        const { lua, seen } = guarded(G_INDEX);
+        // The lookup runs before the call; it resolves to a non-function, so
+        // call() rejects the target afterwards. The guard is what matters.
+        expect(() => lua.call('missing_fn')).toThrow(/is not a function/);
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('rejects a reset from a _G __newindex reached by set_userdata', () => {
+        const { lua, seen } = guarded(G_NEWINDEX);
+        lua.set_userdata('ud', { a: 1 }, { readable: true });
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('rejects a reset from a _G __newindex reached by register_class', () => {
+        const { lua, seen } = guarded(G_NEWINDEX);
+        lua.register_class('K', { construct: () => ({}) });
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('rejects a reset from a package __index reached by add_search_path', () => {
+        const { lua, seen } = guarded(
+          `setmetatable(package, { __index = function(t, k) return doreset() end })
+           rawset(package, 'path', nil)`);
+        lua.add_search_path('./?.lua');
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('rejects a reset from a package.searchers __newindex reached by add_searcher', () => {
+        const { lua, seen } = guarded(
+          `package.searchers = setmetatable(package.searchers,
+             { __newindex = function(t, k, v) doreset() end })`);
+        lua.add_searcher(() => null);
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // The vector that needs no hostile metatable at all, and the reason this
+      // was high rather than medium: an ordinary Lua __gc finalizer notifying
+      // JS, plus an ordinary gc('collect').
+      it('rejects a reset from a __gc finalizer reached by gc("collect")', () => {
+        const { lua, seen } = guarded(
+          `do local t = setmetatable({}, { __gc = function() doreset() end }) end`);
+        lua.gc('collect');
+        expect(seen).not.toHaveLength(0);
+        expect(seen[0]).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // A debug hook is another JS re-entry point, and it fires on paths that
+      // never open a CallScope.
+      it('rejects a reset from a debug hook firing inside an unscoped path', () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`setmetatable(_G, { __index = function(t, k)
+          local s = 0 for i = 1, 50000 do s = s + i end return s end })`);
+        let armed = false;
+        lua.set_hook(() => {
+          if (!armed) return;
+          armed = false;
+          try { lua.reset(); seen.push('RESET RAN'); }
+          catch (e: any) { seen.push(e.message); }
+        }, { count: 1000 });
+        armed = true;
+        lua.get_global('missing');
+        expect(seen[0]).toMatch(GUARD);
+        lua.remove_hook();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // The one window the core's depth cannot see: lua_close fires the
+      // outgoing state's finalizers after `runtime` already points at the
+      // replacement, so a finalizer calling reset() would find depth 0.
+      it('rejects a re-entrant reset from a __gc finalizer of the retiring state', () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({
+          renest: () => {
+            try { lua.reset(); seen.push('RESET RAN'); }
+            catch (e: any) { seen.push(e.message); }
+            return 1;
+          },
+        }, ALL_LIBS);
+        lua.execute_script(`keep = setmetatable({}, { __gc = function() renest() end })`);
+        lua.reset();  // the outer reset; its lua_close reaches renest()
+        expect(seen).not.toHaveLength(0);
+        expect(seen[0]).toMatch(/reset\(\) cannot be called re-entrantly/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('still allows reset() once Lua has returned', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('x = 1');
+        lua.reset();
+        expect(lua.get_global('x')).toBeNull();
+        expect(lua.execute_script('return 5')).toBe(5);
+      });
+    });
+
+    // --- F1 (second consequence): the same missing CallScope meant a staged
+    // js_error_registry_ entry from a raising host callback was never cleared
+    // on those paths. This is the CR-8 F5 accumulation class at the
+    // global-access surface it did not sweep: one pinned JS Error per failing
+    // call, unbounded.
+    describe('F1: staged JS errors do not accumulate on the global surface', () => {
+      /** Runs `fn` N times against a _G whose metamethods throw from JS, and
+       *  reports how many of the thrown Errors are still reachable. */
+      const accumulate = async (fn: (lua: any, i: number) => void, n = 20) => {
+        const refs: WeakRef<Error>[] = [];
+        const lua: any = new lua_native.init({
+          boom: () => { const e = new Error('staged'); refs.push(new WeakRef(e)); throw e; },
+        }, ALL_LIBS);
+        lua.execute_script(`setmetatable(_G, {
+          __index    = function(t, k) return boom() end,
+          __newindex = function(t, k, v) return boom() end })`);
+        for (let i = 0; i < n; ++i) { try { fn(lua, i); } catch { /* expected */ } }
+        await gcSettle();
+        return refs.filter((r) => r.deref() !== undefined).length;
+      };
+
+      // At most one: a CallScope clears the registry when the *next* outermost
+      // call starts, so the most recent entry legitimately survives — exactly
+      // what the CR-8 F5 fix produces for the table handles.
+      it('get_global keeps at most one staged Error alive', async () => {
+        expect(await accumulate((l, i) => l.get_global('missing' + i))).toBeLessThanOrEqual(1);
+      });
+
+      it('set_global keeps at most one staged Error alive', async () => {
+        expect(await accumulate((l, i) => l.set_global('brand_new' + i, 1))).toBeLessThanOrEqual(1);
+      });
+
+      it('get_global_ref keeps at most one staged Error alive', async () => {
+        expect(await accumulate((l, i) => l.get_global_ref('missing' + i))).toBeLessThanOrEqual(1);
+      });
+
+      it('call keeps at most one staged Error alive', async () => {
+        expect(await accumulate((l, i) => l.call('missing_fn' + i))).toBeLessThanOrEqual(1);
+      });
+    });
+
+    // --- F2: BeginExecutionBudget ran only in ProtectedCall and the two
+    // lua_resume sites, so every metamethod-driven path (table handles, Proxy
+    // traps, metatabled _G access) executed Lua against whatever deadline and
+    // instruction tally the previous execution left behind. The budget is now
+    // started by ExecutionScope at the outermost entry, wherever that is.
+    describe('F2: the execution budget starts wherever Lua starts running', () => {
+      /** A table whose __index burns roughly 20k VM instructions per read —
+       *  enough to fire the count hook, nowhere near the limits used below. */
+      const COSTLY_INDEX = `t = setmetatable({}, { __index = function(tbl, k)
+        local s = 0 for i = 1, 20000 do s = s + i end return s end })`;
+
+      it('does not abort a table-handle read against a stale deadline', async () => {
+        const lua: any = new lua_native.init({}, { ...ALL_LIBS, timeout: 200 });
+        lua.execute_script(COSTLY_INDEX);
+        const h = lua.get_global_ref('t');
+        // Idle well past the deadline the arming execute_script set. Before the
+        // fix this read aborted with "execution timeout" after microseconds.
+        await new Promise((r) => setTimeout(r, 400));
+        expect(h.get('anything')).toBe(200010000);
+      });
+
+      it('does not accumulate the instruction tally across table-handle reads', () => {
+        const lua: any = new lua_native.init({}, { ...ALL_LIBS, maxInstructions: 200_000 });
+        lua.execute_script(COSTLY_INDEX);
+        const h = lua.get_global_ref('t');
+        for (let i = 0; i < 30; ++i) expect(h.get('k' + i)).toBe(200010000);
+      });
+
+      it('does not accumulate the instruction tally across Proxy-trap reads', () => {
+        const lua: any = new lua_native.init({}, { ...ALL_LIBS, maxInstructions: 200_000 });
+        lua.execute_script(COSTLY_INDEX);
+        const proxy: any = lua.get_global('t');
+        for (let i = 0; i < 30; ++i) expect(proxy['k' + i]).toBe(200010000);
+      });
+
+      it('does not accumulate the instruction tally across get_global reads', () => {
+        const lua: any = new lua_native.init({}, { ...ALL_LIBS, maxInstructions: 200_000 });
+        lua.execute_script(`setmetatable(_G, { __index = function(t, k)
+          local s = 0 for i = 1, 20000 do s = s + i end return s end })`);
+        for (let i = 0; i < 30; ++i) expect(lua.get_global('missing' + i)).toBe(200010000);
+      });
+
+      // The limits must still bind on those paths: the defect was mistimed
+      // enforcement, never an escape, and the fix must not turn it into one.
+      it('still aborts an endless metamethod reached through a table handle', () => {
+        const lua: any = new lua_native.init({}, { ...ALL_LIBS, timeout: 250 });
+        lua.execute_script(`t = setmetatable({}, { __index = function() while true do end end })`);
+        const h = lua.get_global_ref('t');
+        expect(() => h.get('x')).toThrow(/execution timeout/);
+      });
+
+      it('still aborts an endless metamethod reached through get_global', () => {
+        const lua: any = new lua_native.init({}, { ...ALL_LIBS, maxInstructions: 500_000 });
+        lua.execute_script(`setmetatable(_G, { __index = function() while true do end end })`);
+        expect(() => lua.get_global('missing')).toThrow(/instruction limit exceeded/);
+      });
+
+      // A nested entry shares the enclosing budget rather than refreshing it,
+      // so re-entry can no longer extend a limit the outer execution is
+      // already spending.
+      it('a re-entrant execute_script does not refresh the enclosing budget', () => {
+        const lua: any = new lua_native.init({
+          reenter: () => { lua.execute_script('return 1'); return 1; },
+        }, { ...ALL_LIBS, maxInstructions: 300_000 });
+        expect(() => lua.execute_script(
+          'while true do reenter() end')).toThrow(/instruction limit exceeded/);
+      });
+    });
+
+    // --- F3: reset() replayed add_search_path but silently dropped
+    // add_searcher, so the two halves of module resolution behaved
+    // differently across a reset.
+    describe('F3: reset() replays JS searchers', () => {
+      it('resolves through a searcher registered before the reset', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.add_searcher((name: string) =>
+          name === 'jsmod' ? 'return { v = 99 }' : null);
+        expect(lua.execute_script('return require("jsmod").v')).toBe(99);
+        lua.reset();
+        expect(lua.execute_script('return require("jsmod").v')).toBe(99);
+      });
+
+      it('replays several searchers, in order, across repeated resets', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.add_searcher((n: string) => (n === 'a' ? 'return 1' : null));
+        lua.add_searcher((n: string) => (n === 'b' ? 'return 2' : null));
+        for (let i = 0; i < 3; ++i) {
+          lua.reset();
+          // Bind first: require() returns the module *and* the loader data, so
+          // a bare `return require(...)` would marshal as a two-element array.
+          expect(lua.execute_script('local m = require("a") return m')).toBe(1);
+          expect(lua.execute_script('local m = require("b") return m')).toBe(2);
+        }
+      });
+
+      it('does not replay a searcher whose registration failed', () => {
+        // No 'package' library: add_searcher throws and records nothing, so a
+        // later reset must not resurrect it.
+        const lua: any = new lua_native.init({}, { libraries: ['base'] });
+        expect(() => lua.add_searcher(() => null)).toThrow(/package.*not loaded/);
+        expect(() => lua.reset()).not.toThrow();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    // --- F4: the output handler is invoked through a copied owner and with
+    // full exception containment, the discipline the debug hook documents for
+    // itself. Previously a handler that cleared itself mid-call destroyed the
+    // std::function it was executing on — benign only because the capture list
+    // happened to fit libc++'s small-buffer optimization.
+    describe('F4: the output handler survives self-modification', () => {
+      it('survives a print handler that clears itself mid-call', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const seen: string[] = [];
+        lua.set_print_handler((t: string) => {
+          seen.push(t);
+          if (seen.length === 2) lua.set_print_handler(null);
+        });
+        lua.execute_script('print("a") print("b") print("c") print("d")');
+        expect(seen).toEqual(['a\n', 'b\n']);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('survives a print handler that replaces itself mid-call', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const seen: string[] = [];
+        const second = (t: string) => seen.push('2:' + t.trim());
+        lua.set_print_handler((t: string) => {
+          seen.push('1:' + t.trim());
+          if (seen.length === 2) lua.set_print_handler(second);
+        });
+        lua.execute_script('print("a") print("b") print("c")');
+        expect(seen).toEqual(['1:a', '1:b', '2:c']);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('survives an io.write handler that clears itself mid-call', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const seen: string[] = [];
+        lua.set_print_handler((t: string) => {
+          seen.push(t);
+          if (seen.length === 2) lua.set_print_handler(null);
+        });
+        lua.execute_script('io.write("a") io.write("b") io.write("c")');
+        expect(seen).toEqual(['a', 'b']);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('contains a throwing print handler rather than corrupting the VM', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_print_handler(() => { throw new Error('handler blew up'); });
+        expect(() => lua.execute_script('print("x") return 1')).not.toThrow();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+  });
 });

@@ -1134,6 +1134,13 @@ Napi::Value LuaContext::SetGlobal(const Napi::CallbackInfo& info) {
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
 
+  // A metatabled _G runs its __newindex here, which can reach a throwing host
+  // callback that stages a js_error_registry_ entry. Scope the whole method so
+  // that entry is cleared at the next outermost call instead of accumulating —
+  // the CR-8 F5 discipline, applied to the global-access surface it did not
+  // sweep (CR-9 F1).
+  CallScope _cs(this);
+
   // A dotted name addresses a nested field: config.db.host = value, creating
   // missing intermediate tables. Functions take the reclaimable nested-closure
   // path (via NapiToCoreInstance) rather than the named-persistent top-level
@@ -1184,6 +1191,10 @@ Napi::Value LuaContext::GetGlobal(const Napi::CallbackInfo& info) {
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
 
+  // See SetGlobal: a metatabled _G runs its __index here, so scope the method
+  // to keep staged js_error_registry_ entries from accumulating (CR-9 F1).
+  CallScope _cs(this);
+
   // A dotted name reads a nested field: config.db.host. A nil anywhere along
   // the path yields null (optional chaining), matching how a missing single
   // global reads back as null.
@@ -1233,6 +1244,11 @@ Napi::Value LuaContext::Call(const Napi::CallbackInfo& info) {
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
 
+  // Opened *above* the lookup, not after it: resolving `name` goes through the
+  // protected global path, so a metatabled _G runs its __index — Lua, and from
+  // there a host callback — before the call itself begins (CR-9 F1).
+  CallScope scope(this);
+
   lua_core::LuaPtr target;
   try {
     if (name.find('.') != std::string::npos) {
@@ -1275,7 +1291,6 @@ Napi::Value LuaContext::Call(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  CallScope scope(this);
   const auto result =
     runtime->CallFunction(std::get<lua_core::LuaFunctionRef>(target->value), args);
   if (std::holds_alternative<std::string>(result)) {
@@ -1341,6 +1356,9 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   std::vector<std::string> registered_method_fns;
   bool global_installed = false;
   try {
+    // The global write fires __newindex on a metatabled _G — Lua, and from
+    // there a host callback (CR-9 F1).
+    CallScope _cs(this);
     bool needs_proxy = readable || writable || has_methods;
     if (needs_proxy) {
       runtime->CreateProxyUserdataGlobal(name, ref_id);
@@ -1543,6 +1561,8 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   // write. Surface that as a JS error: letting a std::runtime_error unwind
   // across the N-API boundary terminates the process (the H1 class).
   try {
+    // The class-global write fires __newindex on a metatabled _G (CR-9 F1).
+    CallScope _cs(this);
     runtime->RegisterClass(class_name, ctor_name, method_map, metamethods, parent_class);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -1654,6 +1674,9 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // The global form reads _G[name] through the protected path, so a
+    // metatabled _G runs its __index here (CR-9 F1).
+    CallScope _cs(this);
     if (targetRef) {
       runtime->SetTableRefMetatable(targetRef->tableRef.ref, entries);
     } else {
@@ -1688,6 +1711,9 @@ Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // Reads and writes package.path, so a metatabled package runs its
+    // __index/__newindex here (CR-9 F1).
+    CallScope _cs(this);
     runtime->AddSearchPath(path);
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -1749,6 +1775,9 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // Reads package / package.loaded, so a metatabled package runs its
+    // __index here (CR-9 F1).
+    CallScope _cs(this);
     runtime->RegisterModuleTable(name, entries);
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -1849,8 +1878,16 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
 }
 
 Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int registry_ref) {
-  auto* dataPtr = new LuaTableRefData(
+  // Take ownership of the caller's freshly-minted registry ref immediately:
+  // LuaTableRef claims a share of the slot in its constructor, and the
+  // unique_ptr releases it again if any N-API allocation below throws before
+  // the External's finalizer becomes the owner. Without this, a throw between
+  // the core call that minted the ref (get_global_ref, create_table,
+  // create_environment, get_ref) and the External left the slot owned by
+  // nobody (CR-9 F4).
+  auto data = std::make_unique<LuaTableRefData>(
     runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this, alive_);
+  LuaTableRefData* dataPtr = data.get();
 
   const Napi::Object handle = Napi::Object::New(env_);
 
@@ -1862,6 +1899,9 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
   // the same ownership discipline used for __luaFnOwner (H3 / L6).
   const auto external = Napi::External<LuaTableRefData>::New(env_, dataPtr,
     [](Napi::Env, const LuaTableRefData* d) { delete d; });
+  // Ownership has transferred: from here a throw leaves the External unrooted,
+  // and its finalizer reclaims dataPtr (and the ref) when it is collected.
+  (void)data.release();
   DefineHiddenProp(env_, handle, "_tableRef", external, /*writable=*/false);
 
   auto addMethod = [&](const char* name,
@@ -1888,7 +1928,9 @@ Napi::Value LuaContext::CreateTableMethod(const Napi::CallbackInfo& info) {
   int ref;
   // One collector spans the element loop and CreateTableFrom so a failure part
   // way through (or in the core call) sweeps the reclaimable callbacks minted
-  // by the elements already converted (F1).
+  // by the elements already converted (F1). The CallScope covers the user JS a
+  // registered type converter can run during conversion (CR-9 F1).
+  CallScope _cs(this);
   JsCallbackCollectorScope collector(this);
   if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
     try {
@@ -1940,8 +1982,11 @@ Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
   // GetGlobalRef reads _G[name] through the protected-get path, which throws a
   // std::runtime_error if a __index metamethod on the globals table raises;
   // surface it as a JS exception rather than letting it unwind past N-API.
+  // That __index is Lua and can reach a host callback, so the read is scoped
+  // like any other metamethod-capable operation (CR-9 F1).
   std::variant<int, std::string> result;
   try {
+    CallScope _cs(this);
     result = runtime->GetGlobalRef(name);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -2157,6 +2202,12 @@ Napi::Value LuaContext::GC(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   const std::string command = info[0].As<Napi::String>().Utf8Value();
+
+  // 'collect' and 'step' run __gc finalizers, which are Lua and can re-enter a
+  // host callback — the CR-9 F1 vector that needs no metatable at all. The core
+  // brackets lua_gc itself; this scope additionally clears the JS-error
+  // registry at the outermost entry, as every other Lua-running method does.
+  CallScope _cs(this);
 
   try {
     if (command == "param") {
@@ -2962,17 +3013,42 @@ Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
 Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   if (RejectIfBusy()) return env.Undefined();
 
-  // Reentrancy: a non-zero call depth means a Lua call is live on the C stack
-  // right now — a host callback, a metamethod, or a table trap re-entering JS.
-  // Retiring the state under it would free the lua_State the frames below are
-  // still executing on. Reject instead; the caller can reset once the call
-  // returns.
-  if (call_depth_ > 0) {
+  // Reentrancy: retiring the state while Lua frames are live on the C stack
+  // would free the very lua_State those frames are executing on — a
+  // use-after-free, reproduced at nine entry points as CR-9 F1.
+  //
+  // The authority is the *core's* depth, not this context's call_depth_.
+  // call_depth_ is raised by CallScope, which only eight of the binding methods
+  // opened; every other one — get_global, set_userdata, gc, add_searcher, … —
+  // ran Lua with this guard silently disarmed. LuaRuntime::IsExecuting() is
+  // maintained by the core at every point Lua can actually start running, so a
+  // binding method cannot fail to arm it by omission. call_depth_ is still
+  // checked as a cheap second opinion: it also covers a JS→Lua boundary that
+  // has returned from Lua but is still mid-call on this context.
+  if (runtime->IsExecuting() || call_depth_ > 0) {
     Napi::Error::New(env,
       "reset() cannot be called while Lua is executing (from inside a host "
-      "callback or metamethod)").ThrowAsJavaScriptException();
+      "callback, metamethod, or __gc finalizer)").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+
+  // A reset already in progress is the one window IsExecuting() cannot see:
+  // swapping `runtime` below destroys the outgoing state, and lua_close fires
+  // its __gc finalizers *after* the member already points at the replacement,
+  // so a finalizer that re-enters JS and calls reset() would find a fresh
+  // runtime reporting depth 0. Re-entering here would retire the replacement
+  // out from under the outer call.
+  if (in_reset_) {
+    Napi::Error::New(env,
+      "reset() cannot be called re-entrantly (from inside a __gc finalizer of "
+      "the state being retired)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  struct ResetFlag {
+    bool& f;
+    explicit ResetFlag(bool& b) : f(b) { f = true; }
+    ~ResetFlag() { f = false; }
+  } resetting(in_reset_);
 
   // Build the replacement first: if construction fails (allocation failure),
   // the context keeps its current, working state rather than being left
@@ -3027,6 +3103,19 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   try {
     if (!allow_bytecode_) runtime->SetAllowBytecode(false);
     for (const auto& path : search_paths_) runtime->AddSearchPath(path);
+    // Replay the JS searchers too (CR-9 F3): they are context configuration in
+    // exactly the way the search paths above are, so dropping them made the two
+    // halves of module resolution behave differently across a reset. Fresh
+    // names are minted rather than reused — next_searcher_id_ stays monotonic,
+    // so a name from before the reset can never collide with one after — and
+    // the pair is registered only after the core call succeeds (the N5
+    // ordering, as in add_searcher itself).
+    for (const auto& searcher : searchers_) {
+      const std::string name = "__searcher_" + std::to_string(next_searcher_id_++);
+      runtime->AddJsSearcher(name);
+      js_callbacks_[name] = Napi::Persistent(searcher.Value());
+      runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
+    }
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
@@ -3054,7 +3143,13 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // — and DetachRuntimeHandlers has just removed it from the outgoing runtime.
   if (!debug_hook_.IsEmpty()) {
     const Napi::Function hook = debug_hook_.Value();
-    InstallDebugHook(hook, debug_hook_mask_, debug_hook_count_);
+    // Guarded for the same reason as set_hook's call site (CR-9 F4).
+    try {
+      InstallDebugHook(hook, debug_hook_mask_, debug_hook_count_);
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
   }
 
   // Re-publish the shared globals. Unlike modules and userdata — whose Lua-side
@@ -3198,7 +3293,15 @@ Napi::Value LuaContext::SetHook(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  InstallDebugHook(info[0].As<Napi::Function>(), mask, count);
+  // SetDebugHook allocates the shared callback owner, so it can throw
+  // std::bad_alloc; every neighbouring install is guarded and this one was the
+  // exception. An unguarded throw here would unwind past N-API and terminate
+  // the process (the H1 class, CR-9 F4).
+  try {
+    InstallDebugHook(info[0].As<Napi::Function>(), mask, count);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+  }
   return env.Undefined();
 }
 
@@ -3222,6 +3325,9 @@ Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
   // as a JS error rather than letting it terminate the process (the H1 class,
   // CR-6 F1).
   try {
+    // The print/io.write overrides are protected _G writes, so a metatabled _G
+    // runs its __newindex here (CR-9 F1).
+    CallScope _cs(this);
     if (info.Length() >= 1 && info[0].IsFunction()) {
       InstallPrintHandler(info[0].As<Napi::Function>());
     } else {
@@ -3251,6 +3357,9 @@ Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
   // stores the name in the searcher closure's upvalue, and nothing resolves it
   // in host_functions_ until a later require().
   try {
+    // Reads package.searchers and appends to it, so a metatabled package or
+    // searchers table runs its __index/__len/__newindex here (CR-9 F1).
+    CallScope _cs(this);
     runtime->AddJsSearcher(name);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -3258,6 +3367,9 @@ Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
   }
   js_callbacks_[name] = Napi::Persistent(info[0].As<Napi::Function>());
   runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
+  // Recorded only after the core call succeeds, so a rejected registration is
+  // never replayed by reset() (CR-9 F3, mirroring add_search_path).
+  searchers_.emplace_back(Napi::Persistent(info[0].As<Napi::Function>()));
   return env.Undefined();
 }
 
@@ -3608,7 +3720,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // Return a coroutine object with the thread reference (data owned by the
           // External's finalizer).
           const lua_core::CoroutineStatus status = lua_core::LuaRuntime::GetCoroutineStatus(v);
-          return CreateCoroutineObject(new LuaThreadData(runtime, v),
+          return CreateCoroutineObject(std::make_unique<LuaThreadData>(runtime, v),
             status == lua_core::CoroutineStatus::Suspended ? "suspended" :
             status == lua_core::CoroutineStatus::Running ? "running" : "dead");
         } else if constexpr (std::is_same_v<T, lua_core::LuaUserdataRef>) {
@@ -3807,7 +3919,11 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  auto* state = new LuaCoroIterState();
+  // Owned by the unique_ptr until the External's finalizer takes over, so a
+  // throw from the N-API allocations below cannot leak it (CR-9 F4, the same
+  // discipline as CreateTableHandle).
+  auto state_owner = std::make_unique<LuaCoroIterState>();
+  LuaCoroIterState* state = state_owner.get();
   state->context = binding->context;
   state->contextAlive = binding->contextAlive;
   state->coro = Napi::Persistent(info.This().As<Napi::Object>());
@@ -3818,6 +3934,7 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
   // alive — the same ownership discipline as the table handles (H3 / L6).
   const auto owner = Napi::External<LuaCoroIterState>::New(env, state,
     [](Napi::Env, const LuaCoroIterState* s) { delete s; });
+  (void)state_owner.release();  // ownership transferred to the finalizer
   DefineHiddenProp(env, iterator, "__coroIterOwner", owner, /*writable=*/false);
 
   auto addMethod = [&](const char* name,
@@ -3833,21 +3950,30 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
   return iterator;
 }
 
-Napi::Object LuaContext::CreateCoroutineObject(LuaThreadData* dataPtr,
+Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> data,
                                                const std::string& status) {
+  // `data` owns the thread's registry ref until the External's finalizer takes
+  // over, so a throw from the N-API allocations below releases the slot instead
+  // of orphaning it (CR-9 F4).
   const Napi::Object coro = Napi::Object::New(env);
-  // The External's finalizer owns dataPtr — freed when the coroutine object is
+  // The External's finalizer owns the data — freed when the coroutine object is
   // garbage-collected.
-  (void)coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, dataPtr,
+  (void)coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, data.get(),
     [](Napi::Env, const LuaThreadData* d) { delete d; }));
+  (void)data.release();  // ownership transferred to the finalizer
   (void)coro.Set("status", Napi::String::New(env, status));
 
-  auto* binding = new LuaContextBinding{this, alive_};
+  auto binding_owner = std::make_unique<LuaContextBinding>(LuaContextBinding{this, alive_});
+  LuaContextBinding* binding = binding_owner.get();
   const Napi::Function iterFn =
     Napi::Function::New(env, CoroSymbolIterator, "[Symbol.iterator]", binding);
-  DefineHiddenProp(env, iterFn, "__coroBindingOwner",
-    Napi::External<LuaContextBinding>::New(env, binding,
-      [](Napi::Env, const LuaContextBinding* b) { delete b; }),
+  const auto bindingExternal = Napi::External<LuaContextBinding>::New(env, binding,
+    [](Napi::Env, const LuaContextBinding* b) { delete b; });
+  // Released the moment the External exists — not after DefineHiddenProp, which
+  // can throw: the finalizer is already the owner by then, so a later release
+  // would be a double free.
+  (void)binding_owner.release();
+  DefineHiddenProp(env, iterFn, "__coroBindingOwner", bindingExternal,
     /*writable=*/false);
   (void)coro.Set(SymbolIteratorKey(env), iterFn);
   return coro;
@@ -3932,7 +4058,8 @@ Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
   }
 
   const auto& threadRef = std::get<lua_core::LuaThreadRef>(result);
-  return CreateCoroutineObject(new LuaThreadData(runtime, threadRef), "suspended");
+  return CreateCoroutineObject(
+    std::make_unique<LuaThreadData>(runtime, threadRef), "suspended");
 }
 
 Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {

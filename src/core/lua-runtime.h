@@ -576,11 +576,11 @@ public:
   static constexpr int kMaxGCParam = 100000;
 
   // Execution time limits: cap the number of VM instructions a single execution
-  // (execute_script/file, a Lua function call, or one coroutine resume) may run
-  // before it is aborted with "instruction limit exceeded". 0 = unlimited. The
-  // count-hook that enforces this also honors a pending cancel() request, so a
-  // compute-bound loop can be interrupted cooperatively. Best set at
-  // construction; a post-construction change applies to threads created after.
+  // may run before it is aborted with "instruction limit exceeded".
+  // 0 = unlimited. The count-hook that enforces this also honors a pending
+  // cancel() request, so a compute-bound loop can be interrupted cooperatively.
+  // Best set at construction; a post-construction change applies to threads
+  // created after. See SetTimeout for what "a single execution" means.
   void SetMaxInstructions(size_t limit);
   [[nodiscard]] size_t GetMaxInstructions() const { return max_instructions_; }
 
@@ -588,9 +588,20 @@ public:
   // more than `ms` real milliseconds with "execution timeout". 0 = no timeout.
   //
   // Enforced from the same count-hook as the instruction limit, and with the
-  // same per-execution-call budget: the deadline is reset at each entry point
-  // (execute_script/file, load_bytecode, a Lua-function call, each coroutine
-  // resume), so it bounds one execution rather than a context's total lifetime.
+  // same per-execution budget. "One execution" is every *outermost* entry into
+  // Lua on this runtime — not just the obvious ones. The budget is started by
+  // ExecutionScope, which brackets every path that can run Lua code:
+  // ProtectedCall (execute_script/file, load_bytecode, a Lua-function call),
+  // both lua_resume sites, and the protected-frame helpers (RunProtected,
+  // ProtectedTableCall, PushProtectedGlobal, ToLuaValueProtected) that back the
+  // table handles, the Proxy traps, metatabled _G access, and environments.
+  // Before CR-9 F2 only the first three started a budget, so a metamethod
+  // reached through a table handle ran against whatever deadline and tally the
+  // previous execution left behind and could abort spuriously.
+  //
+  // Nested entries do NOT restart the budget: a host callback that re-enters
+  // Lua shares the enclosing execution's budget, so the limit bounds the whole
+  // call tree rather than being reset by each re-entry.
   //
   // Two consequences of being hook-driven: the check happens between VM
   // instructions, so a single long-running C call (a huge string.rep, a host
@@ -600,6 +611,19 @@ public:
   // the more deterministic one.
   void SetTimeout(size_t ms);
   [[nodiscard]] size_t GetTimeout() const { return timeout_ms_; }
+
+  // True while Lua code may be executing on this runtime's C stack — i.e.
+  // inside any ExecutionScope (see SetTimeout for the full list of bracketed
+  // paths), including a metamethod, a host-function bridge, or a __gc
+  // finalizer reached from lua_gc.
+  //
+  // A caller that would free or replace the lua_State must consult this first:
+  // retiring the state under live frames frees the very lua_State those frames
+  // are running on. The binding layer's reset() does exactly that (CR-9 F1).
+  // Deliberately owned by the core rather than by a binding-side counter, so a
+  // new binding method cannot forget to arm it — it never has to know it
+  // exists.
+  [[nodiscard]] bool IsExecuting() const { return lua_depth_ > 0; }
 
   // Debug hooks (lua_sethook): line / call / return / count tracing, for
   // profilers and debugger integrations.
@@ -698,9 +722,24 @@ private:
   mutable LuaPtr last_error_value_;     // structured value of the last error
   LuaPtr pending_error_value_;          // staged by a host wrapper to be raised
 
-  // I/O and chunk-loading control
-  OutputHandler output_handler_;        // print()/io.write() sink (null = stdout)
+  // I/O and chunk-loading control.
+  //
+  // The handler lives behind a shared_ptr for the same reason debug_hook_ does:
+  // a print handler that calls set_print_handler() from inside itself — to
+  // silence further output, the obvious use — would otherwise destroy the
+  // std::function currently executing. That was benign only because the
+  // capture list fits libc++'s small-buffer optimization, which is an
+  // implementation detail rather than a guarantee (CR-9 F4).
+  std::shared_ptr<OutputHandler> output_handler_;  // null = stdout
   bool allow_bytecode_ = true;          // false = reject binary chunks
+
+  // Hands `text` to the output handler, if one is installed and this is not a
+  // worker-thread run. Returns false when the caller should write to stdout
+  // instead. Copies the owner before calling and contains anything the handler
+  // throws — Lua is built as C, so an exception must not unwind through the
+  // print/io.write C frame (CR-9 F4; the debug hook's DispatchDebugHook has
+  // done both since it was written).
+  [[nodiscard]] bool DispatchOutput(const std::string& text) const;
 
   // Coroutine-driven async (main-thread promise awaiting) state
   bool await_driver_mode_ = false;  // true while execute_async is driving
@@ -738,10 +777,38 @@ private:
   int debug_count_interval_ = 0;            // requested "count" granularity
   mutable size_t debug_count_tally_ = 0;    // instructions since the last one
 
+  // Nesting depth of ExecutionScope — how many frames of this runtime's C
+  // stack may currently be running Lua. See IsExecuting().
+  mutable int lua_depth_ = 0;
+
+  // RAII bracket for "Lua may run inside here". Every path that can execute
+  // Lua code opens one; the outermost also starts the per-execution budget, so
+  // the two facts that depend on knowing Lua is running — the reentrancy guard
+  // (CR-9 F1) and the instruction/wall-clock budget (CR-9 F2) — are maintained
+  // in one place instead of at each caller's discretion.
+  //
+  // Non-throwing and allocation-free, so it is safe to open immediately before
+  // a longjmp-capable Lua call: a Lua error unwinds through the enclosing
+  // lua_pcall, which returns normally to the scope's owner, and the destructor
+  // then runs as usual.
+  class ExecutionScope {
+   public:
+    explicit ExecutionScope(const LuaRuntime* rt) noexcept : rt_(rt) {
+      if (rt_->lua_depth_++ == 0) rt_->BeginExecutionBudget();
+    }
+    ~ExecutionScope() { --rt_->lua_depth_; }
+    ExecutionScope(const ExecutionScope&) = delete;
+    ExecutionScope& operator=(const ExecutionScope&) = delete;
+
+   private:
+    const LuaRuntime* rt_;
+  };
+
   void InitState();
   // Starts a fresh per-execution budget: clears the instruction tally and, when
-  // a timeout is configured, sets the wall-clock deadline. Called from every
-  // entry point that begins one execution, so the two limits stay in lockstep.
+  // a timeout is configured, sets the wall-clock deadline. Called only by
+  // ExecutionScope, at the outermost entry into Lua, so the two limits stay in
+  // lockstep and a nested re-entry cannot refresh an enclosing budget.
   void BeginExecutionBudget() const;
   // Installs or removes the hook on L_ to reflect max_instructions_ and the
   // debug hook together — see SetDebugHook for how the two share one

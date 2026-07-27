@@ -400,6 +400,12 @@ int CheckGCAvailable(const int res, const std::string& command) {
 
 LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
                                                 const size_t step_size) const {
+  // "collect" and "step" run __gc finalizers, which are Lua code and can
+  // re-enter the host — the one path into user Lua that reaches no lua_pcall of
+  // ours, and so the CR-9 F1 vector that needs no metatable at all: an ordinary
+  // finalizer calling a JS callback that calls reset(). Bracket the whole
+  // function; the non-collecting commands pay only an integer increment.
+  ExecutionScope exec(this);
   if (command == "collect") {
     (void)CheckGCAvailable(lua_gc(L_, LUA_GCCOLLECT), command);
     return std::monostate{};
@@ -521,7 +527,7 @@ LuaRuntime::~LuaRuntime() {
   // (possibly already torn-down) host handler. The binding layer also clears
   // these, but the core must not depend on it.
   userdata_gc_callback_ = nullptr;
-  output_handler_ = nullptr;
+  output_handler_.reset();
   // lua_close also fires the host-fn sentinel __gc metamethods; clear the
   // callback so teardown never calls back into a torn-down binding handler (M2).
   host_fn_gc_callback_ = nullptr;
@@ -1432,10 +1438,32 @@ void LuaRuntime::SetOutputHandler(OutputHandler handler) {
     // a handler set that print/io.write were never rewired to reach (CR-8 F7).
     // The overrides read output_handler_ at call time, so the order is safe.
     InstallOutputRedirection();
-    output_handler_ = std::move(handler);
+    output_handler_ = std::make_shared<OutputHandler>(std::move(handler));
   } else {
-    output_handler_ = nullptr;
+    // Reset (not just clear) so a dispatch in flight keeps its own owner alive
+    // — a handler that clears itself mid-call must not destroy the running
+    // std::function (CR-9 F4).
+    output_handler_.reset();
   }
+}
+
+bool LuaRuntime::DispatchOutput(const std::string& text) const {
+  // Copy the owner before calling: a handler that calls set_print_handler()
+  // from inside itself would otherwise destroy the std::function executing
+  // right now (CR-9 F4).
+  const std::shared_ptr<OutputHandler> handler = output_handler_;
+  if (!handler || !*handler) return false;
+  // A worker thread owns the state during execute_script_async; the handler
+  // bridges to JS, and off-thread N-API is illegal.
+  if (async_mode_) return false;
+  // Lua is built as C — a C++ exception must not unwind through its frames.
+  // Contain everything the handler throws, the way DispatchDebugHook does.
+  try {
+    (*handler)(text);
+  } catch (...) {
+    // A throwing output handler is swallowed rather than corrupting the VM.
+  }
+  return true;
 }
 
 void LuaRuntime::InstallOutputRedirection() {
@@ -1487,9 +1515,7 @@ int LuaRuntime::LuaPrint(lua_State* L) {
   }
   lua_pop(L, 1);
 
-  if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
-    runtime->output_handler_(out);
-  } else {
+  if (!runtime || !runtime->DispatchOutput(out)) {
     fwrite(out.data(), 1, out.size(), stdout);
   }
   return 0;
@@ -1528,9 +1554,7 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
   }
   lua_pop(L, 1);
 
-  if (runtime && runtime->output_handler_ && !runtime->async_mode_) {
-    runtime->output_handler_(out);
-  } else {
+  if (!runtime || !runtime->DispatchOutput(out)) {
     fwrite(out.data(), 1, out.size(), stdout);
   }
   return 0;
@@ -1901,12 +1925,12 @@ int LuaRuntime::MessageHandler(lua_State* L) {
 // Calls a function already on the stack (with nargs args above it) under the
 // traceback message handler.
 int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
-  // Fresh instruction + wall-clock budget per top-level execution
-  // (execute_script/file, load_bytecode, a Lua function call). Nested
-  // Lua→host→Lua calls re-enter here and legitimately get their own budget; a
-  // plain Lua loop that never re-enters keeps accumulating and is caught.
-  // No-op when both limits are unset.
-  BeginExecutionBudget();
+  // Lua runs inside this frame: mark it so reset() can't retire the state from
+  // under it (CR-9 F1), and start the per-execution budget if this is the
+  // outermost entry (CR-9 F2). A nested Lua→host→Lua call re-enters here at
+  // depth > 0 and deliberately shares the enclosing budget, so re-entry can no
+  // longer refresh a limit the outer execution is already spending.
+  ExecutionScope exec(this);
   const int base = lua_gettop(L_) - nargs;  // index of the function
   lua_pushcfunction(L_, MessageHandler);
   lua_insert(L_, base);  // move handler below the function
@@ -1919,6 +1943,9 @@ int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
 // error and throws std::runtime_error so the binding layer surfaces it as a JS
 // exception (rather than the Lua panic handler aborting the process).
 void LuaRuntime::ProtectedTableCall(int nargs, int nresults) const {
+  // The trampoline can fire __index/__newindex/__len, i.e. arbitrary Lua and
+  // from there a host callback — so this is an execution like any other.
+  ExecutionScope exec(this);
   if (lua_pcall(L_, nargs, nresults, 0) != LUA_OK) {
     const char* msg = lua_tostring(L_, -1);
     std::string err = msg ? msg : "table access error";
@@ -1953,6 +1980,11 @@ void LuaRuntime::RunProtected(const std::function<void()>& op) const {
   ProtectedThunk thunk{&op, nullptr};
   ProtectedThunk* prev = active_thunk_;
   active_thunk_ = &thunk;
+  // `op` performs the table/global reads and writes that fire __index /
+  // __newindex, so Lua can run in here — bracket it (CR-9 F1/F2). This is the
+  // helper most of the metamethod-capable surface funnels through: the table
+  // handles, the Proxy traps, metatabled _G access, and environments.
+  ExecutionScope exec(this);
   // Light C function (0 upvalues) — Lua guarantees this push never raises a
   // memory error, so the protected frame is established before any allocation.
   lua_pushcfunction(L_, ProtectedThunkRunner);
@@ -2014,6 +2046,11 @@ LuaPtr LuaRuntime::ToLuaValueProtected(lua_State* from, const int index) const {
   ProtectedConvert convert;
   ProtectedConvert* prev = active_convert_;
   active_convert_ = &convert;
+  // ToLuaValue traverses raw, so no metamethod runs in here — but its luaL_ref
+  // and table allocations can drive a GC step, and a __gc finalizer is Lua code
+  // that can re-enter the host. Bracket it for the same reason as the rest
+  // (CR-9 F1).
+  ExecutionScope exec(this);
   // Light C function (0 upvalues) — its push never allocates, so the protected
   // frame is established before anything inside it can raise.
   lua_pushcfunction(L_, ProtectedConvertRunner);
@@ -2111,7 +2148,10 @@ std::string LuaRuntime::CaptureError(lua_State* L) const {
     }
     lua_pop(L, 1);
   }
-  // Stringify under protection so a raising __tostring can't panic here.
+  // Stringify under protection so a raising __tostring can't panic here. The
+  // __tostring is user Lua and can re-enter the host, so it is an execution
+  // like any other (CR-9 F1).
+  ExecutionScope exec(this);
   lua_pushcfunction(L, ProtectedToString);
   lua_pushvalue(L, -2);  // the error value
   if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_type(L, -1) == LUA_TSTRING) {
@@ -2314,6 +2354,9 @@ void LuaRuntime::PushProtectedGlobal(const std::string& name) const {
   }
   const std::string* prev = active_global_name_;
   active_global_name_ = &name;
+  // Reads _G[name] through lua_gettable, so a metatabled _G runs its __index
+  // here — arbitrary Lua, and from there a host callback (CR-9 F1/F2).
+  ExecutionScope exec(this);
   lua_pushcfunction(L_, ProtectedGlobalGetRunner);
   const int status = lua_pcall(L_, 0, 1, 0);
   active_global_name_ = prev;
@@ -3157,10 +3200,17 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     return result;
   }
 
-  // Resume the coroutine (fresh instruction + wall-clock budget for this step).
-  BeginExecutionBudget();
+  // Resume the coroutine. The scope marks the state as executing (CR-9 F1) and,
+  // at the outermost entry, starts a fresh instruction + wall-clock budget for
+  // this step (CR-9 F2). Scoped tightly around the resume so the result
+  // conversion below runs at the depth it would otherwise have.
   int nresults = 0;
-  int resumeStatus = lua_resume(threadRef.thread, L_, static_cast<int>(args.size()), &nresults);
+  int resumeStatus;
+  {
+    ExecutionScope exec(this);
+    resumeStatus =
+      lua_resume(threadRef.thread, L_, static_cast<int>(args.size()), &nresults);
+  }
 
   if (resumeStatus == LUA_YIELD) {
     result.status = CoroutineStatus::Suspended;
@@ -3308,10 +3358,6 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   }
 
   last_error_value_.reset();
-  // Fresh instruction + wall-clock budget for this resume step. Time spent
-  // suspended awaiting a JS promise therefore does not count against the
-  // timeout — it bounds Lua compute per step, not the round trip.
-  BeginExecutionBudget();
   await_is_error_ = arg_is_error;
 
   if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
@@ -3331,9 +3377,17 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     return result;
   }
 
+  // Marks the state as executing (CR-9 F1) and, at the outermost entry, starts
+  // a fresh instruction + wall-clock budget for this resume step (CR-9 F2).
+  // Time spent suspended awaiting a JS promise therefore does not count against
+  // the timeout — it bounds Lua compute per step, not the round trip.
   int nresults = 0;
-  const int status = lua_resume(threadRef.thread, L_,
-                                static_cast<int>(args.size()), &nresults);
+  int status;
+  {
+    ExecutionScope exec(this);
+    status = lua_resume(threadRef.thread, L_,
+                        static_cast<int>(args.size()), &nresults);
+  }
 
   if (status == LUA_YIELD) {
     // Suspended to await a promise; discard any yielded values (we yield none).

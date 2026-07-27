@@ -243,11 +243,13 @@ public:
     // returns.
     Napi::Object CreateTableHandle(Napi::Env env_, int registry_ref);
 
-    // Wraps `dataPtr` (whose ownership passes to the returned object's
-    // finalizer) as the JS coroutine object: the `_coroutine` marker, a `status`
-    // string, and the `Symbol.iterator` factory that makes it usable with
-    // for..of / for await (A4).
-    Napi::Object CreateCoroutineObject(LuaThreadData* dataPtr,
+    // Wraps `data` (whose ownership passes to the returned object's finalizer)
+    // as the JS coroutine object: the `_coroutine` marker, a `status` string,
+    // and the `Symbol.iterator` factory that makes it usable with for..of /
+    // for await (A4). Takes a unique_ptr so the thread's registry ref is
+    // released rather than orphaned if an N-API allocation throws before the
+    // finalizer becomes its owner (CR-9 F4).
+    Napi::Object CreateCoroutineObject(std::unique_ptr<LuaThreadData> data,
                                        const std::string& status);
 
     // Reconstructs the original JS error for a surfaced Lua error (or a plain
@@ -406,6 +408,13 @@ private:
     int next_js_error_id_ = 1;
     int call_depth_ = 0;  // clears the registry when the outermost call starts
 
+    // True for the duration of Reset(). Guards the one reentrancy window the
+    // core's LuaRuntime::IsExecuting() cannot see: the outgoing state's
+    // lua_close fires __gc finalizers after `runtime` already points at the
+    // replacement, so a finalizer that calls reset() would see a fresh runtime
+    // reporting depth 0 (CR-9 F1).
+    bool in_reset_ = false;
+
     // Names of classes already registered on this context. luaL_newmetatable
     // silently returns the existing metatable for a repeated name, so a second
     // register_class(sameName) would half-merge definitions; reject it (L7).
@@ -442,6 +451,11 @@ private:
     bool allow_bytecode_ = true;
     // Search paths added via add_search_path, in the order they were added.
     std::vector<std::string> search_paths_;
+    // Searcher functions added via add_searcher, in the order they were added.
+    // A JS searcher is context configuration exactly like a search path — it
+    // lives in JS, not in the retiring Lua state — so reset() replays it rather
+    // than silently dropping it (CR-9 F3).
+    std::vector<Napi::FunctionReference> searchers_;
     // SharedTables this context subscribed to via the `shared` init option,
     // paired with the global name each is published under. Held strongly (the
     // subscription is context configuration, and a SharedTable is a small JS
