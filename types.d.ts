@@ -1187,12 +1187,29 @@ export interface LuaContext {
    * garbage-collected, so its memory is only reclaimed once they are gone —
    * `release()` them first to reclaim it immediately.
    *
-   * Throws if an async operation is in flight (`is_busy()`), or if called while
-   * Lua is executing — from inside a host callback, metamethod, table trap,
-   * debug hook, or `__gc` finalizer — since the state being retired is the one
-   * those frames are running on. That includes a finalizer reached from
-   * `gc('collect')`, and a re-entrant `reset()` from a finalizer of the state
-   * a `reset()` is already retiring.
+   * **Throws in three distinct situations**, deliberately reported with three
+   * distinct messages — they are different facts, and collapsing them into
+   * "while Lua is executing" is what hid a use-after-free for four review
+   * passes:
+   *
+   * 1. *An async operation is in flight* (`is_busy()` is true). This also
+   *    covers the window in which a completed async run's values are still
+   *    being converted back to JavaScript — so a `register_from_lua_converter`
+   *    handler running on an `execute_async` result cannot reset either.
+   * 2. *Lua is executing* — from inside a host callback, metamethod, table
+   *    trap, debug hook, or `__gc` finalizer, since the state being retired is
+   *    the one those frames are running on. That includes a finalizer reached
+   *    from `gc('collect')`, and a re-entrant `reset()` from a finalizer of the
+   *    state a `reset()` is already retiring.
+   * 3. *Another lua-native call is on the stack, running your JavaScript, with
+   *    no Lua executing at all.* Every method starts by turning JS into
+   *    something Lua can accept and ends by turning the result back — and those
+   *    conversions run code you supplied: a registered type converter, a getter
+   *    on a definition object passed to `set_metatable` / `register_class` /
+   *    `set_userdata` / `register_module` / `set_hook`, or a `Proxy` trap on any
+   *    object handed to the addon. `reset()` from one of those is refused,
+   *    because the call it interrupted would finish its work against a state
+   *    that no longer exists.
    *
    * @example
    * const lua = new lua_native.init({ log: console.log }, { libraries: 'safe' });

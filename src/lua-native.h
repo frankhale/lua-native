@@ -278,13 +278,37 @@ public:
     // reads and writes, and an ASan-confirmed use-after-free of the retired
     // state at finalization.
     //
-    // The invariant is checkable, and the check is mechanical: in every
-    // JS-facing entry point, this scope should appear above the first
+    // The invariant is checkable, and the check is mechanical — but a
+    // mechanical check has two halves, the predicate and the **universe it
+    // ranges over**, and only the first is usually written down. CR-13 wrote
+    // the predicate and left the universe implied; read as "LuaContext instance
+    // method" it returned clean on a tree containing an ASan-confirmed
+    // use-after-free in a worker completion callback (CR-14 F1). So the
+    // universe is stated first, and it is the hazard's:
+    //
+    //   **Every function in lua-native.cpp that, on the main thread, reads
+    //   `runtime` / `alive_` / `js_userdata_` (or mints a handle from them) and
+    //   can also run user JS.** That is: the instance methods, the Proxy traps
+    //   and table-handle methods, the coroutine-iterator callbacks, the
+    //   SharedTable methods — and the N-API completion callbacks, which are not
+    //   methods and take no CallbackInfo. Helper functions count as their
+    //   caller's: `LuaFunctionDataFrom` and `TableRefDataFrom` both run
+    //   `Has`/`Get` on a caller-supplied object, so a per-function split of this
+    //   file does not see them at their call sites.
+    //
+    // Predicate: within that universe, this scope should appear above the first
     // `.Get(` / `.Call(` / `GetPropertyNames(` / `NapiToCoreInstance(` /
-    // `CoreToNapi(` line. Split lua-native.cpp by function, find the first of
-    // each per entry point, compare. As of CR-13 exactly six entry points have
-    // user JS above their scope, and each is verified inert — this is the whole
-    // list, so a seventh is a regression:
+    // `CoreToNapi(` / `LuaFunctionDataFrom(` / `TableRefDataFrom(` line.
+    //
+    // Two members are guarded by `is_busy_` instead of by a scope, which is a
+    // different mechanism and so is easy to mis-read as an omission:
+    // `DriveAsync` (its Finished branch marshals *before* FinishAsync) and
+    // `OnAwaitSettled` (converts while the run is still engaged). See
+    // ClearBusy(), which records the ordering rule all three marshalling sites
+    // depend on.
+    //
+    // Members with user JS above their scope — each verified inert, so an
+    // addition is a regression:
     //
     //   TableRefGetTrap      — `target.Get("_tableRef")` is a fast-path return
     //                          on the addon's own proxy target; it touches no
@@ -297,13 +321,37 @@ public:
     //   Release              — its `Has`/`Get` can run traps, but the
     //                          `data->runtime.get() != runtime.get()` check runs
     //                          *after* them and fails closed on a foreign handle.
-    //   CoroIteratorNext     — `coro.Get("_coroutine")` is a dead-status probe
-    //                          on an addon-minted object; the scope is above the
-    //                          resume and the argument conversion it performs.
+    //   CoroIteratorNext     — `coro.Get("_coroutine")` is a dead-status probe;
+    //                          `this` is user-supplied (`iter.call(proxy)`), so
+    //                          it can be a trap, but ResumeCoroutineObject
+    //                          re-reads the marker inside the scope and rejects
+    //                          on runtime identity. The scope is above the
+    //                          resume and the argument conversion.
+    //   CreateCoroutine      — `LuaFunctionDataFrom(info[0])` runs `Has`/`Get`
+    //                          (a Proxy over a Lua function is `IsFunction()`),
+    //                          and the runtime-identity / released-ref checks
+    //                          run after them. Fails closed.
+    //   ExecuteScriptIn      — `TableRefDataFrom(info[0])`, same shape; only a
+    //                          `Utf8Value()` separates its identity check from
+    //                          the use.
+    //   SharedTable::Set     — pushes to every subscriber, but each push routes
+    //   SharedTable::Sync      through that context's own `set_global`, which
+    //                          opens its own scope. Touches no context state
+    //                          directly.
     //
-    // Three methods deliberately have no scope at all — `reset()` (it *is* the
-    // guarded operation), `cancel()` (must work while a run is in flight) and
+    // Members that deliberately have no scope at all, because they run no user
+    // JS and touch no state a reset can invalidate: `remove_hook`,
+    // `get_memory_usage`, `info`, `register_type_converter`,
+    // `register_from_lua_converter`, `execute_script_async`,
+    // `execute_file_async` (each only reads primitives off `info` and queues),
+    // plus the three that must work regardless — `reset()` (it *is* the guarded
+    // operation), `cancel()` (must work while a run is in flight) and
     // `is_busy()` (reads one atomic).
+    //
+    // Both lists are hand-maintained, which is their weakness: CR-14 found ten
+    // omissions and every one was inert, because an omission with a consequence
+    // gets caught by a test and only the harmless ones survive. Re-derive them
+    // rather than trusting them.
     struct CallScope {
       LuaContext* ctx;
       explicit CallScope(LuaContext* c) : ctx(c) {

@@ -9212,4 +9212,220 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  describe('CODE-REVIEW-14 regressions', () => {
+
+    const GUARD14 =
+      /reset\(\) cannot be called (while Lua is executing|from inside another lua-native call|(?:.*)busy)|busy with an async operation/;
+
+    // --- F1: the worker-async completion callbacks marshal their results AFTER
+    // clearing is_busy_ and opened no CallScope, so a Lua->JS converter could
+    // retire the state mid-marshal. The values still being converted belong to
+    // the retired state: the remaining ones were wrapped as handles pairing the
+    // NEW runtime with the OLD state's registry refs — silent reads/writes onto
+    // unrelated live objects, and an ASan-confirmed use-after-free of the
+    // retired lua_State at finalization. Same class as CR-13 F1, at an entry
+    // point that is not a binding method.
+    describe('F1: reset() is refused while an async run marshals its results', () => {
+      /** A converter that resets on first call; returns what reset() did. */
+      const resettingConverter = (lua: any, seen: { value: string }) => {
+        lua.register_from_lua_converter(
+          (_v: any) => {
+            if (seen.value === 'converter never ran') {
+              try { lua.reset(); seen.value = 'RESET RAN'; }
+              catch (e: any) { seen.value = e.message; }
+            }
+            return false;
+          },
+          (v: any) => v);
+      };
+
+      it('execute_script_async: a Lua->JS converter cannot retire the state mid-marshal', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const seen = { value: 'converter never ran' };
+        resettingConverter(lua, seen);
+
+        const res = await lua.execute_script_async(
+          `return setmetatable({tag='A'},{}), setmetatable({tag='B'},{})`);
+
+        expect(seen.value, 'the converter never ran').not.toBe('converter never ran');
+        expect(seen.value).toMatch(GUARD14);
+        // The decisive assertion: the SECOND value is converted after the point
+        // the reset would have landed. It must still name its own object in the
+        // state it was created on, not an unrelated slot in a fresh registry.
+        expect(res[0].tag).toBe('A');
+        expect(res[1].tag).toBe('B');
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('execute_file_async: same guard on the file worker', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const seen = { value: 'converter never ran' };
+        resettingConverter(lua, seen);
+
+        const res = await lua.execute_file_async(
+          path.join(__dirname, '../fixtures/return-metatabled.lua'));
+
+        expect(seen.value, 'the converter never ran').not.toBe('converter never ran');
+        expect(seen.value).toMatch(GUARD14);
+        expect(res[0].tag).toBe('A');
+        expect(res[1].tag).toBe('B');
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a handle minted during the marshal survives its own collection', async () => {
+        // The endgame of the mis-binding: the stale handle's registry-owner
+        // deleter captured the RETIRED state's lua_State* while its shared_ptr
+        // kept only the replacement alive, so nothing held the old state up and
+        // finalizing the handle unref'd into freed memory (heap-use-after-free
+        // under test-ts-asan). Drive the collection explicitly — the finalizer
+        // is the only place the free is observable.
+        if (typeof global.gc !== 'function') {
+          throw new Error('this test requires --expose-gc (see run-sanitized-ts.js)');
+        }
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const seen = { value: 'converter never ran' };
+        resettingConverter(lua, seen);
+
+        let res: any = await lua.execute_script_async(
+          `return setmetatable({tag='A'},{}), setmetatable({tag='B'},{})`);
+        let stale: any = res[1];
+        res = null;
+        for (let i = 0; i < 4; i++) global.gc!();
+        await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 4; i++) global.gc!();
+
+        expect(stale.tag).toBe('B');   // still bound to a state that exists
+        stale = null;
+        for (let i = 0; i < 4; i++) global.gc!();
+        await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 4; i++) global.gc!();
+
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a converter may still call back into the context during the marshal', () => {
+        // The fix must not over-reach: dropping is_busy_ before the marshal is
+        // deliberate, so an ordinary synchronous call from a converter has to
+        // keep working. Only reset() is refused.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let observed: unknown = null;
+        lua.register_from_lua_converter(
+          (_v: any) => { observed ??= lua.execute_script('return 7'); return false; },
+          (v: any) => v);
+        return lua.execute_script_async(`return setmetatable({tag='A'},{})`)
+          .then((r: any) => {
+            expect(observed).toBe(7);
+            expect(r.tag).toBe('A');
+          });
+      });
+    });
+
+    // --- F2: __luaClassOwner was a raw LuaRuntime*, which identifies a runtime
+    // only while it is alive. Once a context was collected the allocator handed
+    // its block to the next make_shared<LuaRuntime>, and a retained instance
+    // from the dead context passed the live one's ownership check — silently
+    // aliasing that context's own userdata instead of deep-copying (CR-2 M6's
+    // guarantee). LuaRuntime::Id() is monotonic and never reused.
+    describe('F2: a class instance from a collected context cannot alias a new one', () => {
+      const makeCtx = (tag: string) => {
+        const lua: any = new lua_native.init({}, { libraries: 'safe' as const });
+        lua.register_class('Thing', {
+          construct: (n: string) => ({ name: n, from: tag }),
+          readable: true,
+          writable: true,
+        });
+        return lua;
+      };
+
+      it('deep-copies rather than aliasing after the minting context is freed', async () => {
+        if (typeof global.gc !== 'function') {
+          throw new Error('this test requires --expose-gc (see run-sanitized-ts.js)');
+        }
+        // Whether the replacement runtime lands on a freed one's address is up
+        // to the allocator, so a single A→B pair reproduces the pre-fix defect
+        // only some of the time. Retain instances from several collected
+        // contexts and offer them all: one hit is enough, and post-fix every one
+        // of them must still deep-copy. (Verified against the pre-fix binary:
+        // this shape fails, the single-pair shape failed only ~2 runs in 3.)
+        const foreigners: any[] = [];
+        for (let i = 0; i < 8; i++) {
+          let a: any = makeCtx(`A${i}`);
+          foreigners.push(a.execute_script(`return Thing.new("alpha${i}")`));
+          a = null;
+          for (let g = 0; g < 3; g++) global.gc!();
+        }
+        await new Promise((r) => setTimeout(r, 20));
+        for (let g = 0; g < 6; g++) global.gc!();
+        expect(foreigners[0].name).toBe('alpha0');
+
+        const b = makeCtx('B');
+        const own = b.execute_script('return Thing.new("beta")');
+
+        for (let i = 0; i < foreigners.length; i++) {
+          b.set_global('incoming', foreigners[i]);
+          // Whether or not B's runtime landed on this one's freed address, the
+          // answer must be the same: a foreign instance is a plain table.
+          expect(b.execute_script('return type(incoming)'),
+            `foreign instance ${i} was aliased instead of deep-copied`).toBe('table');
+          expect(b.execute_script('return incoming.name')).toBe(`alpha${i}`);
+          expect(b.execute_script('return incoming.from')).toBe(`A${i}`);
+          // And B's own instance is untouched by anything done through it.
+          b.execute_script('incoming.name = "WRITTEN"');
+          expect(own.name).toBe('beta');
+        }
+      });
+
+      it('a same-context instance still round-trips as userdata', () => {
+        const lua = makeCtx('C');
+        const inst = lua.execute_script('return Thing.new("gamma")');
+        lua.set_global('back', inst);
+        expect(lua.execute_script('return type(back)')).toBe('userdata');
+        expect(lua.execute_script('return back.name')).toBe('gamma');
+      });
+
+      it('an instance does not survive its own context being reset', () => {
+        const lua = makeCtx('D');
+        const inst = lua.execute_script('return Thing.new("delta")');
+        lua.reset();
+        lua.register_class('Thing', {
+          construct: (n: string) => ({ name: n, from: 'D2' }),
+          readable: true,
+        });
+        lua.execute_script('return Thing.new("post-reset")');
+        lua.set_global('stale', inst);
+        // The fresh runtime has a new id, so the pre-reset stamp misses.
+        expect(lua.execute_script('return type(stale)')).toBe('table');
+        expect(lua.execute_script('return stale.name')).toBe('delta');
+      });
+    });
+
+    // --- F4: reset() has three distinct throw conditions and types.d.ts
+    // documented one. Pin all three, since the contract is now written as three.
+    it('F4: reset() reports its three refusal conditions distinctly', async () => {
+      // (2) Lua executing.
+      let fromLua = '';
+      const a: any = new lua_native.init(
+        { hit: () => { try { a.reset(); } catch (e: any) { fromLua = e.message; } return 1; } },
+        ALL_LIBS);
+      a.execute_script('hit()');
+      expect(fromLua).toMatch(/while Lua is executing/);
+
+      // (3) A binding call on the stack running user JS, no Lua executing.
+      const b: any = new lua_native.init({}, ALL_LIBS);
+      let fromJs = '';
+      b.register_from_lua_converter(
+        (v: any) => typeof v === 'object' && v !== null && v.plain === 1,
+        (v: any) => { try { b.reset(); } catch (e: any) { fromJs = e.message; } return v; });
+      b.execute_script('_G.r = { x = { plain = 1 } }');
+      b.get_global_ref('r').pairs();
+      expect(fromJs).toMatch(/from inside another lua-native call/);
+
+      // (1) An async run in flight.
+      const c: any = new lua_native.init({}, ALL_LIBS);
+      const run = c.execute_script_async('local i = 0 for k = 1, 2e5 do i = i + 1 end return i');
+      expect(() => c.reset()).toThrow(/busy with an async operation/);
+      await run;
+    });
+  });
+
 });

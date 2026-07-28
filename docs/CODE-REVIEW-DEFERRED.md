@@ -1,7 +1,7 @@
 # CODE-REVIEW-DEFERRED
 
 Consolidated tracker for findings across **all code reviews (CODE-REVIEW-1
-through CODE-REVIEW-10)** that were **deferred, only partially resolved,
+through CODE-REVIEW-14)** that were **deferred, only partially resolved,
 deliberately not applied, or resolved by documentation** — the standing
 backlog the reviews' priority lists point at. Items are grouped by their source
 review and tagged with the original finding ID so they can be traced back.
@@ -19,7 +19,11 @@ CODE-REVIEW-11 added; all five of its findings were resolved in the same pass.
 Note for future audits: two of them (F1, and F4's `set_metatable` /
 `register_module` half) were *reintroductions* of hazards earlier reviews had
 already closed — F1 by a later style commit, F4 by a fix that swept one of five
-sites. A clean backlog is not the same as a class staying closed.
+sites. A clean backlog is not the same as a class staying closed. **Updated
+July 28, 2026**: CODE-REVIEW-12, -13 and -14 added; each resolved every finding
+in its own pass, so none contributes to the backlog. CR-14 is a second entry in
+the "clean backlog ≠ closed class" column — its high finding is CR-13 F1's class
+at a site CR-13's own mechanical check structurally could not see.
 
 ## Ledger
 
@@ -36,7 +40,9 @@ sites. A clean backlog is not the same as a class staying closed.
 | CODE-REVIEW-9 | `6839145` | none — all four findings (F1–F4) resolved in the remediation pass |
 | CODE-REVIEW-10 | `9260396` | none — all three findings (F1–F3) resolved in the remediation pass |
 | CODE-REVIEW-11 | `076e9e4` | none — all five findings (F1–F5) resolved in the remediation pass |
-| CODE-REVIEW-12 | CR-11 remediation tree | **five findings (F1–F5) open**, all low — see `CODE-REVIEW-12.md`. Re-confirmed the CR-3 M5 and CR-5 F8 release-time deferrals as still current. |
+| CODE-REVIEW-12 | CR-11 remediation tree | none — all five findings (F1–F5) resolved in the remediation pass (`dc4891e`) |
+| CODE-REVIEW-13 | `8bf7018` | none — all three findings (F1–F3) resolved in the remediation pass (`1cf81a6`). Re-confirmed the CR-3 M5 and CR-5 F8 release-time deferrals. |
+| CODE-REVIEW-14 | `1cf81a6` | none — all five findings (F1–F5) resolved in the same pass. Re-confirmed the CR-3 M5 and CR-5 F8 release-time deferrals as still current. |
 
 ---
 
@@ -491,9 +497,53 @@ read the code:
 
 ---
 
+## From CODE-REVIEW-13 (commit `8bf7018`)
+
+**Nothing deferred.** All three findings resolved in the remediation pass. One
+note worth keeping, because it shapes how the next pass should read the code:
+
+- **The reentrancy guard has two halves and they answer different questions.**
+  `LuaRuntime::IsExecuting()` means "Lua may be running on this state";
+  `LuaContext::call_depth_` means "a binding method is on the stack, so JS may
+  re-enter". `reset()` needs both, and reports them with two distinct messages
+  precisely so the distinction cannot be lost again — a single message saying
+  "while Lua is executing" for a case where no Lua was running is how it was
+  lost the first time.
+
+---
+
+## From CODE-REVIEW-14 (commit `1cf81a6`)
+
+**Nothing deferred.** All five findings resolved in the same pass. Three notes,
+none a residual:
+
+- **The `CallScope` enumeration now states its universe, and the universe is the
+  load-bearing half.** CR-13 installed a mechanical check ("first scope vs. first
+  `.Get(`, per entry point") without defining *entry point*; read as "instance
+  method" — the only reading that made its recorded count come out right — it
+  returned clean on a tree containing an ASan-confirmed use-after-free in
+  `LuaScriptAsyncWorker::OnOK`. The universe is now written above the predicate,
+  and it includes the N-API completion callbacks and the two helper functions
+  (`LuaFunctionDataFrom`, `TableRefDataFrom`) whose `.Get(` a per-function split
+  cannot see.
+- **Three sites marshal async results, and only two of them were guarded by
+  design.** `DriveAsync` and `OnAwaitSettled` convert while `is_busy_` is still
+  set; both worker `OnOK`s clear it first and now open a `CallScope` instead. The
+  ordering rule is recorded at `ClearBusy()` — the function that drops the flag —
+  rather than at the sites that were wrong.
+- **Identity tokens that are raw pointers need a stated lifetime.** Every
+  `data->runtime.get() == runtime.get()` comparison in the binding is sound
+  *because* the `*Data` holds a `shared_ptr<LuaRuntime>`, which is not visible at
+  the comparison. `__luaClassOwner` had no such share, so a collected context's
+  address identified a live one; it is now paired with the monotonic
+  `LuaRuntime::Id()`, which cannot be recycled. If a future marker uses a pointer
+  as a token, say at the comparison what keeps the pointee alive.
+
+---
+
 ## Suggested order for a future hardening pass
 
-Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-10 is resolved.
+Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-14 is resolved.
 What remains, in the order it should be acted on:
 
 1. **Before the first publish for outside consumers** (release blockers, both

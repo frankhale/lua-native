@@ -282,6 +282,19 @@ public:
   // SetMaxInstructions; the remaining fields are fixed at construction.
   [[nodiscard]] const RuntimeConfig& GetConfig() const { return config_; }
 
+  // A process-wide monotonic identity for this state — deliberately NOT its
+  // address.
+  //
+  // The binding layer stamps class instances with the runtime that minted them
+  // so an instance from another context can't alias a same-numbered userdata
+  // slot (CR-2 M6). That stamp used to be the raw `LuaRuntime*`, which is a
+  // unique token only while the object is alive: once a context is collected,
+  // the allocator hands the same block to the next `make_shared<LuaRuntime>`,
+  // and a retained instance from the dead context then passed the live one's
+  // ownership check (CR-14 F2, reproduced). Ids are never reused, so there is
+  // no ABA — and unlike an owning share, carrying one pins nothing.
+  [[nodiscard]] uint64_t Id() const { return id_; }
+
   LuaRuntime(const LuaRuntime&) = delete;
   LuaRuntime& operator=(const LuaRuntime&) = delete;
   LuaRuntime(LuaRuntime&&) = delete;
@@ -697,6 +710,16 @@ public:
   // the second. "Provably" means naming the enclosing scope, not asserting that
   // a finalizer is unlikely — CR-12 F3's two sites were unreachable in practice
   // and still wrong in kind.
+  //
+  // One documented consequence of the broader trigger, recorded rather than
+  // fixed (CR-14 F5, not driven). Two raw `lua_next` traversals allocate from
+  // inside the loop: GetTableKeys stringifies numeric keys, and ToLuaValue's
+  // table branch takes a luaL_ref per nested function/thread/metatabled table.
+  // By the rule above those allocations can run a __gc finalizer, and Lua's
+  // contract forbids *adding a key* to a table while it is being traversed —
+  // so a finalizer that mutates the specific table under iteration makes
+  // lua_next undefined. Bounded: it needs a finalizer that names that table,
+  // and it is the same exposure Lua's own `pairs()` has.
   [[nodiscard]] bool IsExecuting() const { return lua_depth_ > 0; }
 
   // Debug hooks (lua_sethook): line / call / return / count tracing, for
@@ -777,6 +800,10 @@ private:
   MemoryAllocator allocator_;
   lua_State* L_ { nullptr };
   RuntimeConfig config_;  // see GetConfig()
+  // See Id(). Assigned once per constructed state; the delegating constructors
+  // funnel into one target, so a default member initializer runs exactly once.
+  static uint64_t NextRuntimeId();
+  const uint64_t id_ = NextRuntimeId();
   // Every registered JS callback, keyed by the name its Lua closure carries as
   // an upvalue.
   //

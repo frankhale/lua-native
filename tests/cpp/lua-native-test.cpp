@@ -3940,6 +3940,43 @@ TEST(LuaRuntimeConfig, DefaultConstructorRecordsBareState) {
   EXPECT_TRUE(rt.GetConfig().libraries.empty());
 }
 
+// --- Id(): the identity token the binding stamps class instances with.
+// It must be monotonic rather than address-derived: the binding used a raw
+// LuaRuntime*, and once a context was collected the allocator handed its block
+// to the next state, so an instance from the dead context passed the live one's
+// ownership check (CR-14 F2).
+
+TEST(LuaRuntimeIdentity, DistinctRuntimesHaveDistinctIds) {
+  const LuaRuntime a;
+  const LuaRuntime b;
+  EXPECT_NE(a.Id(), b.Id());
+  EXPECT_EQ(a.Id(), a.Id());  // stable for a given state
+}
+
+TEST(LuaRuntimeIdentity, IdIsNotReusedAfterAStateIsDestroyed) {
+  // The property the raw pointer did not have. Record an id, destroy the state,
+  // then build replacements in the same storage and confirm none reuses it.
+  uint64_t retired = 0;
+  const void* retired_addr = nullptr;
+  {
+    const LuaRuntime doomed;
+    retired = doomed.Id();
+    retired_addr = static_cast<const void*>(&doomed);
+  }
+
+  bool address_was_reused = false;
+  for (int i = 0; i < 32; ++i) {
+    const auto fresh = std::make_unique<LuaRuntime>();
+    EXPECT_NE(fresh->Id(), retired);
+    if (static_cast<const void*>(fresh.get()) == retired_addr) {
+      address_was_reused = true;
+    }
+  }
+  // Not an assertion about the allocator — just a note that when reuse does
+  // happen (it commonly does), the id still separates the two states.
+  (void)address_was_reused;
+}
+
 TEST(LuaRuntimeConfig, SetMaxInstructionsUpdatesConfig) {
   LuaRuntime rt(LuaRuntime::AllLibraries());
   rt.SetMaxInstructions(250000);

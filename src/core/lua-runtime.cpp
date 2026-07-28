@@ -513,6 +513,14 @@ int LuaRuntime::GetVersionNumber() {
   return LUA_VERSION_NUM;
 }
 
+// Monotonic, never reused, and never rewound — see Id(). Relaxed ordering is
+// enough: the value is only ever compared for equality, never used to order
+// anything.
+uint64_t LuaRuntime::NextRuntimeId() {
+  static std::atomic<uint64_t> counter{1};
+  return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 // Delegating constructors funnel into the RuntimeConfig overload so state
 // creation, the null check, library loading, and InitState() live in one place.
 LuaRuntime::LuaRuntime() : LuaRuntime(RuntimeConfig{}) {}

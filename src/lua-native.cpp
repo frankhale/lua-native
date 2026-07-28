@@ -1107,6 +1107,15 @@ void LuaContext::InstallRuntimeHandlers() {
       if (!it->second.writable) {
         throw std::runtime_error("userdata is not writable");
       }
+      // Order-critical, and correct only because C++17 sequences a member
+      // call's postfix-expression before its arguments: `it` is dereferenced
+      // and the Napi::Object materialized BEFORE CoreToNapi runs the Lua→JS
+      // converters, which can register a userdata and rehash js_userdata_
+      // (invalidating `it`). Do not hoist the argument into a local declared
+      // above this line, and do not rewrite it as `auto& e = it->second; …` —
+      // either form reintroduces a use-after-invalidate that no test can see,
+      // since the language, not the code, is what currently enforces it
+      // (CR-13's "verified and rejected"; comment added by CR-14 F5).
       it->second.object.Value().Set(key, CoreToNapi(*value));
     }
   );
@@ -2181,9 +2190,10 @@ Napi::Value LuaContext::CreateEnvironment(const Napi::CallbackInfo& info) {
 
   int ref;
   try {
-    // Reading a whitelisted name can fire an __index on _G that re-enters JS,
-    // so scope the build like any other metamethod-capable operation.
-    CallScope _cs(this);
+    // Reading a whitelisted name can fire an __index on _G that re-enters JS.
+    // The method-entry scope above already covers it — a second, shadowing
+    // scope lived here until CR-14 F5, which made "find the first CallScope"
+    // ambiguous in the one method that had two.
     ref = runtime->CreateEnvironment(whitelist, inherit);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -2620,15 +2630,26 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     const auto instObj = instance.As<Napi::Object>();
     // Tag the instance so that passing the JS object back into Lua re-materializes
     // it as the same class userdata instead of deep-copying it to a table. The
-    // owner marker carries this context's runtime pointer so a ref_id from a
-    // foreign context isn't mistaken for one of our js_userdata_ slots (the ref_id
-    // alone is just an integer and would collide across contexts). The External
-    // wraps the raw pointer for identity comparison only — it never owns or
-    // dereferences the runtime, so no finalizer is needed.
+    // owner markers say which state minted it, so a ref_id from a foreign
+    // context isn't mistaken for one of our js_userdata_ slots (the ref_id alone
+    // is just an integer and would collide across contexts — CR-2 M6).
+    //
+    // Two markers, and the *id* is the load-bearing one. The External wraps the
+    // raw runtime pointer for identity comparison only — it never owns or
+    // dereferences it, so no finalizer is needed, and that is exactly why it is
+    // not sufficient on its own: a pointer identifies a runtime only while that
+    // runtime is alive. Once a context is collected, the allocator hands its
+    // block to the next `make_shared<LuaRuntime>`, and this instance would then
+    // pass an unrelated live context's ownership check — reproduced, silently
+    // aliasing that context's own userdata (CR-14 F2). LuaRuntime::Id() is
+    // monotonic and never reused, so it cannot be recycled. Both must match;
+    // the External stays because a genuine one cannot be minted from JS.
     DefineHiddenProp(env, instObj, "__luaClassRef", Napi::Number::New(env, ref_id));
     DefineHiddenProp(env, instObj, "__luaClassName", Napi::String::New(env, class_name));
     DefineHiddenProp(env, instObj, "__luaClassOwner",
       Napi::External<lua_core::LuaRuntime>::New(env, runtime.get()));
+    DefineHiddenProp(env, instObj, "__luaClassOwnerId",
+      Napi::BigInt::New(env, runtime->Id()));
 
     UserdataEntry entry;
     entry.object = Napi::Persistent(instObj);
@@ -2684,6 +2705,21 @@ Napi::Value LuaContext::ExecuteFile(const Napi::CallbackInfo& info) {
 void LuaContext::ClearBusy() {
   // Worker teardown (OnOK/OnError). Clear any cancel signalled during the run so
   // a cancelled worker doesn't leave the flag set to abort the next run (L8).
+  //
+  // **Dropping is_busy_ disarms the reset() guard.** Three sites marshal a
+  // completed async run's values into JS, and marshalling runs user JS (the
+  // Lua→JS converters) over values that still hold the *running* state's
+  // registry refs. `is_busy_` is what refuses a reset() during that window, so
+  // it may not be dropped while the conversion is outstanding:
+  //
+  //   DriveAsync (Finished)  — ResultsToJs, then FinishAsync(). Correct.
+  //   OnAwaitSettled         — converts while the run is still engaged. Correct.
+  //   both workers' OnOK     — call this first, so they open a CallScope
+  //                            instead, which arms the other half of the guard
+  //                            (CR-14 F1).
+  //
+  // A caller that clears the flag before converting and opens no scope has an
+  // unguarded window; that is what CR-14 F1 was.
   runtime->ClearCancel();
   is_busy_ = false;
 }
@@ -3605,6 +3641,22 @@ Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
 void LuaScriptAsyncWorker::OnOK() {
   Napi::Env env = Env();
   context_->ClearBusy();
+  // The marshal below runs user JS — CoreToNapi consults the registered Lua→JS
+  // converters — while `result_` still holds registry refs minted by the state
+  // the run executed on. A converter that called reset() from here used to
+  // succeed: is_busy_ has just been dropped, no Lua is executing, and OnOK is
+  // not a binding method so nothing raised call_depth_. The remaining values
+  // were then wrapped as handles pairing the *new* runtime with the *old*
+  // state's refs — silent reads and writes onto unrelated live objects, and an
+  // ASan-confirmed use-after-free of the retired state at finalization
+  // (CR-14 F1, the CR-13 F1 class at a non-method entry point).
+  //
+  // A CallScope rather than deferring ClearBusy: a converter is legitimately
+  // allowed to call back into the context synchronously here, and leaving
+  // is_busy_ set would break that. Clearing the JS-error registry at this
+  // outermost entry is inert — a worker run has JS callbacks disabled
+  // (async_mode_), so it can stage nothing.
+  LuaContext::CallScope _cs(context_);
 
   if (std::holds_alternative<std::string>(result_)) {
     deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
@@ -3629,6 +3681,10 @@ void LuaScriptAsyncWorker::OnError(const Napi::Error& error) {
 void LuaFileAsyncWorker::OnOK() {
   Napi::Env env = Env();
   context_->ClearBusy();
+  // See LuaScriptAsyncWorker::OnOK: the marshal below runs the Lua→JS
+  // converters over values belonging to the state the run executed on, so
+  // reset() must be refused for its duration (CR-14 F1).
+  LuaContext::CallScope _cs(context_);
 
   if (std::holds_alternative<std::string>(result_)) {
     deferred_.Reject(Napi::Error::New(env, std::get<std::string>(result_)).Value());
@@ -3815,11 +3871,25 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
       // otherwise alias an unrelated slot in this js_userdata_. Foreign or
       // invalid markers fall through to a plain deep copy (same policy as the
       // _tableRef / _userdata markers above).
+      //
+      // The id is what makes "this runtime" mean this runtime. The pointer
+      // comparison beside it is a second barrier, not the test: the `*Data`
+      // structs behind _tableRef / _userdata / _coroutine each hold a
+      // shared_ptr<LuaRuntime>, so *their* address comparisons are backed by a
+      // lifetime and cannot see a recycled block — this marker holds no share,
+      // and before CR-14 F2 the address alone was the whole check.
       if (obj.Has("__luaClassRef")) {
         Napi::Value r = obj.Get("__luaClassRef");
         Napi::Value cn = obj.Get("__luaClassName");
         Napi::Value owner = obj.Get("__luaClassOwner");
-        const bool owned = owner.IsExternal() &&
+        Napi::Value ownerId = obj.Get("__luaClassOwnerId");
+        bool id_matches = false;
+        if (ownerId.IsBigInt()) {
+          bool lossless = false;
+          const uint64_t stamped = ownerId.As<Napi::BigInt>().Uint64Value(&lossless);
+          id_matches = lossless && stamped == runtime->Id();
+        }
+        const bool owned = id_matches && owner.IsExternal() &&
           owner.As<Napi::External<lua_core::LuaRuntime>>().Data() == runtime.get();
         if (owned && r.IsNumber() && cn.IsString()) {
           const int ref_id = r.As<Napi::Number>().Int32Value();

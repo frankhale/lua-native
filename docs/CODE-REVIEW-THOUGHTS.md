@@ -548,3 +548,103 @@ CR-10's standing rule gets a sibling:
 
 The ten pins added with this remediation are that category's first members;
 eight of them fail against the pre-fix binary.
+
+---
+
+## Addendum (July 28, 2026, after CODE-REVIEW-14)
+
+CR-13 did the thing this document has asked for since CR-2: it converted a
+property that lived in a reviewer's head into a procedure the next reviewer can
+run in seconds — *"split lua-native.cpp by function, find the first `CallScope`
+and the first `.Get(` per entry point, compare."* That was right, and it worked:
+every one of CR-13's seven doors is still shut and re-verifying them took minutes
+rather than a pass.
+
+It is also how CR-14's high finding survived. **The check ran clean on a tree
+containing the very hazard it was written for.** Not through carelessness — the
+sentence that defines it says "per entry point" and never says what an entry
+point *is*. Read at all, the only definition under which its recorded count of
+six comes out right is "`LuaContext` instance method". The hazard does not care
+whether the frame is a method; it cares whether user JS can run while the addon
+holds live references into a `lua_State` that `reset()` can retire.
+`LuaScriptAsyncWorker::OnOK` is a main-thread N-API completion callback with no
+`CallbackInfo` at all, it clears `is_busy_` and *then* runs the Lua→JS converters
+over the run's results, and it produced the same ASan `heap-use-after-free` at
+`lua-runtime.cpp:782` that CR-13 F1 did.
+
+So the clause this pass adds is about mechanical checks rather than about guards:
+
+> **A mechanical check has two halves: the predicate and the universe it ranges
+> over. The predicate is almost always written down and the universe almost
+> never is — and a check whose universe is narrower than its class returns
+> "clean" forever.** Write the universe beside the predicate, and justify it
+> against the hazard rather than against the sites the finding happened to name.
+
+Three second-order lessons, each of which cost something:
+
+**A completeness claim decays fastest exactly where being wrong is harmless.**
+CR-13's enumeration had ten omissions and every single one was inert — seven
+scope-free methods that run no user JS, two helper-hidden reads that fail closed,
+one `SharedTable` sibling that delegates to a scoped call. That is not luck, it
+is the mechanism: an omission with a consequence gets found by a test or a crash,
+so the ones that survive in a hand-maintained list are precisely the ones nothing
+detects. The list therefore *looks* healthy right up to the moment a non-inert
+member joins it. CR-12's rule was "treat a comment asserting completeness as a
+claim to be checked"; the sharper form is **check an enumeration against a
+generator, not against your memory of writing it.** A grep that produces the list
+is worth more than a list a grep would have produced — which is why CR-12 F2's
+one-hit grep has aged better than any prose enumeration in this codebase.
+
+**Address identity is not identity, and the two are textually identical.** The
+binding has five markers that answer "did this context mint you?", and four of
+them compare `data->runtime.get() == runtime.get()`. Those four are sound — but
+not for any reason visible at the comparison. They are sound because the `*Data`
+struct holds a `shared_ptr<LuaRuntime>`, declared in another file, whose job of
+keeping the address unique is mentioned nowhere near the check. The fifth,
+`__luaClassOwner`, holds no share, so once its context was collected the
+allocator handed the block to the next `make_shared<LuaRuntime>` and a retained
+instance passed an unrelated live context's ownership check — silently aliasing
+that context's own userdata, in about two runs in three. CR-13 noted that this
+codebase's identity guards "all share a failure mode" along the *generation*
+axis; the *lifetime* axis is a second one, and it is the axis where the guard was
+wrong rather than merely narrow. **Where a pointer is used as an identity token,
+its uniqueness comes from a lifetime — so name the lifetime at the comparison, or
+don't use a pointer.** The fix uses a monotonic id, which has no lifetime to
+name.
+
+**Ordering that is correct at every site can still be undefended.** Three
+functions marshal a completed async run's values into JS, and marshalling runs
+user JS. Two of them convert before dropping `is_busy_` and one drops it first.
+Nothing anywhere stated that the order mattered, so the two correct sites were
+correct by accident and the third was not a regression from a rule — it predated
+the rule and was never brought under it. The remediation therefore records the
+constraint at `ClearBusy()`, the function that drops the flag, rather than at the
+two sites that got it wrong: **an invariant belongs at the operation that can
+violate it, not at the callers that happened to.** That is the same relocation
+CR-9 made for `ExecutionScope`, at a much smaller scale.
+
+Finally, the harness. All four sanitizer runs and 806 tests passed on the tree
+containing F1 — the third consecutive pass where that sentence is true — and ASan
+reported the use-after-free within seconds of a reproduction existing. CR-13's
+standing rule was *"for every guard, one test per kind of user code the
+surrounding method can run."* The suite **has** the kind: a `register_from_lua_-
+converter` handler that calls `reset()` is CR-13's own first regression test.
+What it did not have is that converter at this **site**. So the rule needs its
+other half:
+
+> **One test per kind of user code × per site that can run it.** The kinds are a
+> short list a person can hold in their head; the sites are a long one that has
+> to be generated. When a rule is expressed as kinds × sites, the sites are
+> always the half that rots.
+
+One data point in the pins' favour, and it is the loudest this series has
+produced: the F1 GC-lifetime pin does not merely fail against the pre-fix binary,
+it terminates the vitest worker with `mutex lock failed: Invalid argument` —
+`UnrefOrDefer` taking a mutex on a destroyed `LuaRuntime`. And one against
+complacency: the F2 pin, written the obvious way as a single A→B pair, passed
+about one run in three purely because the allocator did not recycle the block
+that time. It had to be rewritten to offer instances from eight collected
+contexts before it failed reliably. **A pin that depends on the allocator is not
+a pin until you have run it enough times to know its failure rate** — the same
+lesson CR-11 learned about needing two converters and a large capture list, in a
+new disguise.
