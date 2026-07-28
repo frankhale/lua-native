@@ -440,6 +440,12 @@ LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
     return CheckGCAvailable(lua_gc(L_, LUA_GCISRUNNING), command) != 0;
   }
   if (command == "incremental" || command == "generational") {
+    // Bracketed for the same reason as "collect"/"step": luaC_changemode drives
+    // the collector through a full cycle, which includes the state that runs
+    // pending __gc finalizers. CR-10 F3 narrowed this function's scope to the
+    // two obviously-collecting commands and took the bracket off these; a probe
+    // measured 374 finalizers running here at depth 0 (CR-11 F3).
+    ExecutionScope exec(this);
     const int prev = CheckGCAvailable(
         lua_gc(L_, command == "incremental" ? LUA_GCINC : LUA_GCGEN), command);
     return std::string(prev == LUA_GCGEN ? "generational" : "incremental");
@@ -451,10 +457,12 @@ LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
   throw std::runtime_error(msg);
 }
 
-// No ExecutionScope, unlike GarbageCollect's "collect"/"step": LUA_GCPARAM only
-// reads or writes a collector tuning field and never runs a finalizer, so no
-// Lua can execute in here (CR-10 F3 — the asymmetry with its neighbour is
-// deliberate, not an omission).
+// No ExecutionScope. Every command in GarbageCollect that can reach a finalizer
+// — "collect", "step", "incremental", "generational" — is bracketed;
+// LUA_GCPARAM only reads or writes a collector tuning field and drives no
+// collection at all, so no Lua can execute in here. The asymmetry with its
+// neighbour is deliberate, not an omission (CR-10 F3, corrected by CR-11 F3
+// after the mode switches turned out to run finalizers).
 int LuaRuntime::GarbageCollectParam(const std::string& param, const int value) const {
   // Maps the `collectgarbage('param', ...)` names to the LUA_GCP* constants.
   static const std::unordered_map<std::string, int> kGCParams = {
@@ -541,6 +549,13 @@ LuaRuntime::~LuaRuntime() {
   // lua_close also fires the host-fn sentinel __gc metamethods; clear the
   // callback so teardown never calls back into a torn-down binding handler (M2).
   host_fn_gc_callback_ = nullptr;
+  // Same reasoning for the proxy-userdata property handlers: a __gc metamethod
+  // that reads a field off a proxy userdata during teardown reaches them. The
+  // binding's DetachRuntimeHandlers clears these too, but as the comment above
+  // says, the core must not depend on it — and until CR-11 F5 these were the
+  // two of the five bridging handlers where it silently did.
+  property_getter_ = nullptr;
+  property_setter_ = nullptr;
 
   // Remove the count-hook before lua_close so a __gc finalizer running during
   // teardown can't trip the instruction limit / cancel raise.
@@ -907,8 +922,12 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
     if (converted) {
       LuaPtr resultHolder;
       bool called = true;
+      // Copy the owner before calling: the JS this dispatches into can replace
+      // host_functions_[func_name], which would otherwise destroy the callable
+      // executing right now (CR-11 F2).
+      const std::shared_ptr<Function> fn = it->second;
       try {
-        resultHolder = it->second(args);
+        resultHolder = (*fn)(args);
       } catch (const std::exception& e) {
         if (runtime->HasPendingErrorValue()) {
           LuaPtr errVal = runtime->TakePendingErrorValue();
@@ -976,6 +995,10 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
 
 bool LuaRuntime::HasClass(const std::string& class_name) const {
   StackGuard guard(L_);
+  // The registry read interns its key string, which allocates — and an
+  // allocation can drive a GC step whose __gc finalizers re-enter the host
+  // (CR-11 F3). No metamethod can fire: the registry has no metatable.
+  ExecutionScope exec(this);
   const std::string mt_name = kClassMetaPrefix + class_name;
   lua_getfield(L_, LUA_REGISTRYINDEX, mt_name.c_str());
   return lua_istable(L_, -1);
@@ -1227,7 +1250,10 @@ int LuaRuntime::ClassIndex(lua_State* L) {
 // --- Metatable support ---
 
 void LuaRuntime::StoreHostFunction(const std::string& name, Function fn) {
-  host_functions_[name] = std::move(fn);
+  // Assigning a fresh owner rather than into the existing std::function: a
+  // bridge that is mid-call on this name holds its own share and keeps running
+  // against the callable it started with (CR-11 F2).
+  host_functions_[name] = std::make_shared<Function>(std::move(fn));
 }
 
 void LuaRuntime::RemoveHostFunction(const std::string& name) {
@@ -1245,8 +1271,16 @@ void LuaRuntime::ClearHostFunctions() {
 }
 
 void LuaRuntime::RegisterReclaimableHostFunction(const std::string& name, Function fn) {
-  host_functions_[name] = std::move(fn);
+  host_functions_[name] = std::make_shared<Function>(std::move(fn));
   reclaimable_host_fns_[name] = 0;  // live-closure count, incremented on each push
+}
+
+void LuaRuntime::ReserveReclaimableHostFunction(const std::string& name) {
+  // See the header: the reservation exists only so a closure materialized by
+  // the core call below the caller carries the reclaim sentinel. No
+  // host_functions_ entry is created, so the CR-8 F3 ordering — nothing
+  // registered until the core call succeeds — is preserved exactly.
+  reclaimable_host_fns_.emplace(name, 0);
 }
 
 bool LuaRuntime::EraseReclaimableIfUnpushed(const std::string& name) {
@@ -1325,9 +1359,9 @@ void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<M
 
     for (const auto& entry : entries) {
       if (entry.is_function) {
-        // Push function name as upvalue, then create closure
-        lua_pushstring(L_, entry.func_name.c_str());
-        lua_pushcclosure(L_, LuaCallHostFunction, 1);
+        // One builder for every host-function closure, so a name the binding
+        // reserved as reclaimable gets its sentinel here (CR-11 F4).
+        PushHostFunctionClosure(L_, entry.func_name);
       } else {
         PushLuaValue(L_, entry.value);
       }
@@ -1356,8 +1390,8 @@ void LuaRuntime::SetTableRefMetatable(const int registry_ref,
 
     for (const auto& entry : entries) {
       if (entry.is_function) {
-        lua_pushstring(L_, entry.func_name.c_str());
-        lua_pushcclosure(L_, LuaCallHostFunction, 1);
+        // See SetGlobalMetatable: one builder, so a reserved name is reclaimable.
+        PushHostFunctionClosure(L_, entry.func_name);
       } else {
         PushLuaValue(L_, entry.value);
       }
@@ -1435,9 +1469,9 @@ void LuaRuntime::RegisterModuleTable(const std::string& name,
 
     for (const auto& entry : entries) {
       if (entry.is_function) {
-        // Push function name as upvalue, then create closure
-        lua_pushstring(L_, entry.func_name.c_str());
-        lua_pushcclosure(L_, LuaCallHostFunction, 1);
+        // One builder for every host-function closure, so a name the binding
+        // reserved as reclaimable gets its sentinel here (CR-11 F4).
+        PushHostFunctionClosure(L_, entry.func_name);
       } else {
         PushLuaValue(L_, entry.value);
       }
@@ -1672,10 +1706,13 @@ int LuaRuntime::JsSearcher(lua_State* L) {
   {
     LuaPtr result;
     bool ok = true;
+    // See LuaCallHostFunction: copy the owner before calling, so a searcher
+    // that re-registers itself can't destroy the callable in flight (CR-11 F2).
+    const std::shared_ptr<Function> fn = it->second;
     try {
       std::vector<LuaPtr> args{
         std::make_shared<LuaValue>(LuaValue::from(std::string(modname)))};
-      result = it->second(args);
+      result = (*fn)(args);
     } catch (const std::exception& e) {
       luaL_where(L, 1);
       lua_pushfstring(L, "searcher for '%s' failed: %s", modname, e.what());
@@ -1782,8 +1819,12 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
     if (converted) {
       LuaPtr resultHolder;
       bool called = true;
+      // Copy the owner before calling: a JS callback that re-registers its own
+      // name (`set_global('foo', fn)` from inside `foo`) would otherwise
+      // destroy the std::function executing right now (CR-11 F2).
+      const std::shared_ptr<Function> fn = it->second;
       try {
-        resultHolder = it->second(args);
+        resultHolder = (*fn)(args);
       } catch (const std::exception& e) {
         // If the wrapper staged a structured error (a JS Error object), raise
         // that table so the original error can be reconstructed on the way out.
@@ -2065,6 +2106,12 @@ LuaPtr LuaRuntime::ToLuaValueProtected(lua_State* from, const int index) const {
       // for these, so there is nothing an ERRMEM could interrupt.
       return ToLuaValue(from, abs_index);
   }
+  // ToLuaValue traverses raw, so no metamethod runs in here — but its luaL_ref
+  // and table allocations can drive a GC step, and a __gc finalizer is Lua code
+  // that can re-enter the host. Bracket it for the same reason as the rest
+  // (CR-9 F1). Opened before the lua_checkstack below rather than after,
+  // because growing the stack is itself an allocation (CR-11 F3).
+  ExecutionScope exec(this);
   // Reserve the trampoline + argument slots before the frame is set up, so the
   // setup itself can't be the thing that fails (lua_checkstack reports failure
   // by return value rather than raising).
@@ -2074,11 +2121,6 @@ LuaPtr LuaRuntime::ToLuaValueProtected(lua_State* from, const int index) const {
   ProtectedConvert convert;
   ProtectedConvert* prev = active_convert_;
   active_convert_ = &convert;
-  // ToLuaValue traverses raw, so no metamethod runs in here — but its luaL_ref
-  // and table allocations can drive a GC step, and a __gc finalizer is Lua code
-  // that can re-enter the host. Bracket it for the same reason as the rest
-  // (CR-9 F1).
-  ExecutionScope exec(this);
   // Light C function (0 upvalues) — its push never allocates, so the protected
   // frame is established before anything inside it can raise.
   lua_pushcfunction(L_, ProtectedConvertRunner);
@@ -2374,8 +2416,10 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
     lua_pop(L_, 1);                                         // pop globals table
   });
   // Stored only after the protected _G write succeeds, so a raising __newindex
-  // doesn't leave an entry with no global pointing at it (N5).
-  host_functions_[name] = std::move(fn);
+  // doesn't leave an entry with no global pointing at it (N5). Fresh owner, so
+  // re-registering a name that is mid-call doesn't destroy the running callable
+  // (CR-11 F2).
+  host_functions_[name] = std::make_shared<Function>(std::move(fn));
 }
 
 // Trampoline for PushProtectedGlobal: [] -> [value]. Light C function (0
@@ -2400,14 +2444,15 @@ int LuaRuntime::ProtectedGlobalGetRunner(lua_State* L) {
 // Reads _G[name] under protection, leaving the value on top of the stack.
 // Callers manage stack cleanup (typically via StackGuard).
 void LuaRuntime::PushProtectedGlobal(const std::string& name) const {
+  // Reads _G[name] through lua_gettable, so a metatabled _G runs its __index
+  // here — arbitrary Lua, and from there a host callback (CR-9 F1/F2). Opened
+  // before lua_checkstack, since growing the stack allocates (CR-11 F3).
+  ExecutionScope exec(this);
   if (!lua_checkstack(L_, 2)) {
     throw std::runtime_error("Lua stack overflow while reading a global");
   }
   const std::string* prev = active_global_name_;
   active_global_name_ = &name;
-  // Reads _G[name] through lua_gettable, so a metatabled _G runs its __index
-  // here — arbitrary Lua, and from there a host callback (CR-9 F1/F2).
-  ExecutionScope exec(this);
   lua_pushcfunction(L_, ProtectedGlobalGetRunner);
   const int status = lua_pcall(L_, 0, 1, 0);
   active_global_name_ = prev;
@@ -2505,23 +2550,31 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
   last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
-  if (!lua_checkstack(L_, static_cast<int>(args.size()) + LUA_MINSTACK)) {
-    return std::string("stack overflow: too many arguments to Lua function");
-  }
-  lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
-
-  // PushLuaValue throws on depth/stack overflow; if it does, restore the stack
-  // and return a string error rather than letting the exception unwind out of
-  // this method (and, via the function-handle trampoline, past N-API) (H1).
-  try {
-    for (const auto& arg : args) {
-      PushLuaValue(L_, arg);
+  // Staging the arguments allocates — a table, a string per key, a closure and
+  // a sentinel per nested JS function — and lua_checkstack can grow the stack.
+  // Any of that can drive a GC step whose __gc finalizers re-enter the host, so
+  // it is bracketed on the "can allocate from Lua" rule (CR-11 F3). Scoped to
+  // the staging alone, so the ProtectedCall below still starts the budget.
+  {
+    ExecutionScope exec(this);
+    if (!lua_checkstack(L_, static_cast<int>(args.size()) + LUA_MINSTACK)) {
+      return std::string("stack overflow: too many arguments to Lua function");
     }
-  } catch (const std::exception& e) {
-    lua_settop(L_, stackBefore);
-    std::string msg = "Error converting argument to Lua function: ";
-    msg += e.what();
-    return msg;
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, funcRef.ref);
+
+    // PushLuaValue throws on depth/stack overflow; if it does, restore the stack
+    // and return a string error rather than letting the exception unwind out of
+    // this method (and, via the function-handle trampoline, past N-API) (H1).
+    try {
+      for (const auto& arg : args) {
+        PushLuaValue(L_, arg);
+      }
+    } catch (const std::exception& e) {
+      lua_settop(L_, stackBefore);
+      std::string msg = "Error converting argument to Lua function: ";
+      msg += e.what();
+      return msg;
+    }
   }
 
   if (ProtectedCall(static_cast<int>(args.size()), LUA_MULTRET) != LUA_OK) {
@@ -2674,6 +2727,60 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
   }
 }
 
+// Materializes a registered host function as a Lua closure (upvalue 1 = the
+// host function name), the same shape RegisterFunction installs.
+//
+// Factored out of PushLuaValue's HostFunctionName branch so that every closure
+// the core builds over a host-function name goes through one place and picks up
+// the reclaim accounting: the metatable, module and searcher builders used to
+// push their own bare closure, which is why their names could never be
+// reclaimed (CR-11 F4).
+//
+// Holds no non-trivial C++ local across a raise-capable call: `name` is the
+// caller's, and the sentinel's string is heap-allocated and owned by the
+// sentinel from the moment it is stored (N1/N2).
+void LuaRuntime::PushHostFunctionClosure(lua_State* L, const std::string& name) {
+  lua_pushlstring(L, name.c_str(), name.size());
+  // If the name is reclaimable (an anonymous nested callback, or a metatable /
+  // module entry that a later registration can supersede), attach a sentinel
+  // userdata as upvalue 2 whose __gc reclaims the registry entry once this
+  // closure is collected, and bump the live-closure count. LuaCallHostFunction
+  // only reads upvalue 1, so the extra upvalue is inert to the call path (M2).
+  bool reclaimable = false;
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  if (auto* rt = static_cast<LuaRuntime*>(lua_touserdata(L, -1))) {
+    lua_pop(L, 1);
+    if (rt->reclaimable_host_fns_.count(name)) {
+      reclaimable = true;
+      // Build the sentinel fully before touching the live count: if either
+      // allocation below raises LUA_ERRMEM, no accounting has happened, so no
+      // phantom +1 can strand the entry (N1). The slot stays null (its __gc
+      // no-ops) until the count owns a decrement.
+      auto** slot = static_cast<std::string**>(
+          lua_newuserdatauv(L, sizeof(std::string*), 0));
+      *slot = nullptr;
+      luaL_setmetatable(L, kHostFnSentinelMeta);
+      // Re-find after the raise-capable allocations: a GC step inside them can
+      // collect this name's last live closure and erase the entry (the count is
+      // not pinned yet). If that happened, the host function is gone — leave the
+      // sentinel inert; the closure raises the missing-function error if it is
+      // ever called.
+      auto it = rt->reclaimable_host_fns_.find(name);
+      if (it != rt->reclaimable_host_fns_.end()) {
+        // Arm, then count: a bad_alloc from the string copy leaves the slot
+        // null and the count untouched (still balanced), and once armed the
+        // increment cannot fail. If the closure push below raises, the unwound
+        // sentinel's __gc performs the matching decrement.
+        *slot = new std::string(name);
+        ++it->second;
+      }
+    }
+  } else {
+    lua_pop(L, 1);
+  }
+  lua_pushcclosure(L, LuaCallHostFunction, reclaimable ? 2 : 1);
+}
+
 void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth) {
   if (!value) {
     lua_pushnil(L);
@@ -2744,48 +2851,7 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
             if (runtime) runtime->IncrementUserdataRefCount(v.ref_id);
           }
         } else if constexpr (std::is_same_v<T, HostFunctionName>) {
-          // Materialize a registered host function as a Lua closure (upvalue 1 =
-          // the host function name), the same shape RegisterFunction installs.
-          lua_pushlstring(L, v.name.c_str(), v.name.size());
-          // If the name is reclaimable (an anonymous nested callback), attach a
-          // sentinel userdata as upvalue 2 whose __gc reclaims the registry
-          // entry once this closure is collected, and bump the live-closure
-          // count. LuaCallHostFunction only reads upvalue 1, so the extra
-          // upvalue is inert to the call path (M2).
-          bool reclaimable = false;
-          lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
-          if (auto* rt = static_cast<LuaRuntime*>(lua_touserdata(L, -1))) {
-            lua_pop(L, 1);
-            if (rt->reclaimable_host_fns_.count(v.name)) {
-              reclaimable = true;
-              // Build the sentinel fully before touching the live count: if
-              // either allocation below raises LUA_ERRMEM, no accounting has
-              // happened, so no phantom +1 can strand the entry (N1). The slot
-              // stays null (its __gc no-ops) until the count owns a decrement.
-              auto** slot = static_cast<std::string**>(
-                  lua_newuserdatauv(L, sizeof(std::string*), 0));
-              *slot = nullptr;
-              luaL_setmetatable(L, kHostFnSentinelMeta);
-              // Re-find after the raise-capable allocations: a GC step inside
-              // them can collect this name's last live closure and erase the
-              // entry (the count is not pinned yet). If that happened, the
-              // host function is gone — leave the sentinel inert; the closure
-              // raises the missing-function error if it is ever called.
-              auto it = rt->reclaimable_host_fns_.find(v.name);
-              if (it != rt->reclaimable_host_fns_.end()) {
-                // Arm, then count: a bad_alloc from the string copy leaves the
-                // slot null and the count untouched (still balanced), and once
-                // armed the increment cannot fail. If the closure push below
-                // raises, the unwound sentinel's __gc performs the matching
-                // decrement.
-                *slot = new std::string(v.name);
-                ++it->second;
-              }
-            }
-          } else {
-            lua_pop(L, 1);
-          }
-          lua_pushcclosure(L, LuaCallHostFunction, reclaimable ? 2 : 1);
+          PushHostFunctionClosure(L, v.name);
         }
       },
       value->value);
@@ -3239,22 +3305,27 @@ CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
     return result;
   }
 
-  // Push arguments onto the coroutine's stack
-  if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
-    result.status = CoroutineStatus::Dead;
-    result.error = "stack overflow: too many coroutine arguments";
-    return result;
-  }
-  try {
-    for (const auto& arg : args) {
-      PushLuaValue(threadRef.thread, arg);
+  // Push arguments onto the coroutine's stack. Bracketed for the same reason as
+  // CallFunction's staging: the pushes allocate, and an allocation can run a
+  // __gc finalizer that re-enters the host (CR-11 F3).
+  {
+    ExecutionScope exec(this);
+    if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
+      result.status = CoroutineStatus::Dead;
+      result.error = "stack overflow: too many coroutine arguments";
+      return result;
     }
-  } catch (const std::exception& e) {
-    result.status = CoroutineStatus::Dead;
-    std::string msg = "Error converting coroutine arguments: ";
-    msg += e.what();
-    result.error = msg;
-    return result;
+    try {
+      for (const auto& arg : args) {
+        PushLuaValue(threadRef.thread, arg);
+      }
+    } catch (const std::exception& e) {
+      result.status = CoroutineStatus::Dead;
+      std::string msg = "Error converting coroutine arguments: ";
+      msg += e.what();
+      result.error = msg;
+      return result;
+    }
   }
 
   // Resume the coroutine. The scope marks the state as executing (CR-9 F1) and,
@@ -3425,21 +3496,28 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   last_error_value_.reset();
   await_is_error_ = arg_is_error;
 
-  if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
-    result.state = AsyncStepResult::State::Error;
-    result.error = "stack overflow: too many resume values";
-    return result;
-  }
-  try {
-    for (const auto& arg : args) {
-      PushLuaValue(threadRef.thread, arg);
+  // See CallFunction / ResumeCoroutine: staging the resume values allocates, so
+  // it is bracketed too. This one had no binding-side guard at all either — the
+  // async driver reaches it from DriveAsync, which opens no CallScope
+  // (CR-11 F3).
+  {
+    ExecutionScope exec(this);
+    if (!lua_checkstack(threadRef.thread, static_cast<int>(args.size()) + LUA_MINSTACK)) {
+      result.state = AsyncStepResult::State::Error;
+      result.error = "stack overflow: too many resume values";
+      return result;
     }
-  } catch (const std::exception& e) {
-    result.state = AsyncStepResult::State::Error;
-    std::string msg = "Error converting resume value: ";
-    msg += e.what();
-    result.error = msg;
-    return result;
+    try {
+      for (const auto& arg : args) {
+        PushLuaValue(threadRef.thread, arg);
+      }
+    } catch (const std::exception& e) {
+      result.state = AsyncStepResult::State::Error;
+      std::string msg = "Error converting resume value: ";
+      msg += e.what();
+      result.error = msg;
+      return result;
+    }
   }
 
   // Marks the state as executing (CR-9 F1) and, at the outermost entry, starts

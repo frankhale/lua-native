@@ -4812,6 +4812,234 @@ TEST(LuaRuntimeHostFunctions, FinalizerAfterClearHostFunctionsIsContained) {
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
 }
 
+// ---- CODE-REVIEW-11 regressions ----
+
+// F3: the "can allocate from Lua" invariant (CR-10 F1) reaches further than the
+// chunk loaders. Any allocation can drive a GC step, a GC step runs pending
+// __gc finalizers, and a finalizer is Lua that can re-enter the host — so
+// argument staging (which pushes caller-supplied tables, strings and closures)
+// and the collector-mode switches (which drive a full cycle) must be bracketed
+// too.
+//
+// These pins live here rather than in the TypeScript suite deliberately: every
+// binding entry point that reaches these paths opens its own CallScope, so
+// reset() is rejected either way and a JS-level test cannot fail. The fact
+// under test is the core's, and only the core can observe it.
+namespace {
+// Arms a __gc finalizer that records rt.IsExecuting() each time it runs, and
+// leaves `count` finalizable objects pending. Returns the recorder.
+//
+// Declare one BEFORE its LuaRuntime: members are destroyed in reverse order, so
+// a probe declared after the runtime would be gone by the time ~LuaRuntime's
+// lua_close fires the still-pending finalizers into it — the exact use-after-
+// free shape CR-10 F2 is about, and ASan catches it in the harness too.
+struct ExecutingProbe {
+  std::vector<bool> observations;
+
+  void Arm(LuaRuntime& rt, int count) {
+    rt.RegisterFunction("probe", [this, &rt](const std::vector<LuaPtr>&) -> LuaPtr {
+      observations.push_back(rt.IsExecuting());
+      return std::make_shared<LuaValue>(LuaValue::nil());
+    });
+    (void)rt.ExecuteScript(
+      "function mk(n) for i=1,n do "
+      "  local t = setmetatable({}, {__gc = function() probe() end}); t = nil "
+      "end end");
+    (void)rt.ExecuteScript("mk(" + std::to_string(count) + ")");
+    observations.clear();
+  }
+
+  [[nodiscard]] bool AnyAtDepthZero() const {
+    for (const bool executing : observations) {
+      if (!executing) return true;
+    }
+    return false;
+  }
+};
+
+// A caller-supplied argument big enough that staging it certainly allocates —
+// and therefore certainly drives a GC step with finalizers pending.
+LuaPtr BigArgument() {
+  LuaTable big;
+  for (int i = 0; i < 40000; ++i) {
+    big.emplace("k" + std::to_string(i),
+                std::make_shared<LuaValue>(LuaValue::from(std::string(96, 'x'))));
+  }
+  return std::make_shared<LuaValue>(LuaValue::from(std::move(big)));
+}
+}  // namespace
+
+TEST(LuaRuntimeExecuting, TrueWhileStagingCallFunctionArguments) {
+  ExecutingProbe probe;  // outlives rt: see ExecutingProbe
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("function target(x) return 1 end");
+  probe.Arm(rt, 4000);
+
+  const LuaPtr fn = rt.GetGlobal("target");
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(fn->value));
+  (void)rt.CallFunction(std::get<LuaFunctionRef>(fn->value), {BigArgument()});
+
+  // The staging must actually have driven the collector, or the pin is vacuous.
+  ASSERT_FALSE(probe.observations.empty())
+    << "no finalizer ran during argument staging; the probe proves nothing";
+  EXPECT_FALSE(probe.AnyAtDepthZero());
+  EXPECT_FALSE(rt.IsExecuting());  // and the scope is closed on the way out
+}
+
+TEST(LuaRuntimeExecuting, TrueWhileStagingResumeArguments) {
+  ExecutingProbe probe;  // outlives rt: see ExecutingProbe
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.ExecuteScript("co_body = function(x) return 1 end");
+  const LuaPtr fn = rt.GetGlobal("co_body");
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(fn->value));
+  const auto co = rt.CreateCoroutine(std::get<LuaFunctionRef>(fn->value));
+  ASSERT_TRUE(std::holds_alternative<LuaThreadRef>(co));
+  probe.Arm(rt, 4000);
+
+  (void)rt.ResumeCoroutine(std::get<LuaThreadRef>(co), {BigArgument()});
+
+  ASSERT_FALSE(probe.observations.empty());
+  EXPECT_FALSE(probe.AnyAtDepthZero());
+}
+
+TEST(LuaRuntimeExecuting, TrueWhileStagingAsyncResumeValues) {
+  ExecutingProbe probe;  // outlives rt: see ExecutingProbe
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const auto co = rt.CreateCoroutineFromScript("local a = ... ; return 1");
+  ASSERT_TRUE(std::holds_alternative<LuaThreadRef>(co));
+  probe.Arm(rt, 4000);
+
+  (void)rt.ResumeAsyncStep(std::get<LuaThreadRef>(co), {BigArgument()}, false);
+
+  ASSERT_FALSE(probe.observations.empty());
+  EXPECT_FALSE(probe.AnyAtDepthZero());
+}
+
+// CR-10 F3 narrowed GarbageCollect's scope to "collect"/"step". The collector
+// mode switches also run finalizers — luaC_changemode drives a full cycle,
+// including the state that calls __gc — so they lost a guard they had.
+TEST(LuaRuntimeExecuting, TrueInsideAModeSwitchFinalizer) {
+  ExecutingProbe probe;  // outlives rt: see ExecutingProbe
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  probe.Arm(rt, 600);
+
+  (void)rt.GarbageCollect("generational");
+
+  ASSERT_FALSE(probe.observations.empty())
+    << "gc('generational') ran no finalizer; the pin proves nothing";
+  EXPECT_FALSE(probe.AnyAtDepthZero());
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// Control: the read-only commands genuinely run no Lua, so CR-10 F3 was right
+// about those and they must stay unbracketed.
+TEST(LuaRuntimeExecuting, ReadOnlyGcCommandsAreNotExecutions) {
+  ExecutingProbe probe;  // outlives rt: see ExecutingProbe
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  probe.Arm(rt, 600);
+
+  (void)rt.GarbageCollect("count");
+  (void)rt.GarbageCollect("isrunning");
+  (void)rt.GarbageCollect("stop");
+  (void)rt.GarbageCollect("restart");
+
+  EXPECT_TRUE(probe.observations.empty())
+    << "a read-only gc() command ran a finalizer; it needs a scope after all";
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// F2: a host function that replaces its own registration mid-call used to
+// move-assign over the std::function being executed, freeing its captures.
+//
+// The capture list is deliberately larger than libc++'s small-object buffer
+// (3 pointers). A callable that fits inline lives in the map node rather than
+// on the heap, so the same defect corrupts nothing an allocator can see — the
+// binding's wrapper captures a LuaContext*, a std::string and a shared_ptr and
+// is comfortably past the threshold, so the pin must be too. `tag` is read
+// *after* the re-registration, which is the access that faulted.
+TEST(LuaRuntimeHostFunctions, ReplacingAHostFunctionMidCallIsSafe) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  std::string observed;
+  const std::string tag(64, 'x');  // by value below: forces heap storage
+  rt.RegisterFunction("swap", [&rt, &observed, tag](const std::vector<LuaPtr>&) -> LuaPtr {
+    // Replace this very name while its callable is on the C stack.
+    rt.RegisterFunction("swap", [](const std::vector<LuaPtr>&) -> LuaPtr {
+      return std::make_shared<LuaValue>(LuaValue::from(std::string("second")));
+    });
+    // Then keep using state the (now-replaced) closure captured.
+    observed = "first" + tag.substr(0, 0);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string("first")));
+  });
+
+  const auto first = rt.ExecuteScript("return swap()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(first));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(first)[0]->value), "first");
+  EXPECT_EQ(observed, "first");
+
+  // The replacement takes effect from the next call, not the in-flight one.
+  const auto second = rt.ExecuteScript("return swap()");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(second));
+  EXPECT_EQ(std::get<std::string>(std::get<std::vector<LuaPtr>>(second)[0]->value), "second");
+}
+
+TEST(LuaRuntimeHostFunctions, ReplacingAMetamethodHostFunctionMidCallIsSafe) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const std::string tag(64, 'y');  // see above: keeps the closure off the SBO
+  rt.StoreHostFunction("mm", [&rt, tag](const std::vector<LuaPtr>&) -> LuaPtr {
+    rt.StoreHostFunction("mm", [](const std::vector<LuaPtr>&) -> LuaPtr {
+      return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(2)));
+    });
+    // Read a capture after the replacement — the faulting access.
+    return std::make_shared<LuaValue>(
+      LuaValue::from(static_cast<int64_t>(tag.empty() ? 0 : 1)));
+  });
+  (void)rt.ExecuteScript("t = {}");
+  std::vector<MetatableEntry> entries;
+  MetatableEntry e;
+  e.key = "__index";
+  e.is_function = true;
+  e.func_name = "mm";
+  entries.push_back(std::move(e));
+  rt.SetGlobalMetatable("t", entries);
+
+  const auto r1 = rt.ExecuteScript("return t.anything");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(r1));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(r1)[0]->value), 1);
+  const auto r2 = rt.ExecuteScript("return t.anything");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(r2));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(r2)[0]->value), 2);
+}
+
+// F5: ~LuaRuntime cleared three of the five handlers that bridge into an owner,
+// leaving the proxy-userdata property handlers installed across lua_close. A
+// __gc finalizer that reads a property off a proxy userdata during teardown
+// reached them. The binding detaches them itself, so this is only observable
+// from direct use of the core — which is exactly why the core must not rely on
+// its caller, as the destructor's own comment says.
+TEST(LuaRuntimeHostFunctions, PropertyHandlersAreUnboundBeforeClose) {
+  bool getter_ran_during_teardown = false;
+  bool closing = false;
+  {
+    LuaRuntime rt(LuaRuntime::AllLibraries());
+    rt.SetPropertyHandlers(
+      [&](int, const std::string&) -> LuaPtr {
+        if (closing) getter_ran_during_teardown = true;
+        return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(7)));
+      },
+      [](int, const std::string&, const LuaPtr&) {});
+    rt.CreateProxyUserdataGlobal("ud", 1);
+    // The handler is reachable while the state is open...
+    const auto live = rt.ExecuteScript("return ud.field");
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(live));
+    EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(live)[0]->value), 7);
+    // ...and a finalizer that indexes it is left pending at lua_close.
+    (void)rt.ExecuteScript(
+      "_G.keep = setmetatable({}, { __gc = function() local _ = ud.field end })");
+    closing = true;
+  }  // ~LuaRuntime: lua_close fires the finalizer
+  EXPECT_FALSE(getter_ran_during_teardown);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

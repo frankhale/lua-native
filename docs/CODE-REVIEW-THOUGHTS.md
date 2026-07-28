@@ -320,3 +320,72 @@ because `reset()` also destroys a runtime and the state it retires must still be
 able to run its own finalizers against the live context. Both are pinned by
 control tests, since both are the kind of thing a later cleanup would happily
 "simplify" away.
+
+---
+
+## Addendum (July 28, 2026, after CODE-REVIEW-11)
+
+That last sentence turned out to be the whole of CR-11, and it arrived faster
+than expected. This document has spent nine passes on one thesis — *fix classes,
+not sites* — and CR-11 is the first pass to find the two failure modes that
+thesis does not by itself prevent. Both are about durability rather than
+reasoning.
+
+**A fix is only as durable as the thing that stops it being undone.** CR-2 found
+that the type-converter loop held a reference into a vector across a call that
+could reallocate it, rewrote it as an indexed loop, and left a comment saying
+exactly why the indexed form was required. Nine days later a commit whose message
+was "add `const` and `[[nodiscard]]` annotations" turned it back into a
+range-`for`; a day after that, "fix clang-tidy issues" did the same to its twin
+in the other direction. Neither commit touched the comment. The file therefore
+*documented* the fix immediately above code that did not implement it, and three
+subsequent review passes read that comment, agreed with it, and moved on. CR-11
+reproduced the result as a `heap-use-after-free` in both directions.
+
+> **A comment describes intent; only a test or a lint suppression describes what
+> the code is currently doing. When a fix depends on a non-obvious *form* —
+> indexed loop, copy-before-call, scope placement — leave a marker the tooling
+> honours, not only prose.**
+
+**An enumeration error is invisible to a reviewer who checks the sites the fix
+names.** CR-9 F4 stated its class correctly ("a handler that replaces itself
+mid-call must not destroy the `std::function` currently executing") and fixed two
+members of it, `output_handler_` and `debug_hook_`. The third —
+`host_functions_`, one entry per registered JS callback, by far the largest
+population — was never counted, and `set_global('foo', fn)` called from inside
+`foo` remained a use-after-free. M2 built a reclaim mechanism precisely so host
+functions would stop accumulating, and wired it to one of the five sites that
+mint them; the other four pinned their JS closures for the life of the context.
+Neither is a reasoning failure. Both are census failures.
+
+> **When a fix names a class, write the full member list down at the class's
+> home, not at the site being fixed.** `output_handler_`'s comment was the right
+> text in the wrong file: the rule it stated governed a map declared a thousand
+> lines away and never mentioned it.
+
+Two smaller lessons worth carrying forward, both about the *harness* rather than
+the code:
+
+- **A regression pin must fail without the fix, in the exact shape it will be
+  written.** CR-11's F1 needs *two* registered converters — a range-`for` caches
+  `end()` at loop entry, so with one converter the invalidated cursor still
+  compares equal and the run is clean. F2 needs a Promise-returning callback and
+  a capture list past libc++'s small-object buffer — with a plain return the
+  compiler keeps `this` in a register, and with a small capture the closure never
+  leaves the map node, so ASan sees nothing either way. The natural way to write
+  both tests produces a test that passes without the fix. Every pin in this
+  remediation was run against the pre-fix tree, and the ones that did *not* fail
+  were rewritten until they did.
+- **Add "supersede" to the standing test categories**, beside CR-10's "leave it
+  in use at destruction". The suite had thorough coverage of *failed*
+  registrations stranding nothing (CR-8 F3) and none at all of *successful,
+  replaced* ones — the same one-step-past-where-every-test-stops shape that hid
+  CR-10 F2.
+
+One closing data point in the sanitizers' favour, and a nicely humbling one. The
+first draft of CR-11's own C++ probe for F3 declared its recorder after the
+`LuaRuntime` it observed, so `~LuaRuntime`'s teardown finalizers fired into a
+destroyed `std::vector`. `test-cpp-asan` reported it as a `stack-use-after-scope`
+on the first run. The test written to pin a lifetime bug had the lifetime bug —
+which is as good an argument as this series will produce for keeping the
+sanitizer harnesses pointed at the tests as well as the code.

@@ -14,7 +14,12 @@ see its entry for the two narrowed residuals that replace it. **Updated July 27,
 2026**: CODE-REVIEW-9 added; all four of its findings were resolved in the same
 pass, so it contributes nothing to the backlog. **Updated July 28, 2026**:
 CODE-REVIEW-10 added; all three of its findings were likewise resolved in the
-same pass, so it too contributes nothing to the backlog.
+same pass, so it too contributes nothing to the backlog. **Also July 28, 2026**:
+CODE-REVIEW-11 added; all five of its findings were resolved in the same pass.
+Note for future audits: two of them (F1, and F4's `set_metatable` /
+`register_module` half) were *reintroductions* of hazards earlier reviews had
+already closed — F1 by a later style commit, F4 by a fix that swept one of five
+sites. A clean backlog is not the same as a class staying closed.
 
 ## Ledger
 
@@ -30,6 +35,8 @@ same pass, so it too contributes nothing to the backlog.
 | CODE-REVIEW-8 | `330cc30` | F6 ✅ main restructure done July 23, 2026 (bridge value pushes now protected); two narrow residuals remain documented (error-message staging allocations; the stranded constructor `js_userdata_` entry) |
 | CODE-REVIEW-9 | `6839145` | none — all four findings (F1–F4) resolved in the remediation pass |
 | CODE-REVIEW-10 | `9260396` | none — all three findings (F1–F3) resolved in the remediation pass |
+| CODE-REVIEW-11 | `076e9e4` | none — all five findings (F1–F5) resolved in the remediation pass |
+| CODE-REVIEW-12 | CR-11 remediation tree | **five findings (F1–F5) open**, all low — see `CODE-REVIEW-12.md`. Re-confirmed the CR-3 M5 and CR-5 F8 release-time deferrals as still current. |
 
 ---
 

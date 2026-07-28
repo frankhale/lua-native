@@ -8672,4 +8672,273 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // --- CODE-REVIEW-11 regressions ---------------------------------------
+  //
+  // Three of these pin *shapes* rather than behaviours, and the shape matters:
+  //  * F1 needs TWO registered converters. A range-for caches end() at loop
+  //    entry, so with one converter the invalidated cursor still compares equal
+  //    and the bug is invisible. A one-converter test passes without the fix.
+  //  * F2 needs a Promise-returning callback. With a plain return the compiler
+  //    may keep the captured `this` in a register across the JS call, so the
+  //    use-after-free reads nothing freed. The Promise path forces a reload of
+  //    the captured name string, whose buffer is a separate heap block.
+  //  * F4 needs the working M2 path alongside it as a control, or a harness
+  //    that has stopped collecting would report a pass for the wrong reason.
+  describe('CODE-REVIEW-11 regressions', () => {
+    const gcSettle = async () => {
+      expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        global.gc!();
+      }
+    };
+
+    // --- F1: both converter loops iterated their vector by reference while
+    // calling user JS that can register another converter, reallocating it.
+    // CR-2 fixed this with an indexed loop; two later style commits reverted it
+    // to a range-for while leaving the explanatory comment in place.
+    describe('F1: a converter registered from inside a converter', () => {
+      it('does not corrupt the JS->Lua converter loop', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        // Two converters: the first grows the vector and declines, so the loop
+        // must still advance to the second one with a valid cursor.
+        lua.register_type_converter(
+          () => {
+            for (let i = 0; i < 16; i++) {
+              lua.register_type_converter(() => false, (x: any) => x);
+            }
+            return false;
+          },
+          (v: any) => v);
+        lua.register_type_converter(() => false, (v: any) => v);
+
+        lua.set_global('probe', { a: 1 });
+        expect(lua.get_global('probe')).toEqual({ a: 1 });
+      });
+
+      it('does not corrupt the Lua->JS converter loop', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_from_lua_converter(
+          () => {
+            for (let i = 0; i < 16; i++) {
+              lua.register_from_lua_converter(() => false, (x: any) => x);
+            }
+            return false;
+          },
+          (v: any) => v);
+        lua.register_from_lua_converter(() => false, (v: any) => v);
+
+        expect(lua.execute_script('return {a=1}')).toEqual({ a: 1 });
+      });
+
+      it('still applies a converter registered mid-loop on the next conversion', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v: any) => {
+            if (!lua.__armed) {
+              lua.__armed = true;
+              lua.register_type_converter(
+                (x: any) => x && x.__tag === 'late',
+                (x: any) => `converted:${x.v}`);
+            }
+            return false;
+          },
+          (v: any) => v);
+        lua.register_type_converter(() => false, (v: any) => v);
+
+        lua.set_global('first', { __tag: 'late', v: 1 });   // arms it, too late for itself
+        lua.set_global('second', { __tag: 'late', v: 2 });  // now the new converter applies
+        expect(lua.get_global('second')).toBe('converted:2');
+      });
+    });
+
+    // --- F2: re-registering a host function under a name that is currently
+    // executing move-assigned over the std::function being run, destroying its
+    // captures. The CR-9 F4 rule ("don't destroy the callable you're inside"),
+    // which had been applied to the print handler and the debug hook but not to
+    // the host-function map.
+    describe('F2: a JS callback that replaces itself mid-call', () => {
+      it('survives when the in-flight call then uses its captured name', () => {
+        const lua: any = new lua_native.init({
+          foo: () => {
+            lua.set_global('foo', (x: number) => x * 2);
+            // Returning a Promise outside execute_async makes the wrapper build
+            // an error message from its captured name — the read that faulted.
+            return Promise.resolve(1);
+          },
+        }, ALL_LIBS);
+
+        expect(() => lua.execute_script('return foo(1)')).toThrow(/returned a Promise/);
+        // The replacement is in effect for the next call, not this one.
+        expect(lua.execute_script('return foo(21)')).toBe(42);
+      });
+
+      it('survives when the in-flight call then converts a result', () => {
+        const lua: any = new lua_native.init({
+          bar: (n: number) => {
+            lua.set_global('bar', (x: number) => ({ ok: x * 10 }));
+            return { ok: n + 1 };
+          },
+        }, ALL_LIBS);
+
+        expect(lua.execute_script('return bar(1)')).toEqual({ ok: 2 });
+        expect(lua.execute_script('return bar(4)')).toEqual({ ok: 40 });
+      });
+
+      it('replacing a different name from inside a callback still works', () => {
+        const lua: any = new lua_native.init({
+          outer: () => { lua.set_global('inner', () => 'replaced'); return 'outer'; },
+          inner: () => 'original',
+        }, ALL_LIBS);
+
+        expect(lua.execute_script('return inner()')).toBe('original');
+        expect(lua.execute_script('return outer()')).toBe('outer');
+        expect(lua.execute_script('return inner()')).toBe('replaced');
+      });
+
+      it('a metamethod callback that replaces a global mid-call survives', () => {
+        const lua: any = new lua_native.init({
+          swap: () => { lua.set_global('swap', () => 2); return 1; },
+        }, ALL_LIBS);
+        lua.execute_script('t = {}');
+        lua.set_metatable('t', { __index: () => lua.execute_script('return swap()') });
+        expect(lua.execute_script('return t.anything')).toBe(1);
+        expect(lua.execute_script('return swap()')).toBe(2);
+      });
+    });
+
+    // --- F4: set_metatable / register_module minted a fresh host-function name
+    // on every call and never released the previous generation's, and
+    // set_userdata never released its method callbacks even once the userdata
+    // was collected. Each pinned the JS closure (and its captured scope) for the
+    // life of the context.
+    describe('F4: superseded registrations release their callbacks', () => {
+      it('releases the previous metatable generation', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = {}');
+        const refs: WeakRef<object>[] = [];
+        for (let i = 0; i < 20; i++) {
+          const fn = function idx() { return i; };
+          refs.push(new WeakRef(fn));
+          lua.set_metatable('t', { __index: fn });
+        }
+        lua.gc('collect');
+        lua.gc('collect');
+        await gcSettle();
+        // Every superseded generation is released; the one still installed on
+        // `t` is not. (Checked as "all but the last" rather than a raw count:
+        // V8 routinely keeps the final loop value reachable a little longer,
+        // which would make a bare count flaky in the other direction.)
+        expect(refs.slice(0, -1).filter((r) => r.deref())).toHaveLength(0);
+        expect(refs[refs.length - 1].deref()).toBeDefined();
+        // ...and the installed generation still works.
+        expect(lua.execute_script('return t.anything')).toBe(19);
+      });
+
+      it('releases the previous module generation', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const refs: WeakRef<object>[] = [];
+        for (let i = 0; i < 20; i++) {
+          const fn = function mf() { return i; };
+          refs.push(new WeakRef(fn));
+          lua.register_module('m', { f: fn });
+        }
+        lua.gc('collect');
+        lua.gc('collect');
+        await gcSettle();
+        expect(refs.slice(0, -1).filter((r) => r.deref())).toHaveLength(0);
+        expect(refs[refs.length - 1].deref()).toBeDefined();
+        expect(lua.execute_script("return require('m').f()")).toBe(19);
+      });
+
+      it('releases a collected userdata\'s method callbacks', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const refs: WeakRef<object>[] = [];
+        for (let i = 0; i < 20; i++) {
+          const m = function meth() { return i; };
+          refs.push(new WeakRef(m));
+          lua.set_userdata('u' + i, {}, { methods: { go: m } });
+          lua.execute_script(`u${i} = nil`);
+        }
+        lua.gc('collect');
+        lua.gc('collect');
+        await gcSettle();
+        // "All but the last": see the metatable case for why the final loop
+        // value is excluded.
+        expect(refs.slice(0, -1).filter((r) => r.deref())).toHaveLength(0);
+      });
+
+      it('a live userdata keeps its methods (the fix must not over-collect)', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_userdata('u', {}, { methods: { go: () => 'still here' } });
+        lua.gc('collect');
+        lua.gc('collect');
+        await gcSettle();
+        expect(lua.execute_script('return u:go()')).toBe('still here');
+      });
+
+      it('control: the M2 reclaimable path is still reclaiming', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const refs: WeakRef<object>[] = [];
+        for (let i = 0; i < 20; i++) {
+          const fn = function anon() { return i; };
+          refs.push(new WeakRef(fn));
+          lua.set_global('tmp', { cb: fn });
+        }
+        lua.set_global('tmp', null);
+        lua.gc('collect');
+        lua.gc('collect');
+        await gcSettle();
+        expect(refs.slice(0, -1).filter((r) => r.deref())).toHaveLength(0);
+      });
+
+      it('a failed set_metatable still strands nothing (CR-8 F3 ordering intact)', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const wr = (() => {
+          const fn = () => 42;
+          const ref = new WeakRef(fn);
+          expect(() => lua.set_metatable('no_such_global', { __index: fn }))
+            .toThrow(/does not exist/);
+          return ref;
+        })();
+        await gcSettle();
+        expect(wr.deref()).toBeUndefined();
+      });
+    });
+
+    // --- F3 (binding half). The core-level pins live in the C++ suite, since
+    // every binding entry point masks the gap with its own CallScope. What is
+    // checkable here is that the mode switches still behave and that the guard
+    // they lost is back.
+    describe('F3: gc() mode switches run finalizers under the guard', () => {
+      it('rejects reset() from a finalizer reached by gc(\'generational\')', () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({
+          doreset: () => {
+            try { lua.reset(); seen.push('RESET RAN'); }
+            catch (e: any) { seen.push(e.message); }
+            return 1;
+          },
+        }, ALL_LIBS);
+        lua.execute_script(
+          `function mk(n) for i=1,n do
+             local t = setmetatable({}, { __gc = function() doreset() end }); t = nil
+           end end`);
+        lua.execute_script('mk(300)');
+        lua.gc('generational');
+        expect(seen).not.toHaveLength(0);
+        expect(seen.every((m) => /reset\(\) cannot be called while Lua is executing/.test(m)))
+          .toBe(true);
+      });
+
+      it('still reports the previous collector mode', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.gc('incremental');
+        expect(lua.gc('generational')).toBe('incremental');
+        expect(lua.gc('incremental')).toBe('generational');
+      });
+    });
+  });
+
 });

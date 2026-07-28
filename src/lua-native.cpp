@@ -1029,9 +1029,19 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
 }
 
 void LuaContext::InstallRuntimeHandlers() {
-  // Set up userdata GC callback
+  // Set up userdata GC callback. The core has already dropped the Lua-side
+  // method table by the time this runs; drop the JS half — the object reference
+  // and the method callbacks minted alongside it — so a short-lived userdata
+  // with methods doesn't pin them for the life of the context (CR-11 F4).
   runtime->SetUserdataGCCallback([this](int ref_id) {
     js_userdata_.erase(ref_id);
+    if (const auto it = ud_method_fns_.find(ref_id); it != ud_method_fns_.end()) {
+      for (const auto& func_name : it->second) {
+        js_callbacks_.erase(func_name);
+        runtime->RemoveHostFunction(func_name);
+      }
+      ud_method_fns_.erase(it);
+    }
   });
 
   // Drop the paired JS reference when an anonymous nested callback's Lua closure
@@ -1386,6 +1396,10 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
       }
 
       runtime->SetUserdataMethodTable(ref_id, method_map);
+      // Recorded only once the whole build succeeded, so the failure path below
+      // — which erases the same names itself — is the only cleanup on that
+      // route. From here the userdata's own __gc owns their lifetime (CR-11 F4).
+      ud_method_fns_[ref_id] = registered_method_fns;
     }
   } catch (const std::exception& e) {
     js_userdata_.erase(ref_id);
@@ -1571,6 +1585,10 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // Deliberately NOT reserved as reclaimable the way set_metatable's and
+  // register_module's entries are (CR-11 F4): a class registration cannot be
+  // superseded — `registered_classes_` rejects a second use of the name — so
+  // its constructor and methods are permanent by design, not stranded.
   js_callbacks_[ctor_name] = Napi::Persistent(constructFn);
   runtime->StoreHostFunction(ctor_name,
     CreateConstructorWrapper(ctor_name, class_name, readable, writable));
@@ -1673,6 +1691,14 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
     entries.push_back(std::move(entry));
   }
 
+  // Reserve the names as reclaimable *before* the core call, so the closures it
+  // builds carry the reclaim sentinel and this metatable's callbacks are
+  // released once a later set_metatable supersedes it — previously they were
+  // pinned for the life of the context (CR-11 F4). The reservation creates no
+  // host_functions_/js_callbacks_ entry, so the CR-8 F3 ordering is unchanged;
+  // the collector sweeps any reservation whose closure was never built.
+  ReserveDeferredCallbacks(deferred_fns);
+
   try {
     // The global form reads _G[name] through the protected path, so a
     // metatabled _G runs its __index here (CR-9 F1).
@@ -1773,6 +1799,10 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 
     entries.push_back(std::move(entry));
   }
+
+  // See SetMetatable: reserved before the core call so re-registering the same
+  // module name releases the previous generation's callbacks (CR-11 F4).
+  ReserveDeferredCallbacks(deferred_fns);
 
   try {
     // Reads package / package.loaded, so a metatabled package runs its
@@ -2410,17 +2440,23 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
     Napi::HandleScope scope(env);
     // Look the callback up explicitly: operator[] would default-construct an
     // empty FunctionReference for a missing name, and calling that is UB.
-    auto cbIt = js_callbacks_.find(name);
+    const auto cbIt = js_callbacks_.find(name);
     if (cbIt == js_callbacks_.end()) {
       throw std::runtime_error("JS callback '" + name + "' is no longer registered");
     }
+    // Materialize the callback before anything below can run user JS: a nested
+    // registration can rehash js_callbacks_, which invalidates iterators (the
+    // stored FunctionReference is stable, the iterator is not). Taking the
+    // value now also gives this call the function it started with, even if the
+    // entry is replaced mid-flight (CR-11 F5, the binding half of F2).
+    const Napi::Function callback = cbIt->second.Value();
     std::vector<napi_value> jsArgs;
     jsArgs.reserve(args.size());
     for (const auto& a : args) {
       jsArgs.push_back(CoreToNapi(*a));
     }
     try {
-      const Napi::Value result = cbIt->second.Call(jsArgs);
+      const Napi::Value result = callback.Call(jsArgs);
       if (result.IsPromise()) {
         if (!runtime->IsAwaitDriverMode()) {
           throw std::runtime_error(
@@ -2456,11 +2492,14 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     // the outer entry scope until the whole Lua execution returns (M11). Nothing
     // needs to escape: the instance survives via the Napi::Persistent below.
     Napi::HandleScope scope(env);
-    auto cbIt = js_callbacks_.find(name);
+    const auto cbIt = js_callbacks_.find(name);
     if (cbIt == js_callbacks_.end()) {
       throw std::runtime_error(
         "Class '" + class_name + "' constructor is no longer registered");
     }
+    // See CreateJsCallbackWrapper: take the function out of the map before any
+    // user JS runs, so a rehash can't invalidate the iterator (CR-11 F5).
+    const Napi::Function callback = cbIt->second.Value();
     std::vector<napi_value> jsArgs;
     jsArgs.reserve(args.size());
     for (const auto& a : args) {
@@ -2469,7 +2508,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
 
     Napi::Value instance;
     try {
-      instance = cbIt->second.Call(jsArgs);
+      instance = callback.Call(jsArgs);
     } catch (const Napi::Error& e) {
       throw std::runtime_error(StageJsError(e.Value(), e.Message()));
     }
@@ -3137,6 +3176,7 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // ref_id minted before the reset can never collide with one minted after.
   js_callbacks_.clear();
   js_userdata_.clear();
+  ud_method_fns_.clear();  // the userdata whose __gc would drain these are gone
   js_error_registry_.clear();
   registered_classes_.clear();
 
@@ -3522,6 +3562,23 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   return result;
 }
 
+// Marks each deferred name reclaimable and hands it to the active collector.
+//
+// Used by set_metatable / register_module, whose function-valued entries are
+// registered only after their core call succeeds (CR-8 F3) but whose closures
+// are built *by* that call — so the reclaim sentinel can only be attached if
+// the name is already known to be reclaimable. The reservation itself creates
+// no host_functions_ or js_callbacks_ entry, and the enclosing
+// JsCallbackCollectorScope sweeps any reservation whose closure was never built
+// (a failed core call), so nothing is stranded either way (CR-11 F4).
+void LuaContext::ReserveDeferredCallbacks(
+    const std::vector<std::pair<std::string, Napi::Function>>& deferred) {
+  for (const auto& [func_name, fn] : deferred) {
+    runtime->ReserveReclaimableHostFunction(func_name);
+    if (js_callback_collector_) js_callback_collector_->push_back(func_name);
+  }
+}
+
 void LuaContext::SweepUnpushedJsCallbacks(const std::vector<std::string>& names) {
   for (const auto& name : names) {
     if (runtime && runtime->EraseReclaimableIfUnpushed(name)) {
@@ -3642,13 +3699,20 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
 
     // B2: user-registered converters get first look at objects (after internal
     // round-trip markers, before built-in type handling). A converter returns a
-    // JS value that is then converted normally. Index the vector and pull both
-    // function handles out BEFORE calling match(): a match/convert callback may
-    // re-enter and register another converter, reallocating the vector and
-    // invalidating any reference held across the call.
-    for (auto &[fst, snd] : type_converters_) {
-      Napi::Function match = fst.Value();
-      Napi::Function convert = snd.Value();
+    // JS value that is then converted normally.
+    //
+    // Index the vector — do NOT use a range-for — and pull both function
+    // handles out BEFORE calling match(): a match/convert callback may re-enter
+    // and register another converter, reallocating the vector. Copying the
+    // handles protects this iteration's operands; re-reading size() and
+    // indexing each time is what protects the *cursor*, which a range-for
+    // caches as a raw pointer into the old buffer. CR-2 established this and a
+    // later modernization pass reverted it to a range-for, reintroducing a
+    // confirmed heap-use-after-free (CR-11 F1). The NOLINT is load-bearing.
+    // NOLINTNEXTLINE(modernize-loop-convert)
+    for (size_t i = 0; i < type_converters_.size(); ++i) {
+      Napi::Function match = type_converters_[i].first.Value();
+      Napi::Function convert = type_converters_[i].second.Value();
       if (match.Call({value}).ToBoolean().Value()) {
         return NapiToCoreInstance(convert.Call({value}), depth + 1);
       }
@@ -3708,13 +3772,15 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
   if (from_lua_converters_.empty()) return result;
   if (!result.IsObject() || result.IsFunction()) return result;
 
-  // Index the vector and pull both handles out BEFORE calling match(): a
-  // match/convert callback may re-enter and register another converter,
-  // reallocating the vector and invalidating any reference held across the call
-  // (the same discipline as the JS->Lua loop).
-  for (auto &[fst, snd] : from_lua_converters_) {
-    Napi::Function match = fst.Value();
-    const Napi::Function convert = snd.Value();
+  // Index the vector — do NOT use a range-for — and pull both handles out
+  // BEFORE calling match(): a match/convert callback may re-enter and register
+  // another converter, reallocating the vector. See NapiToCoreImpl's loop for
+  // why the cursor, not just the operands, is what the indexing protects, and
+  // why the NOLINT must stay (CR-11 F1).
+  // NOLINTNEXTLINE(modernize-loop-convert)
+  for (size_t i = 0; i < from_lua_converters_.size(); ++i) {
+    Napi::Function match = from_lua_converters_[i].first.Value();
+    const Napi::Function convert = from_lua_converters_[i].second.Value();
     if (match.Call({result}).ToBoolean().Value()) {
       return convert.Call({result});
     }
@@ -3757,16 +3823,23 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
         } else if constexpr (std::is_same_v<T, lua_core::LuaFunctionRef>) {
           // The data is owned by a finalizer tied to the JS function, so it (and
           // its registry ref) is freed when the function is garbage-collected.
-          auto* dataPtr = new LuaFunctionData(runtime, v, this, alive_);
+          // Held by unique_ptr until that finalizer becomes the owner, so an
+          // N-API allocation that throws in between cannot leak it — the same
+          // discipline CreateTableHandle and CreateCoroutineObject use
+          // (CR-9 F4, swept to its remaining siblings by CR-11 F5).
+          auto data = std::make_unique<LuaFunctionData>(runtime, v, this, alive_);
+          LuaFunctionData* dataPtr = data.get();
           const Napi::Function fn =
             Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
           // Non-writable + non-configurable: this External's finalizer owns the
           // LuaFunctionData that `fn` still calls through, so it must not be
           // deletable or reassignable from JS (L6).
-          DefineHiddenProp(env, fn, "__luaFnOwner",
-            Napi::External<LuaFunctionData>::New(env, dataPtr,
-              [](Napi::Env, LuaFunctionData* d) { delete d; }),
-            /*writable=*/false);
+          const auto owner = Napi::External<LuaFunctionData>::New(env, dataPtr,
+            [](Napi::Env, LuaFunctionData* d) { delete d; });
+          // Released the moment the External exists, not after DefineHiddenProp
+          // (which can throw): the finalizer is already the owner by then.
+          (void)data.release();
+          DefineHiddenProp(env, fn, "__luaFnOwner", owner, /*writable=*/false);
           return fn;
         } else if constexpr (std::is_same_v<T, lua_core::LuaThreadRef>) {
           // Return a coroutine object with the thread reference (data owned by the
@@ -3785,11 +3858,14 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
             return env.Null();
           } else {
             // Lua-created userdata - wrap as opaque handle for round-trip (data
-            // owned by the External's finalizer).
-            auto* dataPtr = new LuaUserdataData(runtime, v);
+            // owned by the External's finalizer; unique_ptr until then, see the
+            // LuaFunctionRef branch above).
+            auto data = std::make_unique<LuaUserdataData>(runtime, v);
             Napi::Object handle = Napi::Object::New(env);
-            handle.Set("_userdata", Napi::External<LuaUserdataData>::New(env, dataPtr,
-              [](Napi::Env, LuaUserdataData* d) { delete d; }));
+            const auto owner = Napi::External<LuaUserdataData>::New(env, data.get(),
+              [](Napi::Env, LuaUserdataData* d) { delete d; });
+            (void)data.release();  // ownership transferred to the finalizer
+            handle.Set("_userdata", owner);
             return handle;
           }
         } else if constexpr (std::is_same_v<T, lua_core::LuaTableRef>) {
@@ -3797,11 +3873,15 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // owned by the External's finalizer, tied to the proxy target's life.
           Napi::Object target = Napi::Object::New(env);
 
-          auto* dataPtr = new LuaTableRefData(runtime, v, this, alive_);
+          // unique_ptr until the External's finalizer owns it, see the
+          // LuaFunctionRef branch above (CR-11 F5).
+          auto data = std::make_unique<LuaTableRefData>(runtime, v, this, alive_);
+          LuaTableRefData* dataPtr = data.get();
 
           // Store _tableRef as non-enumerable on target for round-trip detection
           auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
             [](Napi::Env, LuaTableRefData* d) { delete d; });
+          (void)data.release();  // ownership transferred to the finalizer
           const auto Object = env.Global().Get("Object").As<Napi::Object>();
           const auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
           Napi::Object descriptor = Napi::Object::New(env);

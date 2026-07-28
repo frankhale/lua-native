@@ -388,6 +388,16 @@ public:
   // anonymous JS callbacks nested inside values crossing JS→Lua, which would
   // otherwise accumulate for the life of the context (M2).
   void RegisterReclaimableHostFunction(const std::string& name, Function fn);
+  // Marks `name` reclaimable *before* its Function exists, so a closure built
+  // for it during a core call carries the reclaim sentinel — while the caller
+  // still registers the Function (and its paired JS reference) only after that
+  // core call succeeds.
+  //
+  // This is what lets set_metatable / register_module keep the CR-8 F3 ordering
+  // and still be reclaimable (CR-11 F4). Nothing is added to host_functions_,
+  // so a failed core call strands no callable; the reservation itself is swept
+  // by EraseReclaimableIfUnpushed, whose live count is still 0.
+  void ReserveReclaimableHostFunction(const std::string& name);
   // Erases a reclaimable entry that was registered but never materialized as a
   // closure (live count still 0), so a conversion discarded before its value
   // was pushed doesn't strand the entry for the context's lifetime (N4).
@@ -625,12 +635,14 @@ public:
   // Lua shares the enclosing execution's budget, so the limit bounds the whole
   // call tree rather than being reset by each re-entry.
   //
-  // Two consequences of being hook-driven: the check happens between VM
+  // Three consequences of being hook-driven: the check happens between VM
   // instructions, so a single long-running C call (a huge string.rep, a host
-  // callback that blocks) is not interrupted; and granularity is the hook's
-  // sampling interval. It is a complement to maxInstructions, not a
-  // replacement — real time is the more intuitive budget, instruction counts
-  // the more deterministic one.
+  // callback that blocks) is not interrupted; granularity is the hook's
+  // sampling interval; and a __gc finalizer is not interruptible at all, since
+  // Lua clears allowhook around one, so neither this timeout nor
+  // maxInstructions nor cancel() can abort a runaway finalizer (CR-11 F3). It
+  // is a complement to maxInstructions, not a replacement — real time is the
+  // more intuitive budget, instruction counts the more deterministic one.
   void SetTimeout(size_t ms);
   [[nodiscard]] size_t GetTimeout() const { return timeout_ms_; }
 
@@ -688,6 +700,10 @@ public:
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
   static void PushLuaValue(lua_State* L, const LuaPtr& value, int depth = 0);
+  // The single place a host-function name becomes a Lua closure. Public so the
+  // metatable / module / searcher builders share the reclaim accounting rather
+  // than each pushing its own bare lua_pushcclosure (CR-11 F4).
+  static void PushHostFunctionClosure(lua_State* L, const std::string& name);
 
   void StoreFunctionData(void* data, void (*destructor)(void*)) {
     stored_function_data_.emplace_back(data, destructor);
@@ -717,7 +733,21 @@ private:
   MemoryAllocator allocator_;
   lua_State* L_ { nullptr };
   RuntimeConfig config_;  // see GetConfig()
-  std::unordered_map<std::string, Function> host_functions_;
+  // Every registered JS callback, keyed by the name its Lua closure carries as
+  // an upvalue.
+  //
+  // Held behind a shared_ptr for the same reason output_handler_ and
+  // debug_hook_ are (CR-9 F4, extended to this map by CR-11 F2): the three
+  // bridges below invoke an entry while user JS runs inside it, and that JS can
+  // replace the entry — `set_global('foo', fn)` from inside `foo` is an
+  // ordinary hot-swap — which would destroy the std::function currently
+  // executing and leave its captures (a LuaContext*, the name string, the
+  // liveness flag) dangling. Each bridge therefore copies the owner out of the
+  // map before calling, so a replaced entry stays alive until the call returns.
+  //
+  // The indirection also makes erasure safe: ClearHostFunctions() and the
+  // reclaim path can drop an entry that is mid-call without freeing it.
+  std::unordered_map<std::string, std::shared_ptr<Function>> host_functions_;
   std::vector<std::pair<void*, void (*)(void*)>> stored_function_data_;
 
   // Userdata support

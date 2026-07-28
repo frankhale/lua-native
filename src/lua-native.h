@@ -312,6 +312,13 @@ public:
     // static Lua-function trampoline can reach it.
     void SweepUnpushedJsCallbacks(const std::vector<std::string>& names);
 
+    // Reserves each deferred function-entry name as reclaimable before the core
+    // call that materializes its closure, and records it with the active
+    // collector so a failed core call sweeps the reservation (CR-11 F4). Public
+    // only because it sits beside SweepUnpushedJsCallbacks, which is.
+    void ReserveDeferredCallbacks(
+        const std::vector<std::pair<std::string, Napi::Function>>& deferred);
+
 private:
     // The addon env, captured at construction. Safe to reuse from later instance
     // methods because they all run on the same JS thread while this ObjectWrap is
@@ -402,6 +409,16 @@ private:
     // maps and the in-userdata-block storage, so it stays int; the remaining
     // counters only feed unique-name strings and are widened to avoid overflow.
     std::unordered_map<int, UserdataEntry> js_userdata_;
+    // The `__ud_method_<ref_id>_<name>` host functions minted for each userdata,
+    // so they can be dropped when that userdata is collected.
+    //
+    // Their closures are built lazily by the core's UserdataIndex (from names
+    // held in the `_ud_methods_<ref_id>` registry table), so the reclaim-sentinel
+    // mechanism cannot see them — but their natural lifetime is the userdata's,
+    // and the runtime already tells us when that ends. Without this, every
+    // set_userdata(..., { methods }) pinned its method closures for the life of
+    // the context even after the userdata was gone (CR-11 F4).
+    std::unordered_map<int, std::vector<std::string>> ud_method_fns_;
     int next_userdata_id_ = 1;
     uint64_t next_metatable_id_ = 1;
     uint64_t next_module_id_ = 1;
