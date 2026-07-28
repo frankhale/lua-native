@@ -2004,7 +2004,6 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
   // nobody (CR-9 F4).
   auto data = std::make_unique<LuaTableRefData>(
     runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this, alive_);
-  LuaTableRefData* dataPtr = data.get();
 
   const Napi::Object handle = Napi::Object::New(env_);
 
@@ -2014,11 +2013,11 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
   // freed memory once the handle object is collected. Non-configurable so it
   // can't be deleted to free the data out from under the still-bound methods —
   // the same ownership discipline used for __luaFnOwner (H3 / L6).
-  const auto external = Napi::External<LuaTableRefData>::New(env_, dataPtr,
+  const auto external = Napi::External<LuaTableRefData>::New(env_, data.get(),
     [](Napi::Env, const LuaTableRefData* d) { delete d; });
   // Ownership has transferred: from here a throw leaves the External unrooted,
   // and its finalizer reclaims dataPtr (and the ref) when it is collected.
-  (void)data.release();
+  LuaTableRefData* const dataPtr = data.release();
   DefineHiddenProp(env_, handle, "_tableRef", external, /*writable=*/false);
 
   auto addMethod = [&](const char* name,
@@ -4042,7 +4041,9 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           const auto owner = Napi::External<LuaFunctionData>::New(env, dataPtr,
             [](Napi::Env, LuaFunctionData* d) { delete d; });
           // Released the moment the External exists, not after DefineHiddenProp
-          // (which can throw): the finalizer is already the owner by then.
+          // (which can throw): the finalizer is already the owner by then, so
+          // the discarded result is deliberate.
+          // NOLINTNEXTLINE(bugprone-unused-return-value)
           (void)data.release();
           DefineHiddenProp(env, fn, "__luaFnOwner", owner, /*writable=*/false);
           return fn;
@@ -4069,6 +4070,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
             Napi::Object handle = Napi::Object::New(env);
             const auto owner = Napi::External<LuaUserdataData>::New(env, data.get(),
               [](Napi::Env, LuaUserdataData* d) { delete d; });
+            // NOLINTNEXTLINE(bugprone-unused-return-value)
             (void)data.release();  // ownership transferred to the finalizer
             handle.Set("_userdata", owner);
             return handle;
@@ -4086,6 +4088,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // Store _tableRef as non-enumerable on target for round-trip detection
           auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
             [](Napi::Env, LuaTableRefData* d) { delete d; });
+          // NOLINTNEXTLINE(bugprone-unused-return-value)
           (void)data.release();  // ownership transferred to the finalizer
           const auto Object = env.Global().Get("Object").As<Napi::Object>();
           const auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
@@ -4274,6 +4277,7 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
   // alive — the same ownership discipline as the table handles (H3 / L6).
   const auto owner = Napi::External<LuaCoroIterState>::New(env, state,
     [](Napi::Env, const LuaCoroIterState* s) { delete s; });
+  // NOLINTNEXTLINE(bugprone-unused-return-value)
   (void)state_owner.release();  // ownership transferred to the finalizer
   DefineHiddenProp(env, iterator, "__coroIterOwner", owner, /*writable=*/false);
 
@@ -4300,6 +4304,11 @@ Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> da
   // garbage-collected.
   (void)coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, data.get(),
     [](Napi::Env, const LuaThreadData* d) { delete d; }));
+  // Discarding release() is deliberate: the pointer is already held by the
+  // External above. Releasing *after* the External exists is what keeps the
+  // throw path safe, so the result cannot be consumed by folding it into the
+  // New() argument.
+  // NOLINTNEXTLINE(bugprone-unused-return-value)
   (void)data.release();  // ownership transferred to the finalizer
   (void)coro.Set("status", Napi::String::New(env, status));
 
@@ -4311,7 +4320,8 @@ Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> da
     [](Napi::Env, const LuaContextBinding* b) { delete b; });
   // Released the moment the External exists — not after DefineHiddenProp, which
   // can throw: the finalizer is already the owner by then, so a later release
-  // would be a double free.
+  // would be a double free. The discarded result is deliberate for that reason.
+  // NOLINTNEXTLINE(bugprone-unused-return-value)
   (void)binding_owner.release();
   DefineHiddenProp(env, iterFn, "__coroBindingOwner", bindingExternal,
     /*writable=*/false);
@@ -4426,7 +4436,7 @@ Napi::Value LuaContext::ResumeCoroutineObject(const Napi::Object& coroObj,
     return env.Undefined();
   }
 
-  Napi::Value externalVal = coroObj.Get("_coroutine");
+  const Napi::Value externalVal = coroObj.Get("_coroutine");
   if (!externalVal.IsExternal()) {
     Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
     return env.Undefined();
