@@ -47,6 +47,34 @@ looks.
 
 ---
 
+## Resolution status (July 28, 2026)
+
+All five findings resolved. After the fixes: **796 TypeScript tests** (up from
+792 — four new CR-12 regression tests) and **283 C++ tests** (unchanged) pass
+against a freshly built debug binary, and all four sanitizer harnesses are clean:
+`test-ts-asan` (796/796, no sanitizer report), `test-cpp-asan` (283/283),
+`test-cpp-tsan` (283/283) and `test-ts-tsan` (796/796).
+
+Two of this pass's recommendations turned out to be wrong when driven, and both
+are recorded below rather than quietly worked around — the review asked for its
+completeness claims to be checked, and the same standard applies to its
+prescriptions.
+
+| # | Status | Resolution |
+|---|--------|------------|
+| F1 | ✅ Done | All three core bridges take the owner as the first statement of their scoped block and never name `it` again. Placement matters and is not what the recommendation sketched: the copy must live *inside* the block that ends before the `lua_error`, because every raise here longjmps past destructors — a function-scope `shared_ptr` would leak a reference (and with it the JS callback) on each error path. `LuaCallHostFunction` and `UserdataMethodCall` moved the existing CR-11 F2 copy above the argument-conversion loop; `JsSearcher` had an empty window and was swept anyway. **No pin:** as the finding states, both libc++ and the MSVC STL relink nodes on rehash rather than moving them, so there is no platform where this is observable. Unchanged behaviour, one line each. |
+| F2 | ✅ Done | `RegisterClass`'s metamethod loop, `RegisterClass`'s class `new`, and `RegisterFunction` all route through `PushHostFunctionClosure`. Behaviour-preserving by construction — none of those name families is reclaimable, so the helper builds the identical one-upvalue closure — and the comment now states the invariant in a form that can be checked rather than believed: `grep -n 'lua_pushcclosure(.*LuaCallHostFunction' src/core/lua-runtime.cpp` must return exactly one hit, inside the helper. It does. Two TS pins covering the three name families (class metamethods, class constructor, `set_global`). |
+| F3 | ✅ Done | `CaptureError`'s `"message"` key push is now inside the scope that already covered the `__tostring` pcall (hoisted, not added — one scope covers both), and `ResumeAsyncStep`'s `luaL_traceback` is bracketed. The enumeration is recorded next to `IsExecuting()` in the header, in the review's own three buckets, ending with **"unbracketed: nothing"** — so the next pass verifies the class is closed by reading one list. **No pin:** neither site could be driven here either, matching the finding's own calibration. |
+| F4 | ✅ Done — **and the finding under-called it.** | The review reports "I could not construct a consumer" and calibrates accordingly. There is one, and it is two lines: any later host-call failure that raises *without* staging, because the bridge's catch prefers a pending value over its own message. A callback returning a Promise outside `execute_async()` is exactly that path. Pinned as a TS regression test; **verified to fail without the fix**, where `execute_script('return promiser()')` throws `"from the retired generation"` — the retired state's error, delivered to an unrelated call a generation later — instead of `"…returned a Promise…"`. The recommended guard (`runtime->IsExecuting()`) is also not usable: the async promise-settlement path stages from a microtask with no execution in flight at all, so it would have silently disabled D1 error fidelity through async. The fix is owner identity instead — each wrapper captures the raw `LuaRuntime*` it is stored on, and `StageJsError` falls back to the plain message when that is not the context's current runtime. |
+| F5 | ✅ Done, with two corrections | **`next_js_error_id_`** widened to `uint64_t` along with its map key; the id round-trips through Lua as an `int64_t`, and a forged negative now misses the map instead of wrapping into a live entry. **`HasClass` deleted, not wired in** — the suggested caller is wrong: a registration that fails after `luaL_newmetatable` leaves the class metatable behind, so probing the registry reports a name as taken that the binding has already rolled back and must let the caller retry. Wiring it in fails the CR-8 F3 pin, which is how this was caught. The header records why, so the next pass does not re-propose it. **`Propagate`** re-reads `value_.Value()` per target, but the anomaly as described is not reachable: `set()` mutates the object `value_` holds rather than replacing it, so the pre-loop snapshot is a handle to that same object and every push already converts its current contents. Verified both ways — the new re-entrancy test passes with either form. The re-read is kept as a guard on a property no caller states, and both the comment and the test say plainly that they pin behaviour rather than a fix. |
+
+The two release-time deferrals (CR-3 M5's `MACOSX_DEPLOYMENT_TARGET`, CR-5 F8's
+`prebuilds/`) remain deferred by decision.
+
+The original findings follow unchanged for reference.
+
+---
+
 ## Verification of the CODE-REVIEW-11 remediation
 
 | CR-11 # | Verdict |

@@ -487,8 +487,13 @@ public:
       const std::vector<MetatableEntry>& metamethods,
       const std::string& parent_class_name = "");
 
-  /// True if `class_name` has a registered per-class metatable on this state.
-  [[nodiscard]] bool HasClass(const std::string& class_name) const;
+  // HasClass was removed (CR-12 F5): it had no callers, and the one caller
+  // proposed for it — register_class's duplicate check — is wrong. A
+  // registration that failed after luaL_newmetatable leaves the class metatable
+  // behind, so the probe reports a name as taken that the binding has already
+  // rolled back and must let the caller retry (CR-8 F3). A future caller wanting
+  // "is this class usable" needs a test that distinguishes that residue from a
+  // completed registration; the registry probe alone does not.
 
   // Table reference operations (for metatabled tables preserved as refs).
   // The plain-string variants coerce a numeric-looking key to an integer key
@@ -665,6 +670,33 @@ public:
   // Deliberately owned by the core rather than by a binding-side counter, so a
   // new binding method cannot forget to arm it — it never has to know it
   // exists.
+  //
+  // The enumeration below is the whole of it, recorded here so a later pass can
+  // check the class is closed by reading one list instead of re-deriving it
+  // (CR-12 F3). Every allocating call in the core is in exactly one bucket:
+  //
+  //   bracketed by an ExecutionScope: the seven chunk loaders; both lua_resume
+  //     sites; all three argument stagings; RunProtected, ProtectedTableCall,
+  //     PushProtectedGlobal, ToLuaValueProtected; lua_gc's four collecting
+  //     commands; CaptureError (the "message" key push and the __tostring
+  //     pcall); ResumeAsyncStep's luaL_traceback.
+  //
+  //   correct without a scope, by construction: everything reached from inside
+  //     a Lua C frame, where the enclosing entry already holds a scope — the
+  //     three host bridges, LuaPrint/LuaIoWrite, JsSearcher, the userdata and
+  //     class metamethods, MessageHandler, AsyncContinuation, the debug hook;
+  //     everything inside a RunProtected thunk; PushLuaValueProtected
+  //     (documented static precondition); the constructor's InitState and
+  //     library opening, where the state is fresh and no finalizable object can
+  //     exist yet; and the non-allocating reads (lua_rawgeti, lua_next,
+  //     lua_sethook, luaL_unref, lua_setupvalue).
+  //
+  //   unbracketed: nothing.
+  //
+  // A new allocating call belongs in the first bucket unless it is provably in
+  // the second. "Provably" means naming the enclosing scope, not asserting that
+  // a finalizer is unlikely — CR-12 F3's two sites were unreachable in practice
+  // and still wrong in kind.
   [[nodiscard]] bool IsExecuting() const { return lua_depth_ > 0; }
 
   // Debug hooks (lua_sethook): line / call / return / count tracing, for
@@ -703,6 +735,18 @@ public:
   // The single place a host-function name becomes a Lua closure. Public so the
   // metatable / module / searcher builders share the reclaim accounting rather
   // than each pushing its own bare lua_pushcclosure (CR-11 F4).
+  //
+  // "Single place" is a claim, so it is written to be checkable: every closure
+  // over LuaCallHostFunction is built here, and the invariant is verifiable with
+  // `grep -n 'lua_pushcclosure(.*LuaCallHostFunction' src/core/lua-runtime.cpp`
+  // returning exactly the one hit inside this function. CR-11 F4 left three
+  // builders pushing their own — RegisterClass's metamethod loop and class
+  // `new`, and RegisterFunction — so the comment asserted a property the code
+  // did not have; all three now route through here (CR-12 F2). Names that are
+  // not reclaimable (class metamethods, class constructors, `set_global`
+  // functions) get the identical one-upvalue closure the bare push produced, so
+  // routing them through costs nothing and cannot silently miss the accounting
+  // if they ever do become reclaimable.
   static void PushHostFunctionClosure(lua_State* L, const std::string& name);
 
   void StoreFunctionData(void* data, void (*destructor)(void*)) {

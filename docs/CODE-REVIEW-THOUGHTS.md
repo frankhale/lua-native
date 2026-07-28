@@ -389,3 +389,75 @@ destroyed `std::vector`. `test-cpp-asan` reported it as a `stack-use-after-scope
 on the first run. The test written to pin a lifetime bug had the lifetime bug —
 which is as good an argument as this series will produce for keeping the
 sanitizer harnesses pointed at the tests as well as the code.
+
+---
+
+## Addendum (July 28, 2026, after CODE-REVIEW-12)
+
+CR-12 is the first pass to report nothing above low severity, and it argues —
+correctly — that convergence was measured on a diff rather than on a tree. What
+the *remediation* of CR-12 adds is a lesson aimed one level up, at the review
+itself.
+
+**A review's prescriptions are claims too, and they fail in the same way its
+subjects do.** CR-12's closing note tells the reviewer to treat any comment
+asserting completeness as a claim to be checked. Applied honestly, that rule does
+not stop at the code under review. Two of this pass's five recommendations did
+not survive being driven:
+
+- **F5 proposed wiring `HasClass` into `register_class`'s duplicate check.** It
+  looks obviously right: a dead public method and a check that cannot see the
+  state's own registry. But a registration that *fails* after `luaL_newmetatable`
+  leaves the class metatable behind, so the probe reports a name as taken that
+  the binding has already rolled back and must let the caller retry. Wiring it in
+  broke the CR-8 F3 pin on the first run. The two questions — "does this state
+  have a metatable under this name" and "did this context register this class" —
+  read as synonyms and are not.
+- **F4 proposed guarding `StageJsError` on `runtime->IsExecuting()`.** Also
+  plausible, and it would have silently disabled error fidelity through async:
+  the promise-settlement path stages from a microtask with no execution in flight
+  at all, which is indistinguishable from a retired state's finalizer by that
+  test. The condition that actually separates them is owner identity, which the
+  wrappers have to *carry* — no ambient state answers it.
+
+Both were caught the same way, and it is the cheapest possible way: implement the
+recommendation, run the existing suite, watch a pin from four reviews ago fail.
+Neither needed insight. Both needed the fix to be *built* rather than agreed with.
+
+> **Implement a recommendation before believing it. A review that reasons from
+> the same reading of the code that produced the finding will reproduce that
+> reading's blind spots in its prescription — and the existing regression suite
+> is the cheapest referee available, because it encodes contracts the reviewer
+> was not thinking about.**
+
+**The other direction: a finding's severity is also a claim.** F4 was calibrated
+low on the strength of "I could not construct a consumer", with the honest note
+that the calibration rested on being unable to reach it. The consumer is two
+lines — any later host-call failure that raises without staging, because the
+bridge's catch prefers a pending value over its own message; returning a Promise
+outside `execute_async()` is exactly that path. Before the fix, an unrelated
+`execute_script` a generation later throws the retired state's error verbatim.
+The finding was right about the mechanism and wrong about the reach, which is the
+better failure of the two — but "I could not drive it" bounds the harness, not
+the hazard, and the review says so about its own sanitizer runs three paragraphs
+later. That sentence deserves to be applied to the findings as well as to the
+tooling.
+
+**What went right, worth keeping.** F2 asked for an invariant that could be
+checked instead of believed, and the version that landed states it as a command:
+`grep -n 'lua_pushcclosure(.*LuaCallHostFunction' src/core/lua-runtime.cpp` must
+return exactly one hit. F3 asked for the "can allocate from Lua" enumeration to
+be recorded where the invariant lives, so the class can be re-verified by reading
+one list instead of re-deriving it; it now sits next to `IsExecuting()` and ends
+with "unbracketed: nothing". Both are the same move — convert a property that
+currently lives in a reviewer's head into something the next pass can confirm in
+seconds — and both are cheaper than the review that discovered the need for them.
+
+**And one nit that was not a bug.** F5's `Propagate` staleness cannot occur:
+`set()` mutates the object `value_` holds rather than replacing it, so the
+pre-loop snapshot is a handle to that same object and every push already sees the
+newest contents. The re-read landed anyway, because it costs nothing and removes
+a dependency on a property no caller states — but the comment and the test both
+say plainly that they pin behaviour rather than close a defect. Recording a
+non-finding as a non-finding is the same discipline as recording a deferral: the
+ledger is only useful if it is honest in both directions.

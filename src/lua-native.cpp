@@ -706,12 +706,25 @@ void SharedTable::Propagate(const Napi::Env env_) {
   }
   subscribers_.erase(live, subscribers_.end());
 
-  const Napi::Value value = value_.Value();
   std::string failures;
   size_t failed = 0;
   for (const auto& target : targets) {
     try {
-      PushValue(target.context, target.name, value);
+      // Re-read per target rather than snapshotting before the loop. A push
+      // runs user JS (a type converter, a __newindex on the target global) that
+      // can call set()/sync() re-entrantly, and CR-12 F5 read the pre-loop
+      // snapshot as leaving the remaining targets a generation behind.
+      //
+      // It does not, today, and the honest note is why: set() *mutates* the
+      // object value_ holds rather than replacing it, so a snapshot is a handle
+      // to that same object and each push converts its current contents — a
+      // re-entrant update is already visible to every later target. Verified
+      // both ways; the re-entrancy test in the suite passes with either form.
+      // The re-read is kept because it makes that independent of a property no
+      // caller states: the day value_ is reassigned rather than mutated, the
+      // snapshot silently becomes the stale read CR-12 F5 described, and this
+      // line is what stops it.
+      PushValue(target.context, target.name, value_.Value());
     } catch (const Napi::Error& e) {
       // Keep going: one unavailable context (busy with an async op, say) must
       // not silently skip the updates the others can still receive.
@@ -1436,6 +1449,15 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   auto def = info[1].As<Napi::Object>();
 
   // Reject a duplicate class name before any callback is registered (L7).
+  //
+  // The binding's own ledger is the authority here, deliberately, and not the
+  // core's registry: a registration that *failed* (a hostile `_G.__newindex`
+  // rejecting the class global) has already created the class metatable via
+  // luaL_newmetatable, so a registry probe would report the name as taken and
+  // break the CR-8 F3 contract that a rolled-back registration is retryable.
+  // "The state has a metatable under this name" and "this context registered
+  // this class" are different questions; only the second one belongs here
+  // (CR-12 F5, which suggested the probe — it does not work).
   if (registered_classes_.count(class_name)) {
     Napi::Error::New(env,
       "class '" + class_name + "' is already registered on this context")
@@ -2365,15 +2387,21 @@ LuaContext::~LuaContext() {
   if (runtime) runtime->ClearHostFunctions();
 }
 
-std::string LuaContext::StageJsError(const Napi::Value& value, const std::string& message) {
-  // Only object errors carry structure worth preserving. For non-object throws
-  // (throw "str", throw 42) fall back to the value's string form.
-  if (!value.IsObject()) {
+std::string LuaContext::StageJsError(const Napi::Value& value,
+                                     const std::string& message,
+                                     const lua_core::LuaRuntime* owner) {
+  // A raise on a runtime this context no longer owns cannot be delivered: see
+  // the header. Staging it would strand a pending value and a js_error_registry_
+  // entry on the *live* runtime, belonging to an execution on a different Lua
+  // state (CR-12 F4). Only object errors carry structure worth preserving
+  // either, so both cases fall back to the value's string form the same way.
+  const bool deliverable = !owner || owner == runtime.get();
+  if (!deliverable || !value.IsObject()) {
     return message.empty() ? value.ToString().Utf8Value() : message;
   }
   auto obj = value.As<Napi::Object>();
 
-  const int id = next_js_error_id_++;
+  const uint64_t id = next_js_error_id_++;
   js_error_registry_.emplace(id, Napi::Persistent(obj));
 
   lua_core::LuaTable t;
@@ -2401,8 +2429,13 @@ Napi::Value LuaContext::LuaErrorToJsValue(const std::string& fallback) {
     auto it = t.find(lua_core::LuaRuntime::kJsErrorIdField);
     if (it != t.end() && it->second &&
         std::holds_alternative<int64_t>(it->second->value)) {
-      const int id = static_cast<int>(std::get<int64_t>(it->second->value));
-      auto rit = js_error_registry_.find(id);
+      // The field is a plain Lua number by the time it comes back, so anything
+      // could be sitting in it — a hostile script can forge or mangle the id.
+      // Negatives are rejected before the cast rather than wrapping into some
+      // other live entry's key; a value we never minted simply misses.
+      const int64_t raw = std::get<int64_t>(it->second->value);
+      auto rit = raw < 0 ? js_error_registry_.end()
+                         : js_error_registry_.find(static_cast<uint64_t>(raw));
       if (rit != js_error_registry_.end()) {
         Napi::Object original = rit->second.Value();
         js_error_registry_.erase(rit);
@@ -2424,7 +2457,12 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
   // holds a share of it, and lua_close's __gc metamethods dispatch through
   // here. Without the check, a finalizer firing after ~LuaContext reads
   // js_callbacks_ and env out of freed memory (CR-10 F2).
-  return [this, name, alive = context_alive_](
+  // `owner` is the runtime this wrapper is about to be stored on — captured for
+  // identity only, and it cannot dangle, since the map that owns the wrapper
+  // lives on that runtime. It tells StageJsError below whether the raise it is
+  // staging for is happening on this context's *current* state or on a retired
+  // one whose finalizers are still running (CR-12 F4).
+  return [this, name, alive = context_alive_, owner = runtime.get()](
            const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
     if (!alive || !alive->load()) {
       // Must precede every member access, including the HandleScope's `env`.
@@ -2469,7 +2507,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
       }
       return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
     } catch (const Napi::Error& e) {
-      throw std::runtime_error(StageJsError(e.Value(), e.Message()));
+      throw std::runtime_error(StageJsError(e.Value(), e.Message(), owner));
     }
   };
 }
@@ -2477,7 +2515,9 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
 lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     const std::string& name, const std::string& class_name,
     bool readable, bool writable) {
-  return [this, name, class_name, readable, writable, alive = context_alive_](
+  // See CreateJsCallbackWrapper for `owner` (CR-12 F4).
+  return [this, name, class_name, readable, writable, alive = context_alive_,
+          owner = runtime.get()](
       const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
     // See CreateJsCallbackWrapper: this wrapper is stored on the runtime, which
     // can outlive the context, so check liveness before any member access
@@ -2510,7 +2550,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     try {
       instance = callback.Call(jsArgs);
     } catch (const Napi::Error& e) {
-      throw std::runtime_error(StageJsError(e.Value(), e.Message()));
+      throw std::runtime_error(StageJsError(e.Value(), e.Message(), owner));
     }
 
     if (!instance.IsObject() || instance.IsArray() || instance.IsFunction()) {

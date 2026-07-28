@@ -905,6 +905,12 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
   // inside the scope, then longjmp only after C++ locals are destroyed.
   HostCallOutcome outcome = HostCallOutcome::Return1;
   {
+    // See LuaCallHostFunction: take the owner at the top of the scope, before
+    // the conversion loop below can allocate, and never name `it` again
+    // (CR-11 F2 for the callable's lifetime, CR-12 F1 for the iterator's). The
+    // copy lives inside this block because the raises below longjmp.
+    const std::shared_ptr<Function> fn = it->second;
+
     // Convert all arguments (including self at position 1)
     const int argc = lua_gettop(L);
     std::vector<LuaPtr> args;
@@ -922,10 +928,6 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
     if (converted) {
       LuaPtr resultHolder;
       bool called = true;
-      // Copy the owner before calling: the JS this dispatches into can replace
-      // host_functions_[func_name], which would otherwise destroy the callable
-      // executing right now (CR-11 F2).
-      const std::shared_ptr<Function> fn = it->second;
       try {
         resultHolder = (*fn)(args);
       } catch (const std::exception& e) {
@@ -993,17 +995,6 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
 
 // --- Class / usertype support ---
 
-bool LuaRuntime::HasClass(const std::string& class_name) const {
-  StackGuard guard(L_);
-  // The registry read interns its key string, which allocates — and an
-  // allocation can drive a GC step whose __gc finalizers re-enter the host
-  // (CR-11 F3). No metamethod can fire: the registry has no metatable.
-  ExecutionScope exec(this);
-  const std::string mt_name = kClassMetaPrefix + class_name;
-  lua_getfield(L_, LUA_REGISTRYINDEX, mt_name.c_str());
-  return lua_istable(L_, -1);
-}
-
 void LuaRuntime::RegisterClass(
     const std::string& class_name,
     const std::string& constructor_func_name,
@@ -1062,9 +1053,13 @@ void LuaRuntime::RegisterClass(
   lua_setfield(L_, -2, kClassMarkerField);
 
   // Operator overloads / other metamethods dispatch through the host bridge.
+  // Built by the shared helper like every other host-function closure: class
+  // names are never reserved as reclaimable (registered_classes_ forbids
+  // superseding them), so this is the same one-upvalue closure the bare push
+  // produced — routing it through the helper is what keeps the helper's
+  // "single place" claim true (CR-12 F2).
   for (const auto& mm : metamethods) {
-    lua_pushstring(L_, mm.func_name.c_str());
-    lua_pushcclosure(L_, LuaCallHostFunction, 1);
+    PushHostFunctionClosure(L_, mm.func_name);
     lua_setfield(L_, mt_idx, mm.key.c_str());
   }
 
@@ -1113,8 +1108,7 @@ void LuaRuntime::RegisterClass(
 
   // 3. Create the class global table with a `new` constructor function.
   lua_newtable(L_);
-  lua_pushstring(L_, constructor_func_name.c_str());
-  lua_pushcclosure(L_, LuaCallHostFunction, 1);
+  PushHostFunctionClosure(L_, constructor_func_name);  // see the metamethod loop
   lua_setfield(L_, -2, "new");
   lua_setglobal(L_, class_name.c_str());
   });
@@ -1704,11 +1698,14 @@ int LuaRuntime::JsSearcher(lua_State* L) {
   bool raise = false;
   int nresults = 1;
   {
+    // See LuaCallHostFunction: take the owner first and stop naming `it`, so a
+    // searcher that re-registers itself can't destroy the callable in flight
+    // (CR-11 F2) and no rehash can invalidate a held iterator (CR-12 F1).
+    // Nothing allocates between the find and here today; "nothing allocates in
+    // between" is exactly the property that changes silently.
+    const std::shared_ptr<Function> fn = it->second;
     LuaPtr result;
     bool ok = true;
-    // See LuaCallHostFunction: copy the owner before calling, so a searcher
-    // that re-registers itself can't destroy the callable in flight (CR-11 F2).
-    const std::shared_ptr<Function> fn = it->second;
     try {
       std::vector<LuaPtr> args{
         std::make_shared<LuaValue>(LuaValue::from(std::string(modname)))};
@@ -1803,6 +1800,21 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
 
   HostCallOutcome outcome = HostCallOutcome::Return1;
   {
+    // Take the owner here — at the top of the scope, before anything below can
+    // allocate — and never name `it` again. Two reasons, one line:
+    //   * the shared_ptr keeps the callable alive for the whole call, so a JS
+    //     callback that re-registers its own name (`set_global('foo', fn)` from
+    //     inside `foo`) can't destroy the std::function executing right now
+    //     (CR-11 F2);
+    //   * ToLuaValue below allocates (luaL_ref per function/thread/userdata
+    //     argument, a string per numeric key), an allocation can drive a GC
+    //     step, a __gc finalizer is Lua that can re-enter the host, and a
+    //     nested registration *inserts* into host_functions_ — which rehashes
+    //     it and invalidates `it` (CR-12 F1).
+    // It lives inside this block, not at function scope, because every raise
+    // below longjmps past destructors (see the closing brace).
+    const std::shared_ptr<Function> fn = it->second;
+
     const int argc = lua_gettop(L);
     std::vector<LuaPtr> args;
     args.reserve(argc);
@@ -1819,10 +1831,6 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
     if (converted) {
       LuaPtr resultHolder;
       bool called = true;
-      // Copy the owner before calling: a JS callback that re-registers its own
-      // name (`set_global('foo', fn)` from inside `foo`) would otherwise
-      // destroy the std::function executing right now (CR-11 F2).
-      const std::shared_ptr<Function> fn = it->second;
       try {
         resultHolder = (*fn)(args);
       } catch (const std::exception& e) {
@@ -2208,6 +2216,14 @@ std::string LuaRuntime::CaptureError(lua_State* L) const {
     // value absent; LuaErrorToJsValue already falls back to the display string.
     last_error_value_.reset();
   }
+  // One scope covers the rest of the function. It brackets the `"message"` key
+  // push below — which interns a string, and interning allocates, and any
+  // allocation can drive a GC step whose __gc finalizers are Lua that re-enters
+  // the host (the "can allocate from Lua" rule; see IsExecuting). It also
+  // brackets the protected stringify further down, whose __tostring is user Lua
+  // and so is an execution like any other (CR-9 F1). The key push was the
+  // narrower of the two and was left outside until CR-12 F3.
+  ExecutionScope exec(this);
   if (lua_type(L, -1) == LUA_TTABLE) {
     lua_pushstring(L, "message");
     lua_rawget(L, -2);  // raw: won't fire __index on a user error object
@@ -2218,10 +2234,7 @@ std::string LuaRuntime::CaptureError(lua_State* L) const {
     }
     lua_pop(L, 1);
   }
-  // Stringify under protection so a raising __tostring can't panic here. The
-  // __tostring is user Lua and can re-enter the host, so it is an execution
-  // like any other (CR-9 F1).
-  ExecutionScope exec(this);
+  // Stringify under protection so a raising __tostring can't panic here.
   lua_pushcfunction(L, ProtectedToString);
   lua_pushvalue(L, -2);  // the error value
   if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_type(L, -1) == LUA_TSTRING) {
@@ -2410,8 +2423,11 @@ void LuaRuntime::RegisterFunction(const std::string& name, Function fn) {
   RunProtected([&]() {
     lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
     lua_pushlstring(L_, name.data(), name.size());          // key (size-aware)
-    lua_pushstring(L_, name.c_str());                       // closure upvalue
-    lua_pushcclosure(L_, LuaCallHostFunction, 1);           // value = closure
+    // Through the shared helper, not a bare push: a user-chosen name is never
+    // reserved as reclaimable, so this is byte-for-byte the closure the bare
+    // push built — the point is that the helper stays the only place a
+    // host-function name becomes a closure (CR-12 F2).
+    PushHostFunctionClosure(L_, name);                      // value = closure
     lua_settable(L_, -3);                                   // _G[key]=closure (may __newindex)
     lua_pop(L_, 1);                                         // pop globals table
   });
@@ -3556,6 +3572,13 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     // through and are captured as-is.
     if (lua_type(co, -1) == LUA_TSTRING) {
       const char* m = lua_tostring(co, -1);
+      // Bracketed for the same reason the resume above is: building the
+      // traceback string allocates (unboundedly — the message is copied into
+      // it), and an allocation can drive a GC step whose __gc finalizers are
+      // Lua. Nothing else guards this path: DriveAsync opens no CallScope, so
+      // without the scope a finalizer here would see the runtime reporting
+      // depth 0 and could reset() the state it is running on (CR-12 F3).
+      ExecutionScope exec(this);
       luaL_traceback(co, co, m, 1);
       lua_remove(co, -2);  // drop the original string, keep the traceback'd one
     }

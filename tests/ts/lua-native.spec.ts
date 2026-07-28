@@ -8941,4 +8941,115 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  // --- CODE-REVIEW-12 regressions ---------------------------------------
+  describe('CODE-REVIEW-12 regressions', () => {
+
+    /** Two GC passes with settle gaps; see the CR-8 F2 helper. */
+    const gcSettle = async () => {
+      expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc!();
+      await new Promise((r) => setTimeout(r, 10));
+      global.gc!();
+    };
+
+    // F4: reset() deliberately lets the retiring runtime's __gc finalizers reach
+    // the still-live context (CR-10's contract). The host-function wrappers they
+    // dispatch through capture the *context*, so a callback throwing from one
+    // staged its structured error via `runtime` — which by then points at the
+    // replacement. The raise happened on the old state, the staging landed on
+    // the new one, and the new runtime was left holding a pending error value
+    // from an execution on a different Lua state.
+    //
+    // CR-12 called this unreachable ("I could not construct a consumer"). It is
+    // not: the consumer is any later host-call failure that raises *without*
+    // staging, because the bridge's catch prefers a pending value over its own
+    // message. Returning a Promise outside execute_async() is exactly such a
+    // path — before the fix, this reports "from the retired generation".
+    it('F4: a retired state\'s finalizer does not strand a staged error on the live runtime',
+      async () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({
+          thrower: () => {
+            seen.push('finalizer callback ran');
+            throw new Error('from the retired generation');
+          },
+          promiser: () => Promise.resolve(1),
+        }, ALL_LIBS);
+
+        lua.execute_script(
+          '_G.keep = setmetatable({}, { __gc = function() thrower() end })');
+        // A live handle keeps the retiring runtime alive past reset(), so its
+        // finalizers run later — after `runtime` already points at the new state.
+        let handle: any = lua.create_table({ a: 1 });
+        lua.reset();
+        handle = null;
+        await gcSettle();
+        expect(seen, 'the retired state\'s finalizer never ran').not.toHaveLength(0);
+
+        // The live runtime must be holding nothing: this failure stages no value
+        // of its own, so a stranded one would be raised in its place.
+        expect(() => lua.execute_script('return promiser()'))
+          .toThrow(/returned a Promise/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+    // F2: RegisterClass's metamethod loop, its class `new`, and RegisterFunction
+    // pushed their own bare closures instead of going through
+    // PushHostFunctionClosure, whose comment claimed to be the single place a
+    // host-function name becomes a closure. Routing them through is
+    // behaviour-preserving by construction (none of those names is reclaimable,
+    // so the helper builds the identical one-upvalue closure) — these pin that
+    // the three name families still work through the helper.
+    describe('F2: the closure builder is shared by every host-function name', () => {
+      it('class metamethods and constructors still dispatch', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Vec', {
+          construct: (x: number) => ({ x }),
+          methods: { get: (self: any) => self.x },
+          metamethods: {
+            __add: (a: any, b: any) => ({ x: a.x + b.x }),
+            __tostring: (self: any) => `Vec(${self.x})`,
+          },
+        });
+        expect(lua.execute_script('local v = Vec.new(7); return v:get()')).toBe(7);
+        // __add returns a plain object, so the sum arrives as a plain table.
+        expect(lua.execute_script('return (Vec.new(2) + Vec.new(3)).x')).toBe(5);
+        expect(lua.execute_script('return tostring(Vec.new(4))')).toBe('Vec(4)');
+      });
+
+      it('set_global functions still dispatch, and replacing one still works', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('f', (n: number) => n + 1);
+        expect(lua.execute_script('return f(1)')).toBe(2);
+        lua.set_global('f', (n: number) => n * 10);
+        expect(lua.execute_script('return f(4)')).toBe(40);
+      });
+    });
+
+    // F5: Propagate read the shared value once, before the push loop, which
+    // CR-12 read as leaving later targets a generation behind when a push
+    // re-enters set()/sync(). This pins the behaviour rather than the fix: it
+    // passes with the snapshot too (verified), because set() mutates the object
+    // value_ holds instead of replacing it. It is here so that if that ever
+    // changes, the staleness shows up as a failing test rather than as a silent
+    // divergence between two contexts.
+    it('F5: a re-entrant shared-table update leaves every context on the newest value', () => {
+      const shared: any = lua_native.createSharedTable({ n: 1 });
+      let reentered = false;
+      // The first context's converter re-enters on the first push only.
+      const a: any = new lua_native.init({}, { ...ALL_LIBS, shared: { cfg: shared } });
+      const b: any = new lua_native.init({}, { ...ALL_LIBS, shared: { cfg: shared } });
+      a.register_type_converter(
+        (v: any) => !reentered && typeof v === 'object' && v !== null && v.n === 2,
+        (v: any) => { reentered = true; shared.set('n', 3); return v; });
+
+      shared.set('n', 2);
+      expect(reentered, 'the converter never re-entered').toBe(true);
+      // Both states must agree on the newest value, whoever wrote it.
+      expect(a.execute_script('return cfg.n')).toBe(3);
+      expect(b.execute_script('return cfg.n')).toBe(3);
+    });
+  });
+
 });

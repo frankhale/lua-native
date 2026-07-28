@@ -440,8 +440,15 @@ private:
 
     // Error fidelity (D1): keeps thrown JS Error objects alive so they can be
     // reconstructed when a Lua error carrying their id surfaces back to JS.
-    std::unordered_map<int, Napi::ObjectReference> js_error_registry_;
-    int next_js_error_id_ = 1;
+    //
+    // Widened with the other monotonic counters (CR-12 F5): unlike
+    // next_userdata_id_, nothing here constrains the key to int, and a
+    // long-lived server with a throwing callback per request is exactly the
+    // shape that reaches 2^31 — where signed overflow is UB rather than a
+    // harmless wrap. The id travels through Lua as an int64_t field, so the
+    // round trip stays exact.
+    std::unordered_map<uint64_t, Napi::ObjectReference> js_error_registry_;
+    uint64_t next_js_error_id_ = 1;
     int call_depth_ = 0;  // clears the registry when the outermost call starts
 
     // True for the duration of Reset(). Guards the one reentrancy window the
@@ -458,7 +465,21 @@ private:
 
     // Stages a structured error table for a thrown JS value (object errors only)
     // and returns the display message.
-    std::string StageJsError(const Napi::Value& value, const std::string& message);
+    //
+    // `owner` is the runtime whose bridge is about to raise, and it is NOT
+    // always this context's current runtime: reset() deliberately lets the
+    // retiring state's __gc finalizers reach the still-live context (CR-10's
+    // documented contract), so a callback that throws from one of those raises
+    // on the *old* state while `runtime` already points at the new one. Staging
+    // there would leave the new runtime holding a pending value from an
+    // execution on a different Lua state — the M12 hazard reached through
+    // generations (CR-12 F4) — so a mismatch falls back to the plain message,
+    // which is exactly what the raising state's bridge would have used anyway.
+    // nullptr means "the current runtime by construction": the async
+    // promise-settlement path stages from a microtask with no execution in
+    // flight at all, and it consumes the staged value itself.
+    std::string StageJsError(const Napi::Value& value, const std::string& message,
+                             const lua_core::LuaRuntime* owner = nullptr);
 
     // Throws a JS "busy" error and returns true if an async op is in flight, so
     // the caller can early-return. Centralizes the guard duplicated across the
