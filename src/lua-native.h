@@ -124,6 +124,8 @@ public:
 
     explicit SharedTable(const Napi::CallbackInfo& info);
 
+    // Non-const despite only reading value_: InstanceMethod's callback type is a
+    // non-const member function pointer, and node-addon-api has no const overload.
     Napi::Value Get(const Napi::CallbackInfo& info);
     Napi::Value Set(const Napi::CallbackInfo& info);
     Napi::Value Sync(const Napi::CallbackInfo& info);
@@ -410,7 +412,7 @@ public:
     // collector so a failed core call sweeps the reservation (CR-11 F4). Public
     // only because it sits beside SweepUnpushedJsCallbacks, which is.
     void ReserveDeferredCallbacks(
-        const std::vector<std::pair<std::string, Napi::Function>>& deferred);
+        const std::vector<std::pair<std::string, Napi::Function>>& deferred) const;
 
 private:
     // The addon env, captured at construction. Safe to reuse from later instance
@@ -591,7 +593,7 @@ private:
     // Throws a JS "busy" error and returns true if an async op is in flight, so
     // the caller can early-return. Centralizes the guard duplicated across the
     // synchronous API methods.
-    bool RejectIfBusy();
+    bool RejectIfBusy() const;
 
     // Recursive body of NapiToCoreInstance; the public entry wraps depth 0 in
     // a JsCallbackCollectorScope so an aborted conversion sweeps the

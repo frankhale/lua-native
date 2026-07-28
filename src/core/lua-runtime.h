@@ -423,7 +423,7 @@ public:
   // N-API is illegal), same as the userdata GC callback.
   using HostFunctionGCCallback = std::function<void(const std::string&)>;
   void SetHostFunctionGCCallback(HostFunctionGCCallback cb);
-  void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries);
+  void SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries) const;
 
   // Same, for a table that has no global name: `registry_ref` is a table
   // reference minted by CreateTable/CreateTableFrom/GetGlobalRef/CreateEnvironment
@@ -442,7 +442,7 @@ public:
   void SetPendingErrorValue(LuaPtr value) { pending_error_value_ = std::move(value); }
   [[nodiscard]] bool HasPendingErrorValue() const { return static_cast<bool>(pending_error_value_); }
   LuaPtr TakePendingErrorValue() { return std::move(pending_error_value_); }
-  LuaPtr TakeLastErrorValue() { return std::move(last_error_value_); }
+  LuaPtr TakeLastErrorValue() const { return std::move(last_error_value_); }
 
   // Module / require support
   void AddSearchPath(const std::string& path) const;
@@ -458,7 +458,7 @@ public:
 
   // Dynamic require (E2): append a package.searchers entry that resolves an
   // unknown module by calling the named host function (returning Lua source).
-  void AddJsSearcher(const std::string& host_func_name);
+  void AddJsSearcher(const std::string& host_func_name) const;
 
   void CreateUserdataGlobal(const std::string& name, int ref_id);
   void CreateProxyUserdataGlobal(const std::string& name, int ref_id);
@@ -475,7 +475,7 @@ public:
   /// Register a method table for a userdata ref_id.
   /// method_map: maps Lua-facing method name -> host function name
   void SetUserdataMethodTable(int ref_id,
-      const std::unordered_map<std::string, std::string>& method_map);
+      const std::unordered_map<std::string, std::string>& method_map) const;
 
   /// Register a class/usertype. Creates a global table `class_name` with a
   /// `new` function that invokes the constructor host function, plus a shared
@@ -498,7 +498,7 @@ public:
       const std::string& constructor_func_name,
       const std::unordered_map<std::string, std::string>& method_map,
       const std::vector<MetatableEntry>& metamethods,
-      const std::string& parent_class_name = "");
+      const std::string& parent_class_name = "") const;
 
   // HasClass was removed (CR-12 F5): it had no callers, and the one caller
   // proposed for it — register_class's duplicate check — is wrong. A
@@ -523,8 +523,8 @@ public:
   [[nodiscard]] int64_t GetTableLength(int registry_ref) const;
 
   // Table reference API — create and manage live table references
-  [[nodiscard]] int CreateTable();
-  [[nodiscard]] int CreateTableFrom(const LuaTable& initial);
+  [[nodiscard]] int CreateTable() const;
+  [[nodiscard]] int CreateTableFrom(const LuaTable& initial) const;
   [[nodiscard]] int CreateTableFrom(const LuaArray& initial) const;
   [[nodiscard]] std::variant<int, std::string> GetGlobalRef(const std::string& name) const;
 
@@ -957,9 +957,9 @@ private:
   bool HasPackageLibrary() const;
   static void* LuaAllocator(void* ud, void* ptr, size_t osize, size_t nsize);
 
-  void RegisterUserdataMetatable();
-  void RegisterProxyUserdataMetatable();
-  void RegisterHostFnSentinelMetatable();
+  void RegisterUserdataMetatable() const;
+  void RegisterProxyUserdataMetatable() const;
+  void RegisterHostFnSentinelMetatable() const;
 
   // Reclaims a reclaimable host function's entries once its last closure dies.
   void OnHostFnClosureCollected(const std::string& name);
@@ -1061,7 +1061,7 @@ private:
   static int ProtectedGlobalGetRunner(lua_State* L);
 
   // I/O redirection and chunk-loading guards
-  void InstallOutputRedirection();
+  void InstallOutputRedirection() const;
   static int LuaPrint(lua_State* L);
   static int LuaIoWrite(lua_State* L);
   static int SafeLoad(lua_State* L);

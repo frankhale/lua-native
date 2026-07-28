@@ -583,14 +583,14 @@ LuaRuntime::~LuaRuntime() {
 
 // --- Userdata metatable registration ---
 
-void LuaRuntime::RegisterUserdataMetatable() {
+void LuaRuntime::RegisterUserdataMetatable() const {
   luaL_newmetatable(L_, kUserdataMetaName);
   lua_pushcfunction(L_, UserdataGC);
   lua_setfield(L_, -2, "__gc");
   lua_pop(L_, 1);
 }
 
-void LuaRuntime::RegisterProxyUserdataMetatable() {
+void LuaRuntime::RegisterProxyUserdataMetatable() const {
   luaL_newmetatable(L_, kProxyUserdataMetaName);
   lua_pushcfunction(L_, UserdataGC);
   lua_setfield(L_, -2, "__gc");
@@ -787,8 +787,7 @@ void LuaRuntime::UnrefOrDefer(int ref) {
 // state's extra space so it can consult the deferral queue without reading the
 // registry or taking a Lua lock.
 void detail::UnrefRegistrySlot(lua_State* mainL, int ref) {
-  auto* runtime = *static_cast<LuaRuntime**>(lua_getextraspace(mainL));
-  if (runtime) {
+  if (auto* runtime = *static_cast<LuaRuntime**>(lua_getextraspace(mainL))) {
     runtime->UnrefOrDefer(ref);
   } else {
     // No runtime recorded (should not happen once InitState has run): fall back
@@ -866,8 +865,8 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
 }
 
 void LuaRuntime::SetUserdataMethodTable(
-    int ref_id,
-    const std::unordered_map<std::string, std::string>& method_map) {
+    const int ref_id,
+    const std::unordered_map<std::string, std::string>& method_map) const {
   std::string registry_key = kUserdataMethodsPrefix;
   registry_key += std::to_string(ref_id);
   // Protected so an OOM building the method table throws instead of aborting (M3).
@@ -1008,7 +1007,7 @@ void LuaRuntime::RegisterClass(
     const std::string& constructor_func_name,
     const std::unordered_map<std::string, std::string>& method_map,
     const std::vector<MetatableEntry>& metamethods,
-    const std::string& parent_class_name) {
+    const std::string& parent_class_name) const {
   // The whole build (metatable, method table, class global) runs in one
   // protected frame so an OOM under maxMemory, or a raising __newindex on a _G
   // metatable at the final lua_setglobal, throws instead of aborting (M3). Every
@@ -1297,7 +1296,7 @@ void LuaRuntime::SetHostFunctionGCCallback(HostFunctionGCCallback cb) {
   host_fn_gc_callback_ = std::move(cb);
 }
 
-void LuaRuntime::RegisterHostFnSentinelMetatable() {
+void LuaRuntime::RegisterHostFnSentinelMetatable() const {
   luaL_newmetatable(L_, kHostFnSentinelMeta);
   lua_pushcfunction(L_, HostFnSentinelGC);
   lua_setfield(L_, -2, "__gc");
@@ -1335,7 +1334,7 @@ void LuaRuntime::OnHostFnClosureCollected(const std::string& name) {
   }
 }
 
-void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries) {
+void LuaRuntime::SetGlobalMetatable(const std::string& name, const std::vector<MetatableEntry>& entries) const {
   // One protected frame covers the read (already protected on its own), the
   // metatable allocation (M3), and lua_setmetatable. Validation throws and
   // PushLuaValue depth throws propagate out of RunProtected unchanged.
@@ -1522,7 +1521,7 @@ bool LuaRuntime::DispatchOutput(const std::string& text) const {
   return true;
 }
 
-void LuaRuntime::InstallOutputRedirection() {
+void LuaRuntime::InstallOutputRedirection() const {
   // Protected so a __newindex on a _G metatable at the print override can't
   // panic (M3). Light C-function pushes don't allocate, so there's no OOM here.
   RunProtected([&]() {
@@ -1658,7 +1657,7 @@ int LuaRuntime::SafeLoad(lua_State* L) {
 
 // --- Dynamic require via a JS searcher (E2) ---
 
-void LuaRuntime::AddJsSearcher(const std::string& host_func_name) {
+void LuaRuntime::AddJsSearcher(const std::string& host_func_name) const {
   if (!HasPackageLibrary()) {
     throw std::runtime_error(
       "Cannot add searcher: the 'package' library is not loaded.");
@@ -2720,16 +2719,14 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
     case LUA_TUSERDATA: {
       // Check if it's our proxy userdata (property-access-enabled)
       if (luaL_testudata(L, abs_index, kProxyUserdataMetaName)) {
-        auto* block = static_cast<int*>(lua_touserdata(L, abs_index));
-        if (block) {
+        if (auto* block = static_cast<int*>(lua_touserdata(L, abs_index))) {
           return std::make_shared<LuaValue>(LuaValue::from(
             LuaUserdataRef(*block, L, false, LUA_NOREF, true)));
         }
       }
       // Check if it's our opaque userdata
       if (luaL_testudata(L, abs_index, kUserdataMetaName)) {
-        auto* block = static_cast<int*>(lua_touserdata(L, abs_index));
-        if (block) {
+        if (auto* block = static_cast<int*>(lua_touserdata(L, abs_index))) {
           return std::make_shared<LuaValue>(LuaValue::from(
             LuaUserdataRef(*block, L)));
         }
@@ -2741,8 +2738,7 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
         if (lua_isstring(L, -1)) {
           std::string class_name = lua_tostring(L, -1);
           lua_pop(L, 2);  // marker + metatable
-          auto* block = static_cast<int*>(lua_touserdata(L, abs_index));
-          if (block) {
+          if (auto* block = static_cast<int*>(lua_touserdata(L, abs_index))) {
             return std::make_shared<LuaValue>(LuaValue::from(
               LuaUserdataRef(*block, L, false, LUA_NOREF, false, std::move(class_name))));
           }
@@ -3014,7 +3010,7 @@ int64_t LuaRuntime::GetTableLength(int registry_ref) const {
 
 // --- Table reference API ---
 
-int LuaRuntime::CreateTable() {
+int LuaRuntime::CreateTable() const {
   // Protected so an OOM (under maxMemory) in lua_newtable/luaL_ref throws instead
   // of aborting (M5). The table is created and ref'd entirely inside the frame.
   int ref = LUA_NOREF;
@@ -3025,7 +3021,7 @@ int LuaRuntime::CreateTable() {
   return ref;
 }
 
-int LuaRuntime::CreateTableFrom(const LuaTable& initial) {
+int LuaRuntime::CreateTableFrom(const LuaTable& initial) const {
   // Build and ref the whole table inside a protected frame so an OOM anywhere in
   // the build throws rather than aborting (M5). PushLuaValue may also throw a C++
   // exception (depth/stack); RunProtected captures and rethrows it. On any error

@@ -125,7 +125,7 @@ static std::optional<lua_core::LuaValue> ConvertBuiltinType(
 //    synchronously before a worker Queue() or an execute_async begins) closes
 //    the Queue()-to-async_mode_ window and also blocks reentry during a
 //    suspended execute_async, which a runtime->IsAsyncMode() check would miss.
-static bool RejectIfWorkerBusy(Napi::Env env, LuaTableRefData* data) {
+static bool RejectIfWorkerBusy(const Napi::Env env, const LuaTableRefData* data) {
   if (!data || !data->ContextLive() || !data->context) {
     Napi::Error::New(env, "Lua table handle's context has been destroyed")
       .ThrowAsJavaScriptException();
@@ -1418,8 +1418,7 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   try {
     // The global write fires __newindex on a metatabled _G — Lua, and from
     // there a host callback (CR-9 F1); the method-entry scope above covers it.
-    bool needs_proxy = readable || writable || has_methods;
-    if (needs_proxy) {
+    if (bool needs_proxy = readable || writable || has_methods) {
       runtime->CreateProxyUserdataGlobal(name, ref_id);
     } else {
       runtime->CreateUserdataGlobal(name, ref_id);
@@ -2736,7 +2735,7 @@ int LuaContext::NextUserdataId() {
   return next_userdata_id_++;
 }
 
-bool LuaContext::RejectIfBusy() {
+bool LuaContext::RejectIfBusy() const {
   if (is_busy_) {
     Napi::Error::New(env, "Lua context is busy with an async operation")
       .ThrowAsJavaScriptException();
@@ -2941,7 +2940,7 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
         // failure below cannot leak the cookie (it is reclaimed with the
         // then-unrooted handles).
         auto cookieOwner = Napi::External<AwaitCookie>::New(env, cookie,
-          [](Napi::Env, AwaitCookie* c) { delete c; });
+          [](Napi::Env, const AwaitCookie* c) { delete c; });
         auto onResolve = Napi::Function::New(env, &LuaContext::OnAwaitResolveStatic, "onResolve", cookie);
         auto onReject = Napi::Function::New(env, &LuaContext::OnAwaitRejectStatic, "onReject", cookie);
         DefineHiddenProp(env, onResolve, "__cookie", cookieOwner);
@@ -3720,7 +3719,7 @@ static Napi::Value CreateSharedTable(const Napi::CallbackInfo& info) {
   return ctor.New({});
 }
 
-Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
+static Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) {
   const auto result = LuaContext::Init(env, exports);
   const Napi::Function sharedCtor = SharedTable::DefineSharedTable(env);
   // Both constructors are kept alive here for the life of the addon instance;
@@ -3762,7 +3761,7 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
 // JsCallbackCollectorScope sweeps any reservation whose closure was never built
 // (a failed core call), so nothing is stranded either way (CR-11 F4).
 void LuaContext::ReserveDeferredCallbacks(
-    const std::vector<std::pair<std::string, Napi::Function>>& deferred) {
+    const std::vector<std::pair<std::string, Napi::Function>>& deferred) const {
   for (const auto& [func_name, fn] : deferred) {
     runtime->ReserveReclaimableHostFunction(func_name);
     if (js_callback_collector_) js_callback_collector_->push_back(func_name);
@@ -4039,7 +4038,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // LuaFunctionData that `fn` still calls through, so it must not be
           // deletable or reassignable from JS (L6).
           const auto owner = Napi::External<LuaFunctionData>::New(env, dataPtr,
-            [](Napi::Env, LuaFunctionData* d) { delete d; });
+            [](Napi::Env, const LuaFunctionData* d) { delete d; });
           // Released the moment the External exists, not after DefineHiddenProp
           // (which can throw): the finalizer is already the owner by then, so
           // the discarded result is deliberate.
@@ -4069,7 +4068,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
             auto data = std::make_unique<LuaUserdataData>(runtime, v);
             Napi::Object handle = Napi::Object::New(env);
             const auto owner = Napi::External<LuaUserdataData>::New(env, data.get(),
-              [](Napi::Env, LuaUserdataData* d) { delete d; });
+              [](Napi::Env, const LuaUserdataData* d) { delete d; });
             // NOLINTNEXTLINE(bugprone-unused-return-value)
             (void)data.release();  // ownership transferred to the finalizer
             handle.Set("_userdata", owner);
@@ -4087,7 +4086,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
 
           // Store _tableRef as non-enumerable on target for round-trip detection
           auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
-            [](Napi::Env, LuaTableRefData* d) { delete d; });
+            [](Napi::Env, const LuaTableRefData* d) { delete d; });
           // NOLINTNEXTLINE(bugprone-unused-return-value)
           (void)data.release();  // ownership transferred to the finalizer
           const auto Object = env.Global().Get("Object").As<Napi::Object>();
@@ -4138,20 +4137,22 @@ static Napi::Value SymbolIteratorKey(const Napi::Env env) {
   return env.Global().Get("Symbol").As<Napi::Object>().Get("iterator");
 }
 
-// One iteration cursor over a coroutine. Each `[Symbol.iterator]()` call mints
-// a fresh one, so two loops over the same coroutine are independent cursors
-// advancing one shared Lua thread. The coroutine object is held strongly:
-// nothing on the coroutine points back at the iterator, so there is no cycle.
-struct LuaCoroIterState {
-  LuaContext* context = nullptr;
-  std::shared_ptr<std::atomic<bool>> contextAlive;
-  Napi::ObjectReference coro;
-  bool done = false;
+namespace {
+  // One iteration cursor over a coroutine. Each `[Symbol.iterator]()` call mints
+  // a fresh one, so two loops over the same coroutine are independent cursors
+  // advancing one shared Lua thread. The coroutine object is held strongly:
+  // nothing on the coroutine points back at the iterator, so there is no cycle.
+  struct LuaCoroIterState {
+    LuaContext* context = nullptr;
+    std::shared_ptr<std::atomic<bool>> contextAlive;
+    Napi::ObjectReference coro;
+    bool done = false;
 
-  [[nodiscard]] bool ContextLive() const {
-    return context && contextAlive && contextAlive->load();
-  }
-};
+    [[nodiscard]] bool ContextLive() const {
+      return context && contextAlive && contextAlive->load();
+    }
+  };
+}
 
 static Napi::Value CoroIterResult(const Napi::Env env, const Napi::Value& value,
                                   const bool done) {
