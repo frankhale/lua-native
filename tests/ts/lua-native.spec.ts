@@ -9052,4 +9052,164 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  // --- CODE-REVIEW-13 regressions ---------------------------------------
+  //
+  // F1: reset() is guarded by IsExecuting() (Lua is running) and call_depth_
+  // (a binding method is on the stack). Every method opened the second guard
+  // around its *call into Lua* — but a method starts by running user JS:
+  // converters, definition-object getters, Proxy traps. reset() was legal in
+  // that window, and a method caught mid-flight then finished its work against
+  // a state that no longer existed. `handle.pairs()` had no guard at all and
+  // produced handles pairing the new runtime with the old state's registry
+  // refs: silent reads and writes onto unrelated live tables, and an
+  // ASan-confirmed use-after-free of the retired lua_State at finalization.
+  //
+  // Every door below is pinned the same way: make the method's first piece of
+  // user JS call reset(), and require the call to be refused.
+  describe('CODE-REVIEW-13 regressions', () => {
+
+    const GUARD = /reset\(\) cannot be called (while Lua is executing|from inside another lua-native call)/;
+
+    describe('F1: reset() is refused while a binding method runs user JS', () => {
+      /** Calls reset() and returns the rejection message, or 'RESET RAN'. */
+      const tryReset = (lua: any) => {
+        try { lua.reset(); return 'RESET RAN'; }
+        catch (e: any) { return e.message as string; }
+      };
+
+      it('handle.pairs(): a Lua->JS converter cannot retire the state mid-conversion', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          _G.root = {
+            a = { plain = 1 },
+            b = setmetatable({ marked = 'OLD' }, { __index = function() return nil end }),
+          }
+        `);
+        let saw = 'converter never ran';
+        lua.register_from_lua_converter(
+          (v: any) => typeof v === 'object' && v !== null && v.plain === 1,
+          (v: any) => { saw = tryReset(lua); return v; });
+
+        const entries = lua.get_global_ref('root').pairs();
+        expect(saw, 'the converter never ran').not.toBe('converter never ran');
+        expect(saw).toMatch(GUARD);
+
+        // The state survived, so the metatabled entry is still bound to it and
+        // reads its own object rather than an unrelated registry slot.
+        const b = entries.find(([k]: [string]) => k === 'b')[1];
+        expect(b.marked).toBe('OLD');
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('set_metatable(): a definition getter cannot retire the state mid-read', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const target = lua.create_table({ tag: 'TARGET' });
+        let saw = 'getter never ran';
+        expect(() => lua.set_metatable(target, {
+          get __index() { saw = tryReset(lua); return () => 'x'; },
+        })).not.toThrow();
+        expect(saw).toMatch(GUARD);
+        expect(target.get('tag')).toBe('TARGET');
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('register_class(): a definition getter cannot defeat the duplicate guard', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let saw = 'getter never ran';
+        lua.register_class('Foo', {
+          construct: () => ({ v: 1 }),
+          methods: { get: (self: any) => self.v },
+          get metamethods() { saw = tryReset(lua); return undefined; },
+        });
+        expect(saw).toMatch(GUARD);
+        // The reservation survived, so L7 still rejects the second registration
+        // and the class is not a half-merge of two definitions.
+        expect(() => lua.register_class('Foo', { construct: () => ({ v: 2 }) }))
+          .toThrow(/already registered/);
+        expect(lua.execute_script('local o = Foo.new(); return o:get()')).toBe(1);
+      });
+
+      it('set_userdata(): a methods getter cannot retire the state mid-read', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let saw = 'getter never ran';
+        lua.set_userdata('u', { x: 1 }, {
+          methods: { get m() { saw = tryReset(lua); return () => 1; } },
+        });
+        expect(saw).toMatch(GUARD);
+        expect(lua.execute_script('return u:m()')).toBe(1);
+      });
+
+      it('register_module(): a member getter cannot retire the state mid-read', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let saw = 'getter never ran';
+        lua.register_module('m', { get f() { saw = tryReset(lua); return () => 7; } });
+        expect(saw).toMatch(GUARD);
+        expect(lua.execute_script("return require('m').f()")).toBe(7);
+      });
+
+      it('set_hook(): an options getter cannot retire the state mid-read', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let saw = 'getter never ran';
+        lua.set_hook(() => {}, { get count() { saw = tryReset(lua); return 1000; } });
+        expect(saw).toMatch(GUARD);
+        lua.remove_hook();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a Lua-function handle call: an argument converter cannot retire the state', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const f: any = lua.execute_script('return function(a) return a end');
+        let saw = 'converter never ran';
+        lua.register_type_converter(
+          (v: any) => typeof v === 'object' && v !== null && v.trip === true,
+          () => { saw = tryReset(lua); return 1; });
+        expect(f({ trip: true })).toBe(1);
+        expect(saw).toMatch(GUARD);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('reports the two guard conditions distinctly', () => {
+        // call_depth_ only: no Lua is running inside a result converter.
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        let fromJs = '';
+        a.register_from_lua_converter(
+          (v: any) => typeof v === 'object' && v !== null && v.plain === 1,
+          (v: any) => { try { a.reset(); } catch (e: any) { fromJs = e.message; } return v; });
+        a.execute_script('_G.r = { x = { plain = 1 } }');
+        a.get_global_ref('r').pairs();
+        expect(fromJs).toMatch(/from inside another lua-native call/);
+
+        // IsExecuting(): a host callback, with Lua genuinely on the stack.
+        let fromLua = '';
+        const b: any = new lua_native.init({
+          hit: () => { try { b.reset(); } catch (e: any) { fromLua = e.message; } return 1; },
+        }, ALL_LIBS);
+        b.execute_script('hit()');
+        expect(fromLua).toMatch(/while Lua is executing/);
+      });
+    });
+
+    // F2: cancel() on a worker run takes effect whenever the instruction
+    // count-hook is installed — which InstallExecutionHook does for any of
+    // maxInstructions, timeout, or a counting debug hook. Three documents said
+    // "only when maxInstructions is set"; a timeout-only run cancels.
+    it('F2: cancel() interrupts a worker run with only a timeout configured', async () => {
+      const lua: any = new lua_native.init({}, { ...ALL_LIBS, timeout: 60_000 });
+      const run = lua.execute_script_async('local i = 0 while true do i = i + 1 end');
+      await new Promise((r) => setTimeout(r, 50));
+      lua.cancel();
+      await expect(run).rejects.toThrow(/execution cancelled/);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('F2: a worker run with no limits configured has no hook to interrupt it', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const run = lua.execute_script_async('local i = 0 for k = 1, 3e6 do i = i + 1 end return i');
+      lua.cancel();                       // no hook installed: nothing to poll
+      await expect(run).resolves.toBe(3e6);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+  });
+
 });

@@ -710,12 +710,29 @@ export interface LuaContext {
   execute_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
 
   /**
-   * Cancels an in-flight `execute_async` run. The returned Promise from the
-   * cancelled `execute_async` rejects with an "execution cancelled" error, and
-   * the suspended coroutine is abandoned. No-op if nothing is running.
+   * Cancels an in-flight asynchronous run. No-op if nothing is running.
    *
-   * Because JavaScript is single-threaded, this can only take effect while the
-   * script is suspended awaiting a Promise (not during a synchronous Lua loop).
+   * The two async families are cancelled by different mechanisms, and what you
+   * can interrupt differs:
+   *
+   * **`execute_async` (main thread).** The suspended coroutine is abandoned and
+   * the returned Promise rejects with an "execution cancelled" error. Because
+   * JavaScript is single-threaded, this can only take effect while the script
+   * is suspended awaiting a Promise — a synchronous Lua loop inside
+   * `execute_async` never yields control back to `cancel()`.
+   *
+   * **`execute_script_async` / `execute_file_async` (worker thread).** The Lua
+   * runs off-thread, so it *is* interruptible mid-loop — cooperatively, via the
+   * same instruction count-hook that backs {@link LuaConfig.maxInstructions}.
+   * The run rejects with "execution cancelled". This works only when that hook
+   * is installed, which happens when **any** of `maxInstructions`, `timeout`,
+   * or a {@link set_hook} with a `count` interval is configured. With none of
+   * them set there is no hook, and a worker run cannot be interrupted at all —
+   * set `timeout` if you want `cancel()` to be able to reach it.
+   *
+   * Not reachable from inside a *synchronous* `execute_script`: a host callback
+   * that calls `cancel()` during one is a silent no-op, since neither async
+   * family is in flight. Use `maxInstructions` or `timeout` to bound those.
    */
   cancel(): void;
 

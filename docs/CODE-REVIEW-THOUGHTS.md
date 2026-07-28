@@ -461,3 +461,90 @@ a dependency on a property no caller states — but the comment and the test bot
 say plainly that they pin behaviour rather than close a defect. Recording a
 non-finding as a non-finding is the same discipline as recording a deferral: the
 ledger is only useful if it is honest in both directions.
+
+---
+
+## Addendum (July 28, 2026, after CODE-REVIEW-13)
+
+CR-12 declared convergence and, to its credit, immediately qualified it: the
+measurement was taken on a diff, not on a tree. CR-13 is what that qualification
+was worth. The CR-12 remediation verified clean under an independent
+re-derivation — and the tree it sat in contained an ASan-confirmed
+use-after-free reachable from three public entry points, none of them in the
+diff. One pass after "no findings above low", the finding is high.
+
+That is not a failure of the convergence thesis. It is the thesis working as
+stated: *reviews are samplers, not proofs*, and a sampler that keeps drawing
+from the same distribution keeps returning the same answer. What changed in
+CR-13 was not effort or care. It was one word in the question.
+
+**The audit question had a variable in it, and nobody was varying it.** Every
+pass since CR-9 has checked the reentrancy guard by asking **"is it armed before
+Lua runs?"** The answer was always yes — CR-9 made that structurally true by
+moving `IsExecuting()` into the core, and that fix has held for four passes
+without a single new site. The guard has a second half, `call_depth_`, whose job
+is to say *"a binding method is on the stack, so JS may re-enter"*. Nobody asked
+**"is it armed before user JS runs?"**, and the answer there was no: every method
+opened its `CallScope` around the call into Lua, while the argument-conversion
+and definition-reading phase above it — type converters, definition-object
+getters, Proxy traps, all of them host extension points the library advertises —
+ran unguarded. `reset()` was legal there, and a method caught mid-flight finished
+its work against a state that no longer existed: handles pairing the new runtime
+with the old state's registry refs, silent reads and writes onto unrelated live
+tables, and a freed `lua_State` dereferenced at finalization.
+
+So the clause this pass adds is about the shape of the audit rather than the
+shape of the code:
+
+> **When a guard protects against re-entrancy, the audit question is "armed
+> before *what*?" — and the answer is not the thing the guard is named after.
+> It is the first line that can run code you do not control.** At a JS↔native
+> boundary those differ by the entire conversion phase. Enumerate the kinds of
+> user code a method can run — converter, getter, trap, metamethod, finalizer —
+> and check the guard against the *earliest* of them.
+
+Three second-order lessons, each of which cost something to learn:
+
+**Relocating one half of an invariant can hide that the other half was never
+relocated.** CR-9's fix was right and remains right. Its side effect was that
+`IsExecuting()` began answering every question anyone asked about reentrancy, so
+`call_depth_` stopped being audited on its own — it survives in `Reset()` as what
+the comment called "a cheap second opinion". It is not a second opinion. It
+answers a different question, and it was the only thing guarding a window
+`IsExecuting()` cannot see by construction. The remediation now reports the two
+conditions with two distinct error messages, because a single message that said
+"while Lua is executing" for a case where no Lua was running is exactly how the
+distinction got lost.
+
+**A comment justifying the *absence* of a guard is more dangerous than one
+justifying its presence, and should be read as a completeness claim.** CR-12
+established that "the single place", "every path", "all callers" are claims to
+check. `TableHandlePairs` carried the inverse form — *"pairs() is raw traversal
+and needs none"* — which is true about metamethods, silent about JS, and
+terminates inquiry just as effectively. Three passes read it and agreed. A claim
+that something is unnecessary is still a claim; the tell is that it explains a
+difference from its siblings, and eleven siblings did have the guard.
+
+**Check-then-use across user JS is its own class, and this codebase has it in
+five places.** `targetRef->runtime.get() != runtime.get()`,
+`threadData->runtime.get() != runtime.get()`, and their relatives each compare a
+captured pointer against a member that user JS can change between the check and
+the use. Every one is correct against the threat it was written for — a handle
+from *another* context — and blind to the same context becoming a different
+generation. Entry-armed scoping closes all of them at once, which is the
+argument for fixing this at the class level rather than adding a re-check to
+each.
+
+Finally, on the harness. All four sanitizers and 796 tests passed on the tree
+containing this bug, and ASan reported the use-after-free within seconds of a
+reproduction existing. It had no way to invent one: no test in the suite called
+`reset()` from inside a converter or a getter, because nobody had thought to.
+CR-10's standing rule gets a sibling:
+
+> **For every guard, one test per kind of user code the surrounding method can
+> run** — converter, definition getter, Proxy trap, metamethod, finalizer. A
+> guard is only as good as the callback shapes someone thought to try, and the
+> suite is where that thinking is recorded.
+
+The ten pins added with this remediation are that category's first members;
+eight of them fail against the pre-fix binary.

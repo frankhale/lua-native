@@ -497,6 +497,19 @@ static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
   }
 
   try {
+    // The one table-handle entry point that had no CallScope. Its neighbours'
+    // comments explain theirs in terms of metamethods, and pairs() genuinely
+    // fires none — lua_next is a raw traversal. That reasoning is about Lua and
+    // says nothing about the *other* thing the scope guards: the CoreToNapi
+    // calls below run the registered Lua->JS converters, which are user JS that
+    // can call reset(). Without this line a converter could retire the state
+    // mid-loop, and the remaining table values were then wrapped as handles
+    // pairing the new runtime with this state's registry refs — reads and
+    // writes landing on unrelated live objects, and a use-after-free of the
+    // retired lua_State when the handle was finalized (CR-13 F1). It also
+    // clears a staged js_error_registry_ entry at the outermost access, which
+    // is the half of DEFERRED L7 that named the Proxy traps and missed this.
+    LuaContext::CallScope scope(data->context);
     auto pairs = data->runtime->TablePairs(data->tableRef.ref);
     Napi::Array result = Napi::Array::New(env, pairs.size());
     for (size_t i = 0; i < pairs.size(); ++i) {
@@ -525,7 +538,8 @@ static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
 
   try {
     // See TableHandleGet: CallScope — the ipairs collection respects __index
-    // (CR-8 F5). pairs() is raw traversal and needs none.
+    // (CR-8 F5). pairs() has one too: it fires no metamethod, but it converts
+    // results through user JS like this one does (CR-13 F1).
     LuaContext::CallScope scope(data->context);
     auto ipairs = data->runtime->TableIPairs(data->tableRef.ref);
     Napi::Array result = Napi::Array::New(env, ipairs.size());
@@ -589,6 +603,12 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // Above the argument conversion, not just around the call: the converters it
+  // runs are user JS, and one that called reset() left this frame calling into
+  // the retired state with arguments — including any nested callbacks — minted
+  // on the new one (CR-13 F1).
+  LuaContext::CallScope _cs(data->context);
+
   // Convert JS arguments to Lua values. One collector spans every argument so
   // that a later argument failing to convert sweeps the reclaimable callbacks
   // minted by the earlier ones — each argument's own conversion scope has
@@ -609,7 +629,6 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
   // Call the Lua function. A failed call can also leave arguments unpushed
   // (CallFunction restores the stack if an arg push raises); the collector's
   // destructor sweeps those too.
-  LuaContext::CallScope _cs(data->context);
   const auto result = data->runtime->CallFunction(data->funcRef, args);
 
   // Handle error case
@@ -1325,6 +1344,9 @@ Napi::Value LuaContext::Call(const Napi::CallbackInfo& info) {
 
 Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  // At entry, above the options / methods property reads below — any of which
+  // can be a getter that re-enters this context (CR-13 F1).
+  CallScope _cs(this);
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object[, options])").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1361,7 +1383,13 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
     }
   }
 
-  int ref_id = next_userdata_id_++;
+  int ref_id;
+  try {
+    ref_id = NextUserdataId();
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
   UserdataEntry entry;
   entry.object = Napi::Persistent(info[1].As<Napi::Object>());
@@ -1380,8 +1408,7 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   bool global_installed = false;
   try {
     // The global write fires __newindex on a metatabled _G — Lua, and from
-    // there a host callback (CR-9 F1).
-    CallScope _cs(this);
+    // there a host callback (CR-9 F1); the method-entry scope above covers it.
     bool needs_proxy = readable || writable || has_methods;
     if (needs_proxy) {
       runtime->CreateProxyUserdataGlobal(name, ref_id);
@@ -1438,6 +1465,13 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
 
 Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  // At entry, above every `def.Get(...)` below: each of those can run a hostile
+  // getter or Proxy trap — the N3 threat model this method already defends
+  // against — and one that called reset() used to succeed, wiping
+  // `registered_classes_` and with it the reservation two lines below. The L7
+  // duplicate guard then reported success for a second registration of the same
+  // name, and luaL_newmetatable half-merged the two definitions (CR-13 F1).
+  CallScope _cs(this);
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env,
       "register_class(name, definition) requires a string name and an object")
@@ -1597,8 +1631,8 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   // write. Surface that as a JS error: letting a std::runtime_error unwind
   // across the N-API boundary terminates the process (the H1 class).
   try {
-    // The class-global write fires __newindex on a metatabled _G (CR-9 F1).
-    CallScope _cs(this);
+    // The class-global write fires __newindex on a metatabled _G (CR-9 F1);
+    // the method-entry scope above already covers it.
     runtime->RegisterClass(class_name, ctor_name, method_map, metamethods, parent_class);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -1635,6 +1669,13 @@ static LuaTableRefData* TableRefDataFrom(const Napi::Value& value);
 // the same deferred host-function registration and the same rollback on failure.
 Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  // At entry, above the mt.GetPropertyNames()/mt.Get() reads below: a getter on
+  // the definition object that called reset() used to succeed, which made the
+  // target's identity check further down stale. The core call at the end then
+  // paired the *new* runtime with the *old* state's registry ref and attached
+  // the metatable to whatever unrelated object had inherited that slot
+  // (CR-13 F1).
+  CallScope _cs(this);
 
   // Resolve the target before touching the metatable definition, so a bad target
   // is rejected without minting any callback names.
@@ -1723,8 +1764,8 @@ Napi::Value LuaContext::SetMetatable(const Napi::CallbackInfo& info) {
 
   try {
     // The global form reads _G[name] through the protected path, so a
-    // metatabled _G runs its __index here (CR-9 F1).
-    CallScope _cs(this);
+    // metatabled _G runs its __index here (CR-9 F1); the method-entry scope
+    // above already covers it.
     if (targetRef) {
       runtime->SetTableRefMetatable(targetRef->tableRef.ref, entries);
     } else {
@@ -1776,6 +1817,9 @@ Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
 
 Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  // At entry, above the module object's GetPropertyNames()/Get() reads below
+  // (CR-13 F1).
+  CallScope _cs(this);
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
     Napi::TypeError::New(env, "Expected (string, object)").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1828,8 +1872,7 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 
   try {
     // Reads package / package.loaded, so a metatabled package runs its
-    // __index here (CR-9 F1).
-    CallScope _cs(this);
+    // __index here (CR-9 F1); the method-entry scope above covers it.
     runtime->RegisterModuleTable(name, entries);
   } catch (const std::runtime_error& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -1853,6 +1896,10 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
 
   const std::string script = info[0].As<Napi::String>().Utf8Value();
 
+  // Above the options reads below, which can be accessors (CR-13 F1), as well
+  // as the parse further down.
+  CallScope _cs(this);
+
   bool strip_debug = false;
   std::string chunk_name;
   if (info.Length() >= 2 && info[1].IsObject()) {
@@ -1867,8 +1914,8 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
 
   // Compiling parses, parsing allocates, and an allocation can drive a GC step
   // whose __gc finalizers re-enter JS — so this runs Lua just as much as
-  // execute_script does, and needs the same outermost scope (CR-10 F1).
-  CallScope _cs(this);
+  // execute_script does, and needs the same outermost scope (CR-10 F1); the
+  // method-entry scope above covers it.
   const auto result = runtime->CompileScript(script, strip_debug, chunk_name);
 
   if (std::holds_alternative<std::string>(result)) {
@@ -1889,6 +1936,9 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
 
   const std::string filepath = info[0].As<Napi::String>().Utf8Value();
 
+  // See Compile: above the options reads, which can be accessors (CR-13 F1).
+  CallScope _cs(this);
+
   bool strip_debug = false;
   if (info.Length() >= 2 && info[1].IsObject()) {
     auto options = info[1].As<Napi::Object>();
@@ -1897,8 +1947,8 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
     }
   }
 
-  // See Compile: the parse allocates and can reach a __gc finalizer (CR-10 F1).
-  CallScope _cs(this);
+  // The parse allocates and can reach a __gc finalizer (CR-10 F1); the
+  // method-entry scope above covers it.
   const auto result = runtime->CompileFile(filepath, strip_debug);
 
   if (std::holds_alternative<std::string>(result)) {
@@ -2082,6 +2132,11 @@ static LuaTableRefData* TableRefDataFrom(const Napi::Value& value) {
 //   create_environment({ whitelist: [...], inherit: true }) -> + _G fallback
 Napi::Value LuaContext::CreateEnvironment(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  // At entry, above the options / whitelist-array reads below: both can be
+  // Proxy-trapped or accessor-backed. CR-13 F1 could not drive a reset through
+  // this one, which bounds the probe rather than the hazard — it is a member of
+  // the class and is guarded like the rest of it.
+  CallScope _cs(this);
 
   std::vector<std::string> whitelist;
   bool inherit = false;
@@ -2559,7 +2614,9 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     }
 
     // Register the new instance as JS-backed userdata.
-    const int ref_id = next_userdata_id_++;
+    // Throws rather than wrapping; the bridge stages it as an ordinary Lua
+    // error like any other constructor failure.
+    const int ref_id = NextUserdataId();
     const auto instObj = instance.As<Napi::Object>();
     // Tag the instance so that passing the JS object back into Lua re-materializes
     // it as the same class userdata instead of deep-copying it to a table. The
@@ -2629,6 +2686,19 @@ void LuaContext::ClearBusy() {
   // a cancelled worker doesn't leave the flag set to abort the next run (L8).
   runtime->ClearCancel();
   is_busy_ = false;
+}
+
+int LuaContext::NextUserdataId() {
+  if (next_userdata_id_ == std::numeric_limits<int>::max()) {
+    // Not reachable in any sane program (2^31 userdata registrations on one
+    // context), and reset() deliberately does not rewind the counter, so the
+    // only remedy is a new context. Refusing is still the right answer: the
+    // alternative is UB, and a wrapped id would alias a live js_userdata_ entry.
+    throw std::runtime_error(
+      "userdata id space exhausted on this context (2^31 registrations); "
+      "create a new context");
+  }
+  return next_userdata_id_++;
 }
 
 bool LuaContext::RejectIfBusy() {
@@ -3019,9 +3089,16 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
     // A worker-thread run (execute_script_async / execute_file_async) is in
     // flight. It executes Lua synchronously off-thread, so it can only be
     // interrupted cooperatively: signal the runtime and let the instruction
-    // count-hook (polls IsCancelRequested) abort the VM at the next check. This
-    // therefore only takes effect when maxInstructions is set — the hook exists
-    // only then. The worker's OnOK/OnError clears the flag via ClearBusy (L8).
+    // count-hook (polls IsCancelRequested) abort the VM at the next check.
+    //
+    // It therefore takes effect exactly when that hook is installed, which
+    // InstallExecutionHook does for *any* of three consumers: maxInstructions,
+    // timeout, or a debug hook with a count interval. The older wording here
+    // (and in DEFERRED L8, and in types.d.ts) said "only when maxInstructions
+    // is set", which understated it — a timeout-only worker run cancels, and
+    // the hook checks cancellation before either limit (CR-13 F2). With none of
+    // the three set there is no hook and the run is genuinely uninterruptible.
+    // The worker's OnOK/OnError clears the flag via ClearBusy (L8).
     runtime->RequestCancel();
   }
   return env.Undefined();
@@ -3147,13 +3224,27 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // opened; every other one — get_global, set_userdata, gc, add_searcher, … —
   // ran Lua with this guard silently disarmed. LuaRuntime::IsExecuting() is
   // maintained by the core at every point Lua can actually start running, so a
-  // binding method cannot fail to arm it by omission. call_depth_ is still
-  // checked as a cheap second opinion: it also covers a JS→Lua boundary that
-  // has returned from Lua but is still mid-call on this context.
-  if (runtime->IsExecuting() || call_depth_ > 0) {
+  // binding method cannot fail to arm it by omission.
+  //
+  // The two conditions are reported separately because they are different
+  // facts, and CR-13 F1 was the cost of treating the second as a footnote to
+  // the first. `call_depth_` is not a "cheap second opinion" on Lua execution —
+  // it answers "is a binding method on this context's stack", which is true
+  // during the argument-conversion and definition-reading phase where no Lua is
+  // running at all and user JS very much is. A reset there retires the state
+  // under a method that then finishes its work against it. See CallScope.
+  if (runtime->IsExecuting()) {
     Napi::Error::New(env,
       "reset() cannot be called while Lua is executing (from inside a host "
       "callback, metamethod, or __gc finalizer)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (call_depth_ > 0) {
+    Napi::Error::New(env,
+      "reset() cannot be called from inside another lua-native call (a type "
+      "converter, a definition-object getter, or a Proxy trap running while "
+      "that call converts its arguments or results)")
+      .ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -3363,6 +3454,10 @@ Napi::Value LuaContext::SetHook(const Napi::CallbackInfo& info) {
   // A worker thread owns the state during async execution; re-installing the
   // hook underneath it would mutate state it is actively reading.
   if (RejectIfBusy()) return env.Undefined();
+  // At entry, above the options-object reads below (CR-13 F1). This method runs
+  // no Lua of its own beyond lua_sethook, so before CR-13 it had no scope at
+  // all — "runs no Lua" was never the test that mattered.
+  CallScope _cs(this);
 
   if (info.Length() < 1 || !info[0].IsFunction()) {
     Napi::TypeError::New(env, "set_hook(callback, options) requires a function")
@@ -4024,14 +4119,17 @@ static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  // Same outermost-entry bookkeeping resume() does (L7), opened above the
+  // argument handling and the resume it feeds — ResumeCoroutineObject converts
+  // those arguments through user JS (CR-13 F1).
+  LuaContext::CallScope scope(state->context);
+
   // `next(v)` forwards its arguments as the resume values, so a caller can feed
   // a generator-style coroutine from JS.
   std::vector<Napi::Value> args;
   args.reserve(info.Length());
   for (size_t i = 0; i < info.Length(); ++i) args.push_back(info[i]);
 
-  // Same outermost-entry bookkeeping resume() does (L7).
-  LuaContext::CallScope scope(state->context);
   const Napi::Value res = state->context->ResumeCoroutineObject(coro, args);
   if (env.IsExceptionPending() || !res.IsObject()) {
     state->done = true;  // a broken cursor must not be resumable

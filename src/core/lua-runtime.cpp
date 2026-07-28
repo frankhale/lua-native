@@ -1813,6 +1813,16 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
     //     it and invalidates `it` (CR-12 F1).
     // It lives inside this block, not at function scope, because every raise
     // below longjmps past destructors (see the closing brace).
+    //
+    // It is, however, live across the lua_pushfstring calls that *stage* the
+    // error messages, and those allocate — so an LUA_ERRMEM under an exhausted
+    // maxMemory longjmps past ~shared_ptr and leaks a reference (CR-13 F3).
+    // That window is not new: `args` below has always been in it, and the whole
+    // HostCallOutcome dance exists because staging is the one thing that must
+    // happen before the locals die. One more object in a known window; recorded
+    // rather than fixed, because the alternatives (a second lookup, or staging
+    // into C++ storage first) each reintroduce a hazard this file already
+    // closed.
     const std::shared_ptr<Function> fn = it->second;
 
     const int argc = lua_gettop(L);

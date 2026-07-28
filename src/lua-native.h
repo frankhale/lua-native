@@ -258,7 +258,52 @@ public:
     Napi::Value LuaErrorToJsValue(const std::string& fallback);
     void ThrowLuaError(const std::string& fallback);
 
-    // RAII: clears the JS-error registry when the outermost Lua call begins.
+    // RAII: raises `call_depth_`, and clears the JS-error registry at the
+    // outermost entry.
+    //
+    // The invariant this maintains is **"a binding method is on the stack, so
+    // JS may re-enter this context"** — deliberately *not* "Lua may be
+    // running", which is the core's `IsExecuting()` and a different fact.
+    // `reset()` needs both: it retires the lua_State, and a method caught
+    // mid-flight resumes holding refs minted by a state that no longer exists.
+    //
+    // **Open one as the first statement of the method.** A binding method does
+    // not start at its call into Lua — it starts by running user JS: type
+    // converters, definition-object getters, Proxy traps on a caller-supplied
+    // object. CR-13 F1 found this scope placed around the Lua call at seven
+    // entry points and absent from an eighth, leaving that whole
+    // argument-conversion / definition-reading phase unguarded; a converter
+    // calling `reset()` from inside `handle.pairs()` produced handles pairing
+    // the new runtime with the old state's registry refs — silent cross-object
+    // reads and writes, and an ASan-confirmed use-after-free of the retired
+    // state at finalization.
+    //
+    // The invariant is checkable, and the check is mechanical: in every
+    // JS-facing entry point, this scope should appear above the first
+    // `.Get(` / `.Call(` / `GetPropertyNames(` / `NapiToCoreInstance(` /
+    // `CoreToNapi(` line. Split lua-native.cpp by function, find the first of
+    // each per entry point, compare. As of CR-13 exactly six entry points have
+    // user JS above their scope, and each is verified inert — this is the whole
+    // list, so a seventh is a regression:
+    //
+    //   TableRefGetTrap      — `target.Get("_tableRef")` is a fast-path return
+    //                          on the addon's own proxy target; it touches no
+    //                          runtime state and falls out before the Lua work.
+    //   SharedTable::Get     — a plain read of the shared JS object. No runtime.
+    //   LuaContext (ctor)    — reads its options object before `runtime` exists;
+    //                          there is no state to retire, by construction.
+    //   Pcall                — runs the caller's function, then only packages
+    //                          the result. Nothing to invalidate.
+    //   Release              — its `Has`/`Get` can run traps, but the
+    //                          `data->runtime.get() != runtime.get()` check runs
+    //                          *after* them and fails closed on a foreign handle.
+    //   CoroIteratorNext     — `coro.Get("_coroutine")` is a dead-status probe
+    //                          on an addon-minted object; the scope is above the
+    //                          resume and the argument conversion it performs.
+    //
+    // Three methods deliberately have no scope at all — `reset()` (it *is* the
+    // guarded operation), `cancel()` (must work while a run is in flight) and
+    // `is_busy()` (reads one atomic).
     struct CallScope {
       LuaContext* ctx;
       explicit CallScope(LuaContext* c) : ctx(c) {
@@ -408,6 +453,13 @@ private:
     // Userdata reference tracking. next_userdata_id_ keys the int-based userdata
     // maps and the in-userdata-block storage, so it stays int; the remaining
     // counters only feed unique-name strings and are widened to avoid overflow.
+    //
+    // "Stays int" is a real constraint — the id is stored *inside the Lua
+    // userdata block* as an int, so widening it is a core-and-binding change,
+    // not a one-line one — but it is not a licence to overflow: signed overflow
+    // is UB, and a process calling set_userdata per request reaches 2^31. The
+    // counter is therefore range-checked at its single increment site rather
+    // than widened, which converts a UB wrap into a clean JS error (CR-13 F3).
     std::unordered_map<int, UserdataEntry> js_userdata_;
     // The `__ud_method_<ref_id>_<name>` host functions minted for each userdata,
     // so they can be dropped when that userdata is collected.
@@ -480,6 +532,13 @@ private:
     // flight at all, and it consumes the staged value itself.
     std::string StageJsError(const Napi::Value& value, const std::string& message,
                              const lua_core::LuaRuntime* owner = nullptr);
+
+    // Mints the next userdata ref_id. The single increment site for
+    // next_userdata_id_, so the "must stay int" constraint documented there
+    // cannot silently become a signed-overflow UB: this throws instead of
+    // wrapping (CR-13 F3). Callers are on paths that already convert a
+    // std::exception into a JS error.
+    int NextUserdataId();
 
     // Throws a JS "busy" error and returns true if an async op is in flight, so
     // the caller can early-return. Centralizes the guard duplicated across the

@@ -287,8 +287,14 @@ deliberately documented rather than changed:
 - **Resolution:** `cancel()` now calls `runtime->RequestCancel()` when a
   worker-thread run is in flight; the instruction count-hook (gap **A3b**, see
   below) polls `IsCancelRequested()` and aborts the VM loop, so a compute-bound
-  worker run is cooperatively interruptible when `maxInstructions` is set (the
-  hook exists only then). `ClearBusy` clears the flag on worker teardown so a
+  worker run is cooperatively interruptible whenever that hook is installed.
+  **Corrected by CR-13 F2:** this originally read "when `maxInstructions` is set
+  (the hook exists only then)", which understated the mechanism —
+  `InstallExecutionHook` installs `LUA_MASKCOUNT` for *any* of `maxInstructions`,
+  `timeout`, or a debug hook with a `count` interval, and the hook tests
+  cancellation before either limit. A timeout-only worker run cancels; a run with
+  none of the three set has no hook and is genuinely uninterruptible.
+  `ClearBusy` clears the flag on worker teardown so a
   cancelled run can't pre-abort the next one. The unreachable `OnAwaitSettled`
   cancel branch was removed (a cancel while suspended awaiting a promise tears the
   run down in `Cancel()`; worker and coroutine async are mutually exclusive, so
