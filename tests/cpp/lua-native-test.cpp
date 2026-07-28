@@ -4537,6 +4537,281 @@ TEST(LuaRuntimeOutput, ThrowingHandlerIsContained) {
   EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 2);
 }
 
+// ---- CODE-REVIEW-10 regressions ----
+
+namespace {
+
+// A chunk long enough that parsing it allocates continuously, and whose final
+// line is a syntax error. The parse therefore does thousands of allocations —
+// each able to drive a GC step — and then fails, so the body NEVER runs. Any
+// finalizer observed while loading this chunk was reached from the parser, not
+// from executing it, which is what makes the F1 pins airtight.
+std::string BigUnparseableChunk() {
+  std::string s = "local x = 0\n";
+  for (int i = 0; i < 4000; ++i) s += "x = x + 1\n";
+  s += "this is not lua\n";
+  return s;
+}
+
+// Creates `n` finalizable objects whose __gc calls the host function "probe",
+// leaving GC work pending for whatever runs next.
+void ArmFinalizers(const LuaRuntime& rt, int n) {
+  (void)rt.ExecuteScript(
+    "for i = 1, " + std::to_string(n) +
+    " do local t = setmetatable({}, { __gc = function() probe() end }); t = nil end");
+}
+
+// Shared body of the F1 pins: arm finalizers, run `load` (which parses the
+// unparseable chunk), and report whether a finalizer was reached from inside it
+// and what it saw IsExecuting() report. Repeats until a finalizer actually fires
+// so the assertion can never pass vacuously.
+struct LoadProbe {
+  bool ran = false;
+  bool observed = false;
+  bool in_load = false;   // gates recording to the load under test
+};
+
+// Held by shared_ptr and captured *by value*: the registered wrapper is stored
+// on the runtime and therefore outlives this function, so capturing the state by
+// reference would leave the lambda reading a dead stack frame when a finalizer
+// fires later (notably during ~LuaRuntime's lua_close). UBSan catches it.
+using LoadProbePtr = std::shared_ptr<LoadProbe>;
+
+LoadProbePtr ProbeChunkLoad(LuaRuntime& rt, const std::function<void()>& load) {
+  auto probe = std::make_shared<LoadProbe>();
+  LuaRuntime* rt_ptr = &rt;   // outlives the lambda: the lambda lives inside rt
+  rt.RegisterFunction("probe", [probe, rt_ptr](const std::vector<LuaPtr>&) -> LuaPtr {
+    // Only count finalizers reached from inside the load under test; the
+    // ArmFinalizers script below is itself an execution and would otherwise
+    // answer the question for us.
+    if (probe->in_load) {
+      probe->ran = true;
+      probe->observed = rt_ptr->IsExecuting();
+    }
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  for (int attempt = 0; attempt < 25 && !probe->ran; ++attempt) {
+    ArmFinalizers(rt, 200);
+    probe->in_load = true;
+    load();
+    probe->in_load = false;
+  }
+  return probe;
+}
+
+}  // namespace
+
+// F1: a chunk load allocates continuously while parsing, so it can drive a GC
+// step whose __gc finalizers re-enter the host. That makes the loaders as
+// re-entrant as any metamethod even though no user Lua "runs" in them — the
+// trigger for opening an ExecutionScope is "can allocate from Lua", not "runs
+// Lua". Before the fix these reported IsExecuting() == false, which disarmed
+// reset()'s reentrancy guard and freed the lua_State under the parser.
+TEST(LuaRuntimeExecuting, TrueInsideAFinalizerReachedByCompileScript) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const std::string chunk = BigUnparseableChunk();
+  const LoadProbePtr p = ProbeChunkLoad(rt, [&] { (void)rt.CompileScript(chunk); });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the parse; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+TEST(LuaRuntimeExecuting, TrueInsideAFinalizerReachedByExecuteScriptLoad) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const std::string chunk = BigUnparseableChunk();
+  const LoadProbePtr p = ProbeChunkLoad(rt, [&] { (void)rt.ExecuteScript(chunk); });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the parse; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+TEST(LuaRuntimeExecuting, TrueInsideAFinalizerReachedByCreateCoroutineFromScript) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const std::string chunk = BigUnparseableChunk();
+  const LoadProbePtr p =
+    ProbeChunkLoad(rt, [&] { (void)rt.CreateCoroutineFromScript(chunk); });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the parse; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+TEST(LuaRuntimeExecuting, TrueInsideAFinalizerReachedByExecuteScriptInEnvironment) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const int env = rt.CreateEnvironment({}, /*inherit=*/true);
+  const std::string chunk = BigUnparseableChunk();
+  const LoadProbePtr p =
+    ProbeChunkLoad(rt, [&] { (void)rt.ExecuteScriptInEnvironment(env, chunk); });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the parse; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+TEST_F(LuaFileTest, ExecutingIsTrueInsideAFinalizerReachedByCompileFile) {
+  WriteFile(BigUnparseableChunk());
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const LoadProbePtr p = ProbeChunkLoad(rt, [&] { (void)rt.CompileFile(tmp_path_); });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the parse; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+TEST_F(LuaFileTest, ExecutingIsTrueInsideAFinalizerReachedByExecuteFileLoad) {
+  WriteFile(BigUnparseableChunk());
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  const LoadProbePtr p = ProbeChunkLoad(rt, [&] { (void)rt.ExecuteFile(tmp_path_); });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the parse; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// LoadBytecode undumps rather than parses, which allocates the same way: the
+// chunk is constant-heavy rather than instruction-heavy because the undumper
+// interns every distinct string it reads, and all 6000 live inside a function
+// the chunk never calls so the body stays trivial.
+//
+// This one is a **guard, not a regression pin**, and passes with or without the
+// load's ExecutionScope. Unlike its six siblings above, LoadBytecode's failure
+// mode cannot be isolated: its ProtectedCall has been bracketed since CR-9, so
+// a finalizer that misses the undump window is still caught microseconds later
+// by the call. Attempts to force the finalizer into the undump alone (a
+// truncated dump; a body that allocates nothing) did not reproduce. Kept
+// because it does verify the combined path never reports IsExecuting() ==
+// false, which is the property reset() actually depends on.
+TEST(LuaRuntimeExecuting, TrueInsideAFinalizerReachedByLoadBytecode) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  std::string source = "local function unused()\n  local a\n";
+  for (int i = 0; i < 6000; ++i) {
+    source += "  a = \"lua-native-unique-constant-" + std::to_string(i) + "\"\n";
+  }
+  source += "end\nreturn 1";
+  const auto compiled = rt.CompileScript(source);
+  ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
+  const auto& bytecode = std::get<std::vector<uint8_t>>(compiled);
+
+  const LoadProbePtr p = ProbeChunkLoad(rt, [&] {
+    const auto res = rt.LoadBytecode(bytecode);
+    // The body must stay trivial — if it ever starts doing real work this stops
+    // isolating the undump.
+    ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  });
+  ASSERT_TRUE(p->ran) << "no finalizer ran during the undump; the pin proves nothing";
+  EXPECT_TRUE(p->observed);
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// The scope must not leak past the load: a chunk load is not an execution, and
+// leaving the depth raised would wedge reset() permanently.
+TEST(LuaRuntimeExecuting, FalseAfterAFailedChunkLoad) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.CompileScript("this is not lua");
+  EXPECT_FALSE(rt.IsExecuting());
+  (void)rt.ExecuteScript("this is not lua either");
+  EXPECT_FALSE(rt.IsExecuting());
+  (void)rt.CreateCoroutineFromScript("nor is this @@@");
+  EXPECT_FALSE(rt.IsExecuting());
+}
+
+// F3: only the collecting lua_gc commands run finalizers, so only they claim
+// IsExecuting(). Bracketing the read-only ones made the flag mean less than it
+// says (and needlessly restarted the per-execution budget).
+TEST(LuaRuntimeExecuting, FalseForNonCollectingGcCommands) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  (void)rt.GarbageCollect("count");
+  EXPECT_FALSE(rt.IsExecuting());
+  (void)rt.GarbageCollect("isrunning");
+  EXPECT_FALSE(rt.IsExecuting());
+  (void)rt.GarbageCollectParam("pause", -1);
+  EXPECT_FALSE(rt.IsExecuting());
+  // ...but the collecting ones still do (the CR-9 F1 vector).
+  bool observed = false, ran = false;
+  rt.RegisterFunction("probe", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    ran = true;
+    observed = rt.IsExecuting();
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  (void)rt.ExecuteScript(
+    "do local t = setmetatable({}, { __gc = function() probe() end }) end");
+  (void)rt.GarbageCollect("collect");
+  ASSERT_TRUE(ran);
+  EXPECT_TRUE(observed);
+}
+
+// A read-only gc() command must not restart the per-execution instruction
+// budget — it runs no Lua, so it is not an execution boundary.
+TEST(LuaRuntimeInstructions, ReadOnlyGcCommandDoesNotRefreshTheBudget) {
+  RuntimeConfig config;
+  config.libraries = LuaRuntime::AllLibraries();
+  config.max_instructions = 200000;
+  LuaRuntime rt(config);
+
+  // A host callback that burns budget, then calls a read-only gc() command. If
+  // gc('count') restarted the budget, the loop below would never be aborted.
+  rt.RegisterFunction("peek", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    (void)rt.GarbageCollect("count");
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  const auto res = rt.ExecuteScript("while true do peek() end");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("instruction limit exceeded"),
+            std::string::npos);
+}
+
+// F2: the binding owner unbinds the JS-callback bridge before its own members
+// die. ~LuaRuntime clears the other four handler slots for exactly this reason;
+// host_functions_ had no equivalent, so lua_close's __gc metamethods dispatched
+// into a half-destroyed owner.
+TEST(LuaRuntimeHostFunctions, ClearHostFunctionsUnbindsTheBridge) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  bool called = false;
+  rt.RegisterFunction("cb", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    called = true;
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(1)));
+  });
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(rt.ExecuteScript("return cb()")));
+  ASSERT_TRUE(called);
+
+  rt.ClearHostFunctions();
+  called = false;
+  // The Lua-side closure survives; calling it now raises rather than dispatching
+  // into the (notionally destroyed) owner.
+  const auto res = rt.ExecuteScript("return cb()");
+  ASSERT_TRUE(std::holds_alternative<std::string>(res));
+  EXPECT_NE(std::get<std::string>(res).find("not found"), std::string::npos);
+  EXPECT_FALSE(called);
+}
+
+// The state must stay usable afterwards: clearing the bridge is a teardown step,
+// not a corruption.
+TEST(LuaRuntimeHostFunctions, StateRemainsUsableAfterClearHostFunctions) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  rt.RegisterFunction("cb", [](const std::vector<LuaPtr>&) -> LuaPtr {
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  rt.ClearHostFunctions();
+  const auto res = rt.ExecuteScript("return 6 * 7");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+  EXPECT_EQ(std::get<int64_t>(std::get<std::vector<LuaPtr>>(res)[0]->value), 42);
+}
+
+// A __gc finalizer firing after the bridge is cleared must degrade to a
+// contained Lua warning, not a crash — the teardown shape, exercised while the
+// runtime is still alive so the failure mode is observable.
+TEST(LuaRuntimeHostFunctions, FinalizerAfterClearHostFunctionsIsContained) {
+  LuaRuntime rt(LuaRuntime::AllLibraries());
+  bool called = false;
+  rt.RegisterFunction("cb", [&](const std::vector<LuaPtr>&) -> LuaPtr {
+    called = true;
+    return std::make_shared<LuaValue>(LuaValue::nil());
+  });
+  (void)rt.ExecuteScript(
+    "do local t = setmetatable({}, { __gc = function() cb() end }) end");
+  rt.ClearHostFunctions();
+  (void)rt.GarbageCollect("collect");   // fires the finalizer; must not abort
+  EXPECT_FALSE(called);
+  const auto res = rt.ExecuteScript("return 1 + 1");
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res));
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

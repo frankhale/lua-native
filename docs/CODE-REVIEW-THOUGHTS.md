@@ -255,3 +255,68 @@ drove the path* — again confirming that its value is bounded entirely by the
 adversarial coverage of the suite it runs. The eleven new guard tests crash the
 vitest worker outright without the fix, which is the loudest possible form of
 the "regression pins must not rot" lesson from CR-8.
+
+---
+
+## Addendum (July 28, 2026, after CODE-REVIEW-10)
+
+CR-9's remediation was the first *structural* fix in this series, and it worked:
+CR-10 found no binding method that had forgotten a `CallScope`, because the core
+no longer lets one matter. The thesis about relocating invariants held.
+
+What CR-10 adds is the next turn of the same screw:
+
+> **Relocating an invariant does not make it complete; it makes its *statement*
+> load-bearing. Audit the wording against the mechanism, not against the sites
+> the last review listed.**
+
+Once the core owned "Lua is executing," everything downstream depended on the
+core's definition of that phrase — and the definition chosen, *runs Lua*, was
+one word narrower than the hazard, which is *allocates from Lua*. Every
+metamethod path was found and bracketed. Both `lua_resume` sites were found.
+`lua_gc` was found, with the `__gc`-finalizer reasoning spelled out in the
+comment. The chunk loader — the heaviest allocator in the library, called by
+seven core methods — was not, because it does not *look* like it runs Lua. It
+only allocates, and allocation is how the collector gets its turn. Three entry
+points (`compile`, `compile_file`, `execute_async`) were reproduced crashing with
+an ASan-confirmed use-after-free at the identical instruction CR-9 F1 named,
+reached through the parser instead of a metamethod.
+
+The second finding is the more humbling one, and it argues for a new standing
+test category rather than a new design rule. `host_functions_` — the map every
+JS callback dispatches through — sits three lines below `userdata_gc_callback_`
+and `output_handler_` in a `~LuaRuntime` teardown block whose comment states the
+exact hazard it fails to cover. CR-9 *edited that very block* without noticing
+the fourth bridge. Seven lines of entirely ordinary code (a JS callback plus a
+Lua `__gc` finalizer) segfaulted; with a table handle keeping the runtime alive
+past its context, it segfaulted mid-program at an arbitrary GC point rather than
+at exit.
+
+Nine passes missed it for one reason, and it is a coverage reason rather than a
+reasoning one. The suite has eleven `__gc` tests and several *do* call a JS
+callback from a finalizer — but every one of them drains the finalizer with an
+explicit `gc('collect')` while the context is still alive. None ever left one
+**pending at destruction**, which is the only state in which the bug fires. The
+sanitizers found it instantly once a reproduction drove the path; they had never
+been given one.
+
+So the harness lesson from CR-6 and CR-9 gets a concrete extension:
+
+> **A teardown-ordering bug is invisible to a suite that always tears down
+> cleanly.** For every piece of state that bridges the two layers, there should
+> be one test that leaves it *in use* at destruction time rather than draining
+> it first.
+
+The remediation follows the CR-9 pattern deliberately. It did not add three
+`CallScope`s and stop: all seven chunk loaders are bracketed, including the four
+that were only ever *masked* by the binding's `call_depth_`, so the core's
+invariant is self-sufficient rather than co-dependent. And F2 was fixed at the
+class level — a liveness flag captured by the wrappers, which holds however the
+destruction races — with the explicit unbind in `~LuaContext` as belt and
+braces rather than as the mechanism. One subtlety is worth remembering because
+the tidier-looking version is wrong: the wrappers need a flag distinct from
+`alive_`, and the unbind must live in `~LuaContext` rather than `~LuaRuntime`,
+because `reset()` also destroys a runtime and the state it retires must still be
+able to run its own finalizers against the live context. Both are pinned by
+control tests, since both are the kind of thing a later cleanup would happily
+"simplify" away.

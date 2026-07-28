@@ -8455,4 +8455,221 @@ describe('lua-native Node adapter', () => {
       });
     });
   });
+
+  // --- CODE-REVIEW-10 regressions ---------------------------------------
+  //
+  // CR-9 moved the "Lua is executing" invariant into the core, which was right.
+  // CR-10 is about where that relocation stopped: the invariant was stated as
+  // "a path that can run Lua", and the actual hazard is "a path that can
+  // allocate from Lua" — an allocation drives a GC step, a GC step runs __gc
+  // finalizers, and a finalizer is Lua that re-enters the host.
+  describe('CODE-REVIEW-10 regressions', () => {
+
+    // F1: the chunk loaders allocate continuously while parsing, so a GC step
+    // inside luaL_loadbuffer / luaL_loadfile can reach a __gc finalizer. On
+    // compile / compile_file / execute_async neither the core nor the binding
+    // had a scope open, so reset()'s guard was entirely disarmed and the
+    // lua_State was freed under the parser (ASan: heap-use-after-free).
+    describe('F1: a chunk load is an execution too', () => {
+      const GUARD = /reset\(\) cannot be called while Lua is executing/;
+
+      /** A chunk long enough that parsing it drives a GC step. */
+      const bigChunk = () =>
+        'local x = 0\n' + 'x = x + 1\n'.repeat(4000) + 'return x';
+
+      /** Builds a context with pending finalizers that call back into JS, and
+       *  reports what each attempted reset() saw. `armed` gates recording to
+       *  the load under test, so an earlier execution can't answer for it. */
+      const withPendingFinalizers = () => {
+        const seen: string[] = [];
+        let armed = false;
+        const lua: any = new lua_native.init({
+          doreset: () => {
+            if (armed) {
+              try { lua.reset(); seen.push('RESET RAN'); }
+              catch (e: any) { seen.push(e.message); }
+            }
+            return 1;
+          },
+        }, ALL_LIBS);
+        lua.execute_script(
+          `function mk(n)
+             for i = 1, n do
+               local t = setmetatable({}, { __gc = function() doreset() end })
+               t = nil
+             end
+           end`);
+        lua.execute_script('mk(400)');   // leave GC work pending
+        return { lua, seen, arm: () => { armed = true; } };
+      };
+
+      it('rejects a reset from a __gc finalizer reached by compile()', () => {
+        const { lua, seen, arm } = withPendingFinalizers();
+        arm();
+        const big = bigChunk();
+        for (let i = 0; i < 20 && seen.length === 0; i++) lua.compile(big);
+        expect(seen, 'no finalizer ran during the parse').not.toHaveLength(0);
+        expect(seen.every((m) => GUARD.test(m))).toBe(true);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);   // process survived
+      });
+
+      it('rejects a reset from a __gc finalizer reached by compile_file()', () => {
+        const { lua, seen, arm } = withPendingFinalizers();
+        const file = path.join(os.tmpdir(), 'lua-native-cr10-compile-file.lua');
+        fs.writeFileSync(file, bigChunk());
+        try {
+          arm();
+          for (let i = 0; i < 20 && seen.length === 0; i++) lua.compile_file(file);
+        } finally {
+          fs.rmSync(file, { force: true });
+        }
+        expect(seen, 'no finalizer ran during the parse').not.toHaveLength(0);
+        expect(seen.every((m) => GUARD.test(m))).toBe(true);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // execute_async loads its chunk before setting is_busy_, so this window
+      // was guarded by nothing at all.
+      it('rejects a reset from a __gc finalizer reached by execute_async()', async () => {
+        const { lua, seen, arm } = withPendingFinalizers();
+        arm();
+        const big = bigChunk();
+        for (let i = 0; i < 20 && seen.length === 0; i++) await lua.execute_async(big);
+        expect(seen, 'no finalizer ran during the parse').not.toHaveLength(0);
+        expect(seen.every((m) => GUARD.test(m))).toBe(true);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // A chunk load is not an execution: the scope must close with the load,
+      // or reset() would be wedged for the life of the context.
+      it('leaves the guard disarmed once the load has returned', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.compile('return 1');
+        expect(() => lua.reset()).not.toThrow();
+        // A *failed* load must unwind the scope too, not leave the depth raised.
+        expect(() => lua.compile('this is not lua at all')).toThrow(/syntax error/);
+        expect(() => lua.reset()).not.toThrow();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    // F2: the host-function wrappers are stored on the runtime and capture the
+    // context. The runtime outlives the context whenever a handle holds a share
+    // of it, so lua_close — and the __gc metamethods it fires — can dispatch
+    // into a LuaContext whose members are already destroyed. Every other
+    // cross-boundary holder carries a liveness flag; these never did.
+    describe('F2: the JS-callback bridge must not outlive its context', () => {
+
+      // The reproduction, mid-program rather than at process exit: a table
+      // handle keeps the runtime alive past the context, so dropping it runs
+      // lua_close at an arbitrary GC point.
+      it('survives a __gc finalizer that calls JS after its context is collected', async () => {
+        expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+
+        let handle: any = null;
+        (() => {
+          const lua: any = new lua_native.init({ log: () => 1 }, ALL_LIBS);
+          lua.execute_script(
+            `_G.keep = setmetatable({}, { __gc = function() log("late") end })`);
+          handle = lua.create_table({ a: 1 });   // holds a share of the runtime
+        })();
+
+        global.gc!();
+        await new Promise((r) => setTimeout(r, 20));
+        global.gc!();                            // context collected
+
+        handle = null;
+        global.gc!();
+        await new Promise((r) => setTimeout(r, 20));
+        global.gc!();                            // lua_close runs here
+
+        // Reaching this line at all is the assertion: before the fix the
+        // finalizer dispatched into the freed context and killed the process.
+        const fresh: any = new lua_native.init({}, ALL_LIBS);
+        expect(fresh.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // The same shape via a class instance, whose constructor wrapper captures
+      // the context in exactly the same way.
+      it('survives a class-instance finalizer after its context is collected', async () => {
+        expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+
+        let handle: any = null;
+        (() => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          lua.register_class('Res', { construct: () => ({ n: 1 }) });
+          lua.execute_script(`_G.keep = Res.new()`);
+          handle = lua.create_table({ a: 1 });
+        })();
+
+        global.gc!();
+        await new Promise((r) => setTimeout(r, 20));
+        global.gc!();
+        handle = null;
+        global.gc!();
+        await new Promise((r) => setTimeout(r, 20));
+        global.gc!();
+
+        const fresh: any = new lua_native.init({}, ALL_LIBS);
+        expect(fresh.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // The control that pins the fix's *shape*: unbinding must be tied to the
+      // context dying, not to the runtime dying. reset() also destroys a
+      // runtime, and the state it retires must still be able to run its own
+      // finalizers against the (live) context.
+      it('still lets the retiring state reach JS during reset()', () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init(
+          { log: (m: string) => { seen.push(m); return 1; } }, ALL_LIBS);
+        lua.execute_script(
+          `_G.keep = setmetatable({}, { __gc = function() log("closing") end })`);
+        lua.reset();
+        expect(seen).toEqual(['closing']);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      // Ordinary callbacks must be entirely unaffected by the liveness check.
+      it('leaves normal callbacks and finalizers working', () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init(
+          { log: (m: string) => { seen.push(m); return 1; } }, ALL_LIBS);
+        lua.execute_script(`log("direct")`);
+        lua.execute_script(
+          `do local t = setmetatable({}, { __gc = function() log("collected") end }) end`);
+        lua.gc('collect');
+        expect(seen).toEqual(['direct', 'collected']);
+      });
+    });
+
+    // F3: only the collecting lua_gc commands run finalizers, so only they are
+    // an execution. Bracketing the read-only ones made IsExecuting() mean less
+    // than it says and needlessly restarted the per-execution budget.
+    describe('F3: read-only gc() commands are not executions', () => {
+      it('does not restart the instruction budget', () => {
+        const lua: any = new lua_native.init(
+          { peek: () => { lua.gc('count'); return 1; } },
+          { libraries: 'all', maxInstructions: 200000 });
+        // If gc('count') refreshed the budget this loop would never be aborted.
+        expect(() => lua.execute_script('while true do peek() end'))
+          .toThrow(/instruction limit exceeded/);
+      });
+
+      it('still guards the collecting commands', () => {
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({
+          doreset: () => {
+            try { lua.reset(); seen.push('RESET RAN'); }
+            catch (e: any) { seen.push(e.message); }
+            return 1;
+          },
+        }, ALL_LIBS);
+        lua.execute_script(
+          `do local t = setmetatable({}, { __gc = function() doreset() end }) end`);
+        lua.gc('collect');
+        expect(seen).not.toHaveLength(0);
+        expect(seen[0]).toMatch(/reset\(\) cannot be called while Lua is executing/);
+      });
+    });
+  });
 });

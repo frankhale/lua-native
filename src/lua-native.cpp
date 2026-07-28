@@ -1813,6 +1813,10 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
     }
   }
 
+  // Compiling parses, parsing allocates, and an allocation can drive a GC step
+  // whose __gc finalizers re-enter JS — so this runs Lua just as much as
+  // execute_script does, and needs the same outermost scope (CR-10 F1).
+  CallScope _cs(this);
   const auto result = runtime->CompileScript(script, strip_debug, chunk_name);
 
   if (std::holds_alternative<std::string>(result)) {
@@ -1841,6 +1845,8 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
     }
   }
 
+  // See Compile: the parse allocates and can reach a __gc finalizer (CR-10 F1).
+  CallScope _cs(this);
   const auto result = runtime->CompileFile(filepath, strip_debug);
 
   if (std::holds_alternative<std::string>(result)) {
@@ -2311,9 +2317,22 @@ LuaContext::~LuaContext() {
   // Signal any outstanding function/table handles that their context is gone, so
   // a call after destruction fails cleanly instead of dereferencing freed memory.
   if (alive_) alive_->store(false);
+  // Same signal for the host-function wrappers stored on the runtime. They are
+  // reached from lua_close's __gc metamethods, which run *after* this body — at
+  // process teardown, or at an arbitrary later GC if a handle still holds a
+  // share of the runtime (CR-10 F2). Unlike alive_, this flag is never
+  // re-minted, so a reset() does not disarm the wrappers of the live context.
+  if (context_alive_) context_alive_->store(false);
 
   // Clear callbacks to prevent accessing member state during lua_close()
   DetachRuntimeHandlers();
+  // DetachRuntimeHandlers unbinds the four handler slots, but the JS-callback
+  // bridge lives in a map it does not own. Unbind it here — not in
+  // DetachRuntimeHandlers, which reset() also calls and where the retiring
+  // state's finalizers must still reach this (live) context. Belt and braces
+  // with the liveness flag above: this makes a teardown finalizer fail at
+  // lookup rather than relying on every wrapper remembering to check.
+  if (runtime) runtime->ClearHostFunctions();
 }
 
 std::string LuaContext::StageJsError(const Napi::Value& value, const std::string& message) {
@@ -2369,7 +2388,21 @@ void LuaContext::ThrowLuaError(const std::string& fallback) {
 }
 
 lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::string& name) {
-  return [this, name](const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+  // The liveness flag travels with `this` for the same reason every other
+  // cross-boundary holder carries one (H3 / H5 / CR-7 F1): this wrapper is
+  // stored on the runtime, the runtime outlives the context whenever a handle
+  // holds a share of it, and lua_close's __gc metamethods dispatch through
+  // here. Without the check, a finalizer firing after ~LuaContext reads
+  // js_callbacks_ and env out of freed memory (CR-10 F2).
+  return [this, name, alive = context_alive_](
+           const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    if (!alive || !alive->load()) {
+      // Must precede every member access, including the HandleScope's `env`.
+      // Throwing is the right shape: the bridge stages it as an ordinary Lua
+      // error, and inside a finalizer Lua reports it as a warning.
+      throw std::runtime_error(
+        "JS callback '" + name + "' outlived its Lua context");
+    }
     // Runs inside a Lua C frame; scope the per-call handles (args + result) so a
     // tight Lua loop calling this host function doesn't accumulate millions of
     // live handles until the enclosing script returns. The stashed
@@ -2408,8 +2441,15 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
 lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     const std::string& name, const std::string& class_name,
     bool readable, bool writable) {
-  return [this, name, class_name, readable, writable](
+  return [this, name, class_name, readable, writable, alive = context_alive_](
       const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
+    // See CreateJsCallbackWrapper: this wrapper is stored on the runtime, which
+    // can outlive the context, so check liveness before any member access
+    // (CR-10 F2).
+    if (!alive || !alive->load()) {
+      throw std::runtime_error(
+        "class '" + class_name + "' constructor outlived its Lua context");
+    }
     // Bound the N-API handles created below (arg conversions, the constructed
     // instance, the hidden-prop temporaries) to this call. Without a scope,
     // `for i=1,1e6 do MyClass() end` would pile every iteration's handles into
@@ -2581,6 +2621,12 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
   // past N-API.
   std::variant<lua_core::LuaThreadRef, std::string> co = std::string();
   try {
+    // Scoped to the load alone, and deliberately not across the DriveAsync
+    // below: the chunk parse allocates and can reach a __gc finalizer, and this
+    // runs *before* is_busy_ is set, so nothing else guards the window
+    // (CR-10 F1). Holding it open past this point would also leave call_depth_
+    // raised across a suspended await.
+    CallScope _cs(this);
     co = runtime->CreateCoroutineFromScript(script);
   } catch (const std::exception& e) {
     auto deferred = Napi::Promise::Deferred::New(env);
@@ -3369,6 +3415,12 @@ Napi::Value LuaContext::AddSearcher(const Napi::CallbackInfo& info) {
   runtime->StoreHostFunction(name, CreateJsCallbackWrapper(name));
   // Recorded only after the core call succeeds, so a rejected registration is
   // never replayed by reset() (CR-9 F3, mirroring add_search_path).
+  //
+  // A second, independent Persistent to the same function — not a leak. The two
+  // have different lifetimes: the js_callbacks_ entry is keyed by the generated
+  // __searcher_N name and is dropped wholesale by reset(), while this one is
+  // context configuration that must survive a reset in order to be replayed
+  // under a freshly minted name.
   searchers_.emplace_back(Napi::Persistent(info[0].As<Napi::Function>()));
   return env.Undefined();
 }

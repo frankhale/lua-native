@@ -1,7 +1,7 @@
 # CODE-REVIEW-DEFERRED
 
 Consolidated tracker for findings across **all code reviews (CODE-REVIEW-1
-through CODE-REVIEW-9)** that were **deferred, only partially resolved,
+through CODE-REVIEW-10)** that were **deferred, only partially resolved,
 deliberately not applied, or resolved by documentation** — the standing
 backlog the reviews' priority lists point at. Items are grouped by their source
 review and tagged with the original finding ID so they can be traced back.
@@ -12,7 +12,9 @@ Severity labels are carried over from the originating review.
 2026**: the CR-8 F6 main class was closed by code (`PushLuaValueProtected`);
 see its entry for the two narrowed residuals that replace it. **Updated July 27,
 2026**: CODE-REVIEW-9 added; all four of its findings were resolved in the same
-pass, so it contributes nothing to the backlog.
+pass, so it contributes nothing to the backlog. **Updated July 28, 2026**:
+CODE-REVIEW-10 added; all three of its findings were likewise resolved in the
+same pass, so it too contributes nothing to the backlog.
 
 ## Ledger
 
@@ -27,6 +29,7 @@ pass, so it contributes nothing to the backlog.
 | CODE-REVIEW-7 | `5f7b8f6` | none (its audit annotated the CR-2 M5 residual, since closed) |
 | CODE-REVIEW-8 | `330cc30` | F6 ✅ main restructure done July 23, 2026 (bridge value pushes now protected); two narrow residuals remain documented (error-message staging allocations; the stranded constructor `js_userdata_` entry) |
 | CODE-REVIEW-9 | `6839145` | none — all four findings (F1–F4) resolved in the remediation pass |
+| CODE-REVIEW-10 | `9260396` | none — all three findings (F1–F3) resolved in the remediation pass |
 
 ---
 
@@ -445,9 +448,39 @@ next pass should read the code:
 
 ---
 
+---
+
+## From CODE-REVIEW-10 (commit `9260396`)
+
+**Nothing deferred.** All three findings (F1–F3) fully resolved. Three notes
+worth keeping, since none is a residual but each shapes how the next pass should
+read the code:
+
+- **The core invariant's *wording* is now load-bearing.** CR-9 moved "Lua is
+  executing" into `LuaRuntime::ExecutionScope`; CR-10 found that the phrase
+  chosen — "a path that can run Lua" — was one word narrower than the hazard,
+  which is **"a path that can allocate from Lua"** (an allocation drives a GC
+  step, a GC step runs `__gc` finalizers, and a finalizer is Lua). The chunk
+  loaders were the miss. `IsExecuting()` and `SetTimeout` now state the broader
+  trigger explicitly. Any new bare `lua_*` allocation outside a scope should be
+  read against that wording, not against the list of sites CR-9 enumerated.
+- **Two liveness flags now exist on `LuaContext`, and they are not
+  interchangeable.** `alive_` means "handles from this generation are valid" and
+  is re-minted by `reset()`; `context_alive_` means "the `LuaContext` object
+  itself is alive" and is set once, in the destructor. The host-function
+  wrappers must use the latter — using `alive_` would stop the retiring state's
+  own `__gc` finalizers from reaching the (live) context during a reset, which a
+  control test pins.
+- **`ClearHostFunctions()` is called from `~LuaContext` only.** Putting it in
+  `~LuaRuntime` or `DetachRuntimeHandlers` would look tidier and would silently
+  break the same reset-path behaviour; the header and the call site both record
+  why.
+
+---
+
 ## Suggested order for a future hardening pass
 
-Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-9 is resolved.
+Every code-defect finding from CODE-REVIEW-1 through CODE-REVIEW-10 is resolved.
 What remains, in the order it should be acted on:
 
 1. **Before the first publish for outside consumers** (release blockers, both

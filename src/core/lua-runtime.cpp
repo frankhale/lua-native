@@ -403,10 +403,14 @@ LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
   // "collect" and "step" run __gc finalizers, which are Lua code and can
   // re-enter the host — the one path into user Lua that reaches no lua_pcall of
   // ours, and so the CR-9 F1 vector that needs no metatable at all: an ordinary
-  // finalizer calling a JS callback that calls reset(). Bracket the whole
-  // function; the non-collecting commands pay only an integer increment.
-  ExecutionScope exec(this);
+  // finalizer calling a JS callback that calls reset().
+  //
+  // Only those two are bracketed. Bracketing the whole function also made the
+  // read-only commands claim IsExecuting() and restart the per-execution budget
+  // (CR-10 F3); scoping each collecting command individually keeps the flag
+  // meaning what it says.
   if (command == "collect") {
+    ExecutionScope exec(this);
     (void)CheckGCAvailable(lua_gc(L_, LUA_GCCOLLECT), command);
     return std::monostate{};
   }
@@ -427,7 +431,9 @@ LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
   }
   if (command == "step") {
     // The vararg is read as a size_t: the number of bytes to treat as newly
-    // allocated. 0 performs one basic step.
+    // allocated. 0 performs one basic step. Bracketed for the same reason as
+    // "collect": a step can run __gc finalizers.
+    ExecutionScope exec(this);
     return CheckGCAvailable(lua_gc(L_, LUA_GCSTEP, step_size), command) != 0;
   }
   if (command == "isrunning") {
@@ -445,6 +451,10 @@ LuaRuntime::GCResult LuaRuntime::GarbageCollect(const std::string& command,
   throw std::runtime_error(msg);
 }
 
+// No ExecutionScope, unlike GarbageCollect's "collect"/"step": LUA_GCPARAM only
+// reads or writes a collector tuning field and never runs a finalizer, so no
+// Lua can execute in here (CR-10 F3 — the asymmetry with its neighbour is
+// deliberate, not an omission).
 int LuaRuntime::GarbageCollectParam(const std::string& param, const int value) const {
   // Maps the `collectgarbage('param', ...)` names to the LUA_GCP* constants.
   static const std::unordered_map<std::string, int> kGCParams = {
@@ -1224,6 +1234,16 @@ void LuaRuntime::RemoveHostFunction(const std::string& name) {
   host_functions_.erase(name);
 }
 
+void LuaRuntime::ClearHostFunctions() {
+  // See the header: the binding owner calls this from its destructor, before
+  // its own members die, so a __gc finalizer running during a later lua_close
+  // can't dispatch into it (CR-10 F2). reclaimable_host_fns_ is cleared too so
+  // a sentinel __gc firing during teardown finds no entry to decrement rather
+  // than resurrecting one.
+  host_functions_.clear();
+  reclaimable_host_fns_.clear();
+}
+
 void LuaRuntime::RegisterReclaimableHostFunction(const std::string& name, Function fn) {
   host_functions_[name] = std::move(fn);
   reclaimable_host_fns_[name] = 0;  // live-closure count, incremented on each push
@@ -1835,6 +1855,11 @@ CompileResult LuaRuntime::CompileScript(const std::string& script,
                                          bool strip_debug,
                                          const std::string& chunk_name) const {
   StackGuard guard(L_);
+  // Parsing allocates continuously (every interned string, every prototype), so
+  // it can drive a GC step whose __gc finalizers re-enter the host — the same
+  // reasoning ToLuaValueProtected states for its luaL_ref. Compiling therefore
+  // has to be bracketed even though no user Lua "runs" here (CR-10 F1).
+  ExecutionScope exec(this);
 
   // Always load size-aware (luaL_loadstring stops at the first embedded NUL).
   // With no explicit chunk name, mirror luaL_loadstring by using the source
@@ -1875,6 +1900,9 @@ CompileResult LuaRuntime::CompileFile(const std::string& filepath,
   }
 
   StackGuard guard(L_);
+  // See CompileScript: parsing allocates, so a GC step here can run a __gc
+  // finalizer that re-enters the host (CR-10 F1).
+  ExecutionScope exec(this);
 
   if (luaL_loadfile(L_, filepath.c_str()) != LUA_OK) {
     std::string err = lua_tostring(L_, -1);
@@ -2188,18 +2216,25 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
   };
   ReaderData reader{bytecode.data(), bytecode.size(), false};
 
-  int status = lua_load(L_,
-    [](lua_State*, void* ud, size_t* sz) -> const char* {
-      auto* r = static_cast<ReaderData*>(ud);
-      if (r->consumed) {
-        *sz = 0;
-        return nullptr;
-      }
-      *sz = r->size;
-      r->consumed = true;
-      return reinterpret_cast<const char*>(r->data);
-    },
-    &reader, chunk_name.c_str(), "b");
+  // See ExecuteScript: undumping allocates (the prototypes, the interned
+  // strings), so bracket the load — tightly, so the execution budget still
+  // starts at ProtectedCall (CR-10 F1).
+  int status;
+  {
+    ExecutionScope exec(this);
+    status = lua_load(L_,
+      [](lua_State*, void* ud, size_t* sz) -> const char* {
+        auto* r = static_cast<ReaderData*>(ud);
+        if (r->consumed) {
+          *sz = 0;
+          return nullptr;
+        }
+        *sz = r->size;
+        r->consumed = true;
+        return reinterpret_cast<const char*>(r->data);
+      },
+      &reader, chunk_name.c_str(), "b");
+  }
 
   if (status != LUA_OK) {
     std::string error = lua_tostring(L_, -1);
@@ -2233,7 +2268,16 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   const int stackBefore = lua_gettop(L_);
 
   // Size-aware load so scripts with embedded NULs aren't silently truncated.
-  if (luaL_loadbuffer(L_, script.data(), script.size(), script.c_str()) != LUA_OK) {
+  // Bracketed (see CompileScript): the parse allocates and so can run a __gc
+  // finalizer that re-enters the host. Scoped to the load alone, so the
+  // execution budget still starts at ProtectedCall rather than folding in the
+  // compile (CR-10 F1).
+  int loadStatus;
+  {
+    ExecutionScope exec(this);
+    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
+  }
+  if (loadStatus != LUA_OK) {
     std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
@@ -2267,7 +2311,14 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
   last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
-  if (luaL_loadfile(L_, filepath.c_str()) != LUA_OK) {
+  // See ExecuteScript: the parse allocates, so bracket it — tightly, so the
+  // execution budget still starts at ProtectedCall (CR-10 F1).
+  int loadStatus;
+  {
+    ExecutionScope exec(this);
+    loadStatus = luaL_loadfile(L_, filepath.c_str());
+  }
+  if (loadStatus != LUA_OK) {
     std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
@@ -3092,8 +3143,14 @@ ScriptResult LuaRuntime::ExecuteScriptInEnvironment(const int env_ref,
   const int stackBefore = lua_gettop(L_);
 
   // Size-aware load so scripts with embedded NULs aren't silently truncated
-  // (mirrors ExecuteScript, chunk name included).
-  if (luaL_loadbuffer(L_, script.data(), script.size(), script.c_str()) != LUA_OK) {
+  // (mirrors ExecuteScript, chunk name and the load's ExecutionScope included —
+  // the parse allocates and so can run a __gc finalizer, CR-10 F1).
+  int loadStatus;
+  {
+    ExecutionScope exec(this);
+    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
+  }
+  if (loadStatus != LUA_OK) {
     std::string error = CaptureError(L_);
     lua_pop(L_, 1);
     return error;
@@ -3289,8 +3346,16 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
   StackGuard guard(L_);
 
   // Load the script chunk as a function on the main stack (size-aware so
-  // embedded NULs aren't truncated).
-  if (luaL_loadbuffer(L_, script.data(), script.size(), script.c_str()) != LUA_OK) {
+  // embedded NULs aren't truncated). Bracketed for the same reason as
+  // ExecuteScript's load: parsing allocates, so a GC step here can run a __gc
+  // finalizer that re-enters the host — and execute_async reaches this before
+  // it sets is_busy_, so nothing else was guarding it (CR-10 F1).
+  int loadStatus;
+  {
+    ExecutionScope exec(this);
+    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
+  }
+  if (loadStatus != LUA_OK) {
     const char* msg = lua_tostring(L_, -1);
     return std::string(msg ? msg : "failed to load script");
   }

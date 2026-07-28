@@ -366,6 +366,22 @@ public:
   // Only removes the C++ entry; the caller is responsible for any Lua-side
   // reference (there is none for a build that failed before installing it).
   void RemoveHostFunction(const std::string& name);
+  // Drops *every* host function at once, unbinding the JS-callback bridge.
+  //
+  // For a binding layer whose owner object is about to be destroyed: the
+  // wrappers stored here capture that owner, and lua_close (which may run much
+  // later, since any outstanding handle keeps this runtime alive) fires __gc
+  // metamethods that can call them. The owner must therefore unbind itself
+  // *before* its members die — the same contract SetUserdataGCCallback and
+  // friends satisfy by being reset to nullptr, which this map had no equivalent
+  // of (CR-10 F2). A finalizer that calls a cleared name degrades to the
+  // ordinary "Host function '<name>' not found" raise, which Lua reports as a
+  // finalizer warning.
+  //
+  // Deliberately *not* called from ~LuaRuntime: a runtime being retired by
+  // reset() must still let its own __gc finalizers reach the (still live)
+  // binding owner.
+  void ClearHostFunctions();
   // Like StoreHostFunction, but the registry entry (and the binding's paired JS
   // reference, via the host-function GC callback) is reclaimed once every Lua
   // closure materialized from this name is garbage-collected. Used for the
@@ -590,14 +606,20 @@ public:
   // Enforced from the same count-hook as the instruction limit, and with the
   // same per-execution budget. "One execution" is every *outermost* entry into
   // Lua on this runtime — not just the obvious ones. The budget is started by
-  // ExecutionScope, which brackets every path that can run Lua code:
-  // ProtectedCall (execute_script/file, load_bytecode, a Lua-function call),
-  // both lua_resume sites, and the protected-frame helpers (RunProtected,
-  // ProtectedTableCall, PushProtectedGlobal, ToLuaValueProtected) that back the
-  // table handles, the Proxy traps, metatabled _G access, and environments.
-  // Before CR-9 F2 only the first three started a budget, so a metamethod
-  // reached through a table handle ran against whatever deadline and tally the
-  // previous execution left behind and could abort spuriously.
+  // ExecutionScope, which brackets every path that can run Lua code *or
+  // allocate from Lua*: ProtectedCall (execute_script/file, load_bytecode, a
+  // Lua-function call), both lua_resume sites, the protected-frame helpers
+  // (RunProtected, ProtectedTableCall, PushProtectedGlobal,
+  // ToLuaValueProtected) that back the table handles, the Proxy traps,
+  // metatabled _G access and environments, lua_gc's collecting commands, and
+  // the chunk loaders (see IsExecuting for why parsing counts). Before CR-9 F2
+  // only the first three started a budget, so a metamethod reached through a
+  // table handle ran against whatever deadline and tally the previous execution
+  // left behind and could abort spuriously.
+  //
+  // A chunk load's scope is opened and closed around the load alone, so it does
+  // not fold parse time into the execution budget the ProtectedCall below it
+  // then starts — the deadline still bounds the run, not the compile.
   //
   // Nested entries do NOT restart the budget: a host callback that re-enters
   // Lua shares the enclosing execution's budget, so the limit bounds the whole
@@ -614,8 +636,16 @@ public:
 
   // True while Lua code may be executing on this runtime's C stack — i.e.
   // inside any ExecutionScope (see SetTimeout for the full list of bracketed
-  // paths), including a metamethod, a host-function bridge, or a __gc
-  // finalizer reached from lua_gc.
+  // paths), including a metamethod, a host-function bridge, a __gc finalizer
+  // reached from lua_gc, and a __gc finalizer reached from a GC step *inside a
+  // chunk load*.
+  //
+  // The trigger for opening a scope is deliberately "**can allocate from
+  // Lua**", not the narrower "runs Lua" (CR-10 F1). Any allocation can drive a
+  // GC step, a GC step runs pending __gc finalizers, and a finalizer is Lua
+  // code that can re-enter the host. The chunk loaders are the case that makes
+  // the distinction matter: luaL_loadbuffer/luaL_loadfile/lua_load only parse,
+  // yet they allocate continuously and so are as re-entrant as any metamethod.
   //
   // A caller that would free or replace the lua_State must consult this first:
   // retiring the state under live frames frees the very lua_State those frames
@@ -781,11 +811,13 @@ private:
   // stack may currently be running Lua. See IsExecuting().
   mutable int lua_depth_ = 0;
 
-  // RAII bracket for "Lua may run inside here". Every path that can execute
-  // Lua code opens one; the outermost also starts the per-execution budget, so
-  // the two facts that depend on knowing Lua is running — the reentrancy guard
-  // (CR-9 F1) and the instruction/wall-clock budget (CR-9 F2) — are maintained
-  // in one place instead of at each caller's discretion.
+  // RAII bracket for "Lua may run inside here". Every path that can execute Lua
+  // code — *or merely allocate from Lua*, since an allocation can drive a GC
+  // step and a __gc finalizer is Lua (CR-10 F1) — opens one; the outermost also
+  // starts the per-execution budget, so the two facts that depend on knowing
+  // Lua is running — the reentrancy guard (CR-9 F1) and the instruction/
+  // wall-clock budget (CR-9 F2) — are maintained in one place instead of at
+  // each caller's discretion.
   //
   // Non-throwing and allocation-free, so it is safe to open immediately before
   // a longjmp-capable Lua call: a Lua error unwinds through the enclosing
@@ -903,6 +935,13 @@ private:
   // control flow. Static, and the descriptor travels as a light-userdata
   // argument (pushing one never allocates), so it works on whichever thread
   // the bridge was invoked on without a registry read.
+  //
+  // Precondition: being static, this is the one protected-frame helper that
+  // cannot open an ExecutionScope. It does not need to — every call site is a
+  // host bridge already running inside an enclosing scope, so the depth is
+  // never 0 here. A future caller reaching this from depth 0 would push its
+  // allocations (and any GC step they drive) outside the reentrancy guard, so
+  // it must open a scope itself (CR-10 F3).
   struct ProtectedPush {
     const LuaPtr* value;
     std::exception_ptr error;

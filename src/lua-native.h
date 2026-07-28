@@ -334,7 +334,26 @@ private:
     // Flipped to false in ~LuaContext. Shared (by shared_ptr) with every
     // returned function/table handle so a handle used after the context is
     // destroyed fails cleanly instead of dereferencing freed memory.
+    //
+    // Also re-minted by reset(), which is what makes it the wrong flag for the
+    // host-function wrappers — see context_alive_ below.
     std::shared_ptr<std::atomic<bool>> alive_ =
+        std::make_shared<std::atomic<bool>>(true);
+
+    // Flipped to false in ~LuaContext and never re-minted. Captured by the
+    // host-function wrappers (CreateJsCallbackWrapper /
+    // CreateConstructorWrapper), which are stored on the runtime and can be
+    // invoked long after this context dies: every outstanding handle keeps the
+    // runtime alive, so lua_close — and the __gc metamethods it fires — may run
+    // at an arbitrary later GC, dispatching into a wrapper whose captured
+    // `this` is freed memory (CR-10 F2).
+    //
+    // Deliberately distinct from alive_. alive_ answers "are handles from this
+    // generation still valid", so reset() sets it false and mints a new one;
+    // the wrappers need the different fact "is the LuaContext object itself
+    // alive", which a reset does not change — the retiring state's own __gc
+    // finalizers must still be able to reach the (live) context.
+    std::shared_ptr<std::atomic<bool>> context_alive_ =
         std::make_shared<std::atomic<bool>>(true);
 
     // In-flight coroutine-driven async execution state (execute_async).
