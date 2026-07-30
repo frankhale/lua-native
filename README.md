@@ -60,25 +60,211 @@ different Lua version, you will need to build from source.
 
 ## Building from Source
 
-### Prerequisites
+Building compiles a native N-API addon that statically links Lua, so you need a
+C++17 toolchain and a Lua library in addition to Node.js. Linux has not been
+tested.
 
-- **Node.js** (v18 or later recommended)
-- **Python** (required by node-gyp)
-- **VCPKG** with Lua installed (`vcpkg install lua`) - [vcpkg.io](https://vcpkg.io/en/index.html)
-- **Windows**: Visual Studio 2022 or Build Tools with C++ workload
-- **macOS**: Xcode Command Line Tools (`xcode-select --install`)
+### Prerequisites at a Glance
 
-NOTE: There are two ways to build this module. You can use traditional
-`bindings.gyp` along with `node-gyp` or you can use `cmake` on
-Windows and macOS. Linux has not been tested.
+| Dependency               | Version                    | Why it's needed                                                     |
+| ------------------------ | -------------------------- | ------------------------------------------------------------------- |
+| Node.js                  | 20+ (24 LTS recommended)   | Runtime and host for the addon; supplies npm and `node-gyp`         |
+| Python                   | 3.8+                       | Required by `node-gyp` to run gyp                                   |
+| vcpkg                    | any recent checkout        | Provides Lua headers and the static Lua library                     |
+| Lua (via vcpkg)          | 5.5.x                      | The embedded VM this addon links against                            |
+| C++ toolchain            | MSVC v143 / Apple Clang    | Compiles the addon (C++17, exceptions and RTTI enabled)             |
+| Git                      | any                        | Fetching the Google Test submodule for debug builds                 |
+| CMake                    | 3.20+ *(optional)*         | Only for the alternative CMake build path                           |
+
+The addon targets N-API version 8, so any Node.js ≥ 16 can *load* the compiled
+binary. The 20+ floor is for the dev tooling — Vitest 4 requires Node
+`^20 || ^22 || >=24`.
+
+### 1. npm Dependencies
+
+Clone the repository and install:
 
 ```bash
-# Debug build
+git clone https://github.com/frankhale/lua-native.git
+cd lua-native
+npm install
+```
+
+**Runtime dependencies** (installed into consumers of the package too):
+
+- **`node-addon-api`** (`^8.5.0`) — the C++ wrapper around N-API. `binding.gyp`
+  asks it for its header directory with
+  `node -p "require('node-addon-api').include"`, so the build fails without it
+  even though nothing imports it from JavaScript.
+- **`node-gyp-build`** (`^4.8.4`) — runs as the package's `install` script. On a
+  consumer machine it selects a prebuilt binary from `prebuilds/`, falling back
+  to a source build.
+
+**Dev dependencies:**
+
+- **`vitest`** (`^4.0.18`) — the TypeScript/JavaScript test suite (`npm test`).
+- **`prebuildify`** (`^6.0.1`) — produces the prebuilt binaries in `prebuilds/`
+  (`npm run prebuildify`).
+- **`@types/node`** (`^25.3.0`) — types for the test suite and build scripts.
+
+**`node-gyp` is not in `package.json`.** It ships inside npm, and npm puts it on
+the `PATH` for `npm run` scripts, which is how `build-debug` / `build-release`
+find it. If you see `node-gyp: command not found` (common with alternate package
+managers), install it yourself:
+
+```bash
+npm install -g node-gyp
+```
+
+`node-gyp` also needs **Python 3.8 or newer** on the `PATH`. If you have several
+Pythons installed, point it at the right one:
+
+```bash
+npm config set python /path/to/python3
+# or, per-invocation:
+PYTHON=/path/to/python3 npm run build-debug
+```
+
+### 2. vcpkg and Lua
+
+Lua is **not** vendored — it comes from [vcpkg](https://vcpkg.io). Both build
+paths (`node-gyp` and CMake) resolve the Lua include and library paths from the
+`VCPKG_ROOT` environment variable, falling back to `~/vcpkg` when it is unset.
+
+Install vcpkg (skip if you already have one, e.g. the copy CLion manages):
+
+```bash
+# macOS / Linux
+git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
+~/vcpkg/bootstrap-vcpkg.sh
+export VCPKG_ROOT="$HOME/vcpkg"      # add to ~/.zshrc or ~/.bashrc
+```
+
+```powershell
+# Windows (PowerShell)
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+setx VCPKG_ROOT "C:\vcpkg"           # reopen the shell afterward
+```
+
+Then install Lua. **The triplet matters** — `get_vcpkg_path.js` looks for a
+*static* library at
+`$VCPKG_ROOT/installed/<triplet>/lib/{liblua.a,lua.lib}`, and the triplet is
+chosen from your platform and architecture:
+
+| Platform            | Triplet             | Command                             |
+| ------------------- | ------------------- | ----------------------------------- |
+| macOS Apple Silicon | `arm64-osx`         | `vcpkg install lua`                 |
+| macOS Intel         | `x64-osx`           | `vcpkg install lua`                 |
+| Windows x64         | `x64-windows-static`| `vcpkg install lua:x64-windows-static` |
+
+On macOS the default triplets are already static, so a plain `vcpkg install lua`
+is enough. **On Windows you must ask for `x64-windows-static` explicitly** — the
+default `x64-windows` triplet builds a DLL and installs to the wrong directory,
+and the addon is built against the static CRT (`/MT`), so it must link a static
+Lua.
+
+vcpkg's `lua` port is currently **5.5.0**, which is what this project targets.
+The code uses Lua 5.5 APIs (`luaL_openselectedlibs`, the 5.5 `lua_gc` arities,
+native 64-bit integers), so it will **not** compile against Lua 5.4 or earlier.
+
+Verify the resolution before building — these print the exact paths the build
+will use:
+
+```bash
+npm run get-vcpkg-include   # .../installed/arm64-osx/include
+npm run get-vcpkg-lib       # .../installed/arm64-osx/lib/liblua.a
+```
+
+If either path does not exist on disk, fix `VCPKG_ROOT` or the triplet before
+going further; the compiler error you would otherwise get (`lua.hpp` not found,
+or an unresolved-symbol link failure) is much less obvious.
+
+### 3. Platform Build Tools
+
+#### Windows
+
+- **Visual Studio 2022** with the **"Desktop development with C++"** workload,
+  or the standalone **Build Tools for Visual Studio 2022**.
+- That workload supplies the **MSVC v143 toolset** and the **Windows 10/11 SDK**,
+  both required.
+- The build uses the **static runtime** (`/MT`, `/MTd` for debug) and defines
+  `LUA_STATIC`, which is why the static vcpkg triplet above is mandatory.
+- Only **x64** is configured.
+
+#### macOS
+
+- **Xcode Command Line Tools**:
+
+  ```bash
+  xcode-select --install
+  ```
+
+  A full Xcode install works too, but the Command Line Tools alone are enough.
+- Apple Clang with `libc++`, C++17, exceptions and RTTI enabled.
+- `binding.gyp` sets `MACOSX_DEPLOYMENT_TARGET` to **26.0**. If you're on an
+  older macOS, lower that value in `binding.gyp` (and in `CMakeLists.txt` if you
+  use the CMake path) to your OS version.
+- Both arm64 and x64 are supported; prebuilt binaries only cover arm64.
+
+### 4. Google Test Submodule (Debug Builds)
+
+The debug build also compiles the C++ test binary, whose sources include
+`vendor/googletest`. That directory is a **git submodule** — a fresh clone
+leaves it empty and the build fails on a missing `gtest-all.cc`:
+
+```bash
+git submodule update --init --recursive
+```
+
+`npm run build-release` sets `-Dskip_test=1` and skips the test target, so it
+does not need the submodule.
+
+### 5. Build
+
+```bash
+# Debug build — includes the C++ test binary. Required before `npm test`.
 npm run build-debug
 
-# Release build
+# Release build — addon only.
 npm run build-release
 ```
+
+Output lands in `build/Debug/` or `build/Release/` as `lua-native.node`;
+`index.js` searches `prebuilds/` → debug → release → `node-gyp-build`.
+
+**After any C++ change, re-run `npm run build-debug` before `npm test`** — the
+test suite loads the freshly built binary, not a prebuilt one.
+
+#### Alternative: CMake
+
+There are two independent build paths — `binding.gyp` with `node-gyp` (the
+default and the one used for releases) and CMake. The CMake path needs **CMake
+3.20+** on the `PATH` plus the same `VCPKG_ROOT`; it wires up vcpkg's toolchain
+file automatically:
+
+```bash
+npm run build-cmake-debug
+npm run build-cmake-release
+```
+
+#### Clean
+
+```bash
+npm run clean   # removes node-gyp's build/ and the cmake-build-* directories
+```
+
+### Troubleshooting
+
+| Symptom                                                        | Cause and fix                                                                                   |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `node-gyp: command not found`                                  | Not using npm's bundled copy — `npm install -g node-gyp`                                        |
+| `gyp ERR! find Python`                                         | No Python 3.8+ on the `PATH` — install it, or `npm config set python <path>`                    |
+| `fatal error: 'lua.hpp' file not found`                        | Wrong or unset `VCPKG_ROOT`, or Lua not installed for the right triplet — check `npm run get-vcpkg-include` |
+| `cannot open input file 'lua.lib'` / unresolved Lua symbols    | On Windows, Lua installed for `x64-windows` instead of `x64-windows-static`                     |
+| `gtest-all.cc: No such file or directory`                      | Submodule not fetched — `git submodule update --init --recursive`                               |
+| Undefined `luaL_openselectedlibs` or `lua_gc` arity errors     | Linking Lua 5.4 or older; this project requires Lua 5.5                                         |
+| `npm test` behaves as though your C++ change never happened    | Rebuild with `npm run build-debug` first                                                        |
 
 ## Usage
 
@@ -3442,4 +3628,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-28 July 2026
+29 July 2026
