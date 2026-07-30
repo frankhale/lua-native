@@ -51,6 +51,11 @@ data structures.
 npm install lua-native
 ```
 
+**Requires Node.js 20 or later.** The addon is built against N-API version 8, so
+the binary itself will load on older releases, but 20+ is the supported and
+tested floor (24 LTS recommended). Bun and Deno are supported through their
+N-API compatibility layers.
+
 NOTE: Prebuilt binaries are currently available for macOS (Apple Silicon/arm64).
 Intel Mac and Windows users will need to build from source. Linux has not been
 tested.
