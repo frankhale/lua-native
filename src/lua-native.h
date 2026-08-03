@@ -14,6 +14,95 @@
 
 class LuaContext;
 
+// --- Marker-External type tags (CR-15 F6) -----------------------------------
+//
+// The addon hands JS several hidden "marker" properties whose value is a
+// `Napi::External` wrapping one of the *Data structs below: `_tableRef`,
+// `_userdata`, `_coroutine`, `__luaFnOwner`, `__luaClassOwner`. Each read site
+// used to validate only `IsExternal()` and then a
+// `data->runtime.get() == runtime.get()` identity comparison.
+//
+// **That pair checks provenance but not *kind*.** JS cannot mint an External —
+// but it can take a genuine one the addon handed out and present it under a
+// different marker name, e.g. `set_global('x', { _tableRef: coro._coroutine })`.
+// The External is real, and the runtime comparison passes because it is the
+// *same context's* object; only the C++ type is wrong. Every one of the four
+// *Data structs begins with a `shared_ptr<LuaRuntime>`, so the identity check
+// reads the right field of the wrong struct and agrees.
+//
+// Reached that way, `type(x)` in Lua reported `"thread"` for a value pushed
+// through the table-ref path. It did not crash, and the reason is worth writing
+// down because it is not a defence: the reads that would have been wild land on
+// a pointer `MakeRegistryOwner` always initialises to `nullptr`, and
+// `LuaFunctionRef` and `LuaTableRef` happen to be layout-identical. Two
+// accidents of struct layout, either of which a future field reordering
+// removes.
+//
+// N-API type tags are the mechanism built for exactly this: a 128-bit brand
+// applied at mint time and checked before the payload is read. `CheckTypeTag`
+// returns false for an untagged or differently-tagged External rather than
+// throwing, so every site fails closed the way it already tried to.
+//
+// Tag one kind per struct, and tag it at **every** mint site — a kind whose
+// second mint site forgets the tag fails closed at the read, which looks like a
+// released handle and is very hard to trace back. `grep -n 'External<Lua'` is
+// the generator for the mint list; `grep -n 'TaggedData<'` is the read list.
+//
+// Only the dereferenced markers are tagged. `_tableOwner`, `__coroIterOwner`,
+// `__coroBindingOwner` and `__cookie` are GC roots that are written and never
+// read back — their payload reaches the callbacks through `info.Data()`, which
+// is set natively and is not JS-reachable — so there is no read to guard.
+// The literals below are **UUIDs, and the opacity is the point.** `napi_type_tag`
+// is `{uint64_t lower; uint64_t upper}` — a 128-bit value compared bitwise — so
+// there is nothing to derive it from; Node's own documentation specifies a
+// generated UUID and its example is this same shape. Two properties are load-
+// bearing and neither survives a "cleaner" scheme:
+//
+//   * **Stable.** The tag is written onto the JS object at mint and compared at
+//     read, so it must be the same value at both ends. Anything derived from an
+//     address is out — and it is out for this codebase's own reason: CR-14 F2
+//     was an identity token that was a raw pointer, and pointers get recycled.
+//   * **Globally unique, not just locally distinct.** The threat is a foreign
+//     External reaching one of our read sites. Another addon that type-tags its
+//     own objects and happens to collide would be accepted and reinterpreted —
+//     exactly the confusion this exists to stop. A hash of `"LuaTableRefData"`
+//     would be self-documenting and locally distinct, and would give that
+//     property up.
+//
+// Generated with `uuidgen`; regenerate the same way if a sixth kind is added.
+// Changing an existing one is harmless (tags live only for the process), but
+// pointless.
+namespace lua_tags {
+inline constexpr napi_type_tag kTableRefData = {0x6698902f38bc485d, 0x9b90643c0fd512d3};
+inline constexpr napi_type_tag kFunctionData = {0x667131e920a749af, 0xbb1c4846120ea2f7};
+inline constexpr napi_type_tag kUserdataData = {0xa8b9ebcda2c3425c, 0xb7e95102192dfc6d};
+inline constexpr napi_type_tag kThreadData   = {0x03c9d2fd69544592, 0x96fef3e10b2ceb0b};
+inline constexpr napi_type_tag kRuntimeOwner = {0x4407ac2239054ac1, 0xbd118c5dfb000daf};
+
+// Distinctness is the whole mechanism, and a copy-paste that repeated a value
+// would silently re-merge two kinds — while every regression pin kept passing,
+// because each one checks a single specific wrong pairing rather than all ten.
+// That is precisely the failure CR-15 F3 is about (an invariant believed rather
+// than checked), so check it, and check it exhaustively rather than by reading.
+constexpr bool SameTag(const napi_type_tag& a, const napi_type_tag& b) {
+  return a.lower == b.lower && a.upper == b.upper;
+}
+constexpr bool AllTagsDistinct() {
+  const napi_type_tag all[] = {kTableRefData, kFunctionData, kUserdataData,
+                               kThreadData, kRuntimeOwner};
+  constexpr size_t n = sizeof(all) / sizeof(all[0]);
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      if (SameTag(all[i], all[j])) return false;
+    }
+  }
+  return true;
+}
+static_assert(AllTagsDistinct(),
+              "marker type tags must be pairwise distinct: a repeated value "
+              "silently merges two kinds and disables the branding for them");
+}  // namespace lua_tags
+
 // A returned Lua-function/table handle keeps its LuaRuntime alive (via the
 // shared_ptr) but the LuaContext wrapper is an independent GC root that can be
 // collected first. `contextAlive` is a liveness flag shared with the context:
@@ -309,20 +398,12 @@ public:
     // ClearBusy(), which records the ordering rule all three marshalling sites
     // depend on.
     //
-    // Members with user JS above their scope — each verified inert, so an
-    // addition is a regression:
+    // Members that run user JS with a *later* scope — each verified inert, so
+    // an addition is a regression:
     //
     //   TableRefGetTrap      — `target.Get("_tableRef")` is a fast-path return
     //                          on the addon's own proxy target; it touches no
     //                          runtime state and falls out before the Lua work.
-    //   SharedTable::Get     — a plain read of the shared JS object. No runtime.
-    //   LuaContext (ctor)    — reads its options object before `runtime` exists;
-    //                          there is no state to retire, by construction.
-    //   Pcall                — runs the caller's function, then only packages
-    //                          the result. Nothing to invalidate.
-    //   Release              — its `Has`/`Get` can run traps, but the
-    //                          `data->runtime.get() != runtime.get()` check runs
-    //                          *after* them and fails closed on a foreign handle.
     //   CoroIteratorNext     — `coro.Get("_coroutine")` is a dead-status probe;
     //                          `this` is user-supplied (`iter.call(proxy)`), so
     //                          it can be a trap, but ResumeCoroutineObject
@@ -336,24 +417,71 @@ public:
     //   ExecuteScriptIn      — `TableRefDataFrom(info[0])`, same shape; only a
     //                          `Utf8Value()` separates its identity check from
     //                          the use.
-    //   SharedTable::Set     — pushes to every subscriber, but each push routes
-    //   SharedTable::Sync      through that context's own `set_global`, which
-    //                          opens its own scope. Touches no context state
-    //                          directly.
     //
-    // Members that deliberately have no scope at all, because they run no user
-    // JS and touch no state a reset can invalidate: `remove_hook`,
-    // `get_memory_usage`, `info`, `register_type_converter`,
-    // `register_from_lua_converter`, `execute_script_async`,
-    // `execute_file_async` (each only reads primitives off `info` and queues),
-    // plus the three that must work regardless — `reset()` (it *is* the guarded
-    // operation), `cancel()` (must work while a run is in flight) and
-    // `is_busy()` (reads one atomic).
+    // Members that run user JS with *no scope at all*. CR-13 and CR-14 both
+    // filed these under the heading above; they have no scope to be above, and
+    // the distinction matters because "find the first CallScope" returns
+    // nothing for them rather than returning a line to compare (CR-15 F4):
+    //
+    //   SharedTable::Get     — a plain read of the shared JS object. No runtime.
+    //   SharedTable::Set     — push to every subscriber. The *reason* CR-13 gave
+    //   SharedTable::Sync      ("each push routes through that context's own
+    //   SharedTable::PushValue set_global, which opens its own scope") is not
+    //   ::PushTo ::Subscribe   quite true: PushValue reads `context.Get(
+    //   ::Propagate            "set_global")`, and an own property on the
+    //                          wrapper shadows the prototype method, so the push
+    //                          can be an arbitrary user function. It is still
+    //                          inert — SharedTable holds no runtime, no alive_
+    //                          and no js_userdata_, so there is nothing here for
+    //                          a reset to invalidate — but the inertness comes
+    //                          from what SharedTable *is*, not from where the
+    //                          value goes.
+    //   LuaContext (ctor)    — reads its options object before `runtime` exists;
+    //                          there is no state to retire, by construction.
+    //   Pcall                — runs the caller's function, then only packages
+    //                          the result. Nothing to invalidate.
+    //   Release              — its `Has`/`Get` can run traps, but the
+    //                          `data->runtime.get() != runtime.get()` check runs
+    //                          *after* them and fails closed on a foreign handle.
+    //   RegisterCallbacks    — inert from the constructor (no state yet); from
+    //                          reset() it is inside reset()'s own scope, which
+    //                          is why that scope exists (CR-15 F1c).
+    //   CreateTableHandle    — `DefineHiddenProp` reads a patchable
+    //   CreateCoroutineObject  `Object.defineProperty` off the global, and
+    //   CoroSymbolIterator     CoroSymbolIterator also reads `Symbol.iterator`.
+    //                          Inert only because each builds its *Data and
+    //                          pairs it with the runtime *before* the first
+    //                          patchable call, so a reset from a trap flips
+    //                          alive_ and the handle fails closed. Reordering
+    //                          any of the three re-opens CR-13 F1.
+    //
+    // Helper functions whose user JS counts as their caller's: `LuaFunctionDataFrom`
+    // and `TableRefDataFrom` (Has/Get on a caller-supplied object), plus
+    // `DefineHiddenProp` and `SymbolIteratorKey`, which read `Object` /
+    // `Symbol` off the global and are called from eight sites between them.
+    //
+    // Members that deliberately have no scope and run no user JS at all:
+    // `remove_hook`, `get_memory_usage`, `info`, `register_type_converter`,
+    // `register_from_lua_converter` (each reads `info` and stores), plus the
+    // three that must work regardless — `reset()`, `cancel()` (must work while
+    // a run is in flight) and `is_busy()` (reads one atomic).
+    //
+    // `execute_script_async` / `execute_file_async` were on that last list until
+    // CR-15. They still run no user JS — but the list's premise is "touches no
+    // state a reset can invalidate", and they are not readers at all: they hand
+    // the lua_State to another thread. See RejectIfStateInUse.
+    //
+    // `reset()` is on it too, as "it *is* the guarded operation". That is true
+    // of its guard block and false of everything after the state swap, where it
+    // becomes a holder running user JS. It now opens a scope there (CR-15 F1c).
     //
     // Both lists are hand-maintained, which is their weakness: CR-14 found ten
-    // omissions and every one was inert, because an omission with a consequence
-    // gets caught by a test and only the harmless ones survive. Re-derive them
-    // rather than trusting them.
+    // omissions and every one was inert; CR-15 found nine more and a wrong
+    // heading. An omission with a consequence gets caught by a test, so only the
+    // harmless ones survive in a list like this — which is what makes it look
+    // healthy right up until a non-inert member joins. Re-derive by grepping for
+    // `.Get(` / `.Call(` / `GetPropertyNames(` / `env.Global()` rather than
+    // trusting what is written here.
     struct CallScope {
       LuaContext* ctx;
       explicit CallScope(LuaContext* c) : ctx(c) {
@@ -594,6 +722,37 @@ private:
     // the caller can early-return. Centralizes the guard duplicated across the
     // synchronous API methods.
     bool RejectIfBusy() const;
+
+    // Refuses a **worker-thread** async start (`execute_script_async` /
+    // `execute_file_async`) while this thread still holds the lua_State.
+    // `op` names the method, so the three refusals stay distinguishable.
+    //
+    // **`is_busy_` is a one-directional guard, and that asymmetry was CR-15 F1.**
+    // It is written by the launcher and read by everyone *else*, so it answers
+    // "may I enter while a worker runs?" and never "may I hand the state to a
+    // worker while I am already inside it?". CR-1 H4 swept the first question
+    // exhaustively — all 21 main-thread doors refuse during a run, re-verified
+    // this pass — and nobody asked the second, so the two entry points that
+    // perform the handoff checked one condition where `reset()`, the *other*
+    // operation that takes the state away from its current holder, checks three.
+    //
+    // The three are the same three, for the same reasons:
+    //
+    //   is_busy_        — another async run already owns the state.
+    //   IsExecuting()   — Lua is on this thread's C stack (a host callback, a
+    //                     metamethod, a __gc finalizer). Driven: SIGSEGV 5/5,
+    //                     main thread faulting in _longjmp on a shared errorJmp
+    //                     chain while the worker faults in lua_load.
+    //   call_depth_ > 0 — a binding method is mid-flight and user JS is running
+    //                     above a conversion that will touch Lua when it
+    //                     returns; and, since CR-15, reset()'s replay phase,
+    //                     which is a holder that used to declare nothing.
+    //
+    // Deliberately **not** applied to `execute_async`: it is coroutine-driven
+    // and stays on the main thread, so a nested start re-enters Lua on the one
+    // thread that already owns it, which Lua supports and which the suite
+    // exercises. The hazard here is the thread handoff, not the reentrancy.
+    bool RejectIfStateInUse(const char* op);
 
     // Recursive body of NapiToCoreInstance; the public entry wraps depth 0 in
     // a JsCallbackCollectorScope so an aborted conversion sweeps the

@@ -442,7 +442,11 @@ public:
   void SetPendingErrorValue(LuaPtr value) { pending_error_value_ = std::move(value); }
   [[nodiscard]] bool HasPendingErrorValue() const { return static_cast<bool>(pending_error_value_); }
   LuaPtr TakePendingErrorValue() { return std::move(pending_error_value_); }
-  LuaPtr TakeLastErrorValue() const { return std::move(last_error_value_); }
+  // Non-const deliberately: it empties the object. `last_error_value_` is
+  // `mutable` (CaptureError is const and records into it), so a `const` version
+  // compiles — 805d6a9 made it one, and a mutating operation that reads as a
+  // query is exactly the shape CR-11 warned about. Reverted at CR-15 F6.
+  LuaPtr TakeLastErrorValue() { return std::move(last_error_value_); }
 
   // Module / require support
   void AddSearchPath(const std::string& path) const;
@@ -470,6 +474,19 @@ public:
   // a throw the caller may treat as best-effort.
   void RemoveGlobalRaw(const std::string& name) const;
   void IncrementUserdataRefCount(int ref_id);
+
+  // **Precondition: call only from inside a Lua C frame** (a metamethod, a
+  // RunProtected thunk, or anything else already holding an ExecutionScope).
+  //
+  // Dropping the last count clears the userdata's method table with a registry
+  // `lua_setfield`, which interns the key — an allocation, so by the
+  // "can allocate from Lua" rule (see IsExecuting) it needs an enclosing scope
+  // and opens none of its own. At depth 0 an ERRMEM there raises outside any
+  // pcall and panics, and a GC step driven from it would run finalizers while
+  // IsExecuting() reports false. Stated here rather than assumed because the
+  // signature is public and gives no hint (CR-15 F6); PushLuaValueProtected
+  // documents its own precondition the same way. The one caller in this tree,
+  // UserdataGC, satisfies it.
   void DecrementUserdataRefCount(int ref_id);
 
   /// Register a method table for a userdata ref_id.
@@ -711,15 +728,31 @@ public:
   // a finalizer is unlikely — CR-12 F3's two sites were unreachable in practice
   // and still wrong in kind.
   //
-  // One documented consequence of the broader trigger, recorded rather than
-  // fixed (CR-14 F5, not driven). Two raw `lua_next` traversals allocate from
-  // inside the loop: GetTableKeys stringifies numeric keys, and ToLuaValue's
-  // table branch takes a luaL_ref per nested function/thread/metatabled table.
-  // By the rule above those allocations can run a __gc finalizer, and Lua's
-  // contract forbids *adding a key* to a table while it is being traversed —
-  // so a finalizer that mutates the specific table under iteration makes
-  // lua_next undefined. Bounded: it needs a finalizer that names that table,
-  // and it is the same exposure Lua's own `pairs()` has.
+  // One documented consequence of the broader trigger (CR-14 F5). Raw
+  // `lua_next` traversals that allocate from inside the loop are exposed: by
+  // the rule above such an allocation can run a __gc finalizer, and Lua's
+  // contract forbids *adding a key* to a table while it is being traversed, so
+  // a finalizer that mutates the specific table under iteration makes lua_next
+  // undefined. Still not driven — several attempts at CR-15 failed to get a
+  // finalizer to fire inside the cursor — so this remains bounded, and it is
+  // the same exposure Lua's own `pairs()` has.
+  //
+  // The enumeration itself was wrong on arrival, which is the part worth
+  // remembering. CR-14 F5 recorded two sites and TablePairs was the third and
+  // by far the worst: it ran ToLuaValueProtected — a full lua_pcall, not a
+  // string intern — per value with a live cursor, while its own sibling
+  // TableIPairs already collected under protection first and said why. CR-15 F2
+  // moved TablePairs to the sibling's shape (ProtectedTablePairsCollect), so:
+  //
+  //   exposed:  GetTableKeys (stringifies numeric keys inside the loop);
+  //             ToLuaValue's table branch (luaL_ref per nested
+  //             function/thread/metatabled table inside the loop).
+  //   not exposed, by collecting into a Lua array before converting:
+  //             TablePairs, TableIPairs.
+  //
+  // A new raw-lua_next loop belongs in the second group. Re-derive this list by
+  // grepping `lua_next` rather than trusting it — that is exactly how the
+  // TablePairs omission was found one pass after the list was written.
   [[nodiscard]] bool IsExecuting() const { return lua_depth_ > 0; }
 
   // Debug hooks (lua_sethook): line / call / return / count tracing, for

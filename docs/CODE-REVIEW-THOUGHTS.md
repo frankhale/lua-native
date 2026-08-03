@@ -648,3 +648,152 @@ contexts before it failed reliably. **A pin that depends on the allocator is not
 a pin until you have run it enough times to know its failure rate** — the same
 lesson CR-11 learned about needing two converters and a large capture list, in a
 new disguise.
+
+---
+
+## Addendum (August 3, 2026, after CODE-REVIEW-15)
+
+CR-14's clause was about mechanical checks: a check has a predicate and a
+universe, the universe is usually unwritten, and a check whose universe is
+narrower than its class returns "clean" forever. That held up — the universe
+CR-14 wrote down is why re-verifying its remediation took minutes rather than a
+pass.
+
+CR-15 is the same idea moved one level out, and it is the first finding in this
+series that neither a wider universe nor a sharper predicate would have caught.
+Writing the universe fixes *where* you look. It does not fix *what you are
+looking for*, and the whole of CR-15's high finding lives in that gap.
+
+Every pass since CR-9 has audited one operation: `reset()`. It retires the
+`lua_State`, so it accumulated three guard conditions across three passes — CR-9
+added `IsExecuting()`, CR-13 added `call_depth_`, CR-14 extended the busy
+condition to cover the async marshal — each because the previous set was
+insufficient. That work was correct and it holds. What nobody asked is whether
+`reset()` is the only operation of its kind. It is not.
+`execute_script_async` / `execute_file_async` hand the same `lua_State` to a
+libuv worker thread, which takes it away from its current holder exactly as
+`reset()` does, and they check one of the three. A registered JS callback that
+starts an async run — seven lines, no hostile input — puts two threads in one
+Lua state and segfaults deterministically, main thread faulting in `_longjmp` on
+a shared `errorJmp` chain while the worker faults in `lua_load`.
+
+> **A guard is defined by a pair — the hazard, and the set of operations that
+> create it — and only the hazard tends to get written down. When you harden an
+> operation, ask what else does the same thing to the same object. The sibling
+> you miss will be guarded by whatever it happened to inherit, and the reason it
+> looks fine is that what it inherited was genuinely designed for something.**
+
+Three second-order lessons, each of which cost something:
+
+**A one-directional guard reads as a bidirectional one, and the writer is never
+covered by the protocol it establishes.** `is_busy_` is set by the async
+launchers and read by every other entry point. CR-1 H4 established that read side
+and swept it exhaustively; re-driven this pass, **21 of 21 main-thread doors
+refuse while a worker runs**, including every entry point added in the fourteen
+passes since. The sweep is perfect and it is perfectly one-directional. The
+launcher *writes* the flag, so it reads as a participant in the mutual-exclusion
+protocol rather than as the one operation the protocol does not cover — and no
+amount of auditing the readers will surface it, because auditing readers is what
+a mutual-exclusion flag invites you to do. This is a different failure from
+CR-11's census failures: the member was not miscounted, it was miscategorised.
+
+**A function's classification is a claim with an expiry date, and the expiry is
+whenever somebody appends to it.** The nastiest of the three doors is
+`reset()`'s own replay phase. `reset()` was classified — correctly, once — as
+"the operation being guarded", and the `CallScope` comment filed it under the
+methods that need no scope for exactly that reason. Then it grew a second half:
+CR-9 F3 added searcher replay, CR-12 added shared-table replay, and the print
+handler and debug hook re-arming landed alongside. That half runs the callbacks
+object's Proxy traps and the registered type converters against the state
+`reset()` has just minted, with `is_busy_` false, no Lua executing, and
+`call_depth_` at zero — so it could hand the brand-new state to a worker while
+the replay kept writing to it (SIGSEGV, 4 of 10 runs). Note what this does to the
+fix: adding the two missing conditions to the launchers does *not* close this
+door, because all three read false. `reset()` has to declare that it is holding.
+Every guard in the file trusted a one-line description that was accurate when it
+was written and that nobody re-read after the function doubled in size.
+
+**An enumeration written as the remedy for decaying enumerations decayed
+immediately.** CR-14's closing note is the sharpest process advice in this
+document: *check an enumeration against a generator, not against your memory of
+writing it.* The `lua_next` residual list CR-14 F5 wrote in the same remediation
+has two members. `grep -n lua_next src/core/lua-runtime.cpp` returns three
+traversals in the class, and the missing one — `TablePairs` — is not a marginal
+member: it ran a full `lua_pcall` per value inside a live cursor, where the two
+listed members intern a string and take a `luaL_ref`. Its own sibling thirty
+lines below, `TableIPairs`, already collected under protection first and carried
+a comment explaining why for the neighbouring hazard. No insight was required to
+catch this; only the difference between writing a list and running the grep that
+produces it. **The instruction to use a generator has to be followed in the
+commit that writes the list — that is the only moment when the author still
+believes it might be wrong.**
+
+Finally, the harness, and an honest correction. All four sanitizer harnesses and
+814 tests passed on the tree containing F1 — the fourth consecutive pass where
+that is true — and this time the sanitizers were never going to help. A race
+between the main thread and a libuv worker is TSan's department, and
+`test-ts-tsan` is explicitly a best-effort probe that cannot see libuv/V8/Lua
+synchronization. What found F1 was a probe that asked one question of
+twenty-two entry points and noticed the twenty-second answered differently.
+
+The correction belongs here too, because CR-12's addendum asked for it. CR-15's
+F2 was *initially written up as driven*, on the strength of a probe showing a
+200-entry table yielding 2682 entries during a traversal. Re-reading the probe
+showed all 2482 injections happened before the traversal began: the table
+honestly had 2682 entries. Several later attempts to time a finalizer into the
+cursor all failed, and the finding shipped as an undriven hardening. **The
+failure mode was reading a number that matched the expected shape and stopping.**
+CR-12's rule — implement a recommendation before believing it — has a twin:
+*re-read a reproduction before believing it, especially when it agrees with you.*
+
+CR-14's standing rule was one test per kind of user code × per site that can run
+it. F1 adds a third axis, and it is the cheapest of the three:
+
+> **For every guarded resource, one probe per *direction*.** The suite has
+> exhaustive coverage of "call X while an async run is in flight". It had
+> nothing for "start an async run while X is on the stack" — because the guard
+> is named for a *state* rather than a *transition*, and a state only suggests
+> one question.
+
+One last lesson, and it is the most embarrassing one in this document, because
+the review committed the error in the same file where it quotes the warning
+against it.
+
+CR-15's first draft filed the untyped marker Externals under **"verified and
+rejected"** — the section for suspicions that held up under scrutiny. The
+reasoning was that a wrong-kind External passes every identity check (all four
+`*Data` structs begin with a `shared_ptr<LuaRuntime>`, so the check reads the
+right field of the wrong struct), that this is genuinely reachable from JS, but
+that *no crash could be produced*, because the reads that would be wild land on
+a pointer `MakeRegistryOwner` always initialises to `nullptr` and
+`LuaFunctionRef` and `LuaTableRef` happen to be layout-identical. Two accidents
+of struct layout doing the work of a guard — noted as luck, and deferred.
+
+Fixing it produced a better probe, and the better probe showed the assessment
+was simply wrong. The forged `release({_coroutine: fn.__luaFnOwner})` calls do
+not merely fail to crash; they **succeed**, and they destroy the genuine
+handles' registry refs through the mistyped struct. The tell was sitting in the
+probe output the whole time: the *control* assertions at the end — the ones
+using the untouched handles — failed with "table handle has been released" and
+"coroutine has been released". A control failing is the loudest signal a probe
+can produce, and it was read as noise because the interesting lines above it
+said "no crash".
+
+> **"I could not crash it" is a statement about the probe, not about the
+> hazard** — CR-12's addendum, verbatim. What CR-15 adds is where the violation
+> hides: not in the assertions you are watching, but in the *controls*. A
+> control that fails is telling you the setup is no longer what you think it is,
+> and in a memory-safety probe that is usually the finding rather than a flaw in
+> the test.
+
+This is the second correction of its kind in one pass — F2's traversal probe was
+also initially written up as driven, on a number that matched the expected shape
+and turned out to be counting injections that happened before the traversal
+began. Both errors have the same root, and it is not carelessness: **a
+reproduction that agrees with your hypothesis gets read once, and one that
+disagrees gets read three times.** The discipline CR-12 established for
+recommendations — implement it before believing it — needs its twin stated
+plainly, because this pass demonstrates it twice in opposite directions:
+
+> **Re-read a reproduction before believing it, and re-read the ones that
+> confirm you first.**

@@ -664,8 +664,29 @@ export interface LuaContext {
    * Executes a Lua script string asynchronously on a worker thread.
    * Returns a Promise that resolves with the result.
    * JS callbacks are not available during async execution.
+   *
+   * **Throws (synchronously, before any Promise exists) if this thread is
+   * already inside the Lua state.** Running on a worker thread means handing
+   * the `lua_State` to that thread, and a Lua state may only be touched by one
+   * thread at a time — so the same three conditions that make {@link reset}
+   * refuse apply here, for the same reason and with the same three messages:
+   *
+   * 1. *Another async operation is in flight* (`is_busy()` is true).
+   * 2. *Lua is executing on this thread* — you called this from a host
+   *    callback, a metamethod, or a `__gc` finalizer. The worker would parse
+   *    and run on the very state the frame below you is executing in.
+   * 3. *Another lua-native call is on the stack, running your JavaScript* — a
+   *    registered type converter, a definition-object getter, or a `Proxy`
+   *    trap, which will return into native code that still has Lua work to do.
+   *
+   * To run Lua that must call back into JavaScript, or to start work from
+   * inside a callback, use {@link execute_async} instead: it is
+   * coroutine-driven and stays on the main thread, so it is not restricted this
+   * way.
+   *
    * @param script The Lua script to execute
    * @returns Promise resolving with the result of the script execution
+   * @throws If this thread already holds the Lua state (see above)
    */
   execute_script_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
 
@@ -673,8 +694,13 @@ export interface LuaContext {
    * Executes a Lua file asynchronously on a worker thread.
    * Returns a Promise that resolves with the result.
    * JS callbacks are not available during async execution.
+   *
+   * Subject to the same three refusal conditions as
+   * {@link execute_script_async} — see there.
+   *
    * @param filepath The path to the Lua file to execute
    * @returns Promise resolving with the result of the file execution
+   * @throws If this thread already holds the Lua state
    */
   execute_file_async<T extends LuaValue | LuaValue[] = LuaValue>(filepath: string): Promise<T>;
 
@@ -1193,9 +1219,14 @@ export interface LuaContext {
    * passes:
    *
    * 1. *An async operation is in flight* (`is_busy()` is true). This also
-   *    covers the window in which a completed async run's values are still
-   *    being converted back to JavaScript — so a `register_from_lua_converter`
-   *    handler running on an `execute_async` result cannot reset either.
+   *    covers the window in which a completed `execute_async` run's values are
+   *    still being converted back to JavaScript — so a
+   *    `register_from_lua_converter` handler running on an `execute_async`
+   *    result cannot reset either. (The *worker* families,
+   *    `execute_script_async` / `execute_file_async`, clear the busy flag
+   *    before marshalling and hold condition 3 across it instead, so a
+   *    converter running on one of their results is refused with message 3
+   *    rather than message 1. The window is closed either way.)
    * 2. *Lua is executing* — from inside a host callback, metamethod, table
    *    trap, debug hook, or `__gc` finalizer, since the state being retired is
    *    the one those frames are running on. That includes a finalizer reached

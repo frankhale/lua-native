@@ -29,6 +29,39 @@ static void DefineHiddenProp(const Napi::Env env, Napi::Object obj,
   defineProperty.Call({obj, Napi::String::New(env, key), desc});
 }
 
+// --- Marker-External minting and reading (CR-15 F6) --------------------------
+//
+// The only two operations that should ever touch a marker External's payload.
+// See the `lua_tags` block in lua-native.h for why the kind has to be checked
+// and not just the provenance.
+
+// Mints a branded External. The tag goes on immediately, so there is no window
+// in which the External exists untagged and could be read as one.
+template <typename T, typename Finalizer>
+static Napi::External<T> NewTaggedExternal(const Napi::Env env, T* data,
+                                           const napi_type_tag& tag,
+                                           Finalizer finalizer) {
+  const auto external = Napi::External<T>::New(env, data, finalizer);
+  external.TypeTag(&tag);
+  return external;
+}
+
+// Reads a marker External's payload, or nullptr if `value` is not an External
+// of exactly this kind. `CheckTypeTag` returns false (rather than throwing) for
+// an untagged or differently-branded External, so callers keep failing closed
+// the same way they did when they only checked `IsExternal()`.
+//
+// Takes the value by const& and reads it **once**: several call sites used to
+// do `obj.Has(k) && obj.Get(k).IsExternal()` and then a second `obj.Get(k)`,
+// which a Proxy can answer differently each time.
+template <typename T>
+static T* TaggedData(const Napi::Value& value, const napi_type_tag& tag) {
+  if (!value.IsExternal()) return nullptr;
+  const auto external = value.As<Napi::External<T>>();
+  if (!external.CheckTypeTag(&tag)) return nullptr;
+  return external.Data();
+}
+
 // True when `value` is an instance of the named global constructor
 // (e.g. "Map", "Set", "RegExp"). Robust against subclassing.
 static bool IsInstanceOfGlobal(const Napi::Value& value, const char* ctorName) {
@@ -792,8 +825,21 @@ Napi::Value SharedTable::Sync(const Napi::CallbackInfo& info) {
 }
 
 // Resolves a `shared` option entry to its SharedTable, or nullptr if the value
-// wasn't minted by createSharedTable(). The InstanceOf check matters: Unwrap on
-// an arbitrary object would read a garbage pointer out of it.
+// wasn't minted by createSharedTable().
+//
+// **The InstanceOf check is not what makes this safe, and the earlier comment
+// here said it was (CR-15 F5).** `Napi::Object::InstanceOf` is `napi_instanceof`,
+// which is the JS `instanceof` operator and therefore consults
+// `Symbol.hasInstance` — and the constructor, though never exported, is reachable
+// from JS as `createSharedTable().constructor`. Driven: defining
+// `Symbol.hasInstance` on it makes this check pass for a plain object and for a
+// LuaContext. What actually holds the line is the `Unwrap` below: `napi_unwrap`
+// rejects both (they carry no SharedTable wrap), and node-addon-api turns that
+// into a thrown `Napi::Error` rather than a garbage pointer. So the check is a
+// filter that produces a good error message, and the load-bearing guard is one
+// line lower. Do not "simplify" by trusting InstanceOf and skipping Unwrap's
+// failure path, and do not replace Unwrap with a raw `napi_unwrap` whose status
+// is ignored.
 static SharedTable* AsSharedTable(const Napi::Env env, const Napi::Value& value) {
   if (!value.IsObject() || value.IsFunction()) return nullptr;
   const auto* data = env.GetInstanceData<AddonData>();
@@ -1418,7 +1464,9 @@ Napi::Value LuaContext::SetUserdata(const Napi::CallbackInfo& info) {
   try {
     // The global write fires __newindex on a metatabled _G — Lua, and from
     // there a host callback (CR-9 F1); the method-entry scope above covers it.
-    if (bool needs_proxy = readable || writable || has_methods) {
+    // Not a declaration-in-condition: the name is unused in both branches, and
+    // the init-statement form warns (-Wunused-but-set-variable) (CR-15 F6).
+    if (readable || writable || has_methods) {
       runtime->CreateProxyUserdataGlobal(name, ref_id);
     } else {
       runtime->CreateUserdataGlobal(name, ref_id);
@@ -2012,7 +2060,7 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
   // freed memory once the handle object is collected. Non-configurable so it
   // can't be deleted to free the data out from under the still-bound methods —
   // the same ownership discipline used for __luaFnOwner (H3 / L6).
-  const auto external = Napi::External<LuaTableRefData>::New(env_, data.get(),
+  const auto external = NewTaggedExternal(env_, data.get(), lua_tags::kTableRefData,
     [](Napi::Env, const LuaTableRefData* d) { delete d; });
   // Ownership has transferred: from here a throw leaves the External unrooted,
   // and its finalizer reclaims dataPtr (and the ref) when it is collected.
@@ -2123,11 +2171,12 @@ Napi::Value LuaContext::GetGlobalRef(const Napi::CallbackInfo& info) {
 // nullptr for anything else, leaving the caller to raise its own error.
 static LuaTableRefData* TableRefDataFrom(const Napi::Value& value) {
   if (!value.IsObject()) return nullptr;
-  const auto obj = value.As<Napi::Object>();
-  if (!obj.Has("_tableRef")) return nullptr;
-  const auto marker = obj.Get("_tableRef");
-  if (!marker.IsExternal()) return nullptr;
-  return marker.As<Napi::External<LuaTableRefData>>().Data();
+  // One Get, and the kind is checked as well as the shape: a genuine
+  // `_coroutine` or `__luaFnOwner` External re-presented under this name is a
+  // real External from this very context, so `IsExternal()` plus the caller's
+  // runtime-identity check both agree (CR-15 F6).
+  return TaggedData<LuaTableRefData>(value.As<Napi::Object>().Get("_tableRef"),
+                                     lua_tags::kTableRefData);
 }
 
 // Builds an environment table: a fresh Lua table seeded with the whitelisted
@@ -2645,7 +2694,8 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     DefineHiddenProp(env, instObj, "__luaClassRef", Napi::Number::New(env, ref_id));
     DefineHiddenProp(env, instObj, "__luaClassName", Napi::String::New(env, class_name));
     DefineHiddenProp(env, instObj, "__luaClassOwner",
-      Napi::External<lua_core::LuaRuntime>::New(env, runtime.get()));
+      NewTaggedExternal(env, runtime.get(), lua_tags::kRuntimeOwner,
+        [](Napi::Env, lua_core::LuaRuntime*) { /* non-owning: identity only */ }));
     DefineHiddenProp(env, instObj, "__luaClassOwnerId",
       Napi::BigInt::New(env, runtime->Id()));
 
@@ -2748,6 +2798,34 @@ Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& /*info*/) {
   return Napi::Boolean::New(env, is_busy_.load());
 }
 
+// Refuses a worker-thread async start while this thread still holds the
+// lua_State. See the header for why `is_busy_` alone was never enough.
+bool LuaContext::RejectIfStateInUse(const char* op) {
+  if (is_busy_) {
+    Napi::Error::New(env, std::string(op) +
+      " cannot be called while another async operation is in flight")
+      .ThrowAsJavaScriptException();
+    return true;
+  }
+  if (runtime->IsExecuting()) {
+    Napi::Error::New(env, std::string(op) +
+      " cannot be called while Lua is executing (from inside a host callback, "
+      "metamethod, or __gc finalizer): the worker would run on the same "
+      "lua_State this thread is already inside")
+      .ThrowAsJavaScriptException();
+    return true;
+  }
+  if (call_depth_ > 0) {
+    Napi::Error::New(env, std::string(op) +
+      " cannot be called from inside another lua-native call (a type converter, "
+      "a definition-object getter, or a Proxy trap running while that call "
+      "converts its arguments or results)")
+      .ThrowAsJavaScriptException();
+    return true;
+  }
+  return false;
+}
+
 // execute_script_async / execute_file_async run the script on a libuv worker
 // thread: use them for CPU-bound Lua that shouldn't block the event loop, but
 // note the script cannot call back into JS (host callbacks are disabled in
@@ -2755,7 +2833,7 @@ Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& /*info*/) {
 // Promises or invoke JS callbacks, use execute_async (coroutine-driven, stays on
 // the main thread) instead.
 Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
-  if (RejectIfBusy()) return env.Undefined();
+  if (RejectIfStateInUse("execute_script_async()")) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -2772,7 +2850,7 @@ Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
-  if (RejectIfBusy()) return env.Undefined();
+  if (RejectIfStateInUse("execute_file_async()")) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -3190,12 +3268,20 @@ Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
     return env.Undefined();
   };
 
+  // Each marker is read **once** and checked for kind as well as shape
+  // (CR-15 F6). Both mattered here: the old form did `Has(k)` and then two
+  // separate `Get(k)`s, which a Proxy can answer differently each time, and it
+  // trusted the name rather than the payload — so
+  // `release({ _coroutine: fn.__luaFnOwner })` reached `threadRef.release()` on
+  // a LuaFunctionData, i.e. a shared_ptr reset at an offset chosen by the
+  // caller. A wrong-kind External now reads as nullptr and falls through to the
+  // "requires a Lua function, coroutine, or table reference" error below.
   if (target.IsFunction()) {
     const auto fn = target.As<Napi::Object>();
-    if (fn.Has("__luaFnOwner") && fn.Get("__luaFnOwner").IsExternal()) {
-      auto* data = fn.Get("__luaFnOwner").As<Napi::External<LuaFunctionData>>().Data();
-      if (data && data->runtime.get() != runtime.get()) return rejectForeign();
-      if (data && data->funcRef.ref != LUA_NOREF) data->funcRef.release();
+    if (auto* data = TaggedData<LuaFunctionData>(fn.Get("__luaFnOwner"),
+                                                 lua_tags::kFunctionData)) {
+      if (data->runtime.get() != runtime.get()) return rejectForeign();
+      if (data->funcRef.ref != LUA_NOREF) data->funcRef.release();
       return env.Undefined();
     }
     Napi::TypeError::New(env,
@@ -3207,17 +3293,17 @@ Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
   if (target.IsObject()) {
     const auto obj = target.As<Napi::Object>();
 
-    if (obj.Has("_coroutine") && obj.Get("_coroutine").IsExternal()) {
-      auto* data = obj.Get("_coroutine").As<Napi::External<LuaThreadData>>().Data();
-      if (data && data->runtime.get() != runtime.get()) return rejectForeign();
-      if (data && data->threadRef.ref != LUA_NOREF) data->threadRef.release();
+    if (auto* data = TaggedData<LuaThreadData>(obj.Get("_coroutine"),
+                                               lua_tags::kThreadData)) {
+      if (data->runtime.get() != runtime.get()) return rejectForeign();
+      if (data->threadRef.ref != LUA_NOREF) data->threadRef.release();
       return env.Undefined();
     }
 
-    if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
-      auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
-      if (data && data->runtime.get() != runtime.get()) return rejectForeign();
-      if (data && data->tableRef.ref != LUA_NOREF) data->tableRef.release();
+    if (auto* data = TaggedData<LuaTableRefData>(obj.Get("_tableRef"),
+                                                 lua_tags::kTableRefData)) {
+      if (data->runtime.get() != runtime.get()) return rejectForeign();
+      if (data->tableRef.ref != LUA_NOREF) data->tableRef.release();
       return env.Undefined();
     }
   }
@@ -3335,6 +3421,24 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // Swap. This drops the context's share of the old runtime; it is destroyed
   // here iff no handle still holds one.
   runtime = std::move(fresh);
+
+  // From here to the end of the method, reset() is no longer only the *guarded*
+  // operation — it is a *holder*, and it runs user JS while holding.
+  // RegisterCallbacks reads the callbacks object (a Proxy's get traps),
+  // InstallPrintHandler and the SharedTable replay push through set_global (the
+  // registered type converters), and all of it mutates the freshly minted
+  // lua_State. Until CR-15 F1c nothing said so: `in_reset_` blocks a nested
+  // reset() and nothing else, `is_busy_` is false by the guard at the top, and
+  // reset() opens no scope — so a converter reached from the replay could hand
+  // this brand-new state to a libuv worker (SIGSEGV in 4 of 10 runs) while the
+  // replay below kept writing to it from this thread.
+  //
+  // Declaring the holding is what makes RejectIfStateInUse sufficient: the
+  // async launchers ask `call_depth_ > 0`, and this is what answers yes. It
+  // must come *after* the swap above, because lua_close fires the retiring
+  // state's __gc finalizers inside that statement and those are still supposed
+  // to reach `in_reset_`'s more specific diagnosis rather than this one.
+  CallScope _cs(this);
 
   // Drop the bookkeeping that described the old state's contents. The id
   // counters are deliberately left alone: they must stay monotonic so a name or
@@ -3842,9 +3946,13 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
       // second owner for the same slot (which would double-unref). Only trust the
       // marker if it belongs to THIS context's runtime — a ref index from another
       // context would address an unrelated slot in this registry.
-      if (obj.Has("_tableRef") && obj.Get("_tableRef").IsExternal()) {
-        auto* data = obj.Get("_tableRef").As<Napi::External<LuaTableRefData>>().Data();
-        if (data && data->runtime.get() == runtime.get()) {
+      // Read once, and check kind as well as provenance (CR-15 F6): a genuine
+      // `_coroutine` External re-presented here as `_tableRef` used to pass —
+      // same context, and every *Data begins with the shared_ptr the identity
+      // check reads — and push a thread through the table-ref path.
+      if (auto* data = TaggedData<LuaTableRefData>(obj.Get("_tableRef"),
+                                                   lua_tags::kTableRefData)) {
+        if (data->runtime.get() == runtime.get()) {
           // A released handle would push registry slot LUA_NOREF (nil) silently;
           // surface it as an error instead, matching the handle methods (L2).
           if (data->tableRef.ref == LUA_NOREF) {
@@ -3852,13 +3960,13 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
           }
           return lua_core::LuaValue::from(lua_core::LuaTableRef(data->tableRef));
         }
-        // Foreign or invalid marker: fall through to a plain deep copy.
+        // Foreign marker: fall through to a plain deep copy.
       }
 
       // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
-      if (obj.Has("_userdata") && obj.Get("_userdata").IsExternal()) {
-        auto* data = obj.Get("_userdata").As<Napi::External<LuaUserdataData>>().Data();
-        if (data && data->runtime.get() == runtime.get()) {
+      if (auto* data = TaggedData<LuaUserdataData>(obj.Get("_userdata"),
+                                                   lua_tags::kUserdataData)) {
+        if (data->runtime.get() == runtime.get()) {
           return lua_core::LuaValue::from(lua_core::LuaUserdataRef(data->userdataRef));
         }
       }
@@ -3887,8 +3995,11 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
           const uint64_t stamped = ownerId.As<Napi::BigInt>().Uint64Value(&lossless);
           id_matches = lossless && stamped == runtime->Id();
         }
-        const bool owned = id_matches && owner.IsExternal() &&
-          owner.As<Napi::External<lua_core::LuaRuntime>>().Data() == runtime.get();
+        // Branded too (CR-15 F6), so the second barrier cannot be satisfied by
+        // some *other* kind of External this context handed out.
+        const auto* ownerPtr =
+          TaggedData<lua_core::LuaRuntime>(owner, lua_tags::kRuntimeOwner);
+        const bool owned = id_matches && ownerPtr == runtime.get();
         if (owned && r.IsNumber() && cn.IsString()) {
           const int ref_id = r.As<Napi::Number>().Int32Value();
           if (js_userdata_.find(ref_id) != js_userdata_.end()) {
@@ -4037,7 +4148,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // Non-writable + non-configurable: this External's finalizer owns the
           // LuaFunctionData that `fn` still calls through, so it must not be
           // deletable or reassignable from JS (L6).
-          const auto owner = Napi::External<LuaFunctionData>::New(env, dataPtr,
+          const auto owner = NewTaggedExternal(env, dataPtr, lua_tags::kFunctionData,
             [](Napi::Env, const LuaFunctionData* d) { delete d; });
           // Released the moment the External exists, not after DefineHiddenProp
           // (which can throw): the finalizer is already the owner by then, so
@@ -4067,7 +4178,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
             // LuaFunctionRef branch above).
             auto data = std::make_unique<LuaUserdataData>(runtime, v);
             Napi::Object handle = Napi::Object::New(env);
-            const auto owner = Napi::External<LuaUserdataData>::New(env, data.get(),
+            const auto owner = NewTaggedExternal(env, data.get(), lua_tags::kUserdataData,
               [](Napi::Env, const LuaUserdataData* d) { delete d; });
             // NOLINTNEXTLINE(bugprone-unused-return-value)
             (void)data.release();  // ownership transferred to the finalizer
@@ -4085,7 +4196,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           LuaTableRefData* dataPtr = data.get();
 
           // Store _tableRef as non-enumerable on target for round-trip detection
-          auto external = Napi::External<LuaTableRefData>::New(env, dataPtr,
+          auto external = NewTaggedExternal(env, dataPtr, lua_tags::kTableRefData,
             [](Napi::Env, const LuaTableRefData* d) { delete d; });
           // NOLINTNEXTLINE(bugprone-unused-return-value)
           (void)data.release();  // ownership transferred to the finalizer
@@ -4177,14 +4288,16 @@ static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
   // A coroutine that is already dead — exhausted by an earlier loop, or driven
   // to completion by hand — simply ends the iteration, rather than surfacing
   // Lua's "cannot resume dead coroutine" as a thrown error.
-  if (const Napi::Value marker = coro.Get("_coroutine"); marker.IsExternal()) {
-    if (const auto* threadData = marker.As<Napi::External<LuaThreadData>>().Data();
-        threadData && threadData->threadRef.ref != LUA_NOREF &&
-        lua_core::LuaRuntime::GetCoroutineStatus(threadData->threadRef) ==
-          lua_core::CoroutineStatus::Dead) {
-      state->done = true;
-      return CoroIterResult(env, env.Undefined(), true);
-    }
+  // `this` is user-supplied (`iter.call(proxy)`), so this Get can be a trap and
+  // the External it returns can be any the addon has handed out — branded, so a
+  // wrong-kind one reads as nullptr and the probe simply declines (CR-15 F6).
+  if (const auto* threadData =
+        TaggedData<LuaThreadData>(coro.Get("_coroutine"), lua_tags::kThreadData);
+      threadData && threadData->threadRef.ref != LUA_NOREF &&
+      lua_core::LuaRuntime::GetCoroutineStatus(threadData->threadRef) ==
+        lua_core::CoroutineStatus::Dead) {
+    state->done = true;
+    return CoroIterResult(env, env.Undefined(), true);
   }
 
   if (state->context->IsBusy()) {
@@ -4303,7 +4416,7 @@ Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> da
   const Napi::Object coro = Napi::Object::New(env);
   // The External's finalizer owns the data — freed when the coroutine object is
   // garbage-collected.
-  (void)coro.Set("_coroutine", Napi::External<LuaThreadData>::New(env, data.get(),
+  (void)coro.Set("_coroutine", NewTaggedExternal(env, data.get(), lua_tags::kThreadData,
     [](Napi::Env, const LuaThreadData* d) { delete d; }));
   // Discarding release() is deliberate: the pointer is already held by the
   // External above. Releasing *after* the External exists is what keeps the
@@ -4335,11 +4448,9 @@ Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> da
 // JS function, leaving the caller to raise its own error.
 static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value) {
   if (!value.IsFunction()) return nullptr;
-  const auto fn = value.As<Napi::Object>();
-  if (!fn.Has("__luaFnOwner")) return nullptr;
-  const auto marker = fn.Get("__luaFnOwner");
-  if (!marker.IsExternal()) return nullptr;
-  return marker.As<Napi::External<LuaFunctionData>>().Data();
+  // One Get, and branded — see TableRefDataFrom (CR-15 F6).
+  return TaggedData<LuaFunctionData>(value.As<Napi::Object>().Get("__luaFnOwner"),
+                                     lua_tags::kFunctionData);
 }
 
 // create_coroutine(scriptOrFunction)
@@ -4432,19 +4543,17 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
 
 Napi::Value LuaContext::ResumeCoroutineObject(const Napi::Object& coroObj,
                                               const std::vector<Napi::Value>& args_js) {
-  if (!coroObj.Has("_coroutine")) {
+  // Single branded read (CR-15 F6). The old form did Has, then Get, then a
+  // third read through As<>, and trusted the marker's *name*: a table handle's
+  // `_tableRef` External presented as `_coroutine` reached lua_resume through a
+  // LuaTableRefData.
+  const auto* threadData =
+    TaggedData<LuaThreadData>(coroObj.Get("_coroutine"), lua_tags::kThreadData);
+  if (!threadData) {
     Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
     return env.Undefined();
   }
-
-  const Napi::Value externalVal = coroObj.Get("_coroutine");
-  if (!externalVal.IsExternal()) {
-    Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-
-  const auto* threadData = externalVal.As<Napi::External<LuaThreadData>>().Data();
-  if (!threadData || !threadData->runtime) {
+  if (!threadData->runtime) {
     Napi::Error::New(env, "Invalid coroutine reference").ThrowAsJavaScriptException();
     return env.Undefined();
   }

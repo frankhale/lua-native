@@ -9428,4 +9428,236 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  // ============================================
+  // CODE-REVIEW-15 REGRESSIONS
+  // ============================================
+  describe('CODE-REVIEW-15 regressions', () => {
+    // F1. Nothing refused a worker-thread async start while the main thread was
+    // already inside the lua_State. is_busy_ is written by the launcher and read
+    // by everyone else, so it answers "may I enter while a worker runs" and never
+    // "may I hand the state to a worker while I am already in it". The worker
+    // then parses and executes on a lua_State the main thread is running in.
+    //
+    // Doors (a) and (c) below segfault against the pre-fix binary — (a) 5/5 and
+    // 8/8, (c) 4/10 — with the main thread faulting in _longjmp on a shared
+    // errorJmp chain while the worker faults in lua_load.
+    const HELD = /cannot be called (while Lua is executing|from inside another lua-native call)/;
+
+    it('F1a: a host callback cannot start a worker run while Lua is executing', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      let refusal = '';
+      let accepted = false;
+      lua.set_global('cb', () => {
+        try {
+          lua.execute_script_async('local s = 0 for i = 1, 4e6 do s = s + i end return s')
+             .then(() => {}, () => {});
+          accepted = true;
+        } catch (e: any) { refusal = e.message; }
+        return 1;
+      });
+      // The main thread stays inside Lua after cb() returns; pre-fix, the worker
+      // ran concurrently on the same state.
+      expect(lua.execute_script('cb() local t = 0 for i = 1, 4e6 do t = t + i end return t'))
+        .toBe(8000002000000);
+      expect(accepted).toBe(false);
+      expect(refusal).toMatch(/while Lua is executing/);
+      expect(lua.is_busy()).toBe(false);
+    });
+
+    it('F1a: execute_file_async is refused from the same door', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      let refusal = '';
+      lua.set_global('cb', () => {
+        try { lua.execute_file_async('nonexistent.lua').then(() => {}, () => {}); }
+        catch (e: any) { refusal = e.message; }
+        return 1;
+      });
+      lua.execute_script('cb()');
+      expect(refusal).toMatch(/while Lua is executing/);
+    });
+
+    it('F1b: a type converter cannot start a worker run mid-conversion', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      let refusal = '';
+      lua.register_type_converter(
+        (v: any) => v !== null && typeof v === 'object' && v.__mark === true,
+        (v: any) => {
+          try { lua.execute_script_async('return 1').then(() => {}, () => {}); }
+          catch (e: any) { refusal = e.message; }
+          return v.n;
+        });
+      lua.set_global('x', { __mark: true, n: 42 });
+      expect(lua.get_global('x')).toBe(42);
+      expect(refusal).toMatch(/from inside another lua-native call/);
+    });
+
+    // F1c. reset()'s replay phase runs user JS — the callbacks object's traps,
+    // and the type converters reached through the SharedTable replay — against
+    // the state it has just minted, with is_busy_ false, no Lua executing and
+    // (pre-fix) call_depth_ 0. in_reset_ blocks a nested reset() and nothing
+    // else, so a trap could hand the brand-new state to a worker while reset()
+    // kept writing to it from this thread.
+    it('F1c: reset()\'s replay phase refuses a worker start from a callbacks trap', () => {
+      let lua: any = null;
+      let accepted = 0;
+      let refusal = '';
+      const cbs = new Proxy({ a() {}, b() {}, c() {} } as any, {
+        get(t: any, k: string) {
+          if (k === 'a' && lua) {
+            try {
+              lua.execute_script_async('local s = 0 for i = 1, 8e6 do s = s + i end return s')
+                 .then(() => {}, () => {});
+              accepted++;
+            } catch (e: any) { refusal = e.message; }
+          }
+          return t[k];
+        },
+      });
+      lua = new lua_native.init(cbs, ALL_LIBS);
+      lua.reset();
+      expect(accepted).toBe(0);
+      expect(refusal).toMatch(HELD);
+      expect(lua.is_busy()).toBe(false);
+      expect(lua.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    // Controls. These pass both before and after the fix; they exist so the
+    // guard cannot be widened later into something that breaks ordinary async.
+    it('F1 control: a top-level worker start still works', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async('return 6 * 7')).resolves.toBe(42);
+      expect(lua.is_busy()).toBe(false);
+    });
+
+    it('F1 control: a worker start from a settled promise callback still works', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const second = await lua.execute_script_async('return 1')
+        .then(() => lua.execute_script_async('return 2'));
+      expect(second).toBe(2);
+    });
+
+    it('F1 control: execute_async is deliberately NOT guarded — it stays on this thread', async () => {
+      const lua: any = new lua_native.init(
+        { slow: async () => 41 }, ALL_LIBS);
+      let inner: Promise<any> | null = null;
+      lua.set_global('cb', () => { inner = lua.execute_async('local x = slow() return x + 1'); return 1; });
+      expect(lua.execute_script('cb() return "outer"')).toBe('outer');
+      await expect(inner!).resolves.toBe(42);
+    });
+
+    // F2. TablePairs used to run ToLuaValueProtected — a lua_pcall, therefore an
+    // allocation, therefore a possible __gc finalizer — with a live lua_next
+    // cursor into the user's table. Not driven (repeated attempts could not get
+    // a finalizer to fire inside the cursor), so this pins the behaviour the
+    // collect-first rewrite must preserve rather than a defect it closes.
+    it('F2: pairs() still round-trips keys, values and mixed key types', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        t = { alpha = 1, beta = 'two' }
+        t[10] = 'ten'
+        t[2.5] = 'frac'
+        t.nested = { deep = true }
+      `);
+      const seen = new Map<any, any>([...lua.get_global_ref('t').pairs()] as any);
+      expect(seen.get('alpha')).toBe(1);
+      expect(seen.get('beta')).toBe('two');
+      expect(seen.get(10)).toBe('ten');
+      expect(seen.get(2.5)).toBe('frac');
+      expect(seen.get('nested')).toEqual({ deep: true });
+      expect(seen.size).toBe(5);
+    });
+
+    it('F2: pairs() skips unsupported key types, as before', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script(`
+        t = { ok = 1 }
+        t[{}] = 'table key'
+        t[print] = 'function key'
+      `);
+      const seen = [...lua.get_global_ref('t').pairs()] as any[];
+      expect(seen).toHaveLength(1);
+      expect(seen[0][0]).toBe('ok');
+    });
+
+    // F5. Symbol.hasInstance defeats AsSharedTable's InstanceOf filter; what
+    // actually holds is napi_unwrap rejecting an object it never wrapped. This
+    // pins the fail-closed behaviour, since the comment now says the guard is
+    // one line lower than it looks.
+    it('F5: a Symbol.hasInstance forgery cannot be passed off as a SharedTable', () => {
+      const genuine: any = lua_native.createSharedTable({ a: 1 });
+      const victim: any = new lua_native.init({}, ALL_LIBS);
+      Object.defineProperty(genuine.constructor, Symbol.hasInstance, { value: () => true });
+      expect(({}) instanceof genuine.constructor).toBe(true);  // the filter is defeated
+      expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { s: {} } })).toThrow();
+      expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { s: victim } })).toThrow();
+    });
+
+    // F6. Marker Externals carried no type tag, so every read validated
+    // provenance (`IsExternal()` plus `data->runtime.get() == runtime.get()`)
+    // and never *kind*. JS cannot mint an External — but it can take a genuine
+    // one the addon handed out and present it under a different marker name.
+    // All four *Data structs begin with a shared_ptr<LuaRuntime>, so the
+    // identity check reads the right field of the wrong struct and agrees.
+    describe('F6: marker Externals are branded by kind', () => {
+      const fixture = () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = { a = 1 } function f(x) return x end');
+        const handle = lua.get_global_ref('t');
+        const fn = lua.get_global('f');
+        const coro = lua.create_coroutine(lua.get_global('f'));
+        return { lua, handle, fn, coro,
+                 tableExt: handle._tableRef,
+                 fnExt: fn.__luaFnOwner,
+                 coroExt: coro._coroutine };
+      };
+
+      it('a thread External presented as _tableRef no longer reaches the table path', () => {
+        const { lua, coroExt } = fixture();
+        lua.set_global('x', { _tableRef: coroExt });
+        // Pre-fix this was 'thread': the coroutine was pushed through the
+        // table-ref path. It now deep-copies as a plain object instead.
+        expect(lua.execute_script('return type(x)')).toBe('table');
+      });
+
+      it('a userdata External presented as _userdata no longer reaches the userdata path', () => {
+        const { lua, tableExt } = fixture();
+        lua.set_global('y', { _userdata: tableExt });
+        expect(lua.execute_script('return type(y)')).toBe('table');  // was 'userdata'
+      });
+
+      // The sharpest one: pre-fix these three succeeded and *destroyed the
+      // genuine handle's registry ref* through a mistyped struct — the controls
+      // at the end of this test failed with "has been released" as a result.
+      it('release() dispatches on the payload kind, not the marker name', () => {
+        const { lua, handle, fn, coro, tableExt, fnExt, coroExt } = fixture();
+        expect(() => lua.release({ _coroutine: fnExt })).toThrow(/requires a Lua function/);
+        expect(() => lua.release({ _tableRef: coroExt })).toThrow(/requires a Lua function/);
+        const g = () => {};
+        Object.defineProperty(g, '__luaFnOwner', { value: tableExt });
+        expect(() => lua.release(g)).toThrow(/not a Lua function reference/);
+
+        // The genuine handles survived all three attempts.
+        lua.set_global('z', handle);
+        expect(lua.execute_script('return type(z) .. ":" .. tostring(z.a)')).toBe('table:1');
+        expect(fn(21)).toBe(21);
+        expect(lua.resume(coro, 5).status).toBe('dead');
+      });
+
+      it('resume() rejects a table-ref External presented as _coroutine', () => {
+        const { lua, tableExt } = fixture();
+        expect(() => lua.resume({ _coroutine: tableExt })).toThrow(/Invalid coroutine object/);
+      });
+
+      it('control: every genuine marker still round-trips', () => {
+        const { lua, handle, fn, coro } = fixture();
+        lua.set_global('z', handle);
+        expect(lua.execute_script('return z.a')).toBe(1);
+        expect(fn(7)).toBe(7);
+        expect(lua.resume(coro, 3).status).toBe('dead');
+        lua.release(handle);
+        expect(() => lua.get_global_ref('t').get('a')).not.toThrow();
+      });
+    });
+  });
+
 });

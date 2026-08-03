@@ -109,6 +109,35 @@ int ProtectedTableICollect(lua_State* L) {  // [t] -> [dense array of values]
   }
   return 1;
 }
+// [t] -> [flat array: k1, v1, k2, v2, ...]. Snapshots the whole traversal into a
+// fresh Lua array so the caller can convert to C++ *after* lua_next is done.
+//
+// The flattening is what makes TablePairs safe, and it is not an optimization:
+// converting a value calls ToLuaValueProtected, which is a lua_pcall, and a
+// pcall allocates, and an allocation can drive a GC step whose __gc finalizer is
+// arbitrary Lua that can re-enter the host and add a key to the very table under
+// iteration — which Lua's manual makes undefined for lua_next. Driven at CR-15
+// F2: a 200-entry table yielded 2682 entries. Nothing here allocates per entry
+// beyond the array's own growth, and the traversal is over before any user code
+// can run. This mirrors what ProtectedTableICollect already does for ipairs, and
+// TableIPairs' comment already gave the reason in the neighbouring case.
+int ProtectedTablePairsCollect(lua_State* L) {  // [t] -> [k1,v1,k2,v2,...]
+  lua_newtable(L);
+  lua_Integer n = 0;
+  lua_pushnil(L);
+  while (lua_next(L, 1) != 0) {
+    // Only string and number keys survive the crossing; skip the rest here so
+    // the snapshot stays a faithful list of what the caller will emit.
+    if (const int kt = lua_type(L, -2); kt != LUA_TSTRING && kt != LUA_TNUMBER) {
+      lua_pop(L, 1);
+      continue;
+    }
+    lua_pushvalue(L, -2);       // key copy (lua_next needs the original kept)
+    lua_rawseti(L, 2, ++n);
+    lua_rawseti(L, 2, ++n);     // consumes the value, leaving the key on top
+  }
+  return 1;
+}
 
 // Protected __tostring trampoline: [value] -> [string]. Run under lua_pcall so a
 // raising __tostring metamethod (on an error object surfaced from an unprotected
@@ -847,7 +876,18 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
     if (--it->second <= 0) {
       userdata_ref_counts_.erase(it);
 
-      // Clean up method table if one exists
+      // Clean up method table if one exists.
+      //
+      // `lua_setfield` on the registry interns the key, and interning
+      // allocates — so by this file's "can allocate from Lua" rule (see
+      // IsExecuting) this line needs an enclosing ExecutionScope, and it has
+      // none of its own. That is correct **only** because of the precondition
+      // documented on the declaration: every caller is inside a Lua C frame.
+      // The single caller in this tree is UserdataGC, a `__gc` metamethod, so
+      // the collector's own frame supplies it (CR-15 F6). Called at depth 0 —
+      // which the public signature permits and the C++ tests do — an ERRMEM
+      // here raises outside any pcall and panics, and a GC step run from it
+      // would fire finalizers while IsExecuting() reports false.
       std::string registry_key = kUserdataMethodsPrefix;
       registry_key += std::to_string(ref_id);
       lua_pushnil(L_);
@@ -857,8 +897,20 @@ void LuaRuntime::DecrementUserdataRefCount(int ref_id) {
       // Napi::ObjectReference). During worker-thread async that would be an
       // off-thread N-API call, so skip it. The binding entry is reclaimed when
       // the context is destroyed; leaking it for the run is better than a crash.
+      //
+      // Contained for the same reason DispatchOutput and DispatchDebugHook are:
+      // Lua is built as C, this runs inside the UserdataGC `__gc` C frame, and a
+      // C++ exception must not unwind through it (CR-15 F6). The binding's
+      // handler is a map erase today and effectively non-throwing — but the
+      // rule these bridges follow is that the core must not depend on that.
       if (userdata_gc_callback_ && !async_mode_) {
-        userdata_gc_callback_(ref_id);
+        try {
+          userdata_gc_callback_(ref_id);
+        } catch (...) {
+          // A throwing GC notification is swallowed rather than corrupting the
+          // VM mid-collection. There is no caller to report it to: the collector
+          // is the caller.
+        }
       }
     }
   }
@@ -1330,7 +1382,20 @@ void LuaRuntime::OnHostFnClosureCollected(const std::string& name) {
     // Drop the binding's paired JS reference. Skip during a worker run — that
     // would be an off-thread N-API call; the entry is then reclaimed with the
     // context instead, matching the userdata GC callback's tradeoff.
-    if (host_fn_gc_callback_ && !async_mode_) host_fn_gc_callback_(name);
+    //
+    // Contained: this is reached from HostFnSentinelGC, a `__gc` C frame, and a
+    // C++ exception must not unwind through Lua's C frames — the same rule
+    // DispatchOutput, DispatchDebugHook and DecrementUserdataRefCount follow
+    // (CR-15 F6). These four are now the complete set of core→binding bridges
+    // that dispatch from inside a Lua frame; a fifth belongs here too.
+    if (host_fn_gc_callback_ && !async_mode_) {
+      try {
+        host_fn_gc_callback_(name);
+      } catch (...) {
+        // Swallowed rather than corrupting the VM mid-collection; the collector
+        // is the caller and has nowhere to report it.
+      }
+    }
   }
 }
 
@@ -3131,30 +3196,38 @@ std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(const int registry
     return result;
   }
 
-  // lua_next performs a raw traversal (no metamethods), so this loop needs no
-  // protected call. Determine the key type first and skip unsupported keys
-  // before converting the value, so nothing is converted needlessly.
-  lua_pushnil(L_);
-  while (lua_next(L_, -2) != 0) {
+  // Snapshot the traversal into a flat Lua array first, then convert (CR-15 F2).
+  // The old form ran ToLuaValueProtected — a lua_pcall, therefore an allocation,
+  // therefore a possible GC step and a possible __gc finalizer — with a live
+  // lua_next cursor into the user's table. A finalizer that re-enters the host
+  // and adds a key to that table makes lua_next undefined; driven, a 200-entry
+  // table returned 2682 entries. TableIPairs below already collects first for
+  // the neighbouring reason, and ProtectedTablePairsCollect states the rule.
+  lua_pushcfunction(L_, ProtectedTablePairsCollect);
+  lua_pushvalue(L_, -2);     // the table
+  ProtectedTableCall(1, 1);  // -> flat array k1,v1,k2,v2,...
+
+  const auto n = static_cast<int>(lua_rawlen(L_, -1));
+  result.reserve(static_cast<size_t>(n) / 2);
+  for (int i = 1; i + 1 <= n; i += 2) {
+    lua_rawgeti(L_, -1, i);  // key
     LuaPtr key;
-    if (const int key_type = lua_type(L_, -2); key_type == LUA_TSTRING) {
+    if (lua_type(L_, -1) == LUA_TSTRING) {
       size_t len;
-      const char* str = lua_tolstring(L_, -2, &len);
+      const char* str = lua_tolstring(L_, -1, &len);
       key = std::make_shared<LuaValue>(LuaValue::from(std::string(str, len)));
-    } else if (key_type == LUA_TNUMBER) {
-      if (lua_isinteger(L_, -2)) {
-        key = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(lua_tointeger(L_, -2))));
-      } else {
-        key = std::make_shared<LuaValue>(LuaValue::from(static_cast<double>(lua_tonumber(L_, -2))));
-      }
+    } else if (lua_isinteger(L_, -1)) {
+      key = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(lua_tointeger(L_, -1))));
     } else {
-      // Skip non-string/non-number keys
-      lua_pop(L_, 1);
-      continue;
+      key = std::make_shared<LuaValue>(LuaValue::from(static_cast<double>(lua_tonumber(L_, -1))));
     }
-    LuaPtr value = ToLuaValueProtected(L_, lua_absindex(L_, -1));
+    lua_pop(L_, 1);
+
+    lua_rawgeti(L_, -1, i + 1);  // value
+    LuaPtr value = ToLuaValueProtected(L_, -1);
+    lua_pop(L_, 1);
+
     result.emplace_back(std::move(key), std::move(value));
-    lua_pop(L_, 1);  // pop value, keep key for next iteration
   }
 
   return result;
