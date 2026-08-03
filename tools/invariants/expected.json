@@ -58,7 +58,7 @@
     "LuaScriptAsyncWorker::OnOK": "SCOPE_NO_USER_JS",
     "LuaFileAsyncWorker::OnOK": "SCOPE_NO_USER_JS",
     "InitModule": "NO_SCOPE",
-    "NODE_API_MODULE": "NO_SCOPE",
+    "LuaContext::NapiToCoreInstance": "NO_SCOPE",
     "LuaContext::NapiToCoreImpl": "NO_SCOPE",
     "LuaContext::ResultsToJs": "NO_SCOPE",
     "LuaContext::CoreToNapi": "NO_SCOPE",
@@ -88,15 +88,23 @@
   "greppable-counts": {
     "RejectIfBusy() call sites": 31,
     "LuaCallHostFunction closure pushes": 1,
-    "napi_type_tag definitions": 5
+    "napi_type_tag definitions": 6
   },
   "exception-surface": {
-    "throw sites (binding)": 22,
+    "throw sites (binding)": 23,
     "throw sites (core)": 28,
-    "catch sites (binding)": 66,
+    "catch sites (binding)": 67,
     "catch sites (core)": 38,
     "RunProtected calls (core)": 32,
     "lua_pcall calls (core)": 7
+  },
+  "scanner-coverage": {
+    "binding: functions found": 118,
+    "binding: static LuaTableRefData* TableRefDataFrom(const Napi::Value& value);": "declaration",
+    "binding: NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)": "macro-invocation",
+    "binding: unattributed": 0,
+    "core: functions found": 139,
+    "core: unattributed": 0
   },
   "core-call-guarding": {
     "TableRefGetTrap -> GetTableField": "GUARDED",
@@ -109,6 +117,9 @@
     "TableHandleGetRef -> GetTableFieldRef": "GUARDED",
     "TableHandleSet -> SetTableFieldKeyed": "GUARDED",
     "TableHandleHas -> HasTableFieldKeyed": "GUARDED",
+    "TableHandleLength -> GetTableLength": "GUARDED",
+    "TableHandlePairs -> TablePairs": "GUARDED",
+    "TableHandleIPairs -> TableIPairs": "GUARDED",
     "LuaContext::LuaContext -> SetAllowBytecode": "GUARDED",
     "LuaContext::RegisterCallbacks -> RegisterFunction": "GUARDED",
     "LuaContext::RegisterCallbacks -> SetGlobal": "GUARDED",
@@ -116,7 +127,9 @@
     "LuaContext::SetGlobal -> RegisterFunction": "GUARDED",
     "LuaContext::SetGlobal -> SetGlobal": "GUARDED",
     "LuaContext::GetGlobal -> GetGlobalPath": "GUARDED",
+    "LuaContext::GetGlobal -> GetGlobal": "GUARDED",
     "LuaContext::Call -> GetGlobalPath": "GUARDED",
+    "LuaContext::Call -> GetGlobal": "GUARDED",
     "LuaContext::SetUserdata -> CreateProxyUserdataGlobal": "GUARDED",
     "LuaContext::SetUserdata -> CreateUserdataGlobal": "GUARDED",
     "LuaContext::SetUserdata -> SetUserdataMethodTable": "GUARDED",
@@ -130,10 +143,15 @@
     "LuaContext::CreateTableMethod -> CreateTable": "GUARDED",
     "LuaContext::GetGlobalRef -> GetGlobalRef": "GUARDED",
     "LuaContext::CreateEnvironment -> CreateEnvironment": "GUARDED",
+    "LuaContext::GC -> GarbageCollectParam": "GUARDED",
+    "LuaContext::GC -> GarbageCollect": "GUARDED",
     "LuaContext::ExecuteAsync -> CreateCoroutineFromScript": "GUARDED",
     "LuaContext::Reset -> SetAllowBytecode": "GUARDED",
     "LuaContext::Reset -> AddSearchPath": "GUARDED",
     "LuaContext::Reset -> AddJsSearcher": "GUARDED",
-    "LuaContext::AddSearcher -> AddJsSearcher": "GUARDED"
+    "LuaContext::SetPrintHandler -> SetOutputHandler": "GUARDED",
+    "LuaContext::AddSearcher -> AddJsSearcher": "GUARDED",
+    "LuaContext::DetachRuntimeHandlers -> SetOutputHandler": "JUSTIFIED_FALSE_POSITIVE",
+    "LuaContext::InstallPrintHandler -> SetOutputHandler": "CONTAINED_BY_CALLERS(3)"
   }
 }

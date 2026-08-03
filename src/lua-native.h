@@ -78,6 +78,15 @@ inline constexpr napi_type_tag kFunctionData = {0x667131e920a749af, 0xbb1c484612
 inline constexpr napi_type_tag kUserdataData = {0xa8b9ebcda2c3425c, 0xb7e95102192dfc6d};
 inline constexpr napi_type_tag kThreadData   = {0x03c9d2fd69544592, 0x96fef3e10b2ceb0b};
 inline constexpr napi_type_tag kRuntimeOwner = {0x4407ac2239054ac1, 0xbd118c5dfb000daf};
+// The SharedTable ObjectWrap itself, not a marker External (CR-20 follow-up).
+// `InstanceOf` consults Symbol.hasInstance and is user-defeatable, and
+// `napi_unwrap` is **not** a type check — it returns whatever pointer was
+// attached, so a *different* ObjectWrap subclass unwraps successfully and its
+// pointer is reinterpreted. That pair therefore provides no type safety at all
+// once the forgery is in place: a LuaContext was accepted as a shared table and
+// the process aborted. This is CR-15 F6's lesson — provenance is not kind —
+// applied to an ObjectWrap instead of an External.
+inline constexpr napi_type_tag kSharedTable  = {0x3865e102fe364b62, 0x9aebe69347984e92};
 
 // Distinctness is the whole mechanism, and a copy-paste that repeated a value
 // would silently re-merge two kinds — while every regression pin kept passing,
@@ -89,7 +98,7 @@ constexpr bool SameTag(const napi_type_tag& a, const napi_type_tag& b) {
 }
 constexpr bool AllTagsDistinct() {
   const napi_type_tag all[] = {kTableRefData, kFunctionData, kUserdataData,
-                               kThreadData, kRuntimeOwner};
+                               kThreadData, kRuntimeOwner, kSharedTable};
   constexpr size_t n = sizeof(all) / sizeof(all[0]);
   for (size_t i = 0; i < n; ++i) {
     for (size_t j = i + 1; j < n; ++j) {
@@ -890,11 +899,6 @@ private:
     // nullptr means "the current runtime by construction": the async
     // promise-settlement path stages from a microtask with no execution in
     // flight at all, and it consumes the staged value itself.
-    // The message for a caught Napi::Error, with the non-Error throw handled.
-    // See the definition — this is the rule StageJsError always had, applied at
-    // the sites that do not go through it (CR-18 F2).
-    static std::string JsThrowMessage(const Napi::Error& e);
-
     std::string StageJsError(const Napi::Value& value, const std::string& message,
                              const lua_core::LuaRuntime* owner = nullptr);
 
@@ -942,6 +946,48 @@ private:
     // Active collector for in-flight conversions (nullptr when none). See
     // JsCallbackCollectorScope.
     std::vector<std::string>* js_callback_collector_ = nullptr;
+
+    // The chain of objects currently being converted, innermost last, used to
+    // tell a *cycle* from mere depth (CR-20 F2). Before the fix a cyclic object
+    // was reported as "Value nesting depth exceeds the maximum of 100 levels" —
+    // a two-key object described as a hundred levels deep, with the implied
+    // remedy (flatten it) one no amount of flattening achieves.
+    //
+    // **Path, not visited-set.** Entries are popped on the way back out, so an
+    // object referenced twice as siblings — a DAG, which is legal and common —
+    // is converted twice rather than reported as a cycle. Only an object that
+    // is its own ancestor is one.
+    //
+    // Compared with StrictEquals rather than by napi_value identity: a handle
+    // is not a stable identity for a JS object, and the path is bounded by
+    // kMaxDepth so the linear scan is bounded too.
+    std::vector<Napi::Value> conversion_path_;
+
+    // RAII for the above, and for the reset a re-entrant conversion needs: a
+    // type converter can call back in with a *different* value tree, and a
+    // value legitimately present in both trees must not read as a cycle. The
+    // top-level entry therefore hides the enclosing path rather than extending
+    // it.
+    struct ConversionPathScope {
+      LuaContext* ctx;
+      std::vector<Napi::Value> saved;
+      explicit ConversionPathScope(LuaContext* c) : ctx(c) {
+        saved.swap(ctx->conversion_path_);
+      }
+      ~ConversionPathScope() { ctx->conversion_path_.swap(saved); }
+    };
+
+    // Pushes `v` for the duration of one nested conversion.
+    struct ConversionPathEntry {
+      LuaContext* ctx;
+      ConversionPathEntry(LuaContext* c, const Napi::Value& v) : ctx(c) {
+        ctx->conversion_path_.push_back(v);
+      }
+      ~ConversionPathEntry() { ctx->conversion_path_.pop_back(); }
+    };
+
+    // True if `v` is already an ancestor of itself on the current path.
+    [[nodiscard]] bool IsOnConversionPath(const Napi::Value& v) const;
 
     // --- reset() support -------------------------------------------------
     // State that is *context* configuration rather than Lua-state contents, so

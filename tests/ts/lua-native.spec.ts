@@ -9586,10 +9586,50 @@ describe('lua-native Node adapter', () => {
     it('F5: a Symbol.hasInstance forgery cannot be passed off as a SharedTable', () => {
       const genuine: any = lua_native.createSharedTable({ a: 1 });
       const victim: any = new lua_native.init({}, ALL_LIBS);
-      Object.defineProperty(genuine.constructor, Symbol.hasInstance, { value: () => true });
-      expect(({}) instanceof genuine.constructor).toBe(true);  // the filter is defeated
-      expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { s: {} } })).toThrow();
-      expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { s: victim } })).toThrow();
+      const ctor = genuine.constructor;
+      const original = Object.getOwnPropertyDescriptor(ctor, Symbol.hasInstance);
+      // `configurable: true`, and restored in the `finally` — both added at
+      // CR-20's remediation. Patching Symbol.hasInstance on the SharedTable
+      // constructor is process-global and this test left it patched, which made
+      // AsSharedTable's InstanceOf filter accept *any* object for the rest of
+      // the run; napi_unwrap then rejected the object it had never wrapped and
+      // every later `new init({}, { shared })` failed with a bare
+      // "Invalid argument". Nothing caught it because this was the last test in
+      // the suite that constructed a shared context — until one was added after
+      // it, which is how it surfaced.
+      Object.defineProperty(ctor, Symbol.hasInstance, { value: () => true, configurable: true });
+      try {
+        expect(({}) instanceof ctor).toBe(true);  // the filter is defeated
+
+        // Assert the *message*, not merely that something threw. A bare
+        // toThrow() passed for as long as this behaviour has existed and could
+        // not distinguish the intended refusal from a raw N-API
+        // "Invalid argument" — which is what was actually happening, and is the
+        // loose-assertion hazard CR-17 F3 is about.
+        expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { s: {} } }))
+          .toThrow(/must be a shared table created with createSharedTable/);
+
+        // A *differently-wrapped* ObjectWrap is the sharp case: `napi_unwrap` is
+        // not a type check, so before the type tag this unwrapped successfully
+        // and handed back a LuaContext* reinterpreted as a SharedTable*. It was
+        // accepted, and the process aborted.
+        expect(() => new lua_native.init({}, { ...ALL_LIBS, shared: { s: victim } }))
+          .toThrow(/must be a shared table created with createSharedTable/);
+
+        // And the forgery must not cost a *legitimate* caller anything: the
+        // constructor asks this question of the options object before asking it
+        // of each entry, so a defeatable filter used to fail the whole call.
+        const stillWorks: any = new lua_native.init(
+          {}, { ...ALL_LIBS, shared: { s: genuine } });
+        expect(stillWorks.execute_script('return s.a')).toBe(1);
+      } finally {
+        if (original) Object.defineProperty(ctor, Symbol.hasInstance, original);
+        else delete ctor[Symbol.hasInstance];
+      }
+      // The forgery is undone: an ordinary shared context still constructs.
+      const after = lua_native.createSharedTable({ ok: 1 });
+      const fresh: any = new lua_native.init({}, { ...ALL_LIBS, shared: { s: after } });
+      expect(fresh.execute_script('return s.ok')).toBe(1);
     });
 
     // F6. Marker Externals carried no type tag, so every read validated
@@ -9972,7 +10012,7 @@ describe('lua-native Node adapter', () => {
   // CODE-REVIEW-18 regressions
   // ============================================
   //
-  // Found by the exception-escape matrix (`tools/cr18/`): 27 Lua C frames x 11
+  // Found by the exception-escape matrix (`tools/exception-matrix/`): 27 Lua C frames x 11
   // throw kinds, one process per cell. Nothing aborted and no context was left
   // unusable — the findings are all about what the caller is *told* when a
   // contained failure happens, which is the class this codebase moved into.
@@ -10259,6 +10299,144 @@ describe('lua-native Node adapter', () => {
         )).toBe('strkey/intkey');
         const crossed = lua.execute_script('return {["1"]="strkey", [1]="intkey"}');
         expect(Object.keys(crossed)).toEqual(['1']);
+      });
+    });
+  });
+
+  // ============================================
+  // CODE-REVIEW-19 / CODE-REVIEW-20 regressions
+  // ============================================
+  //
+  // CR-19 reviewed the instruments CR-18 added; CR-20 pointed the first
+  // instrument at the JS -> Lua direction. The product-visible fixes are pinned
+  // here; the instrument fixes are pinned in tests/ts/invariants.spec.ts.
+
+  describe('CODE-REVIEW-19 regressions', () => {
+    describe('F3: a shared-table subscriber that throws a non-Error keeps its cause', () => {
+      // The CR-18 F2 class at a fifth site. It survived the producer-side sweep
+      // because SharedTable formats the caught Napi::Error itself, and could not
+      // even call the fix: JsThrowMessage was a private static of LuaContext.
+      const shadow = (ctx: any, fn: unknown) =>
+        Object.defineProperty(ctx, 'set_global', { value: fn, configurable: true });
+
+      for (const [label, thrown] of [
+        ['an Error', new Error('REAL-CAUSE')],
+        ['a bare string', 'REAL-CAUSE'],
+        ['a number', 42],
+      ] as Array<[string, unknown]>) {
+        it(`reports the cause when a subscriber throws ${label}`, () => {
+          const shared = (lua_native as any).createSharedTable({ v: 1 });
+          const a: any = new lua_native.init({}, { ...ALL_LIBS, shared: { s: shared } });
+          shadow(a, () => { throw thrown; });
+          expect(() => shared.set('v', 2)).toThrow(/REAL-CAUSE|42/);
+        });
+      }
+
+      it('names the real fact when set_global has been shadowed by a non-function', () => {
+        // Was "shared table subscriber is not a Lua context" — said of something
+        // that is one. Subscribers are only ever real contexts.
+        const shared = (lua_native as any).createSharedTable({ v: 1 });
+        const a: any = new lua_native.init({}, { ...ALL_LIBS, shared: { s: shared } });
+        Object.defineProperty(a, 'set_global', { value: 42, configurable: true });
+        expect(() => shared.set('v', 2)).toThrow(/shadowed by an own property/);
+      });
+    });
+  });
+
+  describe('CODE-REVIEW-20 regressions', () => {
+    describe('F2: a circular reference is named as one, not as depth', () => {
+      it('a two-key cyclic object reports a cycle', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const cyc: any = { a: 1 };
+        cyc.self = cyc;
+        expect(() => lua.set_global('c', cyc)).toThrow(/circular reference/);
+        // Specifically NOT the old message, which sent the user to flatten an
+        // object that was two levels deep.
+        try { lua.set_global('c', cyc); } catch (e: any) {
+          expect(e.message).not.toMatch(/nesting depth/);
+        }
+      });
+
+      it('a cyclic array reports a cycle', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const arr: any[] = [1];
+        arr.push(arr);
+        expect(() => lua.set_global('a', arr)).toThrow(/circular reference/);
+      });
+
+      it('a genuinely deep acyclic object still reports depth', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let deep: any = {};
+        for (let i = 0; i < 150; i++) deep = { n: deep };
+        expect(() => lua.set_global('d', deep)).toThrow(/nesting depth/);
+      });
+
+      it('a DAG is not a cycle — the same object twice is accepted', () => {
+        // The control that makes the detection path-based rather than a
+        // visited-set. Sharing a subobject is legal and common.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const shared = { x: 1 };
+        expect(() => lua.set_global('g', { a: shared, b: shared })).not.toThrow();
+        expect(lua.execute_script('return g.a.x + g.b.x')).toBe(2);
+      });
+
+      it('a converter re-entering with a value from the outer tree is not a cycle', () => {
+        // The other half of path-scoping: a type converter converts a different
+        // tree, and a value present in both must not read as circular.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const shared = { x: 1 };
+        lua.register_type_converter(
+          (v: any) => v && typeof v === 'object' && v.wrap === true,
+          (v: any) => ({ inner: shared, tag: v.tag }),
+        );
+        expect(() => lua.set_global('w', { outer: shared, w: { wrap: true, tag: 'z' } })).not.toThrow();
+        expect(lua.execute_script('return w.w.inner.x')).toBe(1);
+      });
+    });
+
+    describe('F3: negative zero keeps its sign and float subtype', () => {
+      it('-0 crosses as a Lua float, not as integer 0', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('nz', -0);
+        expect(lua.execute_script('return math.type(nz)')).toBe('float');
+        expect(lua.execute_script('return tostring(1/nz)')).toBe('-inf');
+        expect(Object.is(lua.get_global('nz'), -0)).toBe(true);
+      });
+
+      it('positive zero is still an integer', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('z', 0);
+        expect(lua.execute_script('return math.type(z)')).toBe('integer');
+        expect(lua.execute_script('return tostring(1/z)')).toBe('inf');
+      });
+
+      it('an ordinary integral float is still an integer (this one is not fixable)', () => {
+        // JS cannot tell 1.0 from 1, so no conversion can preserve a
+        // distinction the input never carried. Pinned so the -0 fix is not
+        // later "generalized" into changing this.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('one', 1.0);
+        expect(lua.execute_script('return math.type(one)')).toBe('integer');
+      });
+    });
+
+    describe('F1: the documented array-hole behaviour', () => {
+      // Not a fix — a documented loss, pinned so it cannot change silently in
+      // either direction. See LuaInput in types.d.ts.
+      it('a null in an array truncates the Lua sequence', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('rows', [1, null, 3, 4]);
+        expect(lua.execute_script('return #rows')).toBe(1);
+        expect(lua.execute_script('local c=0 for _ in ipairs(rows) do c=c+1 end return c')).toBe(1);
+        expect(lua.execute_script('local c=0 for _ in pairs(rows) do c=c+1 end return c')).toBe(3);
+        // The later values are present, just not part of the sequence.
+        expect(lua.execute_script('return rows[3]')).toBe(3);
+      });
+
+      it('the documented workaround keeps the sequence intact', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('rows', [1, false, 3, 4]);
+        expect(lua.execute_script('return #rows')).toBe(4);
       });
     });
   });

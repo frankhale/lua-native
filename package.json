@@ -37,9 +37,10 @@
     "start": "vitest",
     "test": "vitest",
     "test-cpp": "node run-tests.js",
-    "check-invariants": "node tools/check-invariants.mjs",
-    "oracle": "node tools/diff-oracle/oracle.mjs",
-    "cr18-matrix": "node tools/cr18/matrix.mjs",
+    "check-invariants": "node tools/invariants/run.mjs",
+    "oracle": "node tools/diff-oracle/run.mjs",
+    "exception-matrix": "node tools/exception-matrix/run.mjs",
+    "roundtrip-matrix": "node tools/roundtrip-matrix/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib"
   },

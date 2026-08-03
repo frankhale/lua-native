@@ -16,7 +16,7 @@ recollection of which sites matter, per CR-14's standing rule.
 Two supporting deliverables landed with it, both from the same document:
 
 - **§4, the comment-enforced invariants**, converted to generated answers a test
-  compares against (`tools/invariants.mjs`, `tests/ts/invariants.spec.ts`).
+  compares against (`tools/invariants/invariants.mjs`, `tests/ts/invariants.spec.ts`).
 - **§5, a differential oracle** against stock Lua 5.5
   (`tools/diff-oracle/`) — the first harness in eighteen passes that checks
   whether an answer is *right* rather than whether nothing crashed.
@@ -97,15 +97,15 @@ there so the *next* change to these paths is deliberate.
 ## The exception-escape matrix
 
 The instrument, described so it can be re-run and extended. It lives in
-`tools/cr18/` and **is** checked in, unlike CR-16's and CR-17's — the axes are
+`tools/exception-matrix/` and **is** checked in, unlike CR-16's and CR-17's — the axes are
 cheap to extend, the whole run is about four minutes, and the reason CR-16 gave
 for not checking its own matrix in (fifteen minutes, one process per cell) does
 not apply at this size.
 
 ```
-node tools/cr18/matrix.mjs                        # the whole matrix
-node tools/cr18/matrix.mjs --control              # just the controls
-node tools/cr18/matrix.mjs --frame=host_function  # one row
+node tools/exception-matrix/run.mjs                        # the whole matrix
+node tools/exception-matrix/run.mjs --control              # just the controls
+node tools/exception-matrix/run.mjs --frame=host_function  # one row
 ```
 
 **Axis B — 27 frames**, grouped by what is on the C stack:
@@ -186,7 +186,7 @@ all real behaviour. Which leads to the part worth keeping:
 | Outcome | Cells | |
 |---|---|---|
 | Clean — the failure surfaced and the context survived | 225 | |
-| By design — recorded, with the reason, in `tools/cr18/expected.mjs` | 52 | |
+| By design — recorded, with the reason, in `tools/exception-matrix/expected.mjs` | 52 | |
 | Not applicable — the kind cannot be armed at that frame | 20 | |
 | **Aborted, context-dead, vacuous or swallowed** | **0** | |
 
@@ -248,7 +248,7 @@ look, and left two siblings saying the old number — the same fix-the-site-not-
 the-class shape as CR-6 F1, applied to a comment.
 
 So the answers are now **generated from the source and frozen**
-(`tools/invariants.expected.json`). Six invariants:
+(`tools/invariants/expected.json`). Six invariants:
 
 1. `callscope-classification` — 71 functions, each scored SCOPE_FIRST /
    SCOPE_LATE / NO_SCOPE / SCOPE_NO_USER_JS by computing the predicate the
@@ -270,7 +270,7 @@ The classification is *frozen*, not *asserted correct*: a function in NO_SCOPE
 is not thereby a defect — the header documents why each current one is inert —
 but a function that changes class, or a new one that arrives in either class,
 turns the suite red instead of quietly joining a list. Re-freezing is
-`node tools/check-invariants.mjs --update`, which makes the change a reviewable
+`node tools/invariants/run.mjs --update`, which makes the change a reviewable
 diff rather than an invisible one.
 
 It earned its keep within the hour: it caught the F2 fix changing the

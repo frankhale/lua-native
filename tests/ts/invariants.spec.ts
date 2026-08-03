@@ -6,8 +6,8 @@
 // each time; the `lua_next` traversal list was incomplete on arrival (CR-15 F3);
 // a "33 synchronous methods" count was written in four places and was 31.
 //
-// So the lists are computed from the source by `tools/invariants.mjs` and frozen
-// in `tools/invariants.expected.json`. A source change that moves one is not
+// So the lists are computed from the source by `tools/invariants/invariants.mjs` and frozen
+// in `tools/invariants/expected.json`. A source change that moves one is not
 // forbidden — it just cannot happen silently, because this test goes red and the
 // re-freeze is a reviewable diff.
 //
@@ -19,7 +19,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { topLevelFunctions, tryGuardMap } from '../../tools/cpp-scan.mjs';
-import { INVARIANTS, computeAll, readExpected, diffInvariant } from '../../tools/invariants.mjs';
+import { INVARIANTS, computeAll, readExpected, diffInvariant } from '../../tools/invariants/invariants.mjs';
 
 // Wraps a body in a function definition the scanner will pick up, and returns
 // whether the marker call `boom()` is scored as inside a try block.
@@ -103,13 +103,13 @@ describe('source invariants match their frozen answers', () => {
         drift,
         [
           '',
-          `Invariant "${inv.id}" drifted from tools/invariants.expected.json.`,
+          `Invariant "${inv.id}" drifted from tools/invariants/expected.json.`,
           inv.note ? `  ${inv.note}` : '',
           '',
           ...drift.map((d) => `  ${d}`),
           '',
           'If the change is intended, re-freeze it so the diff lands in review:',
-          '  node tools/check-invariants.mjs --update',
+          '  node tools/invariants/run.mjs --update',
           '',
         ].join('\n'),
       ).toEqual([]);

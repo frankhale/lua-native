@@ -1,10 +1,10 @@
 // The differential oracle: lua-native against stock Lua 5.5.
 //
-//   node tools/diff-oracle/oracle.mjs                  # both modes
-//   node tools/diff-oracle/oracle.mjs --mode=a         # embedded VM only
-//   node tools/diff-oracle/oracle.mjs --mode=b         # marshalling only
-//   node tools/diff-oracle/oracle.mjs --category=math
-//   node tools/diff-oracle/oracle.mjs --json=out.json
+//   node tools/diff-oracle/run.mjs                  # both modes
+//   node tools/diff-oracle/run.mjs --mode=a         # embedded VM only
+//   node tools/diff-oracle/run.mjs --mode=b         # marshalling only
+//   node tools/diff-oracle/run.mjs --category=math
+//   node tools/diff-oracle/run.mjs --json=out.json
 //
 // **Why this exists.** Seventeen review passes, three exhaustive matrices and
 // four sanitizer harnesses all check the same thing: that nothing crashed and
@@ -172,7 +172,12 @@ function runEmbeddedModeB(caseSource) {
 // nothing:
 //
 //   * **Addresses.** `tostring({})` is "table: 0x...". Two processes never
-//     agree and never could.
+//     agree and never could. Anchored to the `table:` / `thread:` /
+//     `function:` / `userdata:` prefixes Lua actually emits, rather than to
+//     bare `0x…`: the unanchored form also erased any *string-valued* result
+//     that happened to look like a hex literal, so a future `string.format('%x')`
+//     case would have compared equal to a different one and passed silently
+//     (CR-19 F5b).
 //   * **The chunk location prefix.** The reference loads each case as `=case`;
 //     `execute_script` names its chunk `[string "..."]`. Both are correct
 //     reports of where the error happened, in harnesses that put it in
@@ -185,7 +190,7 @@ function runEmbeddedModeB(caseSource) {
 // Everything else is left alone on purpose, including whitespace and quoting.
 function normalise(c) {
   return c
-    .replace(/0x[0-9a-fA-F]+/g, '0xADDR')
+    .replace(/\b(table|thread|function|userdata): 0x[0-9a-fA-F]+/g, '$1: 0xADDR')
     .replace(/\[string \\x22[\s\S]*?\\x22\]:\d+:/g, 'CHUNK:LINE:')
     .replace(/\bcase:\d+:/g, 'CHUNK:LINE:')
     // Strip the traceback but keep whatever closed the canonical form — taking

@@ -70,7 +70,7 @@ export const EXPECTED_NON_SURFACING = {
     + 'point of the kind. Reported rather than hidden, so the row is honest.',
 
   'class_constructor x return_symbol':
-    'Reported correctly, as "Class \'Cr18\' constructor must return an object". '
+    'Reported correctly, as "Class \'Probe\' constructor must return an object". '
     + 'It lands here only because that message names the contract rather than the '
     + 'Symbol, so the kind\'s signature does not match it.',
   'class_constructor x return_bigint_out_of_range':

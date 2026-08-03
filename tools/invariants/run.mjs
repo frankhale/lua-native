@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Reports drift between the invariants computed from the source and the frozen
-// answers in `invariants.expected.json`.
+// answers in `expected.json`.
 //
-//   node tools/check-invariants.mjs            # exit 1 on drift
-//   node tools/check-invariants.mjs --update   # re-freeze after a reviewed change
+//   node tools/invariants/run.mjs            # exit 1 on drift
+//   node tools/invariants/run.mjs --update   # re-freeze after a reviewed change
 
 import { writeFileSync } from 'node:fs';
 import { INVARIANTS, EXPECTED_PATH, computeAll, readExpected, diffInvariant } from './invariants.mjs';
@@ -43,7 +43,7 @@ for (const inv of INVARIANTS) {
 
 if (dirty > 0) {
   console.log(`\n${dirty} invariant(s) drifted. Review the change, then re-freeze with:`);
-  console.log('  node tools/check-invariants.mjs --update');
+  console.log('  node tools/invariants/run.mjs --update');
   process.exit(1);
 }
 console.log('\nall invariants match.');

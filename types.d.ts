@@ -35,6 +35,37 @@ export type LuaValue =
  * of which Lua can produce on the way out.
  *
  * Use this for arguments; use {@link LuaValue} for results.
+ *
+ * @remarks
+ * **What a value can lose on the way in.** The mirror of the list on
+ * {@link LuaContext.execute_script}, which covers the way out. These are
+ * consequences of Lua's data model rather than of this binding, and all of them
+ * are silent.
+ *
+ * 1. **`null` and `undefined` inside an array truncate the sequence.** Both
+ *    convert to Lua `nil`, and a `nil` at index *i* ends the sequence there —
+ *    so `[1, null, 3, 4]` becomes a table where `#t` is `1`, `ipairs` yields one
+ *    element and `table.concat` returns `"1"`. The later values are *not* lost:
+ *    `t[3]` and `t[4]` still hold `3` and `4`, and `pairs` sees all three
+ *    entries. It is only the sequence that is broken, which is the awkward part
+ *    — nothing looks missing if you index, and almost everything is missing if
+ *    you iterate. **Filter or substitute before passing an array that may
+ *    contain `null`**, e.g. `rows.filter(r => r != null)`, or use `false` as a
+ *    placeholder, which Lua treats as a present value.
+ *
+ * 2. **`null` as an object value removes the key.** `{ a: null, b: 1 }` arrives
+ *    as `{ b = 1 }`. Not a `nil` value at key `a` — no key `a`.
+ *
+ * 3. **A circular reference is refused**, with an error naming the cycle. Lua
+ *    tables cannot represent one, so there is no lossy conversion to fall back
+ *    on. Nesting deeper than 100 levels is refused separately, with its own
+ *    message.
+ *
+ * 4. **Nothing else is lost.** Binary strings, embedded NULs, lone surrogates,
+ *    negative zero, the 64-bit integer bounds, string keys that look numeric,
+ *    and nested structures all cross exactly — verified by a round-trip matrix
+ *    over every entry point (`tools/roundtrip-matrix/`), which also checks that all twelve
+ *    entry points agree with each other.
  */
 export type LuaInput =
   | LuaValue
@@ -500,6 +531,13 @@ export interface LuaContext {
    * from {@link get_global_ref} reads the real table in place, so binary
    * strings, boolean keys and colliding keys all stay intact as long as you do
    * not marshal them out.
+   *
+   * **A note on integer width, which changes a type rather than losing data.**
+   * A Lua integer outside ±(2^53 − 1) arrives as a **BigInt**, because a JS
+   * `number` cannot hold it exactly. So `typeof` is not stable across a round
+   * trip at the boundary: `set_global('n', 2 ** 53)` reads back as
+   * `9007199254740992n`, a BigInt, not a number. Values inside the safe range
+   * are unaffected.
    */
   execute_script<T extends LuaValue | LuaValue[] = LuaValue>(script: string): T;
 

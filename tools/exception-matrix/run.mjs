@@ -1,10 +1,10 @@
 // CR-18 exception-escape matrix: the runner.
 //
-//   node tools/cr18/matrix.mjs                       # the whole matrix
-//   node tools/cr18/matrix.mjs --frame=host_function # one row
-//   node tools/cr18/matrix.mjs --kind=throw_error    # one column
-//   node tools/cr18/matrix.mjs --control             # prove it can report dirty
-//   node tools/cr18/matrix.mjs --json=out.json
+//   node tools/exception-matrix/run.mjs                       # the whole matrix
+//   node tools/exception-matrix/run.mjs --frame=host_function # one row
+//   node tools/exception-matrix/run.mjs --kind=throw_error    # one column
+//   node tools/exception-matrix/run.mjs --control             # prove it can report dirty
+//   node tools/exception-matrix/run.mjs --json=out.json
 //
 // One child process per cell. The failure mode being searched for is
 // `std::terminate`, which kills the run — so a crash has to be a data point
@@ -15,7 +15,7 @@
 // vacuous and reported clean; the rule it left behind is that an exhaustive
 // search reporting clean must first demonstrate it can report dirty.
 // `--control` runs cells whose outcome is known bad and fails if they come back
-// clean. `matrix.mjs` runs it automatically before the real matrix.
+// clean. `run.mjs` runs it automatically before the real matrix.
 
 import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
@@ -214,8 +214,20 @@ const leaky = results
 if (leaky.length) {
   console.log('\n=== growth per repeat > 1 KB (possible stranded registration) ===');
   for (const r of leaky.slice(0, 25)) {
-    console.log(`  ${String(r.memGrowthPerIteration).padStart(8)} B/iter  ${r.frame} x ${r.kind}  (${r.repeats} repeats)`);
+    console.log(`  ${String(r.memGrowthPerIteration).padStart(8)} B/iter  ${r.frame} x ${r.kind}  (${r.repeats} repeats, ${r.strandednessScope ?? '?'})`);
   }
+}
+
+// Cells whose re-install was refused measured the trigger only, not the
+// registration path. Reported rather than folded into the clean total, because
+// "install and trigger strands nothing" is not what those cells checked
+// (CR-19 F4).
+const triggerOnly = results.filter((r) => r.strandednessScope === 'trigger-only');
+if (triggerOnly.length) {
+  const frames = [...new Set(triggerOnly.map((r) => r.frame))];
+  console.log(`\n=== strandedness measured trigger-only (re-install refused): ${triggerOnly.length} cells ===`);
+  console.log(`  frames: ${frames.join(', ')}`);
+  console.log('  these cells do not test whether re-registration strands anything');
 }
 
 if (jsonOut) {

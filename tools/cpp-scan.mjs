@@ -72,12 +72,23 @@ export function topLevelFunctions(rawSrc) {
 
     // Accumulate the signature until the body's opening brace, bailing out on a
     // `;` at paren depth 0 (a declaration, not a definition).
+    //
+    // The continuation lines must be *indented*, and that is not cosmetic: a
+    // bodyless macro invocation at column 0 — `NODE_API_MODULE(NAME, Init)` —
+    // has neither a `{` nor a `;`, so without this the scan ran on and adopted
+    // the *next* function's brace, swallowing that function whole. It cost the
+    // CallScope invariant a real member (`NapiToCoreInstance`) and gave the
+    // macro a bogus row carrying that member's data (CR-19 F2). Every genuine
+    // multi-line signature in this codebase indents its continuations —
+    // parameter lists, constructor initializer lists, trailing return types —
+    // so a column-0 line before the body means the candidate ended without one.
     let depthParen = 0;
     let bodyStart = -1;
     let j = i;
     let aborted = false;
     for (; j < lines.length && j < i + 25; j++) {
       const s = lines[j];
+      if (j > i && /^\S/.test(s)) { aborted = true; break; }
       for (let k = 0; k < s.length; k++) {
         const ch = s[k];
         if (ch === '(') depthParen++;
@@ -141,6 +152,52 @@ export function matchLines(fn, re) {
 
 export function readSource(path) {
   return readFileSync(path, 'utf8');
+}
+
+// Every column-0 line that *looks* like a definition but was not attributed to
+// one, each labelled with why it was skipped.
+//
+// This is the check that was missing, and its absence is why CR-19 F2 survived:
+// a scanner that silently drops input reports clean over a smaller universe
+// than anyone thinks it covers, which is the same hazard as a matrix cell that
+// silently runs nothing. A positive control proves the instrument can fire; it
+// says nothing about whether the instrument is pointed at the whole subject.
+//
+// Returns `{ line, text, reason }` for each. `reason` is 'declaration' or
+// 'macro-invocation' for the benign ones and 'UNATTRIBUTED' for anything else —
+// which is a scanner bug, not a source oddity.
+export function unattributedDefinitions(rawSrc) {
+  const src = stripCommentsAndStrings(rawSrc);
+  const lines = src.split('\n');
+  const rawLines = rawSrc.split('\n');
+  const attributed = new Set(topLevelFunctions(rawSrc).map((f) => f.startLine));
+  const out = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!/^[A-Za-z_~]/.test(line)) continue;
+    if (NOT_A_FUNCTION.test(line)) continue;
+    if (!line.includes('(')) continue;
+    if (attributed.has(i + 1)) continue;
+
+    // A declaration ends in `;` once its parens balance.
+    let depth = 0;
+    let reason = 'UNATTRIBUTED';
+    let sawClose = false;
+    for (let k = 0; k < line.length; k++) {
+      const ch = line[k];
+      if (ch === '(') depth++;
+      else if (ch === ')') { depth--; if (depth === 0) sawClose = true; }
+      else if (ch === ';' && depth === 0) { reason = 'declaration'; break; }
+    }
+    // A macro invocation: parens balance and the line ends with nothing after
+    // them — no `;`, no `{`, no trailing specifier.
+    if (reason === 'UNATTRIBUTED' && sawClose && depth === 0 && /\)\s*$/.test(line)) {
+      reason = 'macro-invocation';
+    }
+    out.push({ line: i + 1, text: rawLines[i].trim().slice(0, 100), reason });
+  }
+  return out;
 }
 
 // A per-character map over `fn.body`: 1 where that character sits lexically

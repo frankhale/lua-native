@@ -9,18 +9,18 @@
 // `act(lua)` is the body spliced into whatever callback the frame installs.
 // `options` is merged into the context's init options.
 
-export const MARKER = 'CR18-BOOM';
+export const MARKER = 'PROBE-BOOM';
 
 export const KINDS = [
   {
     id: 'throw_error',
-    signature: /CR18-BOOM(?!-)/,
+    signature: /PROBE-BOOM(?!-)/,
     describe: 'throw new Error',
     act: () => { throw new Error(MARKER); },
   },
   {
     id: 'throw_string',
-    signature: /CR18-BOOM-string/,
+    signature: /PROBE-BOOM-string/,
     describe: 'throw a bare string (not an Error)',
     act: () => { throw `${MARKER}-string`; },
   },
@@ -34,7 +34,7 @@ export const KINDS = [
   },
   {
     id: 'throw_error_hostile_message',
-    signature: /CR18-BOOM-nested|outer|threw an exception|Error/i,
+    signature: /PROBE-BOOM-nested|outer|threw an exception|Error/i,
     describe: 'throw an Error whose .message getter throws',
     // CR-16 listed "a getter on a thrown Error's name" as an injection site.
     // Here it is a throw kind: the *second* exception is raised while the first
@@ -73,7 +73,7 @@ export const KINDS = [
   },
   {
     id: 'raise_g_metamethod',
-    signature: /CR18-BOOM-gmeta/,
+    signature: /PROBE-BOOM-gmeta/,
     describe: 'call back into the context so a raising _G.__newindex fires',
     // The CR-6 F1 trigger, reached from inside a Lua C frame instead of from
     // top-level JS. The core raises a Lua error, RunProtected turns it into a
@@ -82,7 +82,7 @@ export const KINDS = [
     arm: (lua) => {
       lua.execute_script(`setmetatable(_G, { __newindex = function() error('${MARKER}-gmeta') end })`);
     },
-    act: (lua) => { lua.set_global('cr18_probe', 1); },
+    act: (lua) => { lua.set_global('probe_probe', 1); },
   },
   {
     id: 'errmem_oom',
@@ -95,7 +95,7 @@ export const KINDS = [
   },
   {
     id: 'reset_then_throw',
-    signature: /CR18-BOOM-after-reset/,
+    signature: /PROBE-BOOM-after-reset/,
     describe: 'reset() the context, then throw',
     // The state the frame is running on is retired underneath it and *then*
     // the exception starts unwinding through it.
@@ -106,12 +106,12 @@ export const KINDS = [
   },
   {
     id: 'nested_then_throw',
-    signature: /CR18-BOOM-inner/,
+    signature: /PROBE-BOOM-inner/,
     describe: 're-enter Lua, then throw from the inner JS frame',
     // Two Lua C frames between the throw and the top-level catch instead of one.
     arm: (lua) => {
-      lua.set_global('cr18_inner', () => { throw new Error(`${MARKER}-inner`); });
+      lua.set_global('probe_inner', () => { throw new Error(`${MARKER}-inner`); });
     },
-    act: (lua) => { lua.execute_script('cr18_inner()'); },
+    act: (lua) => { lua.execute_script('probe_inner()'); },
   },
 ];

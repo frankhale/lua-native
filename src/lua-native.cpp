@@ -65,6 +65,27 @@ static T* TaggedData(const Napi::Value& value, const napi_type_tag& tag) {
 
 // True when `value` is an instance of the named global constructor
 // (e.g. "Map", "Set", "RegExp"). Robust against subclassing.
+// The message for a caught Napi::Error.
+//
+// `Napi::Error::Message()` — and therefore `Napi::Error::what()` — reads
+// `.message` off the thrown value, so it is **empty for every throw that is not
+// an Error object**: `throw 'boom'`, `throw 42`, `throw null`. Sites that build
+// a diagnostic out of it then report nothing at all. See the comment above
+// StageJsError for the full history; this is the rule, and it is a free
+// function so that every class in this file can reach it (CR-19 F3).
+static std::string JsThrowMessage(const Napi::Error& e) {
+  if (std::string message = e.Message(); !message.empty()) return message;
+  const Napi::Value value = e.Value();
+  if (value.IsEmpty()) return "JavaScript callback threw with no value";
+  // ToString() runs user code (a hostile `toString`/`Symbol.toPrimitive`) and
+  // is on an error path, so it cannot be allowed to throw again.
+  try {
+    return value.ToString().Utf8Value();
+  } catch (...) {
+    return "JavaScript callback threw a value that could not be converted to a string";
+  }
+}
+
 static bool IsInstanceOfGlobal(const Napi::Value& value, const char* ctorName) {
   const Napi::Env env = value.Env();
   const Napi::Value ctor = env.Global().Get(ctorName);
@@ -689,6 +710,11 @@ Napi::Function SharedTable::DefineSharedTable(const Napi::Env env) {
 
 SharedTable::SharedTable(const Napi::CallbackInfo& info) : ObjectWrap(info) {
   const Napi::Env env_ = info.Env();
+  // Brand the instance so AsSharedTable can ask what it *is* rather than what
+  // its constructor claims. Applied at the one mint site there is; a second one
+  // that forgot this would fail closed at the read, which is the right
+  // direction to fail (see lua_tags).
+  info.This().As<Napi::Object>().TypeTag(&lua_tags::kSharedTable);
 
   if (info.Length() > 0 && !info[0].IsUndefined() && !info[0].IsNull()) {
     // IsObject() is true for functions too, so exclude them explicitly.
@@ -711,8 +737,14 @@ void SharedTable::PushValue(const Napi::Object& context, const std::string& name
   const Napi::Env env_ = context.Env();
   const Napi::Value setter = context.Get("set_global");
   if (!setter.IsFunction()) {
+    // Two different facts, and the old message asserted the wrong one: a
+    // subscriber is always a real context (Subscribe is only ever called from
+    // the constructor with `this`), so reaching here means its `set_global` has
+    // been shadowed by an own property rather than that this is not a context
+    // (CR-19 F5c).
     throw Napi::Error::New(env_,
-      "shared table subscriber is not a Lua context");
+      "shared table subscriber's set_global is not a function; it has been "
+      "shadowed by an own property on the context");
   }
   // Routed through the context's own public set_global so a shared value gets
   // exactly the same treatment as any other JS value crossing into that state:
@@ -787,7 +819,10 @@ void SharedTable::Propagate(const Napi::Env env_) {
       if (!failures.empty()) failures += "; ";
       failures += target.name;
       failures += ": ";
-      failures += e.Message();
+      // JsThrowMessage, not Message(): a subscriber that throws a non-Error
+      // otherwise contributes an empty cause and the aggregate reads
+      // "(settings: )" (CR-19 F3).
+      failures += JsThrowMessage(e);
     }
   }
 
@@ -848,8 +883,34 @@ static SharedTable* AsSharedTable(const Napi::Env env, const Napi::Value& value)
   const auto* data = env.GetInstanceData<AddonData>();
   if (!data || data->sharedTableConstructor.IsEmpty()) return nullptr;
   const auto obj = value.As<Napi::Object>();
-  if (!obj.InstanceOf(data->sharedTableConstructor.Value())) return nullptr;
-  return SharedTable::Unwrap(obj);
+  // The brand first, and it is the load-bearing check: `InstanceOf` consults
+  // `Symbol.hasInstance` and so answers whatever user JS wants it to, while
+  // `napi_unwrap` is not a type check either — it hands back whatever pointer
+  // was attached, so a different ObjectWrap subclass unwraps "successfully"
+  // into a wrongly-typed pointer. `CheckTypeTag` compares a 128-bit brand
+  // applied at mint time and cannot be reached from JS at all.
+  if (!obj.CheckTypeTag(&lua_tags::kSharedTable)) return nullptr;
+  // `InstanceOf` consults `Symbol.hasInstance`, so it is user-defeatable — CR-15
+  // F5 established that, and that what actually holds is `napi_unwrap` refusing
+  // an object it never wrapped. What CR-15 did not note is that `Unwrap`
+  // *throws* on that refusal, and this function's callers are written for a
+  // nullptr. Two consequences, both fixed by containing it here:
+  //
+  //   * the raw N-API message ("Invalid argument") escaped in place of the
+  //     caller's own — "shared.s must be a shared table created with
+  //     createSharedTable()" — so the one error a user could act on never ran;
+  //   * and it took *legitimate* calls with it. The constructor asks this
+  //     question of the `shared` option object itself before asking it of each
+  //     entry, so with a forgery active a correct `{ s: genuineSharedTable }`
+  //     failed on the outer object and never reached the entry that was fine.
+  //
+  // Returning nullptr makes the predicate total: this answers "is this a shared
+  // table", and "no" is an answer, not an exception.
+  try {
+    return SharedTable::Unwrap(obj);
+  } catch (const Napi::Error&) {
+    return nullptr;
+  }
 }
 
 Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
@@ -2533,19 +2594,12 @@ LuaContext::~LuaContext() {
 // the producers rather than the 45 consumers is deliberate: the consumers are
 // correct given a correct `what()`, and a 45-site edit is exactly the kind of
 // sweep that has introduced a fresh defect every time it has been done here.
-std::string LuaContext::JsThrowMessage(const Napi::Error& e) {
-  if (std::string message = e.Message(); !message.empty()) return message;
-  const Napi::Value value = e.Value();
-  if (value.IsEmpty()) return "JavaScript callback threw with no value";
-  // ToString() runs user code (a hostile `toString`/`Symbol.toPrimitive`) and
-  // is on an error path, so it cannot be allowed to throw again.
-  try {
-    return value.ToString().Utf8Value();
-  } catch (...) {
-    return "JavaScript callback threw a value that could not be converted to a string";
-  }
-}
-
+//
+// The definition is a file-scope free function rather than a member, and that
+// is CR-19 F3: as a private static of LuaContext it was invisible to
+// SharedTable, which formats a caught Napi::Error itself and so was the one
+// consumer the producer-side fix could not reach. A rule with "one home" has to
+// have a home every site can see.
 std::string LuaContext::StageJsError(const Napi::Value& value,
                                      const std::string& message,
                                      const lua_core::LuaRuntime* owner) {
@@ -3970,6 +4024,13 @@ static Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) 
 
 NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)
 
+bool LuaContext::IsOnConversionPath(const Napi::Value& v) const {
+  for (const auto& seen : conversion_path_) {
+    if (seen.StrictEquals(v)) return true;
+  }
+  return false;
+}
+
 lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int depth) {
   if (depth > 0) return NapiToCoreImpl(value, depth);
   // Top-level conversion: if it aborts partway (a sibling value throwing after
@@ -3978,6 +4039,9 @@ lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int 
   // destruction (N4). On success the names propagate to any enclosing scope,
   // which may still discard the converted value (see OnAwaitSettled).
   JsCallbackCollectorScope collector(this);
+  // A fresh cycle-detection path per logical tree: a converter re-entering here
+  // is converting something else, and a value in both trees is not a cycle.
+  ConversionPathScope path(this);
   lua_core::LuaValue result = NapiToCoreImpl(value, 0);
   // Success: hand the names to any enclosing method-level scope, which may
   // still discard this value. A throw instead leaves them for the collector's
@@ -4049,6 +4113,20 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
   }
   if (type == napi_number) {
     const double num = value.As<Napi::Number>().DoubleValue();
+    // Negative zero is the one exception to "an integral JS number becomes a
+    // Lua integer", and it is an exception because it is the one case where the
+    // information exists on both sides and would be thrown away in the middle.
+    // JavaScript distinguishes -0 from 0 (`Object.is`), Lua represents -0.0
+    // exactly, and Lua's integers do not have a signed zero — so taking the
+    // integral branch here loses the sign, and `1/x` comes out of the crossing
+    // as +inf where it went in as -inf (CR-20 F3).
+    //
+    // Contrast 1.0 vs 1, which is *not* fixable and is not fixed: JavaScript
+    // cannot tell those apart, so no conversion can preserve a distinction the
+    // input never carried.
+    if (num == 0.0 && std::signbit(num)) {
+      return lua_core::LuaValue::from(num);  // stays a float, keeps the sign
+    }
     // Upper bound is strictly < 2^63: static_cast<double>(INT64_MAX) rounds up
     // to exactly 2^63, and casting a double == 2^63 back to int64_t is UB.
     constexpr double kInt64UpperExclusive = 9223372036854775808.0;  // 2^63
@@ -4194,6 +4272,16 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
           [this](const Napi::Value& v, const int d) { return NapiToCoreInstance(v, d); })) {
       return std::move(*builtin);
     }
+
+    // Cycle check before descending, so an object that is its own ancestor is
+    // named as one at the first repeat instead of after a hundred levels of
+    // conversion work that then reports the wrong cause (CR-20 F2).
+    if (IsOnConversionPath(value)) {
+      throw std::runtime_error(
+        "Value contains a circular reference, which Lua tables cannot represent; "
+        "break the cycle before passing it in");
+    }
+    ConversionPathEntry on_path(this, value);
 
     if (value.IsArray()) {
       const auto arr = value.As<Napi::Array>();

@@ -13,11 +13,11 @@
 //
 // The lists here are therefore **generated from the source and frozen**. Each
 // invariant computes its answer by scanning the tree, and the test compares that
-// answer against `invariants.expected.json`. Changing the source's shape is
+// answer against `expected.json`. Changing the source's shape is
 // allowed; changing it *silently* is not — the diff shows up in review.
 //
-//   node tools/check-invariants.mjs            # report (exit 1 on drift)
-//   node tools/check-invariants.mjs --update   # re-freeze after a reviewed change
+//   node tools/invariants/run.mjs            # report (exit 1 on drift)
+//   node tools/invariants/run.mjs --update   # re-freeze after a reviewed change
 //
 // `tests/ts/invariants.spec.ts` runs the same checks, so drift is a red suite.
 
@@ -26,9 +26,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   readSource, topLevelFunctions, stripCommentsAndStrings, stripComments, tryGuardMap,
-} from './cpp-scan.mjs';
+  unattributedDefinitions,
+} from '../cpp-scan.mjs';
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const BINDING = join(ROOT, 'src/lua-native.cpp');
 const CORE = join(ROOT, 'src/core/lua-runtime.cpp');
 
@@ -204,43 +205,174 @@ export function exceptionSurface() {
 // `LuaRuntime` method whose body calls `RunProtected` — and then, for every call
 // to one of them from the binding layer, reports whether the call site is
 // lexically inside a `try` block.
-// A core method throws across the N-API boundary if it calls `RunProtected`
-// (which throws by design) *without* containing that call in its own
-// `try`/`catch`. `CreateCoroutine` is the reason the second half matters: it is
+// A core method lets a C++ exception escape to its caller if it calls
+// `RunProtected` (which throws by design) outside its own `try`/`catch` — or if
+// it *calls another core method that does*.
+//
+// The transitive half is CR-19 F1. Computing only the direct half missed seven
+// methods, `LuaRuntime::GetGlobal` most plainly: it calls `PushProtectedGlobal`
+// and `ToLuaValueProtected`, both of which throw, and contains no `RunProtected`
+// of its own. A binding call to it was not scored `UNGUARDED`; it produced no
+// row at all, which is worse, because a missing row reads as nothing to check.
+//
+// `CreateCoroutine` is why the guarded half still matters: it is
 // RunProtected-backed and cannot throw, because it catches and returns the
-// message as a `std::string`. Scoring it as throwing would put a permanent
-// false row in the guarding table, and a table with a known-false row is one
-// nobody reads.
+// message as a `std::string`.
 export function throwingCoreMethods() {
-  const names = new Set();
-  for (const fn of topLevelFunctions(readSource(CORE))) {
-    if (!fn.name.startsWith('LuaRuntime::')) continue;
-    const guard = tryGuardMap(fn);
-    for (const at of allMatches(fn.body, /\bRunProtected\(/g)) {
-      if (!guard[at]) { names.add(fn.name.slice('LuaRuntime::'.length)); break; }
+  const fns = topLevelFunctions(readSource(CORE)).filter((f) => f.name.startsWith('LuaRuntime::'));
+  const shortName = (f) => f.name.slice('LuaRuntime::'.length);
+  const guards = new Map(fns.map((f) => [f.name, tryGuardMap(f)]));
+
+  // Seed: an unguarded `RunProtected(` or an unguarded bare `throw`.
+  const throwing = new Set();
+  for (const f of fns) {
+    const g = guards.get(f.name);
+    for (const at of allMatches(f.body, /\bRunProtected\(|\bthrow\b/g)) {
+      if (!g[at]) { throwing.add(shortName(f)); break; }
     }
   }
-  return [...names].sort();
+
+  // Closure: an unguarded call to a sibling that throws.
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const f of fns) {
+      if (throwing.has(shortName(f))) continue;
+      const g = guards.get(f.name);
+      for (const callee of throwing) {
+        const re = new RegExp(`\\b${callee}\\s*\\(`, 'g');
+        let hit = false;
+        for (const at of allMatches(f.body, re)) {
+          // Skip a qualified name (`Other::Callee`) — not this method.
+          if (at > 0 && /[A-Za-z0-9_:]/.test(f.body[at - 1])) continue;
+          if (!g[at]) { hit = true; break; }
+        }
+        if (hit) { throwing.add(shortName(f)); changed = true; break; }
+      }
+    }
+  }
+  return [...throwing].sort();
 }
 
-export function unguardedCoreCalls() {
+// Whether a C++ exception can escape each binding function to *its* caller, and
+// therefore whether it can reach N-API from a function nobody calls.
+//
+// The second half of CR-19 F1. Asking "is this call site inside a try" of one
+// function body at a time gets the print-handler chain wrong:
+//
+//     SetPrintHandler        try { … InstallPrintHandler(fn) … } catch (…)
+//       InstallPrintHandler    runtime->SetOutputHandler(lambda)   <- no try
+//
+// The call is unguarded where it is written and guarded where it matters, one
+// frame up. So the question is asked of a *path*: a function escapes if it has
+// an unguarded call to a throwing core method, or an unguarded call to another
+// binding function that escapes. What matters is the fixpoint at the roots —
+// the functions nothing else calls, which are what N-API invokes.
+export function coreCallGuarding() {
   const throwing = throwingCoreMethods();
   if (throwing.length === 0) throw new Error('no throwing core methods found — the scan is broken');
-  const re = new RegExp(`(?:runtime|runtime_|rt)(?:->|\\.)(${throwing.join('|')})\\s*\\(`, 'g');
-  const out = {};
-  for (const fn of topLevelFunctions(readSource(BINDING))) {
-    const guard = tryGuardMap(fn);
-    re.lastIndex = 0;
+  const coreCall = new RegExp(`(?:runtime|runtime_|rt)(?:->|\\.)(${throwing.join('|')})\\s*\\(`, 'g');
+
+  const fns = topLevelFunctions(readSource(BINDING));
+  const guards = new Map(fns.map((f) => [f.name, tryGuardMap(f)]));
+  const bare = (n) => (n.includes('::') ? n.slice(n.lastIndexOf('::') + 2) : n);
+
+  // Direct, unguarded calls into a throwing core method.
+  const localUnguarded = new Map();   // fn name -> [callee]
+  const rows = {};
+  for (const f of fns) {
+    const g = guards.get(f.name);
+    coreCall.lastIndex = 0;
     let m;
-    while ((m = re.exec(fn.body)) !== null) {
-      const key = `${fn.name} -> ${m[1]}`;
-      const state = guard[m.index] ? 'GUARDED' : 'UNGUARDED';
-      // A method calling several: unguarded wins, it is the reportable state.
-      if (out[key] !== 'UNGUARDED') out[key] = state;
+    while ((m = coreCall.exec(f.body)) !== null) {
+      const key = `${f.name} -> ${m[1]}`;
+      const guarded = !!g[m.index];
+      if (rows[key] !== 'UNGUARDED') rows[key] = guarded ? 'GUARDED' : 'UNGUARDED';
+      if (!guarded) {
+        if (!localUnguarded.has(f.name)) localUnguarded.set(f.name, []);
+        localUnguarded.get(f.name).push(m[1]);
+      }
     }
   }
-  return out;
+
+  // Unguarded calls from one binding function to another.
+  const callers = new Map();          // callee fn name -> [{caller, guarded}]
+  const called = new Set();
+  for (const f of fns) {
+    const g = guards.get(f.name);
+    for (const other of fns) {
+      if (other.name === f.name) continue;
+      const re = new RegExp(`\\b${bare(other.name)}\\s*\\(`, 'g');
+      for (const at of allMatches(f.body, re)) {
+        if (at > 0 && /[A-Za-z0-9_]/.test(f.body[at - 1])) continue;
+        called.add(other.name);
+        if (!callers.has(other.name)) callers.set(other.name, []);
+        callers.get(other.name).push({ caller: f.name, guarded: !!g[at] });
+      }
+    }
+  }
+
+  // Fixpoint: escapes(f) = local unguarded core call, or an unguarded call to
+  // some g with escapes(g).
+  const escapes = new Set(localUnguarded.keys());
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const f of fns) {
+      if (escapes.has(f.name)) continue;
+      const g = guards.get(f.name);
+      for (const other of fns) {
+        if (!escapes.has(other.name)) continue;
+        const re = new RegExp(`\\b${bare(other.name)}\\s*\\(`, 'g');
+        let hit = false;
+        for (const at of allMatches(f.body, re)) {
+          if (at > 0 && /[A-Za-z0-9_]/.test(f.body[at - 1])) continue;
+          if (!g[at]) { hit = true; break; }
+        }
+        if (hit) { escapes.add(f.name); changed = true; break; }
+      }
+    }
+  }
+
+  // Report each locally-unguarded function by what actually happens to it.
+  for (const [fn, callees] of localUnguarded) {
+    const cs = callers.get(fn) ?? [];
+    const key = `${fn} -> ${[...new Set(callees)].sort().join('+')}`;
+    delete rows[`${fn} -> ${callees[0]}`];
+    if (cs.length === 0) {
+      // Nothing calls it: N-API does, so an escape here reaches the process.
+      rows[key] = 'ESCAPES_AT_ROOT';
+    } else if (cs.every((c) => c.guarded)) {
+      rows[key] = `CONTAINED_BY_CALLERS(${cs.length})`;
+    } else {
+      rows[key] = 'UNGUARDED_AND_PROPAGATES';
+    }
+    if (JUSTIFIED_ESCAPES[key]) {
+      rows[key] = rows[key] === 'GUARDED' || String(rows[key]).startsWith('CONTAINED')
+        ? `STALE_JUSTIFICATION(${rows[key]})`   // it is contained now; drop the entry
+        : 'JUSTIFIED_FALSE_POSITIVE';
+    }
+  }
+  return rows;
 }
+
+// Escape rows that are false positives of the analysis, with the reason.
+//
+// The closure is argument-insensitive, and CR-19 predicted this exact cost:
+// "an over-approximating check that is fed to a reader as a list of defects is
+// its own failure mode." So the over-approximations are named here rather than
+// left for a reader to re-derive every time — and, as with the other ledgers in
+// this repo, an entry that stops applying is reported instead of being silently
+// ignored.
+export const JUSTIFIED_ESCAPES = {
+  'LuaContext::DetachRuntimeHandlers -> SetOutputHandler':
+    'Passes `nullptr`, and `SetOutputHandler(nullptr)` takes the `else` branch — '
+    + '`output_handler_.reset()` — which never reaches `InstallOutputRedirection` '
+    + 'and so cannot throw. The analysis cannot see argument values. Verified by '
+    + 'reading both branches at CR-19; the throwing branch is the `if (handler)` '
+    + 'one only.',
+};
+
+// Kept as a named export for the review docs that cite it.
+export const unguardedCoreCalls = coreCallGuarding;
 
 function allMatches(text, re) {
   const at = [];
@@ -251,6 +383,37 @@ function allMatches(text, re) {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 7. The scanner's own coverage
+// ---------------------------------------------------------------------------
+//
+// Every invariant above stands on `topLevelFunctions`, and CR-19 F2 was that
+// scanner silently dropping a function: a bodyless macro at column 0 had no
+// brace of its own, so the scan adopted the next function's and swallowed it.
+// The result was a checked-in classification with a bogus row and a missing
+// member, and nothing noticed, because a scanner that drops input reports clean
+// over a smaller universe than anyone believes it covers.
+//
+// So the scanner now has to account for its own input: every column-0 line that
+// looks like a definition is either attributed to a function or explicitly
+// classified as a declaration or a macro invocation. `UNATTRIBUTED` is a
+// scanner bug and turns the suite red.
+export function scannerCoverage() {
+  const out = {};
+  for (const [label, path] of [['binding', BINDING], ['core', CORE]]) {
+    const src = readSource(path);
+    out[`${label}: functions found`] = topLevelFunctions(src).length;
+    const un = unattributedDefinitions(src);
+    // Keyed by the line's *text*, not its line number: a line number changes
+    // whenever anything above it does, so keying on it would make this drift on
+    // every unrelated edit — and an invariant that cries wolf is one that gets
+    // re-frozen without being read, which is the failure it exists to prevent.
+    for (const u of un) out[`${label}: ${u.text}`] = u.reason;
+    out[`${label}: unattributed`] = un.filter((u) => u.reason === 'UNATTRIBUTED').length;
+  }
+  return out;
+}
 
 export const INVARIANTS = [
   {
@@ -282,14 +445,20 @@ export const INVARIANTS = [
     compute: exceptionSurface,
   },
   {
+    id: 'scanner-coverage',
+    title: "The C++ scanner accounts for every definition-shaped line it saw",
+    compute: scannerCoverage,
+    note: 'An UNATTRIBUTED line is a scanner bug: the invariants above would be silently ranging over a smaller universe than they claim (CR-19 F2).',
+  },
+  {
     id: 'core-call-guarding',
-    title: 'Binding calls to RunProtected-backed core methods, guarded or not',
-    compute: unguardedCoreCalls,
-    note: 'The CR-6 F1 class. An UNGUARDED row is a process-abort candidate and must be justified.',
+    title: 'Binding calls that can let a C++ exception reach N-API',
+    compute: coreCallGuarding,
+    note: 'The CR-6 F1 class. ESCAPES_AT_ROOT or UNGUARDED_AND_PROPAGATES is a process-abort candidate and must be justified.',
   },
 ];
 
-export const EXPECTED_PATH = join(ROOT, 'tools/invariants.expected.json');
+export const EXPECTED_PATH = join(ROOT, 'tools/invariants/expected.json');
 
 export function computeAll() {
   const out = {};

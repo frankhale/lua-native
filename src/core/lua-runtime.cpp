@@ -3577,6 +3577,13 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
     loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
   }
   if (loadStatus != LUA_OK) {
+    // Not one of the four barriers CR-18 F1 swept, and the difference is worth
+    // stating rather than leaving a reader to re-derive it (CR-19 F5a): a
+    // `luaL_loadbuffer` failure always leaves a *string* — a syntax-error
+    // message, or "not enough memory" — so `lua_tostring` cannot return null
+    // here and the fallback is unreachable. The barriers' fallbacks were
+    // reachable because a thrown JS error is staged as a *table*, which only
+    // happens once user code is running, which loading is not.
     const char* msg = lua_tostring(L_, -1);
     return std::string(msg ? msg : "failed to load script");
   }

@@ -5,8 +5,8 @@
 ```bash
 npm run oracle              # the whole corpus, both modes
 npm run oracle -- --control # just the controls
-node tools/diff-oracle/oracle.mjs --mode=b --category=string
-node tools/diff-oracle/oracle.mjs --json=out.json
+node tools/diff-oracle/run.mjs --mode=b --category=string
+node tools/diff-oracle/run.mjs --json=out.json
 ```
 
 ---

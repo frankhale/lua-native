@@ -1,7 +1,7 @@
 // Divergences between lua-native and reference Lua that are the binding's
 // design rather than defects.
 //
-// Same terms as `tools/cr18/expected.mjs`: every entry carries the reason it is
+// Same terms as `tools/exception-matrix/expected.mjs`: every entry carries the reason it is
 // not a defect, and an entry whose case *starts* agreeing is reported as
 // STALE rather than silently ignored — a ledger that can only ever suppress
 // hides regressions in the other direction too.
