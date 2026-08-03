@@ -1,6 +1,7 @@
 #include "lua-native.h"
 #include "lua-async-worker.h"
 
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -2798,15 +2799,31 @@ int LuaContext::NextUserdataId() {
 // underneath us and the remaining reads are single-threaded.
 //
 // An eager "compute the whole claim set" version of this function is a data
-// race on all 33 kSyncApi call sites, which is exactly what the first draft of
+// race on every kSyncApi call site, which is exactly what the first draft of
 // this refactor was; TSan reported it on the async tests. If a future claim
 // needs state a worker touches, it must be atomic *or* ordered below this line.
 //
-// Claims are reported most-specific first, so the message names the reason a
-// reader can act on. `Resetting` precedes `BindingCall` because a reset reached
-// from the retiring state's own teardown is a distinct situation from a reset
-// reached from a converter, and CR-13's lesson was that collapsing two distinct
-// facts into one message is how the distinction gets lost.
+// Claims are reported **most specific first**, so the message names the reason a
+// reader can act on. Several are routinely true at once and the order decides
+// which one the caller is told about, so it is a correctness property of the
+// diagnostics rather than a style choice:
+//
+//   `Resetting` is tested LAST, because it is the least specific of the four —
+//   it is true for the whole of reset()'s second half, and during that half a
+//   more specific claim usually also holds and says *where* in it we are. Since
+//   CR-15 gave the replay phase a CallScope, a reset() from a replay Proxy trap
+//   holds Resetting **and** BindingCall; reported as Resetting it produces
+//   "from inside a __gc finalizer of the state being retired", which is simply
+//   false — no finalizer is involved. Reported as BindingCall it names the
+//   Proxy trap, which is what the caller can act on. Resetting is then left
+//   holding exactly the case nothing else can see: a finalizer of the retiring
+//   state, firing inside lua_close, where `runtime` already points at the
+//   replacement (so IsExecuting() is false) and the replay's scope is not yet
+//   open (so call_depth_ is 0). That is the case it was written for.
+//
+// This ordering is what the four hand-written `if` blocks did before the
+// occupancy refactor; unifying them moved Resetting to second and silently
+// changed the message for the replay-trap case (CR-16 F3).
 bool LuaContext::RejectIfOccupied(const char* op,
                                   const lua_occupancy::Claim disallowed,
                                   const char* detail) const {
@@ -2815,6 +2832,21 @@ bool LuaContext::RejectIfOccupied(const char* op,
     return lua_occupancy::Any(disallowed & c);
   };
 
+  // The lazy-ordering safety argument above holds only if AsyncInFlight is
+  // actually tested. A policy that names a claim below it without naming it
+  // reads `lua_depth_` / `call_depth_` with a worker possibly running, which is
+  // the data race TSan caught during the CR-15 refactor. Generative rather than
+  // a list of policies to keep in sync: this fires for any caller, present or
+  // future, that assembles such a policy (CR-16 F4).
+  assert((!lua_occupancy::Any(disallowed & (Claim::LuaExecuting |
+                                            Claim::BindingCall |
+                                            Claim::Resetting)) ||
+          wants(Claim::AsyncInFlight)) &&
+         "an occupancy policy that tests any claim below AsyncInFlight must "
+         "also test AsyncInFlight: the claims below it read state a worker "
+         "thread mutates, and AsyncInFlight returning first is what makes "
+         "those reads single-threaded");
+
   const char* reason = nullptr;
   bool parameterized = true;
   if (wants(Claim::AsyncInFlight) && is_busy_) {
@@ -2822,9 +2854,6 @@ bool LuaContext::RejectIfOccupied(const char* op,
     // the occupancy model and a great many tests match on it verbatim.
     reason = "Lua context is busy with an async operation";
     parameterized = false;
-  } else if (wants(Claim::Resetting) && in_reset_) {
-    reason = " cannot be called re-entrantly (from inside a __gc finalizer of "
-             "the state being retired)";
   } else if (wants(Claim::LuaExecuting) && runtime && runtime->IsExecuting()) {
     reason = " cannot be called while Lua is executing (from inside a host "
              "callback, metamethod, or __gc finalizer)";
@@ -2832,6 +2861,9 @@ bool LuaContext::RejectIfOccupied(const char* op,
     reason = " cannot be called from inside another lua-native call (a type "
              "converter, a definition-object getter, or a Proxy trap running "
              "while that call converts its arguments or results)";
+  } else if (wants(Claim::Resetting) && in_reset_) {
+    reason = " cannot be called re-entrantly (from inside a __gc finalizer of "
+             "the state being retired)";
   } else {
     return false;
   }
@@ -3065,7 +3097,7 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
     } catch (const std::exception& e) {
       attach_err = e.what();
     }
-    if (!attached && async_deferred_ && async_generation_ == attach_gen) {
+    if (!attached && !AsyncRunSuperseded(attach_gen)) {
       auto deferred = *async_deferred_;
       FinishAsync();
       deferred.Reject(Napi::Error::New(env,
@@ -3077,6 +3109,22 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
   // Finished or errored: settle the promise and tear down. Marshalling can throw
   // (e.g. a result value that fails to cross to JS); catch it so the deferred is
   // always settled and the context is never left permanently busy.
+  //
+  // It can also run **user JS**, and that is the harder problem. `ResultsToJs`
+  // consults the registered from-Lua converters and installs hidden props via a
+  // patchable `Object.defineProperty`, so an arbitrary JS function runs between
+  // the copy of the deferred taken below and the settle at the bottom. Almost
+  // everything that function could do is refused — `is_busy_` is still true, so
+  // the occupancy guard turns reset(), the worker launchers and every
+  // synchronous method away. `cancel()` is the exception, deliberately and necessarily: it
+  // is the one method that must work while busy. It settles this very deferred
+  // and may start a replacement run, after which settling our copy concludes a
+  // freed napi_deferred (CR-16 F1, deterministic SIGSEGV).
+  //
+  // So re-check before settling, exactly as OnAwaitSettled does after its own
+  // marshal. This is the third of DriveAsync's three exits; the Awaiting branch
+  // above already had the check and this one did not.
+  const uint64_t settle_gen = async_generation_;
   auto deferred = *async_deferred_;
   if (step.state == lua_core::AsyncStepResult::State::Finished) {
     Napi::Value resolved;
@@ -3088,6 +3136,7 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
       ok = false;
       convErr = e.what();
     }
+    if (AsyncRunSuperseded(settle_gen)) return;  // cancel() already settled it
     FinishAsync();
     if (ok) {
       deferred.Resolve(resolved);
@@ -3097,7 +3146,14 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
     }
   } else {
     // Reconstruct the original JS Error if this was a raised JS callback error.
+    // LuaErrorToJsValue runs no user JS today — it is a registry lookup and a
+    // Napi::Error construction — so this branch is currently unreachable from a
+    // hostile converter. The check is here anyway because that is a property of
+    // LuaErrorToJsValue's body rather than of this call site, and CR-14 F2's
+    // lesson was that a guard whose soundness lives somewhere else stops
+    // holding without anyone editing the guard.
     Napi::Value errValue = LuaErrorToJsValue(step.error);
+    if (AsyncRunSuperseded(settle_gen)) return;
     FinishAsync();
     deferred.Reject(errValue);
   }
@@ -3109,7 +3165,7 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   // A cancel() while suspended awaiting a promise tears the run down immediately
   // in Cancel() (clearing async_co_), so a pending cancel is never observed here
   // — the generation/liveness guard above already discards the late settlement.
-  if (!async_co_ || !async_deferred_ || gen != async_generation_) {
+  if (AsyncRunSuperseded(gen)) {
     return env.Undefined();
   }
 
@@ -3168,7 +3224,7 @@ Napi::Value LuaContext::OnAwaitSettled(const Napi::Value& value, bool is_error, 
   // and disengages async_co_/async_deferred_ — or even starts a new run. Re-check
   // the liveness+generation guard before driving so we neither dereference a
   // disengaged optional nor inject this settlement into a newer run (H2).
-  if (!async_co_ || !async_deferred_ || gen != async_generation_) {
+  if (AsyncRunSuperseded(gen)) {
     return env.Undefined();  // collector's destructor sweeps the dropped args
   }
   DriveAsync(args, is_error);
@@ -3421,8 +3477,8 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // async_co_ is the one registry ref the context holds directly (rather than
   // through a handle that owns a shared_ptr to the runtime). Drop it while its
   // state is still guaranteed open — the unref deleter captured that raw
-  // lua_State*. RejectIfBusy above means a run in flight can't reach here, so
-  // this only covers a defensive residue.
+  // lua_State*. The kRetireState guard above means a run in flight can't reach
+  // here, so this only covers a defensive residue.
   if (async_co_) {
     async_co_->release();
     async_co_.reset();
@@ -3448,8 +3504,8 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // this brand-new state to a libuv worker (SIGSEGV in 4 of 10 runs) while the
   // replay below kept writing to it from this thread.
   //
-  // Declaring the holding is what makes RejectIfStateInUse sufficient: the
-  // async launchers ask `call_depth_ > 0`, and this is what answers yes. It
+  // Declaring the holding is what makes the launchers' kExclusive policy
+  // sufficient: it tests `BindingCall`, and this scope is what answers yes. It
   // must come *after* the swap above, because lua_close fires the retiring
   // state's __gc finalizers inside that statement and those are still supposed
   // to reach `in_reset_`'s more specific diagnosis rather than this one.

@@ -9717,6 +9717,115 @@ describe('lua-native Node adapter', () => {
         }
       }
     });
+
+    // CR-16 F1. `cancel()` is the one method deliberately exempt from the
+    // occupancy guard — it must work while `is_busy_` is true, that being its
+    // entire job. It is therefore the only thing user JS can do during an
+    // execute_async result marshal, and what it does is settle the very
+    // deferred the marshal is about to settle. DriveAsync's terminal exit had
+    // no liveness re-check, so it concluded an already-concluded (freed)
+    // napi_deferred: a deterministic SIGSEGV, 8/8, that took the process down
+    // rather than throwing. Both tests below crash the runner pre-fix.
+    describe('occupancy: cancel() during an async result marshal (CR-16 F1)', () => {
+      it('a from-Lua converter may cancel() the run it is marshalling', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let fired = false;
+        lua.register_from_lua_converter(
+          (v: any) => !!(v && v.k === 1),
+          (v: any) => { if (!fired) { fired = true; lua.cancel(); } return v; });
+
+        await expect(lua.execute_async('return {k=1}')).rejects.toThrow(/execution cancelled/);
+        expect(fired).toBe(true);
+        // The run is fully torn down, not wedged half-settled.
+        expect(lua.is_busy()).toBe(false);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a from-Lua converter may cancel() and start a replacement run', async () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let started: Promise<any> | null = null;
+        let fired = false;
+        lua.register_from_lua_converter(
+          (v: any) => !!(v && v.k === 1),
+          (v: any) => {
+            if (!fired) {
+              fired = true;
+              lua.cancel();
+              started = lua.execute_async('return 99');
+            }
+            return v;
+          });
+
+        await expect(lua.execute_async('return {k=1}')).rejects.toThrow(/execution cancelled/);
+        // The generation half of the guard: the outer run's teardown must not
+        // reach into the replacement. Checking the optional alone would pass
+        // here and still tear this run down.
+        expect(started).not.toBeNull();
+        await expect(started!).resolves.toBe(99);
+        expect(lua.is_busy()).toBe(false);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('the sibling window in OnAwaitSettled stays guarded (control)', async () => {
+        // Already had the re-check; pinned so a refactor cannot remove the one
+        // copy that was right while unifying it with the one that was wrong.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v: any) => !!(v && v.__mark),
+          (v: any) => { lua.cancel(); return 1; });
+        lua.set_global('mk', () => Promise.resolve({ __mark: true }));
+
+        await expect(lua.execute_async('local v = await(mk()) return v'))
+          .rejects.toThrow(/execution cancelled/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    // CR-16 F3. Several claims are routinely held at once and the order in
+    // RejectIfOccupied decides which one the caller is told about. Since
+    // CR-15 gave reset()'s replay phase a CallScope, a replay Proxy trap holds
+    // Resetting *and* BindingCall — and for one commit it was reported as
+    // "from inside a __gc finalizer of the state being retired", which is
+    // false. These two pin the split.
+    describe('occupancy: the refusal message names the most specific claim', () => {
+      it('a reset() from the replay phase blames the trap, not a finalizer', () => {
+        let armed = false;
+        let seen = '';
+        const cbs = new Proxy({ a() {}, b() {} }, {
+          get(t: any, k: any, r: any) {
+            if (armed && typeof k === 'string') {
+              armed = false;
+              try { lua.reset(); } catch (e: any) { seen = e.message; }
+            }
+            return Reflect.get(t, k, r);
+          },
+        });
+        const lua: any = new lua_native.init(cbs, ALL_LIBS);
+        armed = true;
+        lua.reset();
+        expect(seen).toMatch(/from inside another lua-native call/);
+        expect(seen).not.toMatch(/__gc finalizer of the state being retired/);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('Resetting still answers for the case nothing else can see', () => {
+        // The finalizer fires inside lua_close, where `runtime` already points
+        // at the replacement (IsExecuting() false) and the replay scope is not
+        // yet open (call_depth_ 0). This is the CR-9 case; it must keep its own
+        // message after Resetting was moved last.
+        const seen: string[] = [];
+        const lua: any = new lua_native.init({
+          renest: () => {
+            try { lua.reset(); seen.push('RESET RAN'); }
+            catch (e: any) { seen.push(e.message); }
+            return 1;
+          },
+        }, ALL_LIBS);
+        lua.execute_script(`keep = setmetatable({}, { __gc = function() renest() end })`);
+        lua.reset();
+        expect(seen[0]).toMatch(/reset\(\) cannot be called re-entrantly/);
+      });
+    });
   });
 
 });

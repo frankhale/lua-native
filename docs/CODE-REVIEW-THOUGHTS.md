@@ -920,3 +920,154 @@ high-value step is a harness that injects a hostile callback — one that calls
 JS-crossing point and asserts survival, so the site list is generated rather than
 remembered. That is the same "check against a generator" lesson this document
 keeps re-learning, finally applied to the search instead of to a comment.
+
+---
+
+## CODE-REVIEW-16 (August 3, 2026) — the generator, finally built
+
+CR-15 closed by naming the step it had not taken:
+
+> *"The remaining high-value step is a harness that injects a hostile callback —
+> one that calls `reset()`, starts an async run, releases a handle, replaces
+> itself — at **every** JS-crossing point and asserts survival, so the site list
+> is generated rather than remembered."*
+
+CR-16 built it: **46 sites × 27 actions, 1242 combinations**, one child process
+each so a crash is a data point rather than the end of the run. The site list
+came out of `grep` over the call-into-JS surface, not out of anyone's memory of
+which sites matter.
+
+**It found one crash, and 1241 clean cells.** That ratio is the substantive
+result of the pass, and it is the first honest evidence that this series is
+converging. The counting exercise in the previous addendum found seven of ten
+highs in one family and severity flat across three passes. The count is still
+one high — but the *cost of finding it* changed completely: CR-9 through CR-15
+each found their high by a human imagining a site, and CR-16 found its high by
+exhausting the space and reading off the single cell that differed. A hazard
+class you can exhaust is a hazard class that has stopped generating.
+
+### The one that got through was not an omission
+
+The five previous highs were guards consulting a subset of the facts. This one
+was a guard that is complete, with a hole cut in it on purpose:
+
+`cancel()` is exempt from the occupancy model because it *must* be — a `cancel()`
+that refused while `is_busy_` is true would never work at all. During
+`execute_async`'s result marshal, `is_busy_` is still true, so of 27 hostile
+actions attempted from inside a from-Lua converter running on the result, 25 are
+refused. The 26th is harmless. The 27th is `cancel()`, and what `cancel()` does
+is settle the very `Promise::Deferred` the marshal is about to settle —
+concluding a `napi_deferred` that N-API has already freed. Deterministic SIGSEGV
+in `ConcludeDeferred`, 8/8.
+
+> **Every exemption from a guard is an unguarded operation, and it is invisible
+> precisely because it was a decision rather than an oversight.** An omission
+> leaves a gap someone can notice by comparing the guard to its siblings. An
+> exemption leaves a *documented, justified* gap that reads as evidence the
+> question was considered — and the question that was considered was "may this
+> operation run while busy?", never "what is running when it does?"
+
+The rule that follows is cheap: for every deliberate exemption from a guard,
+enumerate what holds the resource at the moments the exemption is reachable, and
+ask what the exempt operation does to each. There is exactly one exemption in
+this codebase and it took five minutes to check once someone asked.
+
+### The analysis was already in the file, one function away
+
+`OnAwaitSettled` — the *other* place that marshals a value with a run engaged —
+carries a comment naming `cancel()` explicitly, naming the "or even starts a new
+run" variant, and prescribing the exact re-check that was missing thirty lines
+up in `DriveAsync`. And that re-check is *present* at `OnAwaitSettled`. The
+window with the comment had the guard; the window without the comment had
+neither, and it is the one that settles a promise.
+
+> **A comment explaining a hazard is evidence the hazard was understood, and no
+> evidence whatever that it was searched for.** CR-15's rule — *ask what else
+> does the same thing to the same object* — failed here in its easiest possible
+> case: not a subtle sibling in another layer, but the other exit of a two-exit
+> relationship in the same function's neighbourhood.
+
+The fix was not to add a fourth copy of the predicate. There were three copies,
+all correct, and the fourth site had none; the natural steady state of a
+hand-copied guard is *n−1 of n right*, with no way to tell from reading any one
+of them which is missing. So the predicate became one function,
+`AsyncRunSuperseded(gen)`, and the three copies were replaced by calls to it —
+the same move the occupancy refactor made for the four claim flags, applied to
+the four liveness checks nobody had noticed were also a family.
+
+### A refactor reproduces the class it was built to kill
+
+All four low findings this pass are inside the occupancy refactor, and each is a
+miniature of exactly what that refactor exists to prevent:
+
+- **F2** — the header paragraph that teaches the model told the reader to add a
+  line to `CurrentClaims()`, a function *the same commit deleted*, and deleted
+  because an eager claim set is a data race. The extension point instructs the
+  next author to re-create the hazard the refactor removed. An enumeration that
+  decayed within one commit — CR-14's lesson, with a negative lead time.
+- **F3** — moving `Resetting` from last to second made a `reset()` from the
+  replay phase report "from inside a `__gc` finalizer of the state being
+  retired" when no finalizer is involved. Two distinct facts collapsed into one
+  message, which is CR-13's finding, committed *by a comment citing CR-13* — the
+  overlap that makes the reasoning wrong was created by CR-15's own fix one
+  commit earlier.
+- **F4** — the lazy-evaluation ordering that TSan caught the refactor breaking is
+  explained at length in two comments and enforced nowhere; a policy omitting
+  `AsyncInFlight` silently skips the first test and reads worker-mutated state.
+  An invariant stated and unchecked — CR-15 F6a's finding, one screen away from
+  CR-15 F6a's `static_assert`.
+- **F5** — the public contract in `types.d.ts`, `ASYNC.md` and `FEATURES.md`
+  still describes the pre-refactor messages.
+
+CR-15 recorded the general form ("a refactor whose entire purpose was to retire a
+recurring hazard class introduced a fresh instance of a different one"). CR-16
+adds that the instances are not random:
+
+> **A refactor reproduces the class it was written to kill, because the author is
+> thinking about the abstraction and not about the prose and the constants
+> around it.** The code was right in every case. Everything *describing* the code
+> was one revision behind — and in a codebase where the guards are enforced by
+> comments telling the next person what to do, the description is part of the
+> mechanism.
+
+The corollary for review: **the remediation of pass N is the highest-density
+place to look for pass N+1's findings**, and the denser it is the more
+structural the change was.
+
+### The count nobody depends on
+
+"33 synchronous methods" appears in four comments and three paragraphs of CR-15.
+`grep -c 'if (RejectIfBusy())' src/lua-native.cpp` returns **31**. Nothing
+breaks; that is the point. It is the fourth enumeration in four passes written
+from memory with a one-line command that produces it sitting in the same
+repository. The fix was to replace the number with the grep, not with a
+corrected number — the only version that stays true.
+
+### The harness, and why the suite could not have caught this
+
+All four sanitizer harnesses and 838 tests passed on the tree containing F1 —
+the fifth consecutive pass where that sentence is true. This time neither could
+have helped for a structural reason worth recording: ASan cannot see it because
+the freed object belongs to **libnode**, not to the addon's allocator; TSan
+cannot see it because there is no second thread. It is a use-after-free that a
+memory sanitizer misses because of *whose* memory it is.
+
+And the suite could not have caught it either, for a reason that generalises:
+
+> **A test suite catches the failures a test can survive.** Two of CR-16's five
+> pins do not fail against the pre-fix binary — they take the vitest worker
+> process down, and any suite containing them beforehand would have reported an
+> infrastructure error rather than a test failure. That is a thing people mute.
+> The matrix works because each cell is its own process; **the search space has
+> to be partitioned so that finding a crash is a data point instead of the end of
+> the run.** That, rather than the length of the site list, is the part of this
+> harness worth keeping.
+
+What remains: the harness is not in CI, deliberately — it takes ~15 minutes and
+1242 processes, and its value this pass was in being written *from the grep*.
+Its five findings are pinned in the suite; its sixth output is the knowledge that
+the rest of the space is clean, which belongs in a document rather than a job.
+The open question for CR-17 is whether the same partition-and-exhaust treatment
+can be applied to the *lifetime* class — the remaining highs that are not about
+occupancy at all — where the axis is not "what does user JS do" but "in what
+order do these objects die".

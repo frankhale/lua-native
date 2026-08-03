@@ -275,8 +275,10 @@ real-world patterns naturally separate these: gather data via JS callbacks
 > inside a JS callback, a type converter, a definition-object getter, a `Proxy`
 > trap or a `__gc` finalizer. Those all run while this thread already holds the
 > `lua_State`, and a worker run would hand that same state to a second thread.
-> All three refusal conditions are the ones `reset()` uses, with distinct
-> messages. If you need to kick off Lua work from inside a callback, use
+> All three refusal conditions are three of the four `reset()` uses, and share
+> its wording plus a clause naming the worker handoff. Two of the three name the
+> method; the "already busy" one is the shared message every synchronous method
+> emits. If you need to kick off Lua work from inside a callback, use
 > `execute_async()` — coroutine-driven, main-thread, unrestricted. (Before
 > CR-15 this was accepted and segfaulted deterministically.)
 

@@ -125,12 +125,22 @@ static_assert(AllTagsDistinct(),
 // the right set.
 //
 // **The model.** `Claim` is the set of things that can hold the state.
-// `LuaContext::CurrentClaims()` computes which are held — the single place that
-// knows — and an operation declares a **policy** naming what conflicts with it.
-// Adding a fifth kind of holder means adding one enumerator, one line in
-// `CurrentClaims()`, and one line in the message switch; every operation using
+// `LuaContext::RejectIfOccupied` is the single place that knows which state
+// answers each claim, and an operation declares a **policy** naming what
+// conflicts with it. Adding a fifth kind of holder means adding one enumerator
+// and one `else if` branch in `RejectIfOccupied`; every operation using
 // `kExclusive` then inherits it without being edited. That inheritance is the
 // whole point: it is what a hand-assembled condition list cannot do.
+//
+// **There is deliberately no `CurrentClaims()`-style accessor that computes the
+// whole set.** The first draft of this model had one, and it was a data race on
+// every kSyncApi call site: everything below `AsyncInFlight` reads state a
+// worker thread mutates, and testing `AsyncInFlight` first — and *returning* —
+// is what makes the rest single-threaded. A new claim must therefore be added
+// as a branch in `RejectIfOccupied`'s ordered chain, below that first test, and
+// never to an eagerly-computed set. This paragraph replaces an earlier version
+// of it that told the reader to add a line to `CurrentClaims()`, a function the
+// same commit had already deleted for that exact reason (CR-16 F2).
 //
 // **The two policies are genuinely different, and neither is "stricter".**
 // Synchronous methods deliberately *permit* `LuaExecuting` and `BindingCall`:
@@ -556,7 +566,8 @@ public:
     // `execute_script_async` / `execute_file_async` were on that last list until
     // CR-15. They still run no user JS — but the list's premise is "touches no
     // state a reset can invalidate", and they are not readers at all: they hand
-    // the lua_State to another thread. See RejectIfStateInUse.
+    // the lua_State to another thread. They declare
+    // `lua_occupancy::kExclusive`; see the Claim comment at the top of this file.
     //
     // `reset()` is on it too, as "it *is* the guarded operation". That is true
     // of its guard block and false of everything after the state swap, where it
@@ -695,6 +706,31 @@ private:
     void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error);
     Napi::Value OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen);
     void FinishAsync();
+
+    // --- The async-run liveness guard (the H2 re-check) -----------------------
+    //
+    // True if the execute_async run identified by `gen` is no longer the one
+    // this context is driving: it was settled, or it was settled *and replaced*
+    // by a newer run. The single place that answers that question, for the same
+    // reason lua_occupancy::Claim is the single place that answers "who holds
+    // the state" — four hand-written copies of this predicate is how CR-16 F1
+    // happened, with three sites having it and the fourth not.
+    //
+    // **Every site that runs user JS between deciding to settle a run and
+    // actually settling it must call this afterwards.** `cancel()` is the
+    // reason: it is deliberately exempt from the occupancy guard (it must work
+    // while `is_busy_` is true — that is its entire job), so it is the one
+    // operation a marshal cannot refuse. It calls FinishAsync() and settles the
+    // deferred; a caller that then settles its own copy of that deferred
+    // concludes an already-concluded napi_deferred, which N-API has freed.
+    // Driven as a deterministic SIGSEGV in ConcludeDeferred (CR-16 F1).
+    //
+    // `async_generation_` covers the harder half: a converter may cancel() and
+    // then start a *new* run, re-engaging async_deferred_ with a different
+    // promise. Testing the optional alone would pass and tear the new run down.
+    [[nodiscard]] bool AsyncRunSuperseded(uint64_t gen) const {
+      return !async_co_ || !async_deferred_ || gen != async_generation_;
+    }
     static Napi::Value OnAwaitResolveStatic(const Napi::CallbackInfo& info);
     static Napi::Value OnAwaitRejectStatic(const Napi::CallbackInfo& info);
 
@@ -826,8 +862,11 @@ private:
     bool RejectIfOccupied(const char* op, lua_occupancy::Claim disallowed,
                           const char* detail = nullptr) const;
 
-    // The kSyncApi policy, kept under its original name because 33 call sites
-    // and a great many tests use it. Equivalent to
+    // The kSyncApi policy, kept under its original name because every
+    // synchronous API method and a great many tests use it —
+    // `grep -c 'if (RejectIfBusy())' src/lua-native.cpp` is the count, so nobody
+    // has to keep a number here correct (it was written as 33 and was 31).
+    // Equivalent to
     // `RejectIfOccupied(nullptr, lua_occupancy::kSyncApi)`.
     bool RejectIfBusy() const;
 

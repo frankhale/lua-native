@@ -668,8 +668,12 @@ export interface LuaContext {
    * **Throws (synchronously, before any Promise exists) if this thread is
    * already inside the Lua state.** Running on a worker thread means handing
    * the `lua_State` to that thread, and a Lua state may only be touched by one
-   * thread at a time — so the same three conditions that make {@link reset}
-   * refuse apply here, for the same reason and with the same three messages:
+   * thread at a time — so three of the four conditions that make {@link reset}
+   * refuse apply here, for the same reason and with the same wording, plus a
+   * trailing clause naming the worker handoff. Conditions 2 and 3 name the
+   * method; condition 1 is the shared "Lua context is busy with an async
+   * operation" message that every synchronous method emits, so match on the
+   * reason rather than on the method name if you are branching on it:
    *
    * 1. *Another async operation is in flight* (`is_busy()` is true).
    * 2. *Lua is executing on this thread* — you called this from a host
