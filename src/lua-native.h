@@ -103,6 +103,93 @@ static_assert(AllTagsDistinct(),
               "silently merges two kinds and disables the branding for them");
 }  // namespace lua_tags
 
+// --- Occupancy: who currently holds a context's lua_State --------------------
+//
+// **Why this exists.** A Lua state may be touched by one thing at a time, and
+// several operations are unsafe while something else holds it. The binding
+// tracked that with four independent flags — `is_busy_`, `IsExecuting()`,
+// `call_depth_`, `in_reset_` — and every guarded operation picked a subset **by
+// hand**. The correctness of each choice lived only in the author's head at the
+// moment of writing, and it was wrong more often than not:
+//
+//   CR-9   a method with no CallScope left `call_depth_` unarmed        (high)
+//   CR-10  the chunk loaders left `IsExecuting()` unarmed               (high)
+//   CR-13  `reset()` checked two of the three it needed                 (high)
+//   CR-14  the worker OnOKs dropped `is_busy_` before the marshal       (high)
+//   CR-15  `execute_script_async` checked one of the three it needed    (high)
+//
+// Five consecutive high-severity findings, one per pass, all the same shape: an
+// operation that takes the state away from its holder, consulting a subset of
+// the facts that say whether it has one. Each was fixed at the site and the
+// class kept producing sites, because nothing made the *next* operation inherit
+// the right set.
+//
+// **The model.** `Claim` is the set of things that can hold the state.
+// `LuaContext::CurrentClaims()` computes which are held — the single place that
+// knows — and an operation declares a **policy** naming what conflicts with it.
+// Adding a fifth kind of holder means adding one enumerator, one line in
+// `CurrentClaims()`, and one line in the message switch; every operation using
+// `kExclusive` then inherits it without being edited. That inheritance is the
+// whole point: it is what a hand-assembled condition list cannot do.
+//
+// **The two policies are genuinely different, and neither is "stricter".**
+// Synchronous methods deliberately *permit* `LuaExecuting` and `BindingCall`:
+// calling `execute_script` from inside a host callback is a supported, tested
+// pattern, and so is converting a value from within a type converter. They are
+// re-entrant on one thread, which Lua allows. What they cannot tolerate is
+// another thread owning the state. `kExclusive` is for operations that take the
+// state away from its current holder, where any holder at all is a conflict.
+// Choosing between them is a real design decision per operation; the model
+// makes it an explicit, named one instead of an implicit one.
+namespace lua_occupancy {
+enum class Claim : unsigned {
+  None = 0,
+  // An async run owns the state: a libuv worker (execute_script_async /
+  // execute_file_async) or a suspended coroutine-driven run (execute_async).
+  AsyncInFlight = 1u << 0,
+  // Lua is on this thread's C stack — a host callback, a metamethod, a __gc
+  // finalizer, a debug hook. Maintained by the core, which is the only layer
+  // that can see every entry into Lua (CR-9's relocation).
+  LuaExecuting = 1u << 1,
+  // A binding method is mid-flight with user JS running above a conversion that
+  // will touch Lua when it returns: a type converter, a definition-object
+  // getter, a Proxy trap. Distinct from LuaExecuting — no Lua is running in
+  // that window, which is exactly how CR-13 was missed.
+  BindingCall = 1u << 2,
+  // reset() is between swapping the state and finishing its replay.
+  Resetting = 1u << 3,
+};
+
+constexpr Claim operator|(const Claim a, const Claim b) {
+  return static_cast<Claim>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+constexpr Claim operator&(const Claim a, const Claim b) {
+  return static_cast<Claim>(static_cast<unsigned>(a) & static_cast<unsigned>(b));
+}
+constexpr bool Any(const Claim c) { return static_cast<unsigned>(c) != 0; }
+
+// Policy: an ordinary synchronous API method. Re-entrancy on this thread is
+// supported; another thread owning the state is not. This is what the 33
+// RejectIfBusy() call sites mean.
+inline constexpr Claim kSyncApi = Claim::AsyncInFlight;
+
+// Policy: this operation takes the lua_State away from whoever holds it, so any
+// holder is a conflict. Used by the two worker-async launchers, which hand the
+// state to another thread, and by reset(), which retires it.
+//
+// Deliberately **not** used by `execute_async`: it is coroutine-driven and stays
+// on the main thread, so a nested start re-enters Lua on the thread that already
+// owns it — supported, and pinned by a control test. The hazard kExclusive
+// addresses is losing exclusive access, not reentrancy as such.
+inline constexpr Claim kExclusive =
+    Claim::AsyncInFlight | Claim::LuaExecuting | Claim::BindingCall;
+
+// Policy: reset(), which is kExclusive plus its own reentrancy. A reset reached
+// from the retiring state's __gc finalizers runs with `runtime` already pointing
+// at the replacement, so no other claim can see it (CR-9 F1).
+inline constexpr Claim kRetireState = kExclusive | Claim::Resetting;
+}  // namespace lua_occupancy
+
 // A returned Lua-function/table handle keeps its LuaRuntime alive (via the
 // shared_ptr) but the LuaContext wrapper is an independent GC root that can be
 // collected first. `contextAlive` is a liveness flag shared with the context:
@@ -718,41 +805,31 @@ private:
     // std::exception into a JS error.
     int NextUserdataId();
 
-    // Throws a JS "busy" error and returns true if an async op is in flight, so
-    // the caller can early-return. Centralizes the guard duplicated across the
-    // synchronous API methods.
-    bool RejectIfBusy() const;
+    // --- The occupancy guard --------------------------------------------------
+    //
+    // The single place that maps a claim to the state answering it, and the
+    // single place that reports a conflict. Every guarded operation names a
+    // **policy** from lua_occupancy rather than assembling conditions itself;
+    // see the comment on `lua_occupancy::Claim` for why.
+    //
+    // Returns true (having thrown) if any claim in `disallowed` is held. `op`
+    // names the operation for the message and may be null for kSyncApi, whose
+    // message predates the scheme and is pinned by a great many tests.
+    // `detail` is an optional trailing clause explaining why this operation
+    // cares.
+    //
+    // There is deliberately **no** "compute the whole claim set" accessor: the
+    // claims must be evaluated lazily in the order the definition uses, because
+    // everything below `AsyncInFlight` reads state a worker thread mutates. The
+    // first draft of this refactor had one, and it was a data race on all 33
+    // kSyncApi call sites. See the definition.
+    bool RejectIfOccupied(const char* op, lua_occupancy::Claim disallowed,
+                          const char* detail = nullptr) const;
 
-    // Refuses a **worker-thread** async start (`execute_script_async` /
-    // `execute_file_async`) while this thread still holds the lua_State.
-    // `op` names the method, so the three refusals stay distinguishable.
-    //
-    // **`is_busy_` is a one-directional guard, and that asymmetry was CR-15 F1.**
-    // It is written by the launcher and read by everyone *else*, so it answers
-    // "may I enter while a worker runs?" and never "may I hand the state to a
-    // worker while I am already inside it?". CR-1 H4 swept the first question
-    // exhaustively — all 21 main-thread doors refuse during a run, re-verified
-    // this pass — and nobody asked the second, so the two entry points that
-    // perform the handoff checked one condition where `reset()`, the *other*
-    // operation that takes the state away from its current holder, checks three.
-    //
-    // The three are the same three, for the same reasons:
-    //
-    //   is_busy_        — another async run already owns the state.
-    //   IsExecuting()   — Lua is on this thread's C stack (a host callback, a
-    //                     metamethod, a __gc finalizer). Driven: SIGSEGV 5/5,
-    //                     main thread faulting in _longjmp on a shared errorJmp
-    //                     chain while the worker faults in lua_load.
-    //   call_depth_ > 0 — a binding method is mid-flight and user JS is running
-    //                     above a conversion that will touch Lua when it
-    //                     returns; and, since CR-15, reset()'s replay phase,
-    //                     which is a holder that used to declare nothing.
-    //
-    // Deliberately **not** applied to `execute_async`: it is coroutine-driven
-    // and stays on the main thread, so a nested start re-enters Lua on the one
-    // thread that already owns it, which Lua supports and which the suite
-    // exercises. The hazard here is the thread handoff, not the reentrancy.
-    bool RejectIfStateInUse(const char* op);
+    // The kSyncApi policy, kept under its original name because 33 call sites
+    // and a great many tests use it. Equivalent to
+    // `RejectIfOccupied(nullptr, lua_occupancy::kSyncApi)`.
+    bool RejectIfBusy() const;
 
     // Recursive body of NapiToCoreInstance; the public entry wraps depth 0 in
     // a JsCallbackCollectorScope so an aborted conversion sweeps the

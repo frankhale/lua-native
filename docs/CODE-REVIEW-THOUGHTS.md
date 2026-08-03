@@ -797,3 +797,126 @@ plainly, because this pass demonstrates it twice in opposite directions:
 
 > **Re-read a reproduction before believing it, and re-read the ones that
 > confirm you first.**
+
+---
+
+## Addendum (August 3, 2026, after unifying the occupancy model)
+
+This document has argued since CR-2 that the measure of maturity is a *shift in
+the character of findings*. After CR-15 it was worth checking whether that shift
+had actually happened, and the honest answer was no. Counting the high-severity
+findings from CR-6 onward and classifying them:
+
+**Seven of ten are one family** — user code runs at a moment the native code did
+not expect, and claims, frees or invalidates something the native code is
+mid-way through using. CR-9 (a method with no `CallScope`), CR-10 F1
+(unbracketed chunk loaders), CR-11 F1 (a converter reallocating the vector being
+iterated), CR-11 F2 (a callback replacing itself mid-call), CR-13 (`reset()`
+during argument conversion), CR-14 (`reset()` during the async marshal), CR-15
+(a worker start while the main thread holds the state).
+
+Severity was not falling. The series was producing roughly one high per pass,
+three passes running, all from the same family. That is not convergence, and the
+reason it looked like progress is that each fix was correct: the site closed,
+the class stayed open, and the next pass found the next site.
+
+**The root cause was countable.** Ten occupancy and liveness variables across the
+two layers, four of which (`is_busy_`, `IsExecuting()`, `call_depth_`,
+`in_reset_`) answer "who holds the `lua_State`" — and every guarded operation
+picked a subset **by hand**. `reset()` checked all four, having accumulated them
+one per review pass. `execute_script_async`, which does the same thing to the
+same object, checked one. Nothing connected them, and nothing made a *new*
+operation inherit the right set.
+
+So the fix was not another site, and not another comment enumerating the class.
+It was to make the class un-instantiable: one `Claim` set, one `CurrentClaims()`
+that computes what is held, one `RejectIfOccupied` that reports it, and named
+**policies** (`kSyncApi`, `kExclusive`, `kRetireState`) that operations *declare*
+rather than assemble.
+
+> **When the same class produces a finding every pass, stop fixing sites and
+> count the variables the class ranges over. A hazard family that keeps
+> recurring is usually a missing abstraction wearing a disguise — and the tell
+> is that the fix for pass N looks nothing like the fix for pass N−1 even though
+> the bug is the same bug.**
+
+Two things about this that are worth carrying into future work:
+
+**The inheritance property has to be demonstrated, not asserted.** It is easy to
+write a refactor that *looks* unified and still has three copies of the policy.
+The check is a negative one: remove a claim from the single `kExclusive`
+definition and watch all three operations lose that guard simultaneously. They
+do — including `reset()`, which inherits through `kRetireState`. One line, three
+operations. Conversely, adding a fifth kind of holder now protects all of them
+without any being edited, which is precisely what CR-9, CR-13, CR-14 and CR-15
+each had to do by hand, once each, after the fact.
+
+**Unification is not the same as tightening, and conflating them would have
+broken the library.** The obvious mistake here is to conclude that if `reset()`
+needs four conditions then everything should check four. It must not: the 33
+synchronous methods deliberately *permit* `LuaExecuting` and `BindingCall`,
+because calling `execute_script` from inside a host callback — or converting a
+value from within a type converter — is a supported, tested pattern that Lua
+allows on one thread. Two policies, both correct, genuinely different. The value
+of the model is not that it makes everything strict; it is that it turns an
+implicit per-operation judgement into an explicit named one, so the next author
+makes a *choice* instead of an omission.
+
+The enforcement is a 3×3 occupancy matrix — every `kExclusive` operation × every
+claim — with the instruction to add new operations to it. That is CR-15's "one
+probe per direction" rule made mechanical: the suite had exhaustive coverage of
+"call X while an async run is in flight" and none of "start an async run while X
+is on the stack", and a matrix covers both axes by construction rather than by
+someone remembering the second one exists.
+
+**And the refactor introduced a data race, which is the most useful thing that
+happened all day.** The first draft computed the whole claim set eagerly through
+a `CurrentClaims()` accessor — the obvious shape, and the one that reads best.
+`IsExecuting()` reads `lua_depth_`, a plain `mutable int` written by the async
+worker's `ExecutionScope` **on the worker thread**, so routing all 33
+`RejectIfBusy()` sites through it made every synchronous method read that int
+while a worker ran. `test-ts-tsan` reported ten races on the first run.
+
+The old code had been safe by an argument nobody had written down: `RejectIfBusy`
+read only the atomic `is_busy_`, and the two operations that read `lua_depth_`
+did so *only after* confirming `is_busy_` was false — at which point no worker
+can own the state, because a worker can only be started from the main thread.
+Unifying four hand-written guards into one function silently discarded that
+ordering, because the ordering existed nowhere except in the sequence of `if`
+statements it replaced.
+
+> **A safety property enforced by statement order is invisible to a refactor
+> that preserves behaviour.** Every observable output was identical — all 838
+> tests passed, every pinned message byte-for-byte — and the property was gone.
+> This is CR-11's lesson ("a comment describes intent; only a test or a lint
+> suppression describes what the code is doing") one level deeper: here there
+> was not even a comment, because when guards are written inline nobody thinks
+> of their *sequence* as a claim worth stating.
+
+Two things follow. First, the fix — evaluate claims lazily in the definition's
+order, delete the eager accessor rather than repair it — now says at both the
+declaration and the definition that the ordering is a thread-safety requirement,
+so the next person to collapse the sequential `if`s into a computed bitmask finds
+the reason before doing it. Second, and more uncomfortably: **a refactor whose
+entire purpose was to retire a recurring hazard class introduced a fresh instance
+of a different one.** Structural fixes are not safer than point fixes by nature;
+they are larger, and they move code across a threading boundary that point fixes
+leave alone.
+
+The saving grace is which tool caught it. This document has reported `test-ts-tsan`
+as a best-effort probe for four passes running — clean every time, and explicitly
+discounted, because TSan cannot see libuv/V8/Lua synchronization and the
+assessment above said in as many words that it "reports clean and cannot see" the
+thread hazards. It caught this on the first run, with a stack trace naming both
+sides. **A harness whose clean runs are weak evidence can still produce strong
+evidence when it fails**, and the correct posture toward one is to keep running
+it precisely because you cannot trust its silence.
+
+What none of this fixes: the other three highs (lifetime across layers, and the
+exception-escape class), and it does not make the search mechanical. Every
+finding in this series still required a human to think of a site. The remaining
+high-value step is a harness that injects a hostile callback — one that calls
+`reset()`, starts an async run, releases a handle, replaces itself — at *every*
+JS-crossing point and asserts survival, so the site list is generated rather than
+remembered. That is the same "check against a generator" lesson this document
+keeps re-learning, finally applied to the search instead of to a comment.

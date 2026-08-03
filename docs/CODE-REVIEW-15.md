@@ -186,6 +186,116 @@ changed: `types.d.ts` documents the three new refusal conditions on
 surprising half, so it is stated where a reader hits the async section rather
 than only in the type definitions.
 
+### Structural follow-up: the occupancy model (August 3, 2026)
+
+CR-15's F1 was the fifth consecutive pass to report a high-severity finding of
+one shape — *an operation that takes the `lua_State` away from its holder,
+consulting a subset of the facts that say whether it has one.* Fixing the site
+again would have left the class intact, so after the findings were closed the
+guard family itself was unified.
+
+**Before.** Four independent flags — `is_busy_`, `IsExecuting()`, `call_depth_`,
+`in_reset_` — with each guarded operation picking a subset by hand:
+
+| Operation | Conditions checked (of 4) |
+|---|---|
+| `reset()` | 4 — accumulated one per pass (CR-9, CR-13, CR-15) |
+| `execute_script_async` | 1 before CR-15 F1, 3 after |
+| `execute_file_async` | 1 before CR-15 F1, 3 after |
+| 33 synchronous methods | 1 (`RejectIfBusy`) |
+
+The correctness of each choice lived only in the author's head at the moment of
+writing, and nothing made the *next* operation inherit the right set. That is
+why the class kept producing sites.
+
+**After.** `lua_occupancy::Claim` is the set of things that can hold the state;
+`LuaContext::CurrentClaims()` is the single place that computes which are held;
+`RejectIfOccupied` is the single place that turns a conflict into a JS error;
+and an operation declares a named **policy** rather than a condition list:
+
+- `kSyncApi` (`AsyncInFlight`) — the 33 synchronous methods, via `RejectIfBusy`,
+  whose name and message are unchanged because a great many tests match them.
+- `kExclusive` (`AsyncInFlight | LuaExecuting | BindingCall`) — the two
+  worker-async launchers.
+- `kRetireState` (`kExclusive | Resetting`) — `reset()`.
+
+The two policies are genuinely different and neither is "stricter". Synchronous
+methods deliberately *permit* `LuaExecuting` and `BindingCall` — calling
+`execute_script` from a host callback is supported and tested. `kExclusive` is
+for operations where any holder at all is a conflict. The model makes that an
+explicit, named decision per operation instead of an implicit one.
+
+**What this buys, demonstrated rather than asserted.** Adding a fifth kind of
+holder is one enumerator, one line in `CurrentClaims()`, one line in the message
+switch — and every `kExclusive` operation inherits it *without being edited*.
+Verified in the negative: removing `LuaExecuting` from the single `kExclusive`
+definition makes all three operations lose that guard simultaneously —
+
+```
+× reset() refuses while LuaExecuting is held
+× execute_script_async() refuses while LuaExecuting is held
+× execute_file_async() refuses while LuaExecuting is held
+```
+
+— including `reset()`, which inherits through `kRetireState`. Three operations,
+one line. That is the property a hand-assembled condition list cannot have, and
+its absence is what CR-9, CR-13, CR-14 and CR-15 each paid for once.
+
+**Enforcement.** A 3×3 **occupancy matrix** (three `kExclusive` operations ×
+three claims) pins that the policy is shared, with the instruction to add any new
+`kExclusive` operation to it. Nine new tests, 838 total. This is the "one probe
+per direction" rule from the trajectory note, made mechanical: CR-15 F1 existed
+because the suite tested "call X while an async run is in flight" exhaustively
+and "start an async run while X is on the stack" not at all, and the matrix
+covers both axes by construction.
+
+All pinned refusal messages survive byte-for-byte; `reset()`'s three distinct
+messages and the universal busy message are unchanged.
+
+**The refactor introduced a data race, and TSan caught it.** The first draft had
+a `CurrentClaims()` accessor that computed the whole claim set eagerly — the
+obvious shape, and the one that reads best. It is wrong: `IsExecuting()` reads
+`lua_depth_`, a plain `mutable int` that the async worker's `ExecutionScope`
+increments **on the worker thread**, and routing all 33 `RejectIfBusy()` sites
+through it meant every synchronous method now read that int while a worker was
+running. `test-ts-tsan` reported ten races on the first run after the change:
+
+```
+Read of size 4 by thread T54:
+  #0 lua_core::LuaRuntime::IsExecuting() const           lua-runtime.h:756
+  #1 LuaContext::CurrentClaims() const                   lua-native.cpp:2794
+  #2 LuaContext::RejectIfOccupied(...) const             lua-native.cpp:2811
+  #3 LuaContext::RejectIfBusy() const                    lua-native.cpp:2841
+  #4 LuaContext::SetHook(...)                            lua-native.cpp:3600
+Previous write of size 4 by thread T53:
+  #0 lua_core::LuaRuntime::ExecutionScope::ExecutionScope lua-runtime.h:963
+  #2 lua_core::LuaRuntime::ExecuteScript(...) const       lua-runtime.cpp:2414
+  #3 LuaScriptAsyncWorker::Execute()                      lua-async-worker.h:45
+```
+
+The old code was safe by an argument nobody had written down: `RejectIfBusy`
+read only the atomic `is_busy_`, and the two operations that read `lua_depth_`
+did so *only after* confirming `is_busy_` was false — at which point no worker
+can own the state, because a worker can only be started from the main thread.
+Collapsing four hand-written guards into one function silently discarded that
+ordering.
+
+The fix is to evaluate claims **lazily, in the definition's order**, returning
+on the first conflict: `AsyncInFlight` is tested first, so the reads below it
+happen only when no worker owns the state. The `CurrentClaims()` accessor is
+deleted rather than fixed — an eager claim set cannot be made safe without
+making `lua_depth_` atomic on a hot path — and both the declaration and the
+definition now say that the ordering is a thread-safety requirement, not a
+micro-optimization, so the next person to "clean up" the sequential `if`s into a
+computed bitmask finds the reason first. Re-verified: 0 races, 838/838.
+
+This is worth recording plainly. **A refactor whose entire purpose was to retire
+a recurring hazard class introduced a fresh instance of a different one**, and
+the only reason it did not ship is that a harness the trajectory note had just
+described as near-useless for this codebase caught it on the first run. `TSan`'s
+clean runs have been reported for four passes as weak evidence; this is the run
+where it earned its place.
+
 ### Outstanding
 
 Only the standing release-time deferrals, unchanged by decision as in every pass

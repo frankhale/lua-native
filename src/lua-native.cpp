@@ -2785,46 +2785,80 @@ int LuaContext::NextUserdataId() {
   return next_userdata_id_++;
 }
 
-bool LuaContext::RejectIfBusy() const {
-  if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation")
-      .ThrowAsJavaScriptException();
-    return true;
+// The single place that maps a claim to the state that answers it, and the
+// single place that turns a conflict into a JS error.
+//
+// **Evaluation is lazy and ordered, and that is a thread-safety requirement
+// rather than an optimization.** `AsyncInFlight` is tested first and returns
+// immediately, because every claim below it reads state a *worker thread*
+// mutates: `lua_depth_` behind `IsExecuting()` is a plain int that the worker's
+// ExecutionScope increments while it runs Lua off-thread. Past the first test we
+// know `is_busy_` is false, and a worker can only be started from the main
+// thread — which is the thread we are on — so nothing can begin owning the state
+// underneath us and the remaining reads are single-threaded.
+//
+// An eager "compute the whole claim set" version of this function is a data
+// race on all 33 kSyncApi call sites, which is exactly what the first draft of
+// this refactor was; TSan reported it on the async tests. If a future claim
+// needs state a worker touches, it must be atomic *or* ordered below this line.
+//
+// Claims are reported most-specific first, so the message names the reason a
+// reader can act on. `Resetting` precedes `BindingCall` because a reset reached
+// from the retiring state's own teardown is a distinct situation from a reset
+// reached from a converter, and CR-13's lesson was that collapsing two distinct
+// facts into one message is how the distinction gets lost.
+bool LuaContext::RejectIfOccupied(const char* op,
+                                  const lua_occupancy::Claim disallowed,
+                                  const char* detail) const {
+  using lua_occupancy::Claim;
+  const auto wants = [disallowed](const Claim c) {
+    return lua_occupancy::Any(disallowed & c);
+  };
+
+  const char* reason = nullptr;
+  bool parameterized = true;
+  if (wants(Claim::AsyncInFlight) && is_busy_) {
+    // Unchanged wording, and deliberately not parameterized by `op`: it predates
+    // the occupancy model and a great many tests match on it verbatim.
+    reason = "Lua context is busy with an async operation";
+    parameterized = false;
+  } else if (wants(Claim::Resetting) && in_reset_) {
+    reason = " cannot be called re-entrantly (from inside a __gc finalizer of "
+             "the state being retired)";
+  } else if (wants(Claim::LuaExecuting) && runtime && runtime->IsExecuting()) {
+    reason = " cannot be called while Lua is executing (from inside a host "
+             "callback, metamethod, or __gc finalizer)";
+  } else if (wants(Claim::BindingCall) && call_depth_ > 0) {
+    reason = " cannot be called from inside another lua-native call (a type "
+             "converter, a definition-object getter, or a Proxy trap running "
+             "while that call converts its arguments or results)";
+  } else {
+    return false;
   }
-  return false;
+
+  std::string message = parameterized ? (op ? op : "this operation") : "";
+  message += reason;
+  if (detail) {
+    message += ": ";
+    message += detail;
+  }
+  Napi::Error::New(env, message).ThrowAsJavaScriptException();
+  return true;
+}
+
+bool LuaContext::RejectIfBusy() const {
+  return RejectIfOccupied(nullptr, lua_occupancy::kSyncApi);
 }
 
 Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& /*info*/) {
   return Napi::Boolean::New(env, is_busy_.load());
 }
 
-// Refuses a worker-thread async start while this thread still holds the
-// lua_State. See the header for why `is_busy_` alone was never enough.
-bool LuaContext::RejectIfStateInUse(const char* op) {
-  if (is_busy_) {
-    Napi::Error::New(env, std::string(op) +
-      " cannot be called while another async operation is in flight")
-      .ThrowAsJavaScriptException();
-    return true;
-  }
-  if (runtime->IsExecuting()) {
-    Napi::Error::New(env, std::string(op) +
-      " cannot be called while Lua is executing (from inside a host callback, "
-      "metamethod, or __gc finalizer): the worker would run on the same "
-      "lua_State this thread is already inside")
-      .ThrowAsJavaScriptException();
-    return true;
-  }
-  if (call_depth_ > 0) {
-    Napi::Error::New(env, std::string(op) +
-      " cannot be called from inside another lua-native call (a type converter, "
-      "a definition-object getter, or a Proxy trap running while that call "
-      "converts its arguments or results)")
-      .ThrowAsJavaScriptException();
-    return true;
-  }
-  return false;
-}
+// Why the worker-async launchers use kExclusive: they hand the lua_State to a
+// libuv thread, and a Lua state may be touched by one thread at a time. Stated
+// once here rather than at both call sites.
+static constexpr const char* kWorkerHandoffDetail =
+  "handing the state to a worker thread requires that nothing else holds it";
 
 // execute_script_async / execute_file_async run the script on a libuv worker
 // thread: use them for CPU-bound Lua that shouldn't block the event loop, but
@@ -2833,7 +2867,8 @@ bool LuaContext::RejectIfStateInUse(const char* op) {
 // Promises or invoke JS callbacks, use execute_async (coroutine-driven, stays on
 // the main thread) instead.
 Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
-  if (RejectIfStateInUse("execute_script_async()")) return env.Undefined();
+  if (RejectIfOccupied("execute_script_async()", lua_occupancy::kExclusive,
+                       kWorkerHandoffDetail)) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -2850,7 +2885,8 @@ Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::ExecuteFileAsync(const Napi::CallbackInfo& info) {
-  if (RejectIfStateInUse("execute_file_async()")) return env.Undefined();
+  if (RejectIfOccupied("execute_file_async()", lua_occupancy::kExclusive,
+                       kWorkerHandoffDetail)) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "Expected string argument").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -3333,51 +3369,30 @@ Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
 // stop recognizing pre-reset coroutines and userdata as belonging to this
 // context.
 Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
-  if (RejectIfBusy()) return env.Undefined();
-
-  // Reentrancy: retiring the state while Lua frames are live on the C stack
-  // would free the very lua_State those frames are executing on — a
-  // use-after-free, reproduced at nine entry points as CR-9 F1.
+  // reset() retires the lua_State, so *any* holder is a conflict — which is
+  // what kRetireState says, and saying it is the entire guard. Four separate
+  // `if` blocks used to live here, accumulated one per review pass (CR-9 added
+  // the execution check, CR-13 the binding-call check, CR-15 the scope over the
+  // replay), and each addition had to be re-derived from scratch because
+  // nothing connected them. The claims and their messages now live in one place;
+  // see lua_occupancy::Claim for why.
   //
-  // The authority is the *core's* depth, not this context's call_depth_.
-  // call_depth_ is raised by CallScope, which only eight of the binding methods
-  // opened; every other one — get_global, set_userdata, gc, add_searcher, … —
-  // ran Lua with this guard silently disarmed. LuaRuntime::IsExecuting() is
-  // maintained by the core at every point Lua can actually start running, so a
-  // binding method cannot fail to arm it by omission.
+  // Each claim still answers a different question, and the messages stay
+  // distinct because CR-13 F1 was the cost of collapsing two of them:
   //
-  // The two conditions are reported separately because they are different
-  // facts, and CR-13 F1 was the cost of treating the second as a footnote to
-  // the first. `call_depth_` is not a "cheap second opinion" on Lua execution —
-  // it answers "is a binding method on this context's stack", which is true
-  // during the argument-conversion and definition-reading phase where no Lua is
-  // running at all and user JS very much is. A reset there retires the state
-  // under a method that then finishes its work against it. See CallScope.
-  if (runtime->IsExecuting()) {
-    Napi::Error::New(env,
-      "reset() cannot be called while Lua is executing (from inside a host "
-      "callback, metamethod, or __gc finalizer)").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-  if (call_depth_ > 0) {
-    Napi::Error::New(env,
-      "reset() cannot be called from inside another lua-native call (a type "
-      "converter, a definition-object getter, or a Proxy trap running while "
-      "that call converts its arguments or results)")
-      .ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-
-  // A reset already in progress is the one window IsExecuting() cannot see:
-  // swapping `runtime` below destroys the outgoing state, and lua_close fires
-  // its __gc finalizers *after* the member already points at the replacement,
-  // so a finalizer that re-enters JS and calls reset() would find a fresh
-  // runtime reporting depth 0. Re-entering here would retire the replacement
-  // out from under the outer call.
-  if (in_reset_) {
-    Napi::Error::New(env,
-      "reset() cannot be called re-entrantly (from inside a __gc finalizer of "
-      "the state being retired)").ThrowAsJavaScriptException();
+  //   LuaExecuting — Lua frames are live on this thread's C stack, and
+  //     retiring the state would free the one they are executing on (CR-9 F1).
+  //     The authority is the *core's* depth: it is maintained at every point
+  //     Lua can start running, so a binding method cannot disarm it by omission.
+  //   BindingCall — no Lua is running, but a method is mid-flight with user JS
+  //     above a conversion that will touch Lua when it returns. Not a "second
+  //     opinion" on the above; it covers a window IsExecuting() cannot see by
+  //     construction (CR-13 F1).
+  //   Resetting — swapping `runtime` below destroys the outgoing state, and
+  //     lua_close fires its __gc finalizers *after* the member already points
+  //     at the replacement, so a finalizer calling reset() would find a fresh
+  //     runtime reporting depth 0 (CR-9 F1).
+  if (RejectIfOccupied("reset()", lua_occupancy::kRetireState)) {
     return env.Undefined();
   }
   struct ResetFlag {

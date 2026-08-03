@@ -9658,6 +9658,65 @@ describe('lua-native Node adapter', () => {
         expect(() => lua.get_global_ref('t').get('a')).not.toThrow();
       });
     });
+
+    // The occupancy matrix.
+    //
+    // Every operation that takes the lua_State away from its holder declares
+    // `lua_occupancy::kExclusive`, so all of them refuse under all of its
+    // claims. Before the model was unified these three checked 3, 1 and 1 of
+    // the same conditions respectively, and each gap was a separate
+    // high-severity finding a pass apart (CR-13, CR-15).
+    //
+    // **Add any new kExclusive operation to `EXCLUSIVE_OPS` below.** The matrix
+    // is the enforcement: a policy that drifts fails here rather than in a
+    // review three passes later.
+    describe('occupancy: every kExclusive operation shares one policy', () => {
+      const EXCLUSIVE_OPS: Array<[string, (lua: any) => unknown]> = [
+        ['reset()', (lua) => lua.reset()],
+        ['execute_script_async()', (lua) => lua.execute_script_async('return 1')],
+        ['execute_file_async()', (lua) => lua.execute_file_async('nonexistent.lua')],
+      ];
+
+      // Each claim, and how to be holding it when the operation is attempted.
+      const CLAIMS: Array<[string, RegExp, (lua: any, attempt: () => void) => Promise<void> | void]> = [
+        ['AsyncInFlight', /busy with an async operation/, async (lua, attempt) => {
+          const run = lua.execute_script_async('local i = 0 for k = 1, 2e5 do i = i + 1 end return i');
+          attempt();
+          await run;
+        }],
+        ['LuaExecuting', /while Lua is executing/, (lua, attempt) => {
+          lua.set_global('hit', () => { attempt(); return 1; });
+          lua.execute_script('hit()');
+        }],
+        ['BindingCall', /from inside another lua-native call/, (lua, attempt) => {
+          lua.register_type_converter(
+            (v: any) => v !== null && typeof v === 'object' && v.__mark === true,
+            (v: any) => { attempt(); return v.n; });
+          lua.set_global('probe', { __mark: true, n: 1 });
+        }],
+      ];
+
+      for (const [claimName, expected, induce] of CLAIMS) {
+        for (const [opName, invoke] of EXCLUSIVE_OPS) {
+          it(`${opName} refuses while ${claimName} is held`, async () => {
+            const lua: any = new lua_native.init({}, ALL_LIBS);
+            let message = '';
+            const attempt = () => {
+              try {
+                const r: any = invoke(lua);
+                // A rejected promise must not surface as an unhandled rejection
+                // if the guard let it through; swallow either way.
+                if (r && typeof r.then === 'function') r.then(() => {}, () => {});
+              } catch (e: any) { message = e.message; }
+            };
+            await induce(lua, attempt);
+            expect(message, `${opName} under ${claimName}`).toMatch(expected);
+            // The context survives every refusal and stays usable.
+            expect(lua.execute_script('return 1 + 1')).toBe(2);
+          });
+        }
+      }
+    });
   });
 
 });
