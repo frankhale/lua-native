@@ -2109,6 +2109,34 @@ int LuaRuntime::ProtectedCall(int nargs, int nresults) const {
   return status;
 }
 
+// The message for the Lua error value a failed protected call left on top of
+// the stack.
+//
+// `lua_tostring` answers only for a string or number error value. For anything
+// else it returns null — and "anything else" includes the table this binding
+// stages a thrown JavaScript error into. Each of the four protected barriers
+// used to invent a cause at that point: "protected operation failed (out of
+// memory?)", "table access error", "global access error", "value conversion
+// failed (out of memory?)". So a JS `__index` callback that threw
+// `new Error('...')` was reported to the caller as a memory exhaustion, while
+// the same callback reached through `execute_script` reported its real message
+// — because ExecuteScript goes through CaptureError and these did not
+// (CR-18 F1).
+//
+// The cheap read is kept for the string case rather than routing everything
+// through ErrorValueToString, and that is deliberate: a genuine LUA_ERRMEM
+// leaves the string "not enough memory", and ErrorValueToString interns a key
+// and runs a protected `__tostring`, neither of which is a good idea on a state
+// that has just failed to allocate. The expensive path therefore runs only for
+// the non-string values, which are exactly the ones that were being
+// misreported.
+std::string LuaRuntime::ProtectedFailureMessage() const {
+  if (const int t = lua_type(L_, -1); t == LUA_TSTRING || t == LUA_TNUMBER) {
+    if (const char* msg = lua_tostring(L_, -1)) return msg;
+  }
+  return ErrorValueToString(L_);
+}
+
 // Runs the pre-pushed trampoline + nargs under lua_pcall; on failure pops the
 // error and throws std::runtime_error so the binding layer surfaces it as a JS
 // exception (rather than the Lua panic handler aborting the process).
@@ -2117,8 +2145,7 @@ void LuaRuntime::ProtectedTableCall(int nargs, int nresults) const {
   // from there a host callback — so this is an execution like any other.
   ExecutionScope exec(this);
   if (lua_pcall(L_, nargs, nresults, 0) != LUA_OK) {
-    const char* msg = lua_tostring(L_, -1);
-    std::string err = msg ? msg : "table access error";
+    std::string err = ProtectedFailureMessage();
     lua_pop(L_, 1);
     throw std::runtime_error(err);
   }
@@ -2167,8 +2194,7 @@ void LuaRuntime::RunProtected(const std::function<void()>& op) const {
   if (status != LUA_OK) {
     // A Lua error (typically LUA_ERRMEM under maxMemory). pcall left the message
     // on top and unwound the stack; surface it as a catchable C++ exception.
-    const char* msg = lua_tostring(L_, -1);
-    std::string err = msg ? msg : "protected operation failed (out of memory?)";
+    std::string err = ProtectedFailureMessage();
     lua_pop(L_, 1);
     throw std::runtime_error(err);
   }
@@ -2240,8 +2266,7 @@ LuaPtr LuaRuntime::ToLuaValueProtected(lua_State* from, const int index) const {
   if (status != LUA_OK) {
     // Typically LUA_ERRMEM under maxMemory. pcall left the message on top and
     // unwound the stack; surface it as a catchable C++ exception.
-    const char* msg = lua_tostring(L_, -1);
-    std::string err = msg ? msg : "value conversion failed (out of memory?)";
+    std::string err = ProtectedFailureMessage();
     lua_pop(L_, 1);
     throw std::runtime_error(err);
   }
@@ -2309,6 +2334,18 @@ std::string LuaRuntime::CaptureError(lua_State* L) const {
     // value absent; LuaErrorToJsValue already falls back to the display string.
     last_error_value_.reset();
   }
+  return ErrorValueToString(L);
+}
+
+// The display string for the error value on top of L's stack, without
+// recording it as the structured last error.
+//
+// Split out of CaptureError for the protected barriers (CR-18 F1). They need
+// the message and must *not* have the side effect: they surface their failure
+// as a plain `Napi::Error` rather than through `LuaErrorToJsValue`, so a
+// recorded value would be left unconsumed for some later `ThrowLuaError` to
+// pick up and attribute to the wrong failure.
+std::string LuaRuntime::ErrorValueToString(lua_State* L) const {
   // One scope covers the rest of the function. It brackets the `"message"` key
   // push below — which interns a string, and interning allocates, and any
   // allocation can drive a GC step whose __gc finalizers are Lua that re-enters
@@ -2566,8 +2603,7 @@ void LuaRuntime::PushProtectedGlobal(const std::string& name) const {
   const int status = lua_pcall(L_, 0, 1, 0);
   active_global_name_ = prev;
   if (status != LUA_OK) {
-    const char* msg = lua_tostring(L_, -1);
-    std::string err = msg ? msg : "global access error";
+    std::string err = ProtectedFailureMessage();
     lua_pop(L_, 1);
     throw std::runtime_error(err);
   }

@@ -179,8 +179,10 @@ constexpr Claim operator&(const Claim a, const Claim b) {
 constexpr bool Any(const Claim c) { return static_cast<unsigned>(c) != 0; }
 
 // Policy: an ordinary synchronous API method. Re-entrancy on this thread is
-// supported; another thread owning the state is not. This is what the 33
-// RejectIfBusy() call sites mean.
+// supported; another thread owning the state is not. This is what the
+// RejectIfBusy() call sites mean; their count is a frozen invariant
+// (`greppable-counts` in tools/invariants.expected.json) rather than a number
+// written here, because it was written here as 33 when it was 31.
 inline constexpr Claim kSyncApi = Claim::AsyncInFlight;
 
 // Policy: this operation takes the lua_State away from whoever holds it, so any
@@ -603,13 +605,23 @@ public:
     // of its guard block and false of everything after the state swap, where it
     // becomes a holder running user JS. It now opens a scope there (CR-15 F1c).
     //
-    // Both lists are hand-maintained, which is their weakness: CR-14 found ten
-    // omissions and every one was inert; CR-15 found nine more and a wrong
-    // heading. An omission with a consequence gets caught by a test, so only the
-    // harmless ones survive in a list like this — which is what makes it look
-    // healthy right up until a non-inert member joins. Re-derive by grepping for
-    // `.Get(` / `.Call(` / `GetPropertyNames(` / `env.Global()` rather than
-    // trusting what is written here.
+    // Both lists above are hand-maintained, which is their weakness: CR-14
+    // found ten omissions and every one was inert; CR-15 found nine more and a
+    // wrong heading. An omission with a consequence gets caught by a test, so
+    // only the harmless ones survive in a list like this — which is what makes
+    // it look healthy right up until a non-inert member joins.
+    //
+    // The membership question is therefore no longer answered here. The
+    // predicate stated above is computed over this whole file by
+    // `callScopeClassification()` in `tools/invariants.mjs`, and the answer is
+    // frozen in `tools/invariants.expected.json`, so a function that changes
+    // class — or a new one that arrives with no scope — turns
+    // `tests/ts/invariants.spec.ts` red instead of quietly joining a list.
+    //
+    // Read the prose above for *why* each current member is inert; read
+    // `node tools/check-invariants.mjs` for *who the members are*. When those
+    // two disagree, the generated one is right — that is the whole point, and
+    // it is what three passes of repairing this enumeration by hand bought.
     struct CallScope {
       LuaContext* ctx;
       explicit CallScope(LuaContext* c) : ctx(c) {
@@ -878,6 +890,11 @@ private:
     // nullptr means "the current runtime by construction": the async
     // promise-settlement path stages from a microtask with no execution in
     // flight at all, and it consumes the staged value itself.
+    // The message for a caught Napi::Error, with the non-Error throw handled.
+    // See the definition — this is the rule StageJsError always had, applied at
+    // the sites that do not go through it (CR-18 F2).
+    static std::string JsThrowMessage(const Napi::Error& e);
+
     std::string StageJsError(const Napi::Value& value, const std::string& message,
                              const lua_core::LuaRuntime* owner = nullptr);
 
@@ -904,16 +921,17 @@ private:
     // There is deliberately **no** "compute the whole claim set" accessor: the
     // claims must be evaluated lazily in the order the definition uses, because
     // everything below `AsyncInFlight` reads state a worker thread mutates. The
-    // first draft of this refactor had one, and it was a data race on all 33
-    // kSyncApi call sites. See the definition.
+    // first draft of this refactor had one, and it was a data race on every
+    // kSyncApi call site. See the definition.
     bool RejectIfOccupied(const char* op, lua_occupancy::Claim disallowed,
                           const char* detail = nullptr) const;
 
     // The kSyncApi policy, kept under its original name because every
     // synchronous API method and a great many tests use it —
     // `grep -c 'if (RejectIfBusy())' src/lua-native.cpp` is the count, so nobody
-    // has to keep a number here correct (it was written as 33 and was 31).
-    // Equivalent to
+    // has to keep a number here correct (it was written as 33 and was 31). That
+    // grep is now also a frozen invariant, so the count moving is a red test
+    // rather than something a reader has to re-run. Equivalent to
     // `RejectIfOccupied(nullptr, lua_occupancy::kSyncApi)`.
     bool RejectIfBusy() const;
 

@@ -1145,8 +1145,16 @@ void LuaContext::InstallRuntimeHandlers() {
       if (!it->second.readable) {
         throw std::runtime_error("userdata is not readable");
       }
-      Napi::Value val = it->second.object.Value().Get(key);
-      return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+      // Catch Napi::Error ahead of the core's generic `catch (std::exception&)`
+      // so a non-Error throw keeps its text: `what()` is empty for one, and the
+      // core's "Error reading property '%s': %s" would end at the colon
+      // (CR-18 F2).
+      try {
+        Napi::Value val = it->second.object.Value().Get(key);
+        return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+      } catch (const Napi::Error& e) {
+        throw Napi::Error::New(env, JsThrowMessage(e));
+      }
     },
     // Setter (__newindex)
     [this](int ref_id, const std::string& key, const lua_core::LuaPtr& value) {
@@ -1165,7 +1173,11 @@ void LuaContext::InstallRuntimeHandlers() {
       // either form reintroduces a use-after-invalidate that no test can see,
       // since the language, not the code, is what currently enforces it
       // (CR-13's "verified and rejected"; comment added by CR-14 F5).
-      it->second.object.Value().Set(key, CoreToNapi(*value));
+      try {
+        it->second.object.Value().Set(key, CoreToNapi(*value));
+      } catch (const Napi::Error& e) {
+        throw Napi::Error::New(env, JsThrowMessage(e));  // see the getter (CR-18 F2)
+      }
     }
   );
 }
@@ -2503,6 +2515,37 @@ LuaContext::~LuaContext() {
   if (runtime) runtime->ClearHostFunctions();
 }
 
+// The message for a caught Napi::Error.
+//
+// `Napi::Error::Message()` — and therefore `Napi::Error::what()` — reads
+// `.message` off the thrown value, so it is **empty for every throw that is
+// not an Error object**: `throw 'boom'`, `throw 42`, `throw null`. That empty
+// string then becomes the caller's whole diagnostic, because the 45 binding
+// catch sites are `catch (const std::exception& e)` and rebuild the error from
+// `e.what()`. Driven at CR-18: a type converter that threw a string produced
+// `Error` with no message at all, and the userdata property bridge produced
+// "Error reading property 'p': " with nothing after the colon.
+//
+// The rule has existed at one site since it was written — StageJsError falls
+// back to the value's string form, which is why a host function that throws a
+// string reports it correctly. This is that rule in one place, applied at the
+// four points that call user JS *without* going through StageJsError. Fixing
+// the producers rather than the 45 consumers is deliberate: the consumers are
+// correct given a correct `what()`, and a 45-site edit is exactly the kind of
+// sweep that has introduced a fresh defect every time it has been done here.
+std::string LuaContext::JsThrowMessage(const Napi::Error& e) {
+  if (std::string message = e.Message(); !message.empty()) return message;
+  const Napi::Value value = e.Value();
+  if (value.IsEmpty()) return "JavaScript callback threw with no value";
+  // ToString() runs user code (a hostile `toString`/`Symbol.toPrimitive`) and
+  // is on an error path, so it cannot be allowed to throw again.
+  try {
+    return value.ToString().Utf8Value();
+  } catch (...) {
+    return "JavaScript callback threw a value that could not be converted to a string";
+  }
+}
+
 std::string LuaContext::StageJsError(const Napi::Value& value,
                                      const std::string& message,
                                      const lua_core::LuaRuntime* owner) {
@@ -2623,7 +2666,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
       }
       return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
     } catch (const Napi::Error& e) {
-      throw std::runtime_error(StageJsError(e.Value(), e.Message(), owner));
+      throw std::runtime_error(StageJsError(e.Value(), JsThrowMessage(e), owner));
     }
   };
 }
@@ -2666,7 +2709,7 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     try {
       instance = callback.Call(jsArgs);
     } catch (const Napi::Error& e) {
-      throw std::runtime_error(StageJsError(e.Value(), e.Message(), owner));
+      throw std::runtime_error(StageJsError(e.Value(), JsThrowMessage(e), owner));
     }
 
     if (!instance.IsObject() || instance.IsArray() || instance.IsFunction()) {
@@ -3617,8 +3660,20 @@ void LuaContext::InstallPrintHandler(const Napi::Function& fn) {
     Napi::HandleScope scope(env);
     try {
       print_handler_.Call({Napi::String::New(env, text)});
-    } catch (const Napi::Error&) {
+    } catch (...) {
       // A throwing print handler is swallowed rather than corrupting the VM.
+      // The script continues as though print() succeeded, which is a real
+      // trade-off and is now stated in types.d.ts rather than only here —
+      // CR-18 F3 reached this through all eleven throw kinds and every one
+      // vanished with no way for the caller to learn it had.
+      //
+      // `catch (...)`, not `catch (const Napi::Error&)`: the narrower form was
+      // the only containment, so any other C++ exception — a std::runtime_error
+      // raised by a core call the handler made re-entrantly, a std::bad_alloc —
+      // would have unwound straight through Lua's C frame, which is the exact
+      // hazard this comment claims to prevent. Empirically nothing produced one
+      // (all eleven kinds arrived as Napi::Error), so this closes the gap in
+      // kind rather than in fact.
     }
   });
   print_handler_ = Napi::Persistent(fn);
@@ -3642,8 +3697,10 @@ void LuaContext::InstallDebugHook(const Napi::Function& fn, const int mask,
           Napi::Number::New(env, line),
           Napi::String::New(env, name)
         });
-      } catch (const Napi::Error&) {
-        // A throwing hook is swallowed rather than corrupting the VM.
+      } catch (...) {
+        // A throwing hook is swallowed rather than corrupting the VM. See
+        // InstallPrintHandler for why this catches everything and why the
+        // silence is documented on the public API (CR-18 F3).
       }
     }, mask, count);
 
@@ -4120,8 +4177,15 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
     for (size_t i = 0; i < type_converters_.size(); ++i) {
       Napi::Function match = type_converters_[i].first.Value();
       Napi::Function convert = type_converters_[i].second.Value();
-      if (match.Call({value}).ToBoolean().Value()) {
-        return NapiToCoreInstance(convert.Call({value}), depth + 1);
+      // Same reason as the property bridge: a converter that throws a string
+      // otherwise reaches the caller as `Error` with an empty message
+      // (CR-18 F2).
+      try {
+        if (match.Call({value}).ToBoolean().Value()) {
+          return NapiToCoreInstance(convert.Call({value}), depth + 1);
+        }
+      } catch (const Napi::Error& e) {
+        throw Napi::Error::New(env, JsThrowMessage(e));
       }
     }
 
@@ -4188,8 +4252,20 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
   for (size_t i = 0; i < from_lua_converters_.size(); ++i) {
     Napi::Function match = from_lua_converters_[i].first.Value();
     const Napi::Function convert = from_lua_converters_[i].second.Value();
-    if (match.Call({result}).ToBoolean().Value()) {
-      return convert.Call({result});
+    // Rethrown as a Napi::Error, not a std::runtime_error, and the type is
+    // load-bearing: CoreToNapi is reached from sites that catch Napi::Error
+    // *specifically* (the print-handler and debug-hook bridges among them).
+    // Converting the type here made those handlers miss it, and the escape
+    // took the process down — the CR-6 F1 class, reintroduced by a fix for
+    // CR-18 F2 and caught by the suite before it shipped. Napi::Error derives
+    // from std::exception, so the generic catch sites still see it and now see
+    // a non-empty what().
+    try {
+      if (match.Call({result}).ToBoolean().Value()) {
+        return convert.Call({result});
+      }
+    } catch (const Napi::Error& e) {
+      throw Napi::Error::New(env, JsThrowMessage(e));
     }
   }
   return result;

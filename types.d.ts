@@ -466,6 +466,40 @@ export interface LuaContext {
    * @example
    * const num = lua.execute_script<number>('return 42');
    * const fn = lua.execute_script<LuaFunction>('return function(x) return x * 2 end');
+   *
+   * @remarks
+   * **Three things a value can lose on the way from Lua to JavaScript.** All
+   * three are consequences of the JavaScript type system rather than of this
+   * binding, all three are silent, and all three were found by differential
+   * testing against stock Lua (`tools/diff-oracle/`). They are listed here
+   * because a silent loss you know about is a constraint and a silent loss you
+   * do not is a bug in your program.
+   *
+   * 1. **A Lua string that is not valid UTF-8 is mangled.** Lua strings are
+   *    byte strings and JavaScript strings are UTF-16; every invalid byte
+   *    becomes U+FFFD (the replacement character). The loss is not recoverable
+   *    and not idempotent — a 4-byte blob `"\x00\x01\xFE\xFF"` round-tripped
+   *    through JavaScript comes back into Lua as **8** bytes, and comparing it
+   *    to the original is false. It is also data-dependent, which is the
+   *    dangerous part: `string.pack('i4', 7)` is all bytes below 0x80 and
+   *    survives intact, so binary handling can appear to work for a long time.
+   *    **To move binary data, encode it** — base64 or hex through the boundary,
+   *    or keep it in Lua behind a `LuaTableHandle` and never read it out.
+   *
+   * 2. **Table keys that are not strings or numbers are dropped.**
+   *    `{[true] = 1, [false] = 2}` arrives as `{}`. Not null values — absent
+   *    entries. Boolean, table and function keys have no JavaScript object-key
+   *    equivalent.
+   *
+   * 3. **A string key and a number key with the same text collide.**
+   *    `{["1"] = "strkey", [1] = "intkey"}` is two distinct entries in Lua and
+   *    arrives as a single JavaScript property `"1"`; one value is lost, and
+   *    which one depends on table order. JavaScript object keys are strings.
+   *
+   * None of this applies to values kept on the Lua side: a `LuaTableHandle`
+   * from {@link get_global_ref} reads the real table in place, so binary
+   * strings, boolean keys and colliding keys all stay intact as long as you do
+   * not marshal them out.
    */
   execute_script<T extends LuaValue | LuaValue[] = LuaValue>(script: string): T;
 
@@ -1096,6 +1130,15 @@ export interface LuaContext {
    * lua.set_print_handler((text) => lines.push(text));
    * lua.execute_script('print("hello", 42)'); // lines: ["hello\t42\n"]
    * lua.set_print_handler(null); // back to stdout
+   *
+   * @remarks
+   * **An exception thrown by the handler is swallowed.** The handler runs
+   * inside Lua's C call frame for `print` / `io.write`, and letting a C++
+   * exception unwind through it would corrupt the VM — so the throw is
+   * contained and the script continues exactly as though the output had
+   * succeeded. Nothing is reported to the caller, and `execute_script` returns
+   * normally. If the handler can fail in a way you need to know about, catch
+   * inside it and record the failure yourself.
    */
   set_print_handler(handler?: ((text: string) => void) | null): void;
 
@@ -1146,6 +1189,13 @@ export interface LuaContext {
    * lua.set_hook((_event, line) => {
    *   samples.set(line, (samples.get(line) ?? 0) + 1);
    * }, { count: 10_000 });
+   *
+   * @remarks
+   * **An exception thrown by the callback is swallowed.** The hook runs between
+   * VM instructions, inside Lua's execution, so a C++ exception unwinding
+   * through it would corrupt the VM — the throw is contained and the script
+   * continues. Nothing surfaces to the caller. To stop a script from the hook,
+   * use {@link cancel} rather than throwing.
    */
   set_hook(callback: LuaHookCallback, options: HookOptions): void;
 

@@ -28,6 +28,17 @@ const vcpkgRoot =
 const includePath = path.join(vcpkgRoot, "installed", triplet, "include");
 const libName = platform === "win32" ? "lua.lib" : "liblua.a";
 const libPath = path.join(vcpkgRoot, "installed", triplet, "lib", libName);
+// The stock Lua interpreter, installed by the port's `tools` feature
+// (`vcpkg install lua[tools]`). Used as the reference implementation by the
+// differential oracle; not needed to build or test the addon itself.
+const interpreterPath = path.join(
+  vcpkgRoot,
+  "installed",
+  triplet,
+  "tools",
+  "lua",
+  platform === "win32" ? "lua.exe" : "lua"
+);
 
 // console.log(`triplet: ${triplet}`);
 // console.log(`vcpkgRoot: ${vcpkgRoot}`);
@@ -39,6 +50,8 @@ if (arg === "include") {
   console.log(includePath);
 } else if (arg === "lib") {
   console.log(libPath);
+} else if (arg === "interpreter") {
+  console.log(interpreterPath);
 } else {
   console.log(includePath);
   console.log(libPath);

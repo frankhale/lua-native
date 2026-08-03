@@ -9968,4 +9968,299 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  // ============================================
+  // CODE-REVIEW-18 regressions
+  // ============================================
+  //
+  // Found by the exception-escape matrix (`tools/cr18/`): 27 Lua C frames x 11
+  // throw kinds, one process per cell. Nothing aborted and no context was left
+  // unusable — the findings are all about what the caller is *told* when a
+  // contained failure happens, which is the class this codebase moved into.
+
+  describe('CODE-REVIEW-18 regressions', () => {
+    describe('F1: a protected barrier reports the real cause, not a guessed one', () => {
+      // Pre-fix these all reported "protected operation failed (out of memory?)",
+      // because lua_tostring returns null for the *table* a thrown JS error is
+      // staged into, and each barrier had its own invented fallback. The same
+      // callback reached through execute_script always reported correctly, which
+      // is what made it a discrepancy rather than a missing feature.
+      const armed = () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = {}');
+        const boom = () => { throw new Error('THE-REAL-CAUSE'); };
+        lua.set_metatable('t', { __index: boom, __newindex: boom, __len: boom });
+        return lua;
+      };
+
+      it('execute_script reports it (the control that was always right)', () => {
+        const lua = armed();
+        expect(() => lua.execute_script('return t.x')).toThrow(/THE-REAL-CAUSE/);
+      });
+
+      for (const [name, op] of [
+        ['handle.get()', (h: any) => h.get('x')],
+        ['handle.has()', (h: any) => h.has('x')],
+        ['handle.set()', (h: any) => h.set('x', 1)],
+        ['handle.length()', (h: any) => h.length()],
+        ['handle.get_ref()', (h: any) => h.get_ref('x')],
+      ] as Array<[string, (h: any) => unknown]>) {
+        it(`${name} reports it`, () => {
+          const lua = armed();
+          const h = lua.get_global_ref('t');
+          expect(() => op(h)).toThrow(/THE-REAL-CAUSE/);
+          // The specific wrong answer, asserted specifically: a generic
+          // toThrow() passed for as long as the wrong message existed.
+          try { op(h); } catch (e: any) { expect(e.message).not.toMatch(/out of memory/i); }
+        });
+      }
+
+      it('a dotted get_global / set_global reports it', () => {
+        const lua = armed();
+        expect(() => lua.get_global('t.x')).toThrow(/THE-REAL-CAUSE/);
+        expect(() => lua.set_global('t.x', 1)).toThrow(/THE-REAL-CAUSE/);
+      });
+
+      it('a raising _G metamethod reports it through set_global and get_global', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('raiser', () => { throw new Error('THE-REAL-CAUSE'); });
+        lua.execute_script(
+          'setmetatable(_G, { __newindex = function() raiser() end,'
+          + ' __index = function() raiser() end })');
+        expect(() => lua.set_global('zz', 1)).toThrow(/THE-REAL-CAUSE/);
+        expect(() => lua.get_global('zz')).toThrow(/THE-REAL-CAUSE/);
+      });
+
+      it('a genuine Lua string error is unchanged (the cheap path stays cheap)', () => {
+        // The string case must not start going through ErrorValueToString: it is
+        // what a real LUA_ERRMEM leaves behind, and stringifying under a state
+        // that has just failed to allocate is not something to attempt.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = setmetatable({}, { __index = function() error("PLAIN-LUA") end })');
+        expect(() => lua.get_global_ref('t').get('x')).toThrow(/PLAIN-LUA/);
+      });
+    });
+
+    describe('F2: a thrown non-Error keeps its text', () => {
+      // Napi::Error::Message() reads `.message` off the thrown value, so it is
+      // empty for `throw 'boom'`. The 45 binding catch sites rebuild the error
+      // from what(), so the caller got an Error with no message at all. The
+      // host-function bridge had the right fallback all along; the fix gives the
+      // other three the same one rather than editing the 45 consumers.
+      for (const thrown of ['a plain string', 42, null] as const) {
+        it(`host function: throw ${JSON.stringify(thrown)}`, () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          lua.set_global('f', () => { throw thrown; });
+          expect(() => lua.execute_script('return f()')).toThrow(/THREW|threw an exception/i);
+        });
+      }
+
+      it('a type converter that throws a string keeps the string', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v: any) => v && typeof v === 'object' && 'tag' in v,
+          () => { throw 'STRING-FROM-CONVERTER'; },
+        );
+        expect(() => lua.set_global('x', { tag: 1 })).toThrow(/STRING-FROM-CONVERTER/);
+      });
+
+      it('a userdata property getter that throws a string keeps the string', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const obj = {};
+        Object.defineProperty(obj, 'p', {
+          get: () => { throw 'STRING-FROM-GETTER'; }, enumerable: true,
+        });
+        lua.set_userdata('ud', obj, { readable: true });
+        expect(() => lua.execute_script('return ud.p')).toThrow(/STRING-FROM-GETTER/);
+      });
+
+      it('a from-Lua converter that throws a string keeps the string', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_from_lua_converter(() => true, () => { throw 'STRING-FROM-FROM-LUA'; });
+        expect(() => lua.execute_script('return { a = 1 }')).toThrow(/STRING-FROM-FROM-LUA/);
+      });
+
+      it('an Error thrown from a converter is unaffected', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_type_converter(
+          (v: any) => v && typeof v === 'object' && 'tag' in v,
+          () => { throw new Error('ERROR-FROM-CONVERTER'); },
+        );
+        expect(() => lua.set_global('x', { tag: 1 })).toThrow(/ERROR-FROM-CONVERTER/);
+      });
+
+      it('the rethrow keeps the exception a Napi::Error, not a std::runtime_error', () => {
+        // Load-bearing, and the reason this pin exists: the first version of the
+        // F2 fix rethrew std::runtime_error, which the sites that catch
+        // Napi::Error *specifically* — the print-handler and debug-hook bridges —
+        // then missed, and the escape took the process down. If that regresses,
+        // this whole file's worker dies rather than failing an assertion, so the
+        // real assertion is that the run gets here at all.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_print_handler(() => { throw 'from the print handler'; });
+        lua.register_from_lua_converter(() => true, (v: any) => v);
+        expect(lua.execute_script('print("x") return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('F3: the deliberate swallows stay deliberate, and stay documented', () => {
+      it('a throwing print handler is swallowed and the script completes', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let calls = 0;
+        lua.set_print_handler(() => { calls++; throw new Error('PRINT-BOOM'); });
+        expect(lua.execute_script('print("a") return "finished"')).toBe('finished');
+        expect(calls).toBe(1);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a throwing debug hook is swallowed and the script completes', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let calls = 0;
+        lua.set_hook(() => { calls++; throw new Error('HOOK-BOOM'); }, { line: true });
+        expect(lua.execute_script('local a = 1\nlocal b = 2\nreturn "finished"')).toBe('finished');
+        expect(calls).toBeGreaterThan(0);
+        lua.remove_hook();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a throwing __gc finalizer is contained and leaves a usable context', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        let calls = 0;
+        lua.execute_script('t = {}');
+        lua.set_metatable('t', { __gc: () => { calls++; throw new Error('GC-BOOM'); } });
+        lua.execute_script('t = nil');
+        lua.gc('collect');
+        lua.gc('collect');
+        expect(calls).toBe(1);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a throwing __gc finalizer at reset() is contained', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = {}');
+        lua.set_metatable('t', { __gc: () => { throw new Error('GC-BOOM'); } });
+        expect(() => lua.reset()).not.toThrow();
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+    });
+
+    describe('F4 (negative result): a contained failure strands nothing', () => {
+      it('a coroutine whose host callback throws frees its slot on release', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('f', () => { throw new Error('BOOM'); });
+        const cycle = () => {
+          const co = lua.create_coroutine('return function() return f() end');
+          try { lua.resume(co); } catch { /* expected */ }
+          lua.release(co);
+        };
+        for (let i = 0; i < 20; i++) cycle();
+        lua.gc('collect'); lua.gc('collect');
+        const before = lua.get_memory_usage();
+        for (let i = 0; i < 200; i++) cycle();
+        lua.gc('collect'); lua.gc('collect');
+        // Exactly flat: the error path must not orphan a registry slot or a
+        // staged js_error_registry_ entry. Measured at 0 B over 200 iterations.
+        expect(lua.get_memory_usage() - before).toBeLessThan(4096);
+      });
+    });
+  });
+
+  // ============================================
+  // DIFFERENTIAL ORACLE regressions
+  // ============================================
+  //
+  // Found by `tools/diff-oracle/` — 2678 cases run through both lua-native and
+  // stock Lua 5.5 and compared. These three are silent data loss on the Lua->JS
+  // crossing: no error, no crash, a plausible value. They are pinned rather than
+  // fixed because each is a consequence of the JavaScript type system and
+  // changing any of them is an API decision; the pins exist so that if the
+  // decision is ever taken, it is taken deliberately.
+  //
+  // Each is also documented on execute_script() in types.d.ts. Before the
+  // oracle, nothing in the project recorded that they happen.
+
+  describe('differential-oracle regressions', () => {
+    describe('O1: a Lua string that is not valid UTF-8 does not survive the crossing', () => {
+      it('invalid bytes become U+FFFD', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script('return #("\\xFF\\xFE")')).toBe(2);
+        const crossed = lua.execute_script('return "\\xFF\\xFE"');
+        expect([...Buffer.from(crossed, 'utf8')]).toEqual([0xef, 0xbf, 0xbd, 0xef, 0xbf, 0xbd]);
+      });
+
+      it('the loss is not idempotent — a round trip changes the length', () => {
+        // The sharpest statement of the problem: 4 bytes out, 8 bytes back, and
+        // Lua itself reports the two strings as different.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('blob = "\\x00\\x01\\xFE\\xFF"');
+        expect(lua.execute_script('return #blob')).toBe(4);
+        lua.set_global('back', lua.execute_script('return blob'));
+        expect(lua.execute_script('return #back')).toBe(8);
+        expect(lua.execute_script('return blob == back')).toBe(false);
+      });
+
+      it('is data-dependent: bytes below 0x80 survive, which is what hides it', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const packed = lua.execute_script('return string.pack("i4", 7)');
+        expect([...Buffer.from(packed, 'utf8')]).toEqual([7, 0, 0, 0]);
+        lua.set_global('back', packed);
+        expect(lua.execute_script('return #back')).toBe(4);
+      });
+
+      it('valid UTF-8 crosses unchanged', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script('return "caf\\xC3\\xA9"')).toBe('café');
+      });
+
+      it('the documented workaround works: encode it', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('blob = "\\x00\\x01\\xFE\\xFF"');
+        const hex = lua.execute_script('return (blob:gsub(".", function(c) return string.format("%02x", c:byte()) end))');
+        expect(hex).toBe('0001feff');
+        lua.set_global('hex', hex);
+        expect(lua.execute_script(
+          'local b = (hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)) return b == blob',
+        )).toBe(true);
+      });
+
+      it('a handle keeps it intact, because nothing is marshalled out', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = { blob = "\\x00\\x01\\xFE\\xFF" }');
+        const h = lua.get_global_ref('t');
+        h.set('copy', 'placeholder');
+        expect(lua.execute_script('return #t.blob')).toBe(4);
+      });
+    });
+
+    describe('O2: table keys that are neither string nor number are dropped', () => {
+      it('boolean keys vanish rather than becoming null', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script(
+          'local c = 0 for _ in pairs({[true]=1,[false]=2}) do c = c + 1 end return c',
+        )).toBe(2);
+        expect(lua.execute_script('return {[true]=1, [false]=2}')).toEqual({});
+      });
+
+      it('a table key vanishes too', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script('local k = {} return {[k] = 1}')).toEqual({});
+      });
+
+      it('string and number keys are unaffected', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script('return {a = 1, [2] = "two"}')).toEqual({ a: 1, 2: 'two' });
+      });
+    });
+
+    describe('O3: a string key and a number key with the same text collide', () => {
+      it('two distinct Lua entries arrive as one JS property', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script(
+          'local t = {["1"]="strkey", [1]="intkey"} return t["1"] .. "/" .. t[1]',
+        )).toBe('strkey/intkey');
+        const crossed = lua.execute_script('return {["1"]="strkey", [1]="intkey"}');
+        expect(Object.keys(crossed)).toEqual(['1']);
+      });
+    });
+  });
+
 });

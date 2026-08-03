@@ -30,11 +30,22 @@ npm run test-ts-asan    # .node addon under ASan+UBSan, via the full vitest suit
 npm run test-cpp-tsan   # C++ core under TSan (single-threaded — regression guard)
 npm run test-ts-tsan    # addon under TSan, via the async vitest suite
 
+# Source invariants (generated lists vs their frozen answers)
+npm run check-invariants
+node tools/check-invariants.mjs --update   # re-freeze after a reviewed change
+
+# CR-18 exception-escape matrix (27 Lua C frames x 11 throw kinds, 1 process/cell)
+npm run cr18-matrix
+
+# Differential oracle vs stock Lua 5.5 (2678 cases)
+# Needs the vcpkg port's interpreter:  vcpkg install lua[tools]
+npm run oracle
+
 # Clean build artifacts
 npm run clean
 ```
 
-**Prerequisites:** Lua must be available via vcpkg. The `get_vcpkg_path.js` script resolves include/lib paths from `VCPKG_ROOT` environment variable.
+**Prerequisites:** Lua must be available via vcpkg. The `get_vcpkg_path.js` script resolves include/lib/interpreter paths from the `VCPKG_ROOT` environment variable. Building and testing the addon needs only the library; `npm run oracle` additionally needs the port's interpreter (`vcpkg install lua[tools]`).
 
 **Important:** After C++ changes, you must `npm run build-debug` before running `npm test`. The debug build is required for testing — do not use prebuilt binaries.
 
@@ -51,9 +62,35 @@ so run `build-debug` afterward to return to the normal binary. Highest-value one
 synchronization, so a clean run is not a proof of race-freedom). Full details, the
 preload mechanics, and the July 2026 stress-test results are in
 `docs/SANITIZERS.md`. These sanitizers do **not** catch the exception-abort class
-(a `std::runtime_error` reaching `std::terminate`, e.g. CR-6 F1) — that stays the
-job of the CODE-REVIEW-6 behavioral matrix. See also
-`docs/CODE-REVIEW-THOUGHTS.md`.
+(a `std::runtime_error` reaching `std::terminate`, e.g. CR-6 F1) — that is now
+the job of `npm run cr18-matrix`, the generated search for that class
+(`docs/CODE-REVIEW-18.md`), alongside the CODE-REVIEW-6 behavioral matrix in the
+suite. See also `docs/CODE-REVIEW-THOUGHTS.md`.
+
+**Correctness harnesses (`tools/`).** Three things the test suites do not do:
+
+- `npm run check-invariants` — lists that used to live in comments (the
+  `CallScope` classification, the `lua_next` traversal sites, the occupancy
+  policy set, greppable counts, and every binding call to a `RunProtected`-backed
+  core method scored guarded or not) are computed from the source and compared
+  against `tools/invariants.expected.json`. `tests/ts/invariants.spec.ts` runs the
+  same checks, so drift is a red suite; re-freeze with `--update` so the change
+  lands as a reviewable diff. **Do not "fix" a drifted invariant by editing the
+  expected file without reading what moved** — the whole point is that the diff
+  gets looked at.
+- `npm run cr18-matrix` — the exception-escape matrix. Runs its own controls
+  first and refuses to proceed if they fail.
+- `npm run oracle` — differential testing against stock `lua` from the same
+  vcpkg port that supplies `liblua.a`. Requires `vcpkg install lua[tools]`; the
+  oracle prints both Lua versions and warns if they differ. The only harness here
+  that checks whether an answer is *right* rather than whether nothing crashed.
+  See `docs/DIFFERENTIAL-ORACLE.md`.
+
+All three follow the same rule, which is worth knowing before extending any of
+them: **an exhaustive search that reports clean must first demonstrate it can
+report dirty**, so each runs positive controls before its real work, and each
+keeps a ledger of known-acceptable results where every entry carries its reason
+and a stale entry is reported rather than silently ignored.
 
 ## Architecture
 

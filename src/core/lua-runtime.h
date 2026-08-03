@@ -759,17 +759,30 @@ public:
   // by far the worst: it ran ToLuaValueProtected — a full lua_pcall, not a
   // string intern — per value with a live cursor, while its own sibling
   // TableIPairs already collected under protection first and said why. CR-15 F2
-  // moved TablePairs to the sibling's shape (ProtectedTablePairsCollect), so:
+  // moved TablePairs to the sibling's shape (ProtectedTablePairsCollect).
   //
-  //   exposed:  GetTableKeys (stringifies numeric keys inside the loop);
-  //             ToLuaValue's table branch (luaL_ref per nested
-  //             function/thread/metatabled table inside the loop).
-  //   not exposed, by collecting into a Lua array before converting:
-  //             TablePairs, TableIPairs.
+  // It was then wrong a second time, and the second time is the reason there is
+  // no list here any more. The corrected list named four members, two of which
+  // (TablePairs, TableIPairs) no longer contain a `lua_next` at all — they
+  // traverse through the collectors — and it missed RegisterClass's
+  // metamethod-inheritance copy, which does `lua_getfield` / `lua_setfield` /
+  // `lua_tostring` inside a live cursor over the parent metatable. Two passes
+  // wrote "re-derive this by grepping `lua_next`" and two passes did not.
   //
-  // A new raw-lua_next loop belongs in the second group. Re-derive this list by
-  // grepping `lua_next` rather than trusting it — that is exactly how the
-  // TablePairs omission was found one pass after the list was written.
+  // So the derivation is mechanical now: `tools/invariants.mjs` finds every
+  // `lua_next` loop in this file, records which allocating or metamethod-firing
+  // calls appear inside each cursor, and `tests/ts/invariants.spec.ts` fails if
+  // that answer moves. Run `node tools/check-invariants.mjs` for the current
+  // one; a new raw-lua_next loop shows up there as a new row rather than as a
+  // line somebody has to remember to add here.
+  //
+  // Reachability, for the exposed loops: the finalizer has to add a key to *the
+  // specific table under traversal*. For GetTableKeys and ToLuaValue that table
+  // is the caller's, so it is reachable in principle and still undriven after
+  // several attempts at CR-15. For RegisterClass it is a class metatable held
+  // only in the registry, which nothing outside this file can name — bounded
+  // more tightly than the other two, and recorded rather than fixed for that
+  // reason.
   [[nodiscard]] bool IsExecuting() const { return lua_depth_ > 0; }
 
   // Debug hooks (lua_sethook): line / call / return / count tracing, for
@@ -1030,6 +1043,13 @@ private:
   static int MessageHandler(lua_State* L);
   int ProtectedCall(int nargs, int nresults) const;
   std::string CaptureError(lua_State* L) const;
+  // CaptureError's display-string half, without the side effect of recording
+  // the structured value. See the definition.
+  std::string ErrorValueToString(lua_State* L) const;
+  // The message for the error value a failed protected call left on the stack.
+  // Used by all four protected barriers so none of them can invent a cause
+  // again (CR-18 F1).
+  [[nodiscard]] std::string ProtectedFailureMessage() const;
 
   // Runs a pre-pushed C trampoline (function + nargs already on the stack) under
   // lua_pcall so a raising metamethod becomes a std::runtime_error rather than a
