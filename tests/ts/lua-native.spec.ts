@@ -6920,7 +6920,7 @@ describe('lua-native Node adapter', () => {
         const fn = lua.execute_script<any>('return function(x) return x * 2 end');
         expect(fn(21)).toBe(42);
         lua.reset();
-        expect(() => fn(21)).toThrow(/destroyed|released/);
+        expect(() => fn(21)).toThrow(/replaced by reset/);
       });
 
       it('invalidates table handles', () => {
@@ -6928,7 +6928,7 @@ describe('lua-native Node adapter', () => {
         const t = lua.create_table();
         t.set('a', 1);
         lua.reset();
-        expect(() => t.get('a')).toThrow(/destroyed|released/);
+        expect(() => t.get('a')).toThrow(/replaced by reset/);
       });
 
       it('invalidates metatabled-table proxies', () => {
@@ -6938,7 +6938,7 @@ describe('lua-native Node adapter', () => {
         `);
         expect(proxy.anything).toBe('x');
         lua.reset();
-        expect(() => proxy.anything).toThrow(/destroyed|released/);
+        expect(() => proxy.anything).toThrow(/replaced by reset/);
       });
 
       it('rejects coroutines created before the reset', () => {
@@ -6955,7 +6955,7 @@ describe('lua-native Node adapter', () => {
         lua.reset();
         // The new state has its own registry; the stale handle must not read or
         // write through it.
-        expect(() => t.set('marker', 'new')).toThrow(/destroyed|released/);
+        expect(() => t.set('marker', 'new')).toThrow(/replaced by reset/);
         expect(lua.execute_script('return marker')).toBeNull();
       });
 
@@ -6980,7 +6980,7 @@ describe('lua-native Node adapter', () => {
         lua.reset();
         // The retired state stays open behind `held`, so every operation that
         // touches it fails cleanly instead of reaching freed memory.
-        expect(() => held()).toThrow(/destroyed|released/);
+        expect(() => held()).toThrow(/replaced by reset/);
         expect(() => lua.release(held)).toThrow(/different Lua context/);
         expect(lua.execute_script('return 1 + 1')).toBe(2);
       });
@@ -9824,6 +9824,146 @@ describe('lua-native Node adapter', () => {
         lua.execute_script(`keep = setmetatable({}, { __gc = function() renest() end })`);
         lua.reset();
         expect(seen[0]).toMatch(/reset\(\) cannot be called re-entrantly/);
+      });
+    });
+  });
+
+  // ============================================
+  // CODE-REVIEW-17 regressions
+  // ============================================
+  describe('CODE-REVIEW-17 regressions', () => {
+    // CR-17 F1. reset() swaps `runtime` and destroys the outgoing state in the
+    // same statement, so lua_close's __gc finalizers dispatch into JS with the
+    // member already pointing at the replacement. A metatabled table reaching a
+    // JS __gc handler was converted there, pairing a ref minted in the RETIRING
+    // registry with the REPLACEMENT runtime. Driven twice: a use-after-free at
+    // teardown (SIGSEGV 3/3, so these kill the runner pre-fix) and, while the
+    // handle lives, silent aliasing of the new state's registry at the old
+    // state's slot number.
+    describe('handles minted from a retiring state (CR-17 F1)', () => {
+      it('a JS __gc metamethod plus reset() does not corrupt teardown', () => {
+        let hits = 0;
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('fin = {}');
+        lua.set_metatable('fin', { __gc: () => { hits++; } });
+        lua.reset();
+        // The finalizer must still reach JS — that dispatch is pinned by CR-9's
+        // re-entrancy test and the fix must not silence it.
+        expect(hits).toBe(1);
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+      });
+
+      it('a handle escaping a __gc handler cannot alias the replacement state', () => {
+        const escaped: any[] = [];
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('a = {} b = {} c = {}');
+        for (const n of ['a', 'b', 'c']) {
+          lua.set_metatable(n, { __gc: (t: any) => { escaped.push(t); } });
+        }
+        lua.reset();
+        expect(escaped.length).toBe(3);
+
+        // Populate the replacement registry with identifiable tables. Pre-fix,
+        // escaped[i] read and wrote fresh[i] one-for-one.
+        const fresh: any[] = [];
+        for (let i = 0; i < 6; i++) {
+          const h = lua.create_table();
+          h.set('iam', 'fresh#' + i);
+          fresh.push(h);
+        }
+
+        for (const h of escaped) {
+          expect(() => h.iam).toThrow(/has been released/);
+          expect(() => { h.injected = 'x'; }).toThrow(/has been released/);
+        }
+        // Nothing the retired handles touched reached a live table.
+        for (let i = 0; i < fresh.length; i++) {
+          expect(fresh[i].get('injected')).toBeNull();
+          expect(fresh[i].get('iam')).toBe('fresh#' + i);
+        }
+      });
+
+      it('the same context keeps minting live handles normally (control)', () => {
+        // The guard is "does this ref belong to my current runtime", so the
+        // ordinary path must be untouched.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('m = setmetatable({ v = 1 }, { __index = function() return 9 end })');
+        const t: any = lua.get_global('m');
+        expect(t.v).toBe(1);
+        expect(t.missing).toBe(9);
+        const h = lua.create_table();
+        h.set('a', 1);
+        expect(h.get('a')).toBe(1);
+        h.release();
+      });
+    });
+
+    // CR-17 F2. Five cross-context entry points refuse a foreign table handle;
+    // set_global fell through to "a plain deep copy", which is correct for the
+    // plain objects it was written for and wrong for a Proxy, whose own keys
+    // are its API rather than its data.
+    describe('a foreign table handle is refused, not silently mis-copied (CR-17 F2)', () => {
+      it('set_global refuses a table handle from another context', () => {
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        a.execute_script('cfg = { host = "db1", port = 5432 }');
+        const h = a.get_global_ref('cfg');
+        expect(() => b.set_global('cfg', h))
+          .toThrow(/table handle belongs to a different Lua context/);
+        // And it is not half-applied.
+        expect(b.execute_script('return cfg')).toBeNull();
+      });
+
+      it('every cross-context entry point now agrees', () => {
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        a.execute_script('cfg = { a = 1 }');
+        const h = a.get_global_ref('cfg');
+        for (const attempt of [
+          () => b.release(h),
+          () => b.set_metatable(h, { __index: () => 1 }),
+          () => b.set_global('x', h),
+        ]) {
+          expect(attempt).toThrow(/belongs to a different Lua context/);
+        }
+      });
+
+      it('a handle names the reason it is unusable (CR-17 F3)', async () => {
+        // Two different facts shared one message. reset() and ~LuaContext both
+        // flip `alive_`, so a handle used after a reset that left the context
+        // demonstrably alive still reported "its context has been destroyed".
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('cfg = { a = 1 }');
+        const h = lua.get_global_ref('cfg');
+        const fn = lua.execute_script('return function() return 1 end');
+        lua.reset();
+        // The context is alive; only its state was replaced.
+        expect(lua.execute_script('return 1 + 1')).toBe(2);
+        expect(() => h.get('a')).toThrow(/state was replaced by reset/);
+        expect(() => h.get('a')).not.toThrow(/context has been destroyed/);
+        expect(() => fn()).toThrow(/state was replaced by reset/);
+
+        // The other branch of the same pair: the context really is gone.
+        let orphan: any;
+        (() => {
+          const tmp: any = new lua_native.init({}, ALL_LIBS);
+          tmp.execute_script('c = { a = 1 }');
+          orphan = tmp.get_global_ref('c');
+        })();
+        for (let i = 0; i < 4; i++) { (globalThis as any).gc?.(); await new Promise((r) => setImmediate(r)); }
+        // Only assert the wording when the wrapper actually got collected —
+        // otherwise the cell is vacuous, not passing.
+        try { orphan.get('a'); } catch (e: any) {
+          expect(e.message).toMatch(/context has been destroyed|state was replaced by reset/);
+        }
+      });
+
+      it('copying the data across contexts still works by value (the alternative)', () => {
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        a.execute_script('cfg = { host = "db1", port = 5432 }');
+        b.set_global('cfg', a.get_global('cfg'));
+        expect(b.execute_script('return cfg.host, cfg.port')).toEqual(['db1', 5432]);
       });
     });
   });

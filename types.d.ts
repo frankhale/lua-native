@@ -490,6 +490,14 @@ export interface LuaContext {
    * number), or if the path is malformed (a leading, trailing, or doubled dot).
    * A name with no dot sets a single global whose key may itself contain dots.
    *
+   * **Cross-context values.** A table handle, environment, coroutine or Lua
+   * function belonging to a *different* context is rejected — its registry
+   * index addresses an unrelated state. To copy data between contexts, read it
+   * by value first: `b.set_global('cfg', a.get_global('cfg'))` works, whereas
+   * passing `a.get_global_ref('cfg')` throws "table handle belongs to a
+   * different Lua context". Plain objects, including registered class instances
+   * and JS-created userdata, are deep-copied across as ordinary data.
+   *
    * @param name The name of the global variable, or a dotted path to a nested field
    * @param value The value to set (function, number, boolean, string, or object)
    */
@@ -1213,7 +1221,12 @@ export interface LuaContext {
    * Values that previously crossed into JavaScript (Lua functions, coroutines,
    * table references, opaque userdata) belong to the old state and are
    * invalidated: using one afterwards throws rather than reaching into the new
-   * state. The old state itself is kept alive until the last such wrapper is
+   * state, with a message that names *this* cause — "its Lua state was replaced
+   * by reset(); acquire a new handle" — as distinct from "its Lua context has
+   * been destroyed", which means the `LuaContext` itself was garbage-collected.
+   * A JavaScript `__gc` metamethod still fires during the reset, and a handle
+   * it receives for the object being finalized is already in the invalidated
+   * state: the object is mid-collection and will not exist a moment later. The old state itself is kept alive until the last such wrapper is
    * garbage-collected, so its memory is only reclaimed once they are gone —
    * `release()` them first to reclaim it immediately.
    *

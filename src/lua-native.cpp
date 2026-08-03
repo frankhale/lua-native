@@ -161,7 +161,8 @@ static std::optional<lua_core::LuaValue> ConvertBuiltinType(
 //    suspended execute_async, which a runtime->IsAsyncMode() check would miss.
 static bool RejectIfWorkerBusy(const Napi::Env env, const LuaTableRefData* data) {
   if (!data || !data->ContextLive() || !data->context) {
-    Napi::Error::New(env, "Lua table handle's context has been destroyed")
+    Napi::Error::New(env, std::string("Lua table handle is not usable: ") +
+                          data->liveness.DeadReason())
       .ThrowAsJavaScriptException();
     return true;
   }
@@ -612,7 +613,8 @@ static Napi::Value LuaFunctionCallbackStatic(const Napi::CallbackInfo& info) {
 
   auto* data = static_cast<LuaFunctionData*>(info.Data());
   if (!data || !data->runtime || !data->context || !data->ContextLive()) {
-    Napi::Error::New(env, "Lua function's context has been destroyed")
+    Napi::Error::New(env, std::string("Lua function is not usable: ") +
+                          data->liveness.DeadReason())
       .ThrowAsJavaScriptException();
     return env.Undefined();
   }
@@ -2051,7 +2053,8 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
   // create_environment, get_ref) and the External left the slot owned by
   // nobody (CR-9 F4).
   auto data = std::make_unique<LuaTableRefData>(
-    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this, alive_);
+    runtime, lua_core::LuaTableRef(registry_ref, runtime->RawState()), this,
+    Liveness());
 
   const Napi::Object handle = Napi::Object::New(env_);
 
@@ -4031,7 +4034,26 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
           }
           return lua_core::LuaValue::from(lua_core::LuaTableRef(data->tableRef));
         }
-        // Foreign marker: fall through to a plain deep copy.
+        // Foreign marker. Every other cross-context entry point refuses one —
+        // `release`, `resume`, `create_coroutine`, `execute_script_in` and
+        // `set_metatable` all throw "… belongs to a different Lua context" —
+        // and this site used to fall through to "a plain deep copy" instead.
+        //
+        // That policy is right for the two kinds it was written for. A class
+        // instance and a JS-created userdata are plain objects whose own
+        // enumerable properties *are* their data, so copying them across
+        // contexts copies the data (deferred-ledger M6 pins exactly that:
+        // `foreign.x, foreign.y` survive).
+        //
+        // A table handle is not a plain object. It is a **Proxy** whose own
+        // keys are its API, so the same deep copy produced a Lua table
+        // containing `get, get_ref, has, ipairs, length, pairs, release, set`
+        // as functions and none of the referenced table's fields — silently, and
+        // at ~1.5 KB of registered host callbacks per push (CR-17 F2). Refusing
+        // matches the five siblings and tells the caller the thing that is
+        // actually true; to copy the data across, pass `get_global(name)`
+        // rather than `get_global_ref(name)`.
+        throw std::runtime_error("table handle belongs to a different Lua context");
       }
 
       // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
@@ -4173,6 +4195,51 @@ Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
   return result;
 }
 
+// Pairs a registry ref with `runtime` only when the ref actually belongs to it,
+// and hands back an already-released copy when it does not.
+//
+// **Every registry-backed handle this file mints pairs a ref with a
+// `shared_ptr<LuaRuntime>`, and that pairing is the entire lifetime
+// guarantee**: the runtime — and so the `lua_State` whose registry the ref
+// indexes — cannot be destroyed while the handle lives. The pairing is written
+// as `LuaFunctionData(runtime, v, ...)` at four sites, where `runtime` is the
+// context's *current* member. That is right whenever the value came from the
+// current state, which is every path but one.
+//
+// The exception is `reset()`. It swaps the member first and destroys the
+// outgoing runtime as part of that statement, so `lua_close`'s `__gc`
+// finalizers dispatch into JS with `runtime` already pointing at the
+// replacement. A metatabled table reaching a JS `__gc` handler is converted
+// here, and the ref — an index in the *retiring* registry — was being paired
+// with the *replacement* runtime. Two consequences, both driven (CR-17 F1):
+// the handle's `luaL_unref` runs against a freed `lua_State` at teardown, and
+// while it is alive it reads and writes the replacement state's registry at the
+// retiring state's slot number, aliasing whatever the new state put there.
+//
+// Taking a share of the retiring runtime is not an option — it is inside its
+// own `shared_ptr` deleter, so its use count is already zero and no new share
+// can exist. The ref therefore *cannot* be made valid, and the only correct
+// handle is a dead one. Releasing our copy is the whole fix: the core still
+// holds its own share of the same slot and unrefs it, correctly, against the
+// live retiring state when the dispatch returns.
+//
+// A JS handler consequently sees a handle that reports "has been released",
+// which is the accurate answer rather than a fudge — the object it refers to is
+// mid-finalization and will not exist a moment later.
+//
+// The check is derived from the ref rather than from a flag a caller sets,
+// because the callers are not enumerable by inspection: `owner` was already
+// captured in two wrappers for exactly this hazard (CR-12 F4) and used only on
+// the error path, and any future bridge dispatching from a retiring state would
+// have had to remember to opt in. See `lua_core::detail::OwningRuntime`.
+template <typename RefT>
+RefT LuaContext::RefForThisRuntime(const RefT& ref) const {
+  if (ref.L && lua_core::detail::OwningRuntime(ref.L) == runtime.get()) return ref;
+  RefT dead = ref;
+  dead.release();  // drops only this copy's share; the core's own still unrefs
+  return dead;
+}
+
 Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
   return std::visit(
       [&](const auto& v) -> Napi::Value {
@@ -4212,7 +4279,8 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // N-API allocation that throws in between cannot leak it — the same
           // discipline CreateTableHandle and CreateCoroutineObject use
           // (CR-9 F4, swept to its remaining siblings by CR-11 F5).
-          auto data = std::make_unique<LuaFunctionData>(runtime, v, this, alive_);
+          auto data = std::make_unique<LuaFunctionData>(
+            runtime, RefForThisRuntime(v), this, Liveness());
           LuaFunctionData* dataPtr = data.get();
           const Napi::Function fn =
             Napi::Function::New(env, LuaFunctionCallbackStatic, "luaFunction", dataPtr);
@@ -4232,7 +4300,8 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
           // Return a coroutine object with the thread reference (data owned by the
           // External's finalizer).
           const lua_core::CoroutineStatus status = lua_core::LuaRuntime::GetCoroutineStatus(v);
-          return CreateCoroutineObject(std::make_unique<LuaThreadData>(runtime, v),
+          return CreateCoroutineObject(
+            std::make_unique<LuaThreadData>(runtime, RefForThisRuntime(v)),
             status == lua_core::CoroutineStatus::Suspended ? "suspended" :
             status == lua_core::CoroutineStatus::Running ? "running" : "dead");
         } else if constexpr (std::is_same_v<T, lua_core::LuaUserdataRef>) {
@@ -4247,7 +4316,7 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
             // Lua-created userdata - wrap as opaque handle for round-trip (data
             // owned by the External's finalizer; unique_ptr until then, see the
             // LuaFunctionRef branch above).
-            auto data = std::make_unique<LuaUserdataData>(runtime, v);
+            auto data = std::make_unique<LuaUserdataData>(runtime, RefForThisRuntime(v));
             Napi::Object handle = Napi::Object::New(env);
             const auto owner = NewTaggedExternal(env, data.get(), lua_tags::kUserdataData,
               [](Napi::Env, const LuaUserdataData* d) { delete d; });
@@ -4263,7 +4332,8 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
 
           // unique_ptr until the External's finalizer owns it, see the
           // LuaFunctionRef branch above (CR-11 F5).
-          auto data = std::make_unique<LuaTableRefData>(runtime, v, this, alive_);
+          auto data = std::make_unique<LuaTableRefData>(
+              runtime, RefForThisRuntime(v), this, Liveness());
           LuaTableRefData* dataPtr = data.get();
 
           // Store _tableRef as non-enumerable on target for round-trip detection
@@ -4326,12 +4396,12 @@ namespace {
   // nothing on the coroutine points back at the iterator, so there is no cycle.
   struct LuaCoroIterState {
     LuaContext* context = nullptr;
-    std::shared_ptr<std::atomic<bool>> contextAlive;
+    ContextLiveness liveness;
     Napi::ObjectReference coro;
     bool done = false;
 
     [[nodiscard]] bool ContextLive() const {
-      return context && contextAlive && contextAlive->load();
+      return context && liveness.HandlesLive();
     }
   };
 }
@@ -4348,7 +4418,9 @@ static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
   const Napi::Env env = info.Env();
   auto* state = static_cast<LuaCoroIterState*>(info.Data());
   if (!state || !state->ContextLive()) {
-    Napi::Error::New(env, "Lua coroutine's context has been destroyed")
+    Napi::Error::New(env, std::string("Lua coroutine is not usable: ") +
+                          (state ? state->liveness.DeadReason()
+                                 : "its Lua context has been destroyed"))
       .ThrowAsJavaScriptException();
     return env.Undefined();
   }
@@ -4436,7 +4508,9 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
   const Napi::Env env = info.Env();
   const auto* binding = static_cast<LuaContextBinding*>(info.Data());
   if (!binding || !binding->ContextLive()) {
-    Napi::Error::New(env, "Lua coroutine's context has been destroyed")
+    Napi::Error::New(env, std::string("Lua coroutine is not usable: ") +
+                          (binding ? binding->liveness.DeadReason()
+                                   : "its Lua context has been destroyed"))
       .ThrowAsJavaScriptException();
     return env.Undefined();
   }
@@ -4453,7 +4527,7 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
   auto state_owner = std::make_unique<LuaCoroIterState>();
   LuaCoroIterState* state = state_owner.get();
   state->context = binding->context;
-  state->contextAlive = binding->contextAlive;
+  state->liveness = binding->liveness;
   state->coro = Napi::Persistent(info.This().As<Napi::Object>());
 
   const Napi::Object iterator = Napi::Object::New(env);
@@ -4497,7 +4571,7 @@ Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> da
   (void)data.release();  // ownership transferred to the finalizer
   (void)coro.Set("status", Napi::String::New(env, status));
 
-  auto binding_owner = std::make_unique<LuaContextBinding>(LuaContextBinding{this, alive_});
+  auto binding_owner = std::make_unique<LuaContextBinding>(LuaContextBinding{this, Liveness()});
   LuaContextBinding* binding = binding_owner.get();
   const Napi::Function iterFn =
     Napi::Function::New(env, CoroSymbolIterator, "[Symbol.iterator]", binding);

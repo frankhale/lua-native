@@ -815,6 +815,17 @@ void LuaRuntime::UnrefOrDefer(int ref) {
 // header before LuaRuntime is complete). Resolves the runtime from the main
 // state's extra space so it can consult the deferral queue without reading the
 // registry or taking a Lua lock.
+// See the header. Mirrors MakeRegistryOwner's main-thread resolution so that
+// "the runtime this ref belongs to" is computed one way everywhere.
+LuaRuntime* detail::OwningRuntime(lua_State* L) {
+  if (!L) return nullptr;
+  lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+  lua_State* mainL = lua_tothread(L, -1);
+  lua_pop(L, 1);
+  if (!mainL) mainL = L;  // defensive, as in MakeRegistryOwner
+  return *static_cast<LuaRuntime**>(lua_getextraspace(mainL));
+}
+
 void detail::UnrefRegistrySlot(lua_State* mainL, int ref) {
   if (auto* runtime = *static_cast<LuaRuntime**>(lua_getextraspace(mainL))) {
     runtime->UnrefOrDefer(ref);

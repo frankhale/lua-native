@@ -200,6 +200,36 @@ inline constexpr Claim kExclusive =
 inline constexpr Claim kRetireState = kExclusive | Claim::Resetting;
 }  // namespace lua_occupancy
 
+// The two liveness facts a handle needs, carried together so a new handle kind
+// cannot pick up one and forget the other.
+//
+// They are **different questions with the same answer shape**, and collapsing
+// them is why every handle used to report "its context has been destroyed"
+// after a `reset()` that left the context demonstrably alive (CR-17 F3):
+//
+//   `handles` is `LuaContext::alive_`, which reset() flips to false and then
+//     re-mints. False means "the state this handle indexes was retired" — which
+//     happens on reset *and* on destruction.
+//   `context`  is `LuaContext::context_alive_`, which is never re-minted. False
+//     means the LuaContext object itself is gone.
+//
+// So `handles == false && context == true` is exactly "reset() replaced my
+// state", the case the single flag could not name. `DeadReason()` is the one
+// place that turns the pair into words, so the four message sites cannot drift
+// apart the way they did.
+struct ContextLiveness {
+  std::shared_ptr<std::atomic<bool>> handles;
+  std::shared_ptr<std::atomic<bool>> context;
+
+  [[nodiscard]] bool HandlesLive() const { return handles && handles->load(); }
+  [[nodiscard]] bool ContextObjectLive() const { return context && context->load(); }
+  [[nodiscard]] const char* DeadReason() const {
+    return ContextObjectLive()
+      ? "its Lua state was replaced by reset(); acquire a new handle"
+      : "its Lua context has been destroyed";
+  }
+};
+
 // A returned Lua-function/table handle keeps its LuaRuntime alive (via the
 // shared_ptr) but the LuaContext wrapper is an independent GC root that can be
 // collected first. `contextAlive` is a liveness flag shared with the context:
@@ -209,21 +239,21 @@ struct LuaFunctionData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
   lua_core::LuaFunctionRef funcRef;
   LuaContext* context;
-  std::shared_ptr<std::atomic<bool>> contextAlive;
+  ContextLiveness liveness;
 
   LuaFunctionData(std::shared_ptr<lua_core::LuaRuntime> rt,
                   lua_core::LuaFunctionRef ref,
                   LuaContext* ctx,
-                  std::shared_ptr<std::atomic<bool>> alive)
+                  ContextLiveness live)
     : runtime(std::move(rt)), funcRef(std::move(ref)), context(ctx),
-      contextAlive(std::move(alive)) {}
+      liveness(std::move(live)) {}
 
   ~LuaFunctionData() {
     funcRef.release();
   }
 
-  // True while the backing LuaContext is still alive and usable.
-  [[nodiscard]] bool ContextLive() const { return contextAlive && contextAlive->load(); }
+  // True while this handle's Lua state is still the context's current one.
+  [[nodiscard]] bool ContextLive() const { return liveness.HandlesLive(); }
 };
 
 struct LuaThreadData {
@@ -244,10 +274,10 @@ struct LuaThreadData {
 // invoked after its LuaContext was collected fails cleanly.
 struct LuaContextBinding {
   LuaContext* context;
-  std::shared_ptr<std::atomic<bool>> contextAlive;
+  ContextLiveness liveness;
 
   [[nodiscard]] bool ContextLive() const {
-    return context && contextAlive && contextAlive->load();
+    return context && liveness.HandlesLive();
   }
 };
 
@@ -268,21 +298,21 @@ struct LuaTableRefData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
   lua_core::LuaTableRef tableRef;
   LuaContext* context;
-  std::shared_ptr<std::atomic<bool>> contextAlive;
+  ContextLiveness liveness;
 
   LuaTableRefData(std::shared_ptr<lua_core::LuaRuntime> rt,
                   lua_core::LuaTableRef ref,
                   LuaContext* ctx,
-                  std::shared_ptr<std::atomic<bool>> alive)
+                  ContextLiveness live)
     : runtime(std::move(rt)), tableRef(std::move(ref)), context(ctx),
-      contextAlive(std::move(alive)) {}
+      liveness(std::move(live)) {}
 
   ~LuaTableRefData() {
     tableRef.release();
   }
 
-  // True while the backing LuaContext is still alive and usable.
-  [[nodiscard]] bool ContextLive() const { return contextAlive && contextAlive->load(); }
+  // True while this handle's Lua state is still the context's current one.
+  [[nodiscard]] bool ContextLive() const { return liveness.HandlesLive(); }
 };
 
 struct UserdataEntry {
@@ -745,6 +775,23 @@ private:
     // Only object-valued results are offered, mirroring how the JS->Lua
     // converters above skip primitives.
     std::vector<std::pair<Napi::FunctionReference, Napi::FunctionReference>> from_lua_converters_;
+
+    // The liveness pair every handle this context mints must carry. One place
+    // that assembles it, so the two flags cannot be paired up wrongly at a new
+    // mint site (see ContextLiveness for why there are two).
+    [[nodiscard]] ContextLiveness Liveness() const { return {alive_, context_alive_}; }
+
+    // Returns `ref` unchanged if it belongs to this context's current runtime,
+    // and an already-released copy of it otherwise. Every registry-backed
+    // handle minted below must pass its ref through this, because pairing a ref
+    // with a runtime that does not own it is a use-after-free at teardown and a
+    // cross-state registry aliasing bug while it lives (CR-17 F1). The one
+    // caller that produces foreign refs is `reset()`, whose swap makes the
+    // retiring state's `__gc` finalizers dispatch against the replacement.
+    // See the definition for why a valid pairing is impossible rather than
+    // merely missing.
+    template <typename RefT>
+    RefT RefForThisRuntime(const RefT& ref) const;
 
     // The built-in half of CoreToNapi. CoreToNapi is this plus the from-Lua
     // converter pass, and it is what every recursive call goes through, so a

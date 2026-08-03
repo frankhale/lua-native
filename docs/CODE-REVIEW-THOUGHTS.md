@@ -1071,3 +1071,144 @@ The open question for CR-17 is whether the same partition-and-exhaust treatment
 can be applied to the *lifetime* class — the remaining highs that are not about
 occupancy at all — where the axis is not "what does user JS do" but "in what
 order do these objects die".
+
+---
+
+## CODE-REVIEW-17 (August 3, 2026) — the lifetime axis, and the shift from crashing to lying
+
+CR-16 exhausted "what does user JS do while native code is on the stack" and
+named the axis it had not touched: *in what order do these objects die*. CR-17
+built that: an **orphan matrix** (13 handle kinds × 21 operations, with the
+`LuaContext` wrapper finalized first) and a **life matrix** (20 subjects × 15
+kill events). 68 exercised orphan cells and 300 life cells; four crashes, all one
+root cause.
+
+### The severity question, answered on character rather than count
+
+This document has asked since CR-2 whether the findings are changing character.
+CR-16 could only answer on *cost of discovery*. CR-17 can answer on the findings
+themselves, and the answer is clearer than the raw count suggests.
+
+There is still one high. But the three findings are: a pointer pairing whose
+worst symptom is **silently rewriting live data**; an API door that returns a
+**plausible wrong value**; and a diagnostic that **names the wrong cause**. Only
+the first is memory-safety, and even it was found through its corruption half
+rather than its crash half. Compare CR-9 through CR-15, where every high was "two
+threads in one `lua_State`" or "use-after-free of the state" — findings whose
+only symptom was a segfault.
+
+> **The failure mode this codebase produces has moved from crashing to lying.**
+> That is the normal progression for a maturing native binding, and it is the
+> shift the series was looking for — but it makes the *previous* method stop
+> working, because a crash announces itself and a wrong answer has to be asked
+> for.
+
+Concretely: every earlier high was discoverable by *running* something. F1's
+aliasing, F2's method-name table and F3's wrong message all execute successfully
+and return plausible values. Nothing finds them by execution. Both matrices
+therefore record the **value** of every cell, not just whether it threw — and F2
+came out of reading a column of *successes*.
+
+### A guarantee is only as good as the expression that names its object
+
+F1 is worth stating carefully because the mechanism was never broken.
+
+Every registry-backed handle pairs a ref with a `shared_ptr<LuaRuntime>`, and
+`CLAUDE.md` names that pairing as *the* lifetime guarantee. It is present at all
+four mint sites, correctly ordered, correctly documented. It never failed to hold
+a runtime alive. **It held the wrong one**, in exactly one window: `reset()`
+assigns the member and destroys the outgoing runtime inside that statement, so
+`lua_close`'s `__gc` finalizers dispatch with `runtime` already meaning the
+replacement. A handle minted there carries a ref index from the *retiring*
+registry and a share of the *replacement* runtime.
+
+Driven twice: a use-after-free at teardown (SIGSEGV 3/3, ASan naming both sides),
+and — far worse — five escaped handles aliasing five live tables of the
+replacement state **one-for-one and in order**, with a write through a retired
+handle landing in a table the program was using.
+
+> **A guarantee expressed as "hold a reference to X" is only as good as the
+> expression that computes X — and that expression is invisible to every review
+> that checks whether the reference is held.** Fourteen passes verified the
+> pairing existed. None asked what it was pairing with, because `runtime` reads
+> as a constant and is not one.
+
+### The fact was already captured, by a previous pass, in the same lambda
+
+`CreateJsCallbackWrapper` captures `owner = runtime.get()` and its comment says
+why: to tell `StageJsError` whether a raise is happening on the current state or
+"on a retired one whose finalizers are still running (CR-12 F4)". That is exactly
+the fact F1 needs. It is used at the bottom of the lambda. The argument-conversion
+loop that needed it is **fifteen lines above**.
+
+CR-16's lesson was that the analysis sat in a comment at a sibling function.
+CR-17's is one notch tighter: the *value* was in scope. Which is why the fix
+deliberately refused to extend the opt-in scheme:
+
+> **When a fact must be supplied by callers, the caller set is the maintenance
+> burden — and here it had already been shown incomplete once, by the very pass
+> that introduced it.** Deriving "which runtime owns this ref" *from the ref*
+> covers every conversion path, including the ones nobody enumerated. This is
+> CR-16 F4's "generative rather than a list", applied to data flow instead of to
+> policies.
+
+### A loose assertion is worse than no assertion
+
+Five tests sat directly on F3 — in a `describe` block named "handles minted
+before the reset", asserting on the message a handle gives after a reset — and
+matched `toThrow(/destroyed|released/)`. They passed with the wrong word for as
+long as the wrong word existed, and they will now assert `/replaced by reset/`.
+
+> **A regex that accepts every branch of a distinction is not a weak test of that
+> distinction; it is a test of something else, filed where a reader will believe
+> the distinction is covered.** The cost is not the missed bug — it is that the
+> block's name advertises coverage that its assertions do not provide, so nobody
+> looks again.
+
+The same shape produced F3 itself: `reset()` and `~LuaContext` both flip
+`alive_`, one flag serving two facts, one message serving both. The
+distinguishing flag (`context_alive_`, deliberately never re-minted) already
+existed and simply was not on the handles. Third pass running that this family —
+two distinct facts collapsed into one message — has produced a finding.
+
+### The harness nearly produced nothing, and that is the most useful lesson
+
+**The first orphan matrix was entirely vacuous and reported clean.** Every cell
+dropped the context, ran three GC cycles, used the handle and passed — while a
+sibling closure in the same function held the wrapper alive through V8's shared
+closure context. Nothing was ever collected. It looked exactly like a clean
+result and would have been written up as one: *"13 handle kinds × 21 operations,
+zero failures"*.
+
+What caught it was adding a `FinalizationRegistry` and making the harness prove
+the wrapper actually died before counting the cell — after which every vacuous
+cell announced itself and the matrix was rebuilt to escape only the handle.
+
+> **An exhaustive search that reports clean must first demonstrate it can report
+> dirty.** CR-12 established "I could not crash it is a statement about the
+> probe"; CR-15 added "re-read the reproductions that confirm you first". CR-17
+> gives the mechanical form: for a lifetime harness, prove the thing you are
+> killing actually died — and in general, **every negative result needs a
+> positive control shipped alongside it**, because a harness that cannot fail
+> and a system that cannot break produce identical output.
+
+A second, cheaper instance of the same idea in this pass: the orphan matrix
+reports 205 of its 273 cells as *not applicable* rather than folding them into
+the pass count. A denominator that quietly includes cells which never ran is the
+same lie as a vacuous cell, just easier to commit.
+
+### What remains
+
+The exception-escape class (CR-6 F1) is still the one hazard family with no
+mechanical search behind it — the sanitizers cannot see it and neither matrix
+addresses it, since its axis is "what does the C++ do when an exception crosses a
+Lua C frame". That is the natural CR-18 target, and the partition-and-exhaust
+recipe should transfer: enumerate the throw sites by grep, enumerate the Lua C
+frames they can unwind through, and assert survival per pair.
+
+The other open item is broader and less tractable: **both matrices check that
+nothing crashes and that errors are clean, but only F2 and F3 were found by
+checking that answers are *right*.** Now that the failure mode is lying rather
+than crashing, the next harness generation needs an oracle — for each cell, what
+value *should* this be — and that is a substantially harder thing to write than a
+survival check.

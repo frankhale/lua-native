@@ -30,6 +30,8 @@ using LuaTable = std::unordered_map<std::string, LuaPtr>;
 // always strings and `obj[1]` must address the array part).
 using TableKey = std::variant<std::string, int64_t, double>;
 
+class LuaRuntime;
+
 namespace detail {
 // Unrefs `ref` from mainL's registry, unless a worker thread is mid-run on that
 // state — in which case it defers the unref to a queue drained after the worker
@@ -51,6 +53,21 @@ void UnrefRegistrySlot(lua_State* mainL, int ref);
 // would leave the deleter dereferencing a freed lua_State. Resolve and capture
 // the main thread instead: it stays valid until lua_close. Refs stored on the
 // runtime itself must still be dropped before lua_close (see the destructor).
+// The LuaRuntime that owns the state a ref was taken on, or nullptr if it
+// cannot be determined. Resolves the main thread exactly the way
+// MakeRegistryOwner does and reads the same extraspace pointer
+// UnrefRegistrySlot reads, so all three agree on what "this ref's runtime"
+// means.
+//
+// **This is what lets a caller ask whether a ref belongs to the state it is
+// about to be paired with, without the caller knowing how it got there.** A
+// value can reach the binding from a runtime the context no longer holds — the
+// retiring state's __gc finalizers run *after* reset() has swapped the member —
+// and pairing such a ref with the current runtime aliases one state's registry
+// index into another's (CR-17 F1). Deriving the answer from the ref covers
+// every conversion path rather than the ones someone remembered to annotate.
+LuaRuntime* OwningRuntime(lua_State* L);
+
 inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   if (!L || ref == LUA_NOREF || ref == LUA_REFNIL) return nullptr;
   lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
