@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-lua-native is a native Node.js addon (N-API) that embeds Lua 5.5 (pre-release) into JavaScript/TypeScript applications. It enables bidirectional data exchange and function calls between Node.js and Lua. The module is an ES module (`type: "module"` in package.json).
+lua-native is a native Node.js addon (N-API) that embeds Lua 5.5 into JavaScript/TypeScript applications. It enables bidirectional data exchange and function calls between Node.js and Lua. The module is an ES module (`type: "module"` in package.json).
 
 ## Build & Test Commands
 

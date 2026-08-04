@@ -1626,6 +1626,82 @@ The result was a circularity: **to attach a metatable to a plain nested table fr
 
 ---
 
+## Sealed Sandbox Preset — `libraries: 'sandbox'` (August 2026)
+
+`'safe'` omits `io`, `os` and `debug` — exactly what it documents — but that is
+**not** a sandbox: `base` still carries `dofile`/`loadfile` and `package` still
+provides `require` with a writable `package.path`, so untrusted Lua can execute
+any readable `.lua` file on the host.
+
+`'sandbox'` is the sealed preset:
+
+```js
+const lua = new lua_native.init({}, {
+  libraries: 'sandbox',
+  maxMemory: 256 * 1024,
+  maxInstructions: 1_000_000,
+});
+```
+
+| | `'all'` | `'safe'` | `'sandbox'` |
+|---|---|---|---|
+| `io`, `os`, `debug` | ✅ | — | — |
+| `package` / `require` | ✅ | ✅ | — |
+| `dofile`, `loadfile` | ✅ | ✅ | — (cleared from `base`) |
+| bytecode loading | ✅ | ✅ | off by default |
+| `base`, `coroutine`, `table`, `string`, `math`, `utf8` | ✅ | ✅ | ✅ |
+
+`dofile` and `loadfile` are cleared after the libraries open, because they live
+in `base` and cannot be dropped by omitting a library without also losing
+`pairs`, `type` and `tostring`. `allowBytecode` defaults to `false` under this
+preset since `string.dump` + `load` would otherwise reach the bytecode loader;
+an explicit `allowBytecode: true` still wins. **The seal survives `reset()`** —
+it is part of the runtime config, not a constructor-only step.
+
+`'safe'` was deliberately not tightened in place: that would break every caller
+using `require` under it. See `LIMITATIONS.md` §1.
+
+---
+
+## Byte-Faithful Strings — `binaryStrings` (August 2026)
+
+Lua strings are **byte** strings; JavaScript strings are UTF-16. By default a
+string crossing out of Lua is decoded as UTF-8, so any byte sequence that is not
+valid UTF-8 comes back with U+FFFD in place of each bad byte:
+
+```js
+lua.execute_script('return string.pack("i4", -2)');
+// default        → "\uFFFD\uFFFD\uFFFD\uFFFD"   (bytes lost)
+```
+
+With `binaryStrings: true`, every Lua string is a `Uint8Array` of its exact
+bytes:
+
+```js
+const lua = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+lua.execute_script('return string.pack("i4", -2)');
+// → Uint8Array(4) [254, 255, 255, 255]
+new TextDecoder().decode(lua.execute_script('return "caf\\xC3\\xA9"'));  // 'café'
+```
+
+**Use it for** `string.pack`/`unpack`, compression, crypto, image data, or any
+binary protocol. The default path is fine for text and is unchanged.
+
+Notes:
+
+- **All-or-nothing per context.** Returning bytes only when the decode would
+  have been lossy would make the return type depend on the data — the failure
+  mode that is hardest to write correct code against. Either every string is
+  text or every string is bytes.
+- **Table keys are unaffected.** A JS property key is a string either way.
+- **Values round-trip.** A `Uint8Array` passed back into Lua was already
+  converted to a byte string, so `#b` and `string.byte(b, i)` see the original
+  bytes.
+- The default remains lossy and is ledgered as O1 in
+  `tools/diff-oracle/accepted.mjs`. See `LIMITATIONS.md` §2.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |

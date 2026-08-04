@@ -530,6 +530,28 @@ std::vector<std::string> LuaRuntime::SafeLibraries() {
   return {"base", "package", "coroutine", "table", "string", "math", "utf8"};
 }
 
+// `sandbox`: what `safe` is usually assumed to be.
+//
+// **`safe` is not a sandbox and was not changed into one.** It omits `io`, `os`
+// and `debug` — exactly what it documents — but keeps `package`, so `require`
+// works and `package.path` is writable from inside; and `base` carries `dofile`
+// and `loadfile`. Driven under `safe`, a script executes any readable `.lua`
+// file on the host. Tightening `safe` in place would silently break every
+// caller that uses `require` under it, so this is an additional preset rather
+// than a redefinition.
+//
+// Two halves, and both are needed — dropping `package` alone leaves `dofile`:
+//   * `package` is omitted here, which removes `require` and `package.path`;
+//   * `dofile` and `loadfile` are cleared from the globals by the constructor,
+//     because they live in `base` and cannot be omitted without losing
+//     `pairs`, `type`, `tostring` and the rest.
+//
+// The binding also defaults `allowBytecode` to false for this preset, since
+// `string.dump` + `load` would otherwise reach the bytecode loader.
+std::vector<std::string> LuaRuntime::SandboxLibraries() {
+  return {"base", "coroutine", "table", "string", "math", "utf8"};
+}
+
 std::string LuaRuntime::GetVersion() {
   return LUA_VERSION;
 }
@@ -567,6 +589,17 @@ LuaRuntime::LuaRuntime(const RuntimeConfig& config) : config_(config) {
   }
   if (!config.libraries.empty()) {
     luaL_openselectedlibs(L_, LibraryMask(config.libraries), 0);
+    // The second half of the `sandbox` preset (see SandboxLibraries): `dofile`
+    // and `loadfile` are filesystem doors that ship inside `base`, so they have
+    // to be removed after the library is opened rather than by omitting it.
+    // Keyed off the absence of `package` in an otherwise-base set, which is
+    // exactly what the preset produces.
+    if (config.seal_base_filesystem) {
+      lua_pushnil(L_);
+      lua_setglobal(L_, "dofile");
+      lua_pushnil(L_);
+      lua_setglobal(L_, "loadfile");
+    }
   }
   InitState();
 }

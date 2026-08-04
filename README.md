@@ -60,7 +60,7 @@ NOTE: Prebuilt binaries are currently available for macOS (Apple Silicon/arm64).
 Intel Mac and Windows users will need to build from source. Linux has not been
 tested.
 
-NOTE: The prebuilt binaries include Lua 5.5 (pre-release). If you need a
+NOTE: The prebuilt binaries include Lua 5.5.0. If you need a
 different Lua version, you will need to build from source.
 
 ## Building from Source

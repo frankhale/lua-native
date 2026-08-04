@@ -38,9 +38,15 @@ export const ACCEPTED_DIVERGENCES = [
       + 'trip as 8, with `blob == back` false. It is data-dependent, which is what '
       + 'makes it dangerous — `string.pack("i4", 7)` is all bytes below 0x80 and '
       + 'survives, so binary handling appears to work until a byte goes high. '
-      + 'Documented on execute_script in types.d.ts and pinned; carrying binary '
-      + 'faithfully would mean returning a Uint8Array for non-UTF-8 strings, '
-      + 'which is an API decision rather than a fix.',
+      + 'Documented on execute_script in types.d.ts and pinned. '
+      + 'RESOLVED as an option (August 4, 2026): `binaryStrings: true` returns '
+      + 'every Lua string as a Uint8Array of its raw bytes, which carries '
+      + 'binary faithfully. It stays off by default because flipping it would '
+      + 'change the return type for every existing caller, and it is all-or-'
+      + 'nothing per context rather than "bytes only when the decode is lossy" '
+      + '— a data-dependent return type is the defect class these reviews kept '
+      + 'finding. This ledger entry describes the DEFAULT path, which is '
+      + 'unchanged and still lossy; see docs/LIMITATIONS.md §2.',
   },
   {
     // O2.

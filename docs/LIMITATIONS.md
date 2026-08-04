@@ -37,37 +37,41 @@ load(string.dump(f))                          -> function   (unless allowBytecod
 `loadfile` on a non-Lua file returns `nil`, so the target must parse as Lua. But
 any readable `.lua` file on the host can be executed.
 
-### The workaround: seal it explicitly
-
-There is no missing API — the `libraries` array already expresses this. Omit
-`package`, disable bytecode, and clear the two base-library functions:
+### The fix: `libraries: 'sandbox'` (added August 4, 2026)
 
 ```js
 const lua = new lua_native.init({}, {
-  libraries: ['base', 'coroutine', 'table', 'string', 'math', 'utf8'],
-  allowBytecode: false,
+  libraries: 'sandbox',
   maxMemory: 256 * 1024,
   maxInstructions: 1_000_000,
 });
-lua.execute_script('dofile = nil loadfile = nil');
 ```
 
-Verified with that exact configuration:
+`'sandbox'` is `'safe'` minus `package`, with `dofile` and `loadfile` cleared
+from the globals — they live in `base`, so they cannot be removed by omitting a
+library — and `allowBytecode` defaulting to `false`, since `string.dump` +
+`load` would otherwise reach the bytecode loader. An explicit
+`allowBytecode: true` still wins. `base`, `coroutine`, `table`, `string`,
+`math` and `utf8` remain, so ordinary scripting is unaffected, and **the seal
+survives `reset()`**.
+
+Verified:
 
 ```
-dofile     -> blocked      require   -> blocked      io  -> nil
-loadfile   -> blocked      bytecode  -> blocked      os  -> nil
+dofile / loadfile / require / package  -> nil
+io / os / debug                        -> nil
+math.floor(3.7)..":"..("x"):rep(2)     -> 3:xx     (still works)
+load(string.dump(f))                   -> nil      (bytecode off by default)
 ```
+
+> **`'safe'` was not tightened in place**, deliberately: it would break every
+> caller that uses `require` under it. `'safe'` keeps its documented meaning
+> (all but `io`/`os`/`debug`) and its documented caveat.
 
 Omitting `libraries` entirely gives a **bare state** with no standard library at
 all, which is sealed by construction and is the right choice when the script
-needs nothing but arithmetic.
-
-> **Why a `'sandbox'` preset was not added.** It would duplicate what the array
-> form already does, and a preset that silently differs from `'safe'` by two
-> deleted globals is exactly the kind of thing that goes stale. Changing
-> `'safe'` itself was rejected for a different reason: it would break every
-> existing caller that uses `require` under it.
+needs nothing but arithmetic. An explicit array still works too, if you want a
+set `'sandbox'` does not give you.
 
 ---
 
@@ -94,17 +98,39 @@ JS round trip.
 **Affects:** `string.pack`/`unpack`, compression, crypto, image or protocol
 buffers, anything reading a binary file through Lua.
 
-**Workaround:** keep binary data on one side of the boundary, or encode it
-before crossing (`base64`, or `string.byte(s, 1, -1)` to get an array of
-numbers). Both cost a copy.
+**Without the option below**, the only workarounds are to keep binary data on
+one side of the boundary or encode it before crossing (`base64`, or
+`string.byte(s, 1, -1)` for an array of numbers) — both cost a copy, and the
+byte-array form costs a JS number per byte.
 
-**Status: an open API decision, not a bug.** Carrying binary faithfully means
-returning a `Uint8Array` for non-UTF-8 strings, which changes the return type of
-`execute_script` and every read path — a breaking change that needs a deliberate
-choice (a `binaryStrings` option, or a separate `get_global_bytes()`). It is
-ledgered as O1 in `tools/diff-oracle/accepted.mjs` and documented on
-`execute_script` in `types.d.ts`. **Nothing here is silently wrong; it is
-knowingly lossy.**
+### The fix: `binaryStrings: true` (added August 4, 2026)
+
+```js
+const lua = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+lua.execute_script('return string.pack("i4", -2)');   // → Uint8Array [254,255,255,255]
+```
+
+Every Lua string comes back as a `Uint8Array` of its exact bytes. Values
+round-trip (a `Uint8Array` passed back in was already a Lua byte string), and
+**table keys are unaffected** — a JS property key is a string either way. Text
+is decoded by the caller: `new TextDecoder().decode(bytes)`.
+
+**All-or-nothing per context, deliberately.** Returning bytes *only* when the
+decode would have been lossy is the obvious-looking design and is the one to
+avoid: it makes the return type depend on the data, which is precisely the
+defect class these reviews kept finding — code that looks correct until the
+input changes. Either every string is text or every string is bytes, and the
+caller knows which.
+
+**The default is unchanged and still lossy**, because flipping it would change
+the return type for every existing caller. That default is what the O1 entry in
+`tools/diff-oracle/accepted.mjs` describes, and it stays ledgered.
+
+**Why the converter registry was not used instead.** `register_from_lua_converter`
+deliberately does not fire for primitives — `CoreToNapi` says so and gives the
+reason (a JS call per number and string crossing out of Lua). Routing strings
+through it would have violated that rule *and* required data-dependent dispatch
+to deliver bytes at all.
 
 ---
 

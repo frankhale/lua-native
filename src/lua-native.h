@@ -355,8 +355,15 @@ public:
 
     explicit SharedTable(const Napi::CallbackInfo& info);
 
-    // Non-const despite only reading value_: InstanceMethod's callback type is a
-    // non-const member function pointer, and node-addon-api has no const overload.
+    // Non-const despite only reading value_: InstanceMethod's callback type is
+    // `Napi::Value (T::*)(const CallbackInfo&)` and node-addon-api declares no
+    // const-qualified variant, so `const` here breaks DefineSharedTable.
+    //
+    // **Expect a clang-tidy `readability-make-member-function-const` on Get's
+    // *definition*.** It is correct and unactionable; the definition carries a
+    // NOLINT saying so. The finding is reported in the .cpp while the reason
+    // lived only here, which is why this keeps getting retried — the note is
+    // now at both ends.
     Napi::Value Get(const Napi::CallbackInfo& info);
     Napi::Value Set(const Napi::CallbackInfo& info);
     Napi::Value Sync(const Napi::CallbackInfo& info);
@@ -1005,6 +1012,24 @@ private:
     // Mirrors runtime->SetAllowBytecode: the E3 guard is applied after
     // construction, so it isn't carried by RuntimeConfig.
     bool allow_bytecode_ = true;
+
+    // `binaryStrings`: return every Lua string as a Uint8Array of its raw bytes
+    // instead of decoding it as UTF-8 (LIMITATIONS.md §2).
+    //
+    // **Off by default and deliberately not data-dependent.** Lua strings are
+    // byte strings; JS strings are UTF-16, so a byte sequence that is not valid
+    // UTF-8 cannot survive the default decode and comes back with U+FFFD in
+    // place of each bad byte. The tempting fix — decode when it *is* valid UTF-8
+    // and hand back bytes when it is not — makes the return type depend on the
+    // data, which is the defect class this project's reviews kept finding (a
+    // value that looks right until the input changes). So this is a per-context
+    // switch: either every string is text, or every string is bytes, and the
+    // caller knows which.
+    //
+    // Table *keys* are unaffected — they are set with the std::string directly
+    // rather than through CoreToNapiBuiltin, and a JS property key has to be a
+    // string regardless.
+    bool binary_strings_ = false;
     // Search paths added via add_search_path, in the order they were added.
     std::vector<std::string> search_paths_;
     // Searcher functions added via add_searcher, in the order they were added.

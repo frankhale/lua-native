@@ -205,6 +205,10 @@ struct RuntimeConfig {
   size_t max_memory = 0;        // 0 = unlimited
   size_t max_instructions = 0;  // 0 = unlimited (VM instructions per execution)
   size_t timeout_ms = 0;        // 0 = no wall-clock timeout (per execution)
+  // Clear `dofile`/`loadfile` after opening the libraries. They live in `base`,
+  // so a caller who wants them gone cannot get there by omitting a library.
+  // Set by the `sandbox` preset; see SandboxLibraries.
+  bool seal_base_filesystem = false;
 };
 
 struct MetatableEntry {
@@ -292,6 +296,11 @@ public:
 
   static std::vector<std::string> AllLibraries();
   static std::vector<std::string> SafeLibraries();
+
+  // The library set for `libraries: 'sandbox'` — 'safe' minus `package`, and
+  // the constructor additionally clears `dofile`/`loadfile` from `base`. See
+  // the definition for why 'safe' could not simply be tightened.
+  static std::vector<std::string> SandboxLibraries();
 
   // The configuration this runtime was constructed from, kept verbatim so a
   // caller can build an identically-configured replacement state — the way the

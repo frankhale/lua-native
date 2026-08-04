@@ -116,7 +116,7 @@
     "binding: static LuaTableRefData* TableRefDataFrom(const Napi::Value& value);": "declaration",
     "binding: NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)": "macro-invocation",
     "binding: unattributed": 0,
-    "core: functions found": 139,
+    "core: functions found": 140,
     "core: unattributed": 0
   },
   "core-call-guarding": {

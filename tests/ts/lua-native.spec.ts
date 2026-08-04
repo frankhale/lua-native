@@ -2530,7 +2530,7 @@ describe('lua-native Node adapter', () => {
 
     it('throws on unknown preset string', () => {
       expect(() => new lua_native.init({}, { libraries: 'invalid' as any })).toThrow(
-        /libraries must be 'all', 'safe', or an array/
+        /libraries must be 'all', 'safe', 'sandbox', or an array/
       );
     });
 
@@ -10470,6 +10470,97 @@ describe('lua-native Node adapter', () => {
         lua.set_global('rows', [1, false, 3, 4]);
         expect(lua.execute_script('return #rows')).toBe(4);
       });
+    });
+  });
+
+  describe('binaryStrings — byte-faithful Lua strings (LIMITATIONS §2)', () => {
+    const BINARY = 'return "\\xFF\\xFE\\x41"';   // bytes FF FE 41
+
+    it('is lossy by default — the documented behaviour', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const s: string = lua.execute_script(BINARY);
+      expect([...s].map((c) => c.codePointAt(0))).toEqual([0xfffd, 0xfffd, 0x41]);
+    });
+
+    it('returns exact bytes when enabled', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+      const b = lua.execute_script(BINARY);
+      expect(b).toBeInstanceOf(Uint8Array);
+      expect([...b]).toEqual([255, 254, 65]);
+    });
+
+    it('round-trips: bytes out, bytes back in, same length and content', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+      const b = lua.execute_script(BINARY);
+      lua.set_global('b', b);
+      expect(lua.execute_script('return #b')).toBe(3);
+      expect(lua.execute_script('return string.byte(b, 1)')).toBe(255);
+      expect(lua.execute_script('return string.byte(b, 3)')).toBe(65);
+    });
+
+    it('string.pack survives, which it does not by default', () => {
+      // The motivating case: all-low-byte packs work either way, so the bug
+      // only shows on data with a high byte. Use a value that produces one.
+      const plain: any = new lua_native.init({}, ALL_LIBS);
+      const bin: any = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+      const script = 'return string.pack("i4", -2)';   // FE FF FF FF
+      expect([...bin.execute_script(script)]).toEqual([254, 255, 255, 255]);
+      // …and the default path cannot represent it.
+      expect([...(plain.execute_script(script) as string)]
+        .map((c) => c.codePointAt(0))).not.toEqual([254, 255, 255, 255]);
+    });
+
+    it('table keys stay strings; string values become bytes', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+      const t: any = lua.execute_script('return { alpha = "hi" }');
+      expect(Object.keys(t)).toEqual(['alpha']);          // key is still a string
+      expect(t.alpha).toBeInstanceOf(Uint8Array);
+      expect([...t.alpha]).toEqual([104, 105]);
+    });
+
+    it('valid UTF-8 is unaffected by default and still decodable when enabled', () => {
+      const plain: any = new lua_native.init({}, ALL_LIBS);
+      expect(plain.execute_script('return "caf\\xC3\\xA9"')).toBe('café');
+      const bin: any = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+      const b = bin.execute_script('return "caf\\xC3\\xA9"');
+      expect(new TextDecoder().decode(b)).toBe('café');
+    });
+  });
+
+  describe("libraries: 'sandbox' — the sealed preset (LIMITATIONS §1)", () => {
+    it('removes every filesystem door', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
+      for (const g of ['dofile', 'loadfile', 'require', 'package', 'io', 'os', 'debug']) {
+        expect(lua.execute_script(`return type(${g})`), g).toBe('nil');
+      }
+    });
+
+    it('leaves ordinary scripting intact — a sandbox nobody can use is useless', () => {
+      const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
+      expect(lua.execute_script('return math.floor(3.7) .. ":" .. ("x"):rep(2)')).toBe('3:xx');
+      expect(lua.execute_script('local t = {} for i = 1, 3 do t[i] = i * 2 end return table.concat(t, ",")'))
+        .toBe('2,4,6');
+      expect(lua.execute_script(
+        'local co = coroutine.create(function() coroutine.yield(7) end) local _, v = coroutine.resume(co) return v'))
+        .toBe(7);
+    });
+
+    it('defaults bytecode off, and an explicit allowBytecode:true still wins', () => {
+      const sealed: any = new lua_native.init({}, { libraries: 'sandbox' });
+      expect(sealed.execute_script(
+        'local f = load(string.dump(function() end)) return tostring(f)')).toBe('nil');
+      const opened: any = new lua_native.init({}, { libraries: 'sandbox', allowBytecode: true });
+      expect(opened.execute_script(
+        'local f = load(string.dump(function() end)) return type(f)')).toBe('function');
+    });
+
+    it('the seal survives reset()', () => {
+      // reset() rebuilds the runtime from its config; if the seal lived only in
+      // the constructor path it would silently come back unsealed.
+      const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
+      lua.reset();
+      expect(lua.execute_script('return type(dofile)')).toBe('nil');
+      expect(lua.execute_script('return type(require)')).toBe('nil');
     });
   });
 

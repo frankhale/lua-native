@@ -1500,8 +1500,10 @@ export type LuaLibrary =
  * - 'safe': Load all except io, os, and debug. **Not a sandbox for untrusted
  *   code** — `base` still provides `dofile`/`loadfile` and `package` provides
  *   `require`, so the filesystem is reachable. See docs/LIMITATIONS.md §1.
+ * - 'sandbox': 'safe' minus `package`, with `dofile`/`loadfile` cleared and
+ *   `allowBytecode` defaulting to false. Sealed against filesystem access.
  */
-export type LuaLibraryPreset = 'all' | 'safe';
+export type LuaLibraryPreset = 'all' | 'safe' | 'sandbox';
 
 /**
  * Options for configuring a new Lua context
@@ -1517,9 +1519,16 @@ export interface LuaInitOptions {
    *   `base` (which provides `dofile` and `loadfile`) and `package` (which
    *   provides `require`, with a writable `package.path`), so a script can
    *   execute any readable `.lua` file on the host. Driven and documented in
-   *   `docs/LIMITATIONS.md` §1, which also gives the sealed configuration:
-   *   pass an explicit array without `package`, set `allowBytecode: false`,
-   *   and clear the two base globals.
+   *   `docs/LIMITATIONS.md` §1. Use `'sandbox'` instead if you need a seal.
+   *
+   * - `'sandbox'` — **the sealed preset, for untrusted code.** `'safe'` minus
+   *   `package` (so no `require` and no `package.path`), with `dofile` and
+   *   `loadfile` cleared from the globals — they live in `base`, so they
+   *   cannot be removed by omitting a library — and `allowBytecode` defaulting
+   *   to `false`, since `string.dump` + `load` would otherwise reach the
+   *   bytecode loader. An explicit `allowBytecode: true` still wins.
+   *   `base`, `coroutine`, `table`, `string`, `math` and `utf8` remain, so
+   *   ordinary scripting is unaffected. The seal survives `reset()`.
    * - `LuaLibrary[]` — load specific libraries by name
    * - `[]` — bare state with no standard libraries
    *
@@ -1576,13 +1585,8 @@ export interface LuaInitOptions {
    * // Resource-limited, but NOT sealed — see docs/LIMITATIONS.md §1
    * { libraries: 'safe', maxMemory: 256 * 1024, maxInstructions: 1_000_000 }
    *
-   * // Actually sealed against untrusted code: no package (so no require),
-   * // no bytecode, and dofile/loadfile cleared after construction.
-   * const lua = new lua_native.init({}, {
-   *   libraries: ['base', 'coroutine', 'table', 'string', 'math', 'utf8'],
-   *   allowBytecode: false, maxMemory: 256 * 1024, maxInstructions: 1_000_000,
-   * });
-   * lua.execute_script('dofile = nil loadfile = nil');
+   * // Sealed against untrusted code
+   * { libraries: 'sandbox', maxMemory: 256 * 1024, maxInstructions: 1_000_000 }
    */
   maxInstructions?: number;
 
@@ -1636,6 +1640,34 @@ export interface LuaInitOptions {
    * rejected. Loading untrusted bytecode is unsafe, so disable it when running
    * untrusted scripts. Default: `true`.
    */
+  /**
+   * Return every Lua string as a `Uint8Array` of its raw bytes instead of
+   * decoding it as UTF-8. Default: false.
+   *
+   * Lua strings are **byte** strings; JavaScript strings are UTF-16. By
+   * default a string crossing out of Lua is decoded as UTF-8, so any byte
+   * sequence that is not valid UTF-8 comes back with U+FFFD in place of each
+   * bad byte — lossy, and *data-dependent*: `string.pack('i4', 7)` is all
+   * low bytes and survives, so binary handling looks correct until a byte
+   * goes above 0x7F. Turn this on for `string.pack`/`unpack`, compression,
+   * crypto, image data or any binary protocol.
+   *
+   * **All-or-nothing per context, deliberately.** Returning bytes only when
+   * the decode would have been lossy would make the return type depend on
+   * the data, which is far harder to write correct code against. With this
+   * on, every Lua string is a `Uint8Array` and text must be decoded by the
+   * caller (`new TextDecoder().decode(bytes)`).
+   *
+   * Table **keys** are unaffected — a JS property key is a string either
+   * way. Passing a `Uint8Array` back into Lua already produced a byte
+   * string, so values round-trip.
+   *
+   * @example
+   * const lua = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+   * const bytes = lua.execute_script('return string.pack("i4", 7)');
+   * // → Uint8Array(4) [7, 0, 0, 0]
+   */
+  binaryStrings?: boolean;
   allowBytecode?: boolean;
 
   /**

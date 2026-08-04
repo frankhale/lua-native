@@ -835,6 +835,14 @@ void SharedTable::Propagate(const Napi::Env env_) {
   }
 }
 
+// clang-tidy is right that this reads nothing but `value_` — and it cannot be
+// const anyway. `ObjectWrap::InstanceMethod` takes
+// `Napi::Value (T::*)(const CallbackInfo&)`; node-addon-api declares no
+// const-qualified variant, so adding `const` here stops the member-function
+// pointer matching any overload and DefineSharedTable fails to compile with
+// "no viable function" at the registration site, not here. Set() and Sync()
+// escape the warning only because they call the non-const Propagate().
+// NOLINTNEXTLINE(readability-make-member-function-const)
 Napi::Value SharedTable::Get(const Napi::CallbackInfo& info) {
   const Napi::Env env_ = info.Env();
   if (info.Length() < 1 || !info[0].IsString()) {
@@ -958,10 +966,14 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
   return exports;
 }
 
+// `sandbox_preset` is declared at constructor scope rather than beside the
+// other library locals because the `allowBytecode` default it feeds is parsed
+// in a later sibling block, not in the libraries block.
 LuaContext::LuaContext(const Napi::CallbackInfo& info)
   : ObjectWrap(info), env(info.Env()) {
 
   // Check for options (second argument)
+  bool sandbox_preset = false;
   if (info.Length() > 1 && info[1].IsObject()) {
     auto options = info[1].As<Napi::Object>();
 
@@ -969,8 +981,7 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     size_t max_memory = 0;
     bool has_max_memory = false;
     if (options.Has("maxMemory")) {
-      auto memVal = options.Get("maxMemory");
-      if (memVal.IsNumber()) {
+      if (auto memVal = options.Get("maxMemory"); memVal.IsNumber()) {
         double memNum = memVal.As<Napi::Number>().DoubleValue();
         if (memNum < 0) {
           Napi::RangeError::New(env, "maxMemory must be a non-negative number").ThrowAsJavaScriptException();
@@ -1025,6 +1036,10 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     // Parse libraries
     std::vector<std::string> libraries;
     bool has_libraries = false;
+    // Set by the 'sandbox' preset: clear dofile/loadfile after opening, and
+    // default allowBytecode to off. Both are part of what makes that preset
+    // sealed; see LuaRuntime::SandboxLibraries.
+    bool seal_base_filesystem = false;
     if (options.Has("libraries")) {
       auto libsVal = options.Get("libraries");
       if (libsVal.IsArray()) {
@@ -1044,25 +1059,36 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
           libraries = lua_core::LuaRuntime::AllLibraries();
         } else if (preset == "safe") {
           libraries = lua_core::LuaRuntime::SafeLibraries();
+        } else if (preset == "sandbox") {
+          // 'safe' minus `package`, plus the base-library seal and a bytecode
+          // default of off — the combination that is actually sealed against
+          // untrusted code. See LuaRuntime::SandboxLibraries.
+          libraries = lua_core::LuaRuntime::SandboxLibraries();
+          seal_base_filesystem = true;
+          sandbox_preset = true;
         } else {
-          Napi::TypeError::New(env, "libraries must be 'all', 'safe', or an array of library names").ThrowAsJavaScriptException();
+          Napi::TypeError::New(env, "libraries must be 'all', 'safe', 'sandbox', or an array of library names").ThrowAsJavaScriptException();
           return;
         }
         has_libraries = true;
       } else {
-        Napi::TypeError::New(env, "libraries must be 'all', 'safe', or an array of library names").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "libraries must be 'all', 'safe', 'sandbox', or an array of library names").ThrowAsJavaScriptException();
         return;
       }
     }
 
     // Create runtime with appropriate constructor
     try {
-      if (has_max_memory || has_max_instructions || has_timeout) {
+      // `seal_base_filesystem` lives on RuntimeConfig, so the sandbox preset
+      // must take the config path even with no limits set — the libraries-only
+      // constructor would silently drop the seal.
+      if (has_max_memory || has_max_instructions || has_timeout || seal_base_filesystem) {
         lua_core::RuntimeConfig config;
         config.libraries = std::move(libraries);
         config.max_memory = max_memory;
         config.max_instructions = max_instructions;
         config.timeout_ms = timeout_ms;
+        config.seal_base_filesystem = seal_base_filesystem;
         runtime = std::make_shared<lua_core::LuaRuntime>(config);
       } else if (has_libraries) {
         runtime = std::make_shared<lua_core::LuaRuntime>(libraries);
@@ -1096,10 +1122,22 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
   if (info.Length() > 1 && info[1].IsObject()) {
     auto options = info[1].As<Napi::Object>();
     try {
-      if (options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean() &&
-          !options.Get("allowBytecode").As<Napi::Boolean>().Value()) {
+      // `sandbox` defaults bytecode off — `string.dump` + `load` would
+      // otherwise reach the bytecode loader and undo the point of the preset.
+      // An explicit `allowBytecode: true` still wins, so the default is a
+      // default and not a lock.
+      const bool bytecode_explicit =
+        options.Has("allowBytecode") && options.Get("allowBytecode").IsBoolean();
+      const bool bytecode_wanted =
+        bytecode_explicit ? options.Get("allowBytecode").As<Napi::Boolean>().Value()
+                          : !sandbox_preset;
+      if (!bytecode_wanted) {
         allow_bytecode_ = false;
         runtime->SetAllowBytecode(false);  // E3
+      }
+      if (options.Has("binaryStrings") && options.Get("binaryStrings").IsBoolean() &&
+          options.Get("binaryStrings").As<Napi::Boolean>().Value()) {
+        binary_strings_ = true;
       }
       if (options.Has("print") && options.Get("print").IsFunction()) {
         InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
@@ -2369,6 +2407,7 @@ Napi::Value LuaContext::ExecuteScriptIn(const Napi::CallbackInfo& info) {
   return ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(res));
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& /*info*/) {
   // A worker thread mutates the allocator counter during async execution;
   // reading it concurrently would be a data race.
@@ -2384,6 +2423,7 @@ Napi::Value LuaContext::GetMemoryUsage(const Napi::CallbackInfo& /*info*/) {
 // `memoryKB` is `memoryBytes / 1024` rather than a second reading via
 // `gc('count')`: one source of truth means the two memory fields can never
 // disagree, and it keeps this consistent with `get_memory_usage()`.
+// NOLINTNEXTLINE(readability-make-member-function-const)
 Napi::Value LuaContext::Info(const Napi::CallbackInfo& /*info*/) {
   // Same reason as get_memory_usage: a worker thread mutates the allocator
   // counter during async execution, so reading it concurrently is a data race.
@@ -2979,6 +3019,7 @@ bool LuaContext::RejectIfBusy() const {
   return RejectIfOccupied(nullptr, lua_occupancy::kSyncApi);
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 Napi::Value LuaContext::IsBusyMethod(const Napi::CallbackInfo& /*info*/) {
   return Napi::Boolean::New(env, is_busy_.load());
 }
@@ -3405,6 +3446,7 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsFunction()) {
@@ -3437,6 +3479,7 @@ Napi::Value LuaContext::Pcall(const Napi::CallbackInfo& info) {
 // the registry slot on the next Lua GC cycle instead of waiting for the JS
 // wrapper to be garbage-collected. Double release is a safe no-op; using a
 // wrapper after release throws a clear "has been released" error.
+// NOLINTNEXTLINE(readability-make-member-function-const)
 Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1) {
@@ -4492,6 +4535,30 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
         } else if constexpr (std::is_same_v<T, double>) {
           return Napi::Number::New(env, v);
         } else if constexpr (std::is_same_v<T, std::string>) {
+          // Under `binaryStrings`, hand back the bytes Lua actually holds. The
+          // default path decodes as UTF-8, which replaces every byte of an
+          // invalid sequence with U+FFFD and is lossy for binary payloads
+          // (string.pack, compression, crypto, image data) — see the
+          // binary_strings_ comment in lua-native.h for why this is a switch
+          // rather than an automatic choice.
+          if (binary_strings_) {
+            auto bytes = Napi::Uint8Array::New(env, v.size());
+            if (!v.empty()) std::memcpy(bytes.Data(), v.data(), v.size());
+            // `{env, bytes}` and not `bytes`: this lambda returns Napi::Value,
+            // and Uint8Array is the one type it yields that carries state of
+            // its own over the base — `_type`, `_length` and `_data`, 24 bytes
+            // of cached typed-array info. Returning it directly slices those
+            // off (clang-tidy flags it), and while that is harmless here — the
+            // napi_env/napi_value pair that identifies the JS object lives in
+            // the base, so the value still arrives as a real Uint8Array — a
+            // silent slice is not worth leaving in place. Constructing the
+            // Value from the two scalars copies the handle instead of
+            // truncating an object. Same idiom as the two Buffer returns in
+            // Compile/CompileFile; the other branches here (Boolean, Number,
+            // BigInt, String, Array, Object, Function) add no members over
+            // Value, so `return x;` is exact for them.
+            return {env, bytes};
+          }
           return Napi::String::New(env, v);
         } else if constexpr (std::is_same_v<T, lua_core::LuaArray>) {
           Napi::Array arr = Napi::Array::New(env, v.size());
