@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <functional>
+#include <algorithm>
 
 // --- Built-in JS type conversion helpers (JS -> Lua) ---
 
@@ -4025,10 +4026,8 @@ static Napi::Object InitModule(const Napi::Env env, const Napi::Object exports) 
 NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)
 
 bool LuaContext::IsOnConversionPath(const Napi::Value& v) const {
-  for (const auto& seen : conversion_path_) {
-    if (seen.StrictEquals(v)) return true;
-  }
-  return false;
+  return std::any_of(conversion_path_.begin(), conversion_path_.end(),
+                     [&v](const auto& seen) { return seen.StrictEquals(v); });
 }
 
 lua_core::LuaValue LuaContext::NapiToCoreInstance(const Napi::Value& value, int depth) {
