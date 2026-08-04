@@ -8,7 +8,7 @@
 //
 // **Why this exists.** CODE-REVIEW-20 closed with the observation that three
 // boundaries had never been mechanically searched, and this instrument covers
-// the two cheap ones (CODE-REVIEW-NEXT-STEPS A3): the async surface
+// the two cheap ones (CODE-REVIEW-HISTORY A3): the async surface
 // end-to-end, and the bytecode round trip. The suite exercises all of these
 // doors heavily, but every one of those tests states its own expectation by
 // hand — nothing has ever checked that the alternate doors and the synchronous

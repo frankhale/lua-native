@@ -166,7 +166,7 @@ non-overlapping — neither substitutes for the other.
 
 ## How this fits the review trajectory
 
-`CODE-REVIEW-THOUGHTS.md` argued that convergence to "no significant issues"
+`CODE-REVIEW-HISTORY.md` (Part I) argued that convergence to "no significant issues"
 requires fixing **classes**, not **sites**, and backing that with mechanical
 enforcement so a class cannot silently regrow. This sanitizer work is the second
 half of that — the enforcement half — for the memory/UB classes specifically. The

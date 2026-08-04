@@ -526,7 +526,7 @@ entry points maintain, because before `reset()` existed nothing depended on
 those other twenty-eight maintaining it. A latent, low-severity hole became a
 use-after-free without anyone touching the code that contains it.
 
-So the lesson `CODE-REVIEW-THOUGHTS.md` records — *fix classes, not sites* —
+So the lesson `CODE-REVIEW-HISTORY.md` (Part I) records — *fix classes, not sites* —
 needs a second clause: **an unswept gap is not merely a known low-severity
 residual; it is a hazard whose severity is set by code that has not been
 written yet.** CR-8 F5 was correctly triaged as low *at the time*. The reason

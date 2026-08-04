@@ -4175,12 +4175,6 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
         // `set_metatable` all throw "… belongs to a different Lua context" —
         // and this site used to fall through to "a plain deep copy" instead.
         //
-        // That policy is right for the two kinds it was written for. A class
-        // instance and a JS-created userdata are plain objects whose own
-        // enumerable properties *are* their data, so copying them across
-        // contexts copies the data (deferred-ledger M6 pins exactly that:
-        // `foreign.x, foreign.y` survive).
-        //
         // A table handle is not a plain object. It is a **Proxy** whose own
         // keys are its API, so the same deep copy produced a Lua table
         // containing `get, get_ref, has, ipairs, length, pairs, release, set`
@@ -4192,20 +4186,77 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
         throw std::runtime_error("table handle belongs to a different Lua context");
       }
 
-      // Check if it's an opaque userdata handle (Lua-created, round-tripping through JS)
+      // A **Lua-created** userdata handle is refused across contexts, for the
+      // reason the table handle above is, and the distinction that decides it
+      // is *what the object's own properties are* (CR-22 F1):
+      //
+      //   Lua-created userdata (`io.open(...)` crossing to JS)
+      //       own props = ["_userdata"] — the marker, and nothing else. A deep
+      //       copy therefore yields an empty Lua table: a file handle silently
+      //       becomes `{}`. Same shape as the table-handle Proxy above, same
+      //       remedy.
+      //
+      //   JS-created userdata (`set_userdata('u', obj)`)
+      //       own props = the caller's own data, and `execute_script('return u')`
+      //       hands back **the identical JS object** — `back === obj` is true,
+      //       with no marker on it at all. It never reaches this branch, and it
+      //       must not: passing it to another context is passing a plain JS
+      //       object the caller already holds, so copying its fields is exactly
+      //       what passing any object does. `type()` going from `userdata` to
+      //       `table` is that object not being registered in the second
+      //       context, not a handle failing.
+      //
+      // That difference is why CR-22 F1's first draft was wrong and is worth
+      // keeping written down: it read the second case as an encapsulation
+      // break — "an opaque userdata becomes readable one context away" — when
+      // the reader was the object's own owner, who had it all along. The
+      // opacity contract is about what *Lua* can index in the owning state, and
+      // that still holds. Only the marker-carrying case is a handle, and only a
+      // handle can be stale.
       if (auto* data = TaggedData<LuaUserdataData>(obj.Get("_userdata"),
                                                    lua_tags::kUserdataData)) {
         if (data->runtime.get() == runtime.get()) {
           return lua_core::LuaValue::from(lua_core::LuaUserdataRef(data->userdataRef));
         }
+        throw std::runtime_error("userdata handle belongs to a different Lua context");
       }
+
+      // A coroutine object, for the same reason and found the same way — by the
+      // cross-context search built after the userdata case, which is the point
+      // of building it (CR-22 F2, then F1's class completed).
+      //
+      // Its own properties are `["_coroutine", "status"]`: one marker and one
+      // descriptive string. The deep copy therefore dropped the marker and
+      // produced `{ status = "suspended" }` — an object that looks like a
+      // coroutine, reports a status, and can do nothing. `resume` already
+      // refused a foreign thread ("coroutine belongs to a different Lua
+      // context"); the *value* path did not, so the two halves of the same
+      // question gave different answers.
+      //
+      // There is deliberately no same-runtime branch here. A coroutine is not a
+      // value Lua can hold as a `LuaValue` — `resume` is the only thing that
+      // consumes one, and it reads the marker directly — so within one context
+      // this object still deep-copies exactly as before, and only the foreign
+      // case changes.
+      if (auto* data = TaggedData<LuaThreadData>(obj.Get("_coroutine"),
+                                                 lua_tags::kThreadData)) {
+        if (data->runtime.get() != runtime.get()) {
+          throw std::runtime_error("coroutine belongs to a different Lua context");
+        }
+      }
+
+      // The class-instance marker below is the deliberate exception to that
+      // rule, and it stays one. A foreign instance carries **both** the markers
+      // and its own data (`["hidden", "__luaClassRef", …]`), so the deep copy
+      // moves the data across intact — which is what deferred-ledger M6 chose
+      // and pins (`foreign.x, foreign.y` survive, methods and metatable do
+      // not). Refusing it would reverse a decision that is documented, pinned,
+      // and — unlike the two cases above — actually delivers the data.
 
       // Check if it's a registered class instance round-tripping back to Lua.
       // Only honor the marker if it was minted by THIS context's runtime — the
       // ref_id is a bare integer, so an instance from another context could
-      // otherwise alias an unrelated slot in this js_userdata_. Foreign or
-      // invalid markers fall through to a plain deep copy (same policy as the
-      // _tableRef / _userdata markers above).
+      // otherwise alias an unrelated slot in this js_userdata_ (M6).
       //
       // The id is what makes "this runtime" mean this runtime. The pointer
       // comparison beside it is a second barrier, not the test: the `*Data`
@@ -4237,6 +4288,9 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
               /*is_proxy=*/false, cn.As<Napi::String>().Utf8Value()));
           }
         }
+        // A foreign class instance still deep-copies, and that is deliberate
+        // (M6), not an oversight — see the paragraph above the `_userdata`
+        // check for why this marker is the one exception to the refusal rule.
       }
     }
 

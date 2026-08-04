@@ -37,7 +37,7 @@ consequence is nil, one is a latent cross-generation state leak with no reachabl
 consumer, and one is a re-entrancy ordering wart. Two long-standing release-time
 deferrals were re-confirmed unchanged.
 
-`CODE-REVIEW-THOUGHTS.md` defines convergence as *"findings have collapsed to
+`CODE-REVIEW-HISTORY.md` (Part I) defines convergence as *"findings have collapsed to
 new-code and judgment calls, and no previously-identified class has
 reappeared."* This pass is the first that meets that definition on both halves,
 and the honest thing to do is say so rather than manufacture severity. The
@@ -408,7 +408,7 @@ Two caveats keep it from being a victory lap.
 
 **The first is that convergence was measured on a diff, not on a tree.** The
 window here was 926 lines of remediation, all written days ago with the prior
-reviews in hand. `CODE-REVIEW-THOUGHTS.md` predicted this shape — *"once the tree
+reviews in hand. `CODE-REVIEW-HISTORY.md` (Part I) predicted this shape — *"once the tree
 is clean, review the diff, not the whole tree"* — but it also warned what the
 prediction costs: **"few/no findings" is only meaningful if the baseline was
 genuinely clean, and CR-11 is the proof that a baseline can look clean for three

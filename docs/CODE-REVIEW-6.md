@@ -49,7 +49,7 @@ sibling-conversion leak at all five named entry points; the F5 reservation guard
 and single-read snapshot are correct; the CMake rewrite (F2/F3/F7) is a genuine
 improvement; the type-definition and test-suite fixes (F6, F9, F10) all verify.
 
-But the pattern `CODE-REVIEW-THOUGHTS.md` predicted has recurred one more time,
+But the pattern `CODE-REVIEW-HISTORY.md` (Part I) predicted has recurred one more time,
 and this time it is **high severity**. CR-5's F11 correctly identified that
 `RegisterClass` called a `RunProtected`-backed core method with no `try`/`catch`,
 so an OOM or a raising `_G.__newindex` unwound a `std::runtime_error` across the
@@ -181,7 +181,7 @@ are the same class, latent only because `_G` has no user metatable yet at
 construction — but still OOM-reachable under `maxMemory`). Then treat the class
 mechanically: every `RunProtected`-backed core call reachable from N-API must be
 inside a `try`/`catch`, and any new one added later is a review checklist item.
-The `ASan`/exhaustive-sweep discipline in `CODE-REVIEW-THOUGHTS.md` is the
+The `ASan`/exhaustive-sweep discipline in `CODE-REVIEW-HISTORY.md` (Part I) is the
 durable fix — a single test that arms a raising `_G.__newindex` and then invokes
 *every* binding method, asserting a catchable throw and process survival, would
 have caught F11's incompleteness and would catch the next instance.
@@ -248,7 +248,7 @@ Adversarial suspicions pursued against the new code and refuted:
 2. **F2** — add the table-driven H1-class regression across every binding entry
    point, so this class cannot silently regrow a site again.
 
-Then, per `CODE-REVIEW-THOUGHTS.md`, adopt the mechanical enforcement (a
+Then, per `CODE-REVIEW-HISTORY.md` (Part I), adopt the mechanical enforcement (a
 sanitizer build in CI and the exhaustive-sweep discipline) that turns "fix the
 site" into "the class can't come back" — the fourth recurrence of a known class,
 this time at high severity inside a fix that named the class, is the signal that

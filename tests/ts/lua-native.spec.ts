@@ -10473,6 +10473,91 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  describe('CODE-REVIEW-22 regressions', () => {
+    describe('F1: a Lua-created userdata handle is refused across contexts', () => {
+      // The distinction this finding turned on, and it is the whole point:
+      // a *Lua-created* userdata (io.open) crosses to JS as an object whose own
+      // properties are `["_userdata"]` — the marker and nothing else — so the
+      // deep copy it used to get produced an EMPTY table. A file handle became
+      // `{}` with no keys and no methods, silently. That is CR-17 F2's shape
+      // (a Proxy/marker object deep-copied into something plausible and wrong),
+      // so it gets CR-17 F2's remedy.
+      it('a Lua file handle pushed into another context is refused, not emptied', () => {
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        const f = a.execute_script('return io.open("/dev/null", "r")');
+        expect(Object.getOwnPropertyNames(f)).toEqual(['_userdata']);
+        expect(() => b.set_global('x', f))
+          .toThrow(/userdata handle belongs to a different Lua context/);
+      });
+
+      it('the same handle still round-trips within its OWN context', () => {
+        // The refusal must not break the legitimate case.
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const f = a.execute_script('return io.open("/dev/null", "r")');
+        a.set_global('back', f);
+        expect(a.execute_script('return type(back)')).toBe('userdata');
+      });
+
+      it('a JS-created userdata is NOT a handle and still crosses freely', () => {
+        // The half of CR-22 F1 that was wrong, pinned so it is not "fixed"
+        // later. `set_userdata` hands back the identical JS object with no
+        // marker, so passing it anywhere is passing a plain object the caller
+        // already owns — copying its fields is correct, not a leak.
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        const original = { n: 11 };
+        a.set_userdata('ud', original);
+        const back = a.execute_script('return ud');
+        expect(back).toBe(original);                       // the same object
+        expect(Object.getOwnPropertyNames(back)).toEqual(['n']);  // no marker
+        expect(() => b.set_global('x', back)).not.toThrow();
+        expect(b.execute_script('return type(x) .. ":" .. tostring(x.n)')).toBe('table:11');
+      });
+
+      it('a coroutine pushed into another context is refused, not flattened', () => {
+        // Found by the cross-context matrix built for F2, and it is F1's class
+        // completed: a coroutine object's own properties are
+        // `["_coroutine", "status"]`, so the deep copy dropped the marker and
+        // produced `{ status = "suspended" }` — a thing that looks like a
+        // coroutine, reports a status, and can do nothing. `resume` already
+        // refused a foreign thread; the value path did not.
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        const co = a.create_coroutine('return function() coroutine.yield(1) return 2 end');
+        expect(() => b.set_global('c', co))
+          .toThrow(/coroutine belongs to a different Lua context/);
+        // Still usable in its own context — the refusal must not break that.
+        expect(a.resume(co)).toEqual({ status: 'suspended', values: [1] });
+      });
+
+      it('a Lua function still bridges between contexts (not a handle)', () => {
+        // Deliberately NOT refused, and pinned so it is not "made uniform"
+        // later: a Lua function crosses to JS as a genuine JS callable, so the
+        // second context registering it as a host callback is correct — calling
+        // it runs the first context's Lua and returns the right answer.
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        const fn = a.execute_script('return function(x) return x + 1 end');
+        expect(() => b.set_global('f', fn)).not.toThrow();
+        expect(b.execute_script('return f(1)')).toBe(2);
+      });
+
+      it('a foreign class instance still deep-copies (M6 is deliberate)', () => {
+        // Pinned here too, next to the refusals, because the temptation is to
+        // make all four markers uniform. This one carries its data as well as
+        // its markers, so the copy delivers the data — which is what M6 chose.
+        const a: any = new lua_native.init({}, ALL_LIBS);
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        a.register_class('K', { construct: (v: any) => ({ hidden: v }), readable: true,
+          methods: { get: (s: any) => s.hidden } });
+        const inst = a.execute_script('return K.new(7)');
+        expect(() => b.set_global('x', inst)).not.toThrow();
+        expect(b.execute_script('return type(x) .. ":" .. tostring(x.hidden)')).toBe('table:7');
+      });
+    });
+  });
+
   describe('CODE-REVIEW-21 regressions', () => {
     describe('F2: the cycle check covers the recursing builtin containers', () => {
       // CR-20 F2 put the check below ConvertBuiltinType, so Map and Set —

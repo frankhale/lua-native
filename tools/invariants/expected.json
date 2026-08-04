@@ -99,12 +99,12 @@
   },
   "assertion-strength": {
     "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
-    "toThrow assertions examined": 362,
-    "negative (.not) — exempt by design": 29,
+    "toThrow assertions examined": 367,
+    "negative (.not) — exempt by design": 32,
     "BARE positive assertions": 0
   },
   "exception-surface": {
-    "throw sites (binding)": 23,
+    "throw sites (binding)": 25,
     "throw sites (core)": 28,
     "catch sites (binding)": 67,
     "catch sites (core)": 38,

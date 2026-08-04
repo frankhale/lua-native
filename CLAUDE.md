@@ -47,6 +47,12 @@ npm run roundtrip-matrix
 # Execution-door parity: async + bytecode doors vs execute_script (1339 cases x 3 doors)
 npm run exec-parity
 
+# Handle lifecycle across reset/GC (11 handle kinds x 8 events, 1 process/cell)
+npm run lifecycle-matrix
+
+# Two contexts exchanging values: handles refused, data intact, contexts independent
+npm run cross-context
+
 # Clean build artifacts
 npm run clean
 ```
@@ -71,9 +77,9 @@ preload mechanics, and the July 2026 stress-test results are in
 (a `std::runtime_error` reaching `std::terminate`, e.g. CR-6 F1) — that is now
 the job of `npm run exception-matrix`, the generated search for that class
 (`docs/CODE-REVIEW-18.md`), alongside the CODE-REVIEW-6 behavioral matrix in the
-suite. See also `docs/CODE-REVIEW-THOUGHTS.md`.
+suite. See also `docs/CODE-REVIEW-HISTORY.md` (Part I).
 
-**Correctness harnesses (`tools/`).** Five instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
+**Correctness harnesses (`tools/`).** Seven instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
 
 - `npm run check-invariants` — lists that used to live in comments (the
   `CallScope` classification, the `lua_next` traversal sites, the occupancy
@@ -98,8 +104,27 @@ suite. See also `docs/CODE-REVIEW-THOUGHTS.md`.
   execution door (`execute_script_async`, `execute_async`,
   `compile`→`load_bytecode`), compared against `execute_script` — values *and*
   error messages. See `docs/CODE-REVIEW-21.md`.
+- `npm run lifecycle-matrix` — 10 handle kinds held across `reset`, double
+  reset, re-alias, GC, churn and release, one process per cell. A handle must
+  stay valid or refuse; answering with another state's data is the defect it
+  looks for. See `docs/CODE-REVIEW-22.md`.
+- `npm run cross-context` — the context ↔ context boundary: a handle from one
+  context must be refused by another, a plain value must cross unchanged, and
+  neither context may observe the other. The boundary no earlier list contained
+  (CR-22 F2). See `docs/CODE-REVIEW-22.md`.
 
-All five follow the same conventions, and `tools/README.md` states them with the
+**The review programme is closed** (August 4, 2026). All seven boundaries have a
+generated search, the enumeration is derived from a stated criterion, and review
+is now **triggered by new surface rather than by the calendar**. Before adding a
+public entry point, a handle kind, a marker, an `ObjectWrap` subclass, a Lua C
+callback frame, or bumping Lua, read **`docs/CODE-REVIEW-NEXT-STEPS.md` §15** —
+§15.6 maps each of those to the instrument to extend, and §15.7 is the
+regression-run matrix. (`docs/CODE-REVIEW-HISTORY.md` is the reasoning trail for
+CR-17–22 — history, not instructions.) Four classes now fail closed on their own (a new tag, a
+new `ObjectWrap`, a new occupancy policy, a bare `.toThrow()`), so the check
+happens whether or not anyone remembers.
+
+All seven follow the same conventions, and `tools/README.md` states them with the
 reason each exists — chiefly: **an exhaustive search that reports clean must
 first demonstrate it can report dirty**, so each runs positive controls before
 its real work and refuses to proceed if they fail; each checks per-cell vacuity,
@@ -154,6 +179,8 @@ Lua objects that cross the C++ boundary (functions, coroutines, userdata, metata
 ## Documentation
 
 Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, `FUTURE.md`, `REQUIRE.md`, `USERDATA.md`, `USERDATA-METHOD-BINDING.md`. Consult these before implementing features on the roadmap.
+
+**`docs/README.md` is the index.** It says which documents are **live** (six) and which are **archive** (the 22 numbered review passes plus the merged history). Read it before citing or updating anything under `docs/` — the distinction is not inferable from filenames, and getting it wrong is how the programme's stale-marker defects happened.
 
 ## Conventions
 

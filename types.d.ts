@@ -66,6 +66,23 @@ export type LuaValue =
  *    and nested structures all cross exactly — verified by a round-trip matrix
  *    over every entry point (`tools/roundtrip-matrix/`), which also checks that all twelve
  *    entry points agree with each other.
+ *
+ * **Handles belong to the context that made them.** A *handle* — a table handle
+ * from {@link LuaContext.get_global_ref} or {@link LuaContext.create_table}, a
+ * Lua function, a coroutine, or a Lua-created userdata such as a file object —
+ * is a reference into one `lua_State`. Passing one into a **different** context,
+ * or back into a context that has since been {@link LuaContext.reset}, throws
+ * `"... belongs to a different Lua context"`. It is refused rather than copied
+ * because these objects carry a marker and no data: copying one silently
+ * produced an empty table or a table of the handle's own API methods, which is
+ * a plausible value and the wrong one. To move the *data*, read it out first
+ * (`get_global(name)` rather than `get_global_ref(name)`).
+ *
+ * Two things that are deliberately **not** handles and cross freely:
+ * an object registered with {@link LuaContext.set_userdata} — the binding hands
+ * back the identical JS object, so it is yours and passing it anywhere copies
+ * its fields like any other object — and a registered-class instance, whose
+ * data crosses intact while its methods and metatable do not.
  */
 export type LuaInput =
   | LuaValue

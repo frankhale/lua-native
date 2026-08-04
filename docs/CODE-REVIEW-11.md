@@ -88,7 +88,7 @@ races, with the explicit unbind as belt-and-braces rather than as the mechanism.
 The findings below are not about the remediation being wrong. They are about
 **three different fixes from three different reviews each having been applied to
 the sites that review happened to name, and the class having been left open.**
-That is the thesis `CODE-REVIEW-THOUGHTS.md` opened with, and this pass is the
+That is the thesis `CODE-REVIEW-HISTORY.md` (Part I) opened with, and this pass is the
 first to find it in all three of its forms at once:
 
 - **A fix that was applied, then undone.** CR-2 deliberately rewrote two

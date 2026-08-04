@@ -296,7 +296,7 @@ it was deleted for a specific reason: an eagerly-computed claim set reads
 writing them, which is the ten-race TSan report CR-15 documents at length. So
 the instruction at the extension point is: *do the thing we removed because it
 was a data race.* The reason it was removed is recorded — in `CODE-REVIEW-15.md`
-and in `CODE-REVIEW-THOUGHTS.md`, and at `RejectIfOccupied`'s definition. It is
+and in `CODE-REVIEW-HISTORY.md` (Part I), and at `RejectIfOccupied`'s definition. It is
 not recorded where somebody would act on it.
 
 The other two: `lua-native.h:569` and `lua-native.cpp:3507` both send the reader

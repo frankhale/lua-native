@@ -455,7 +455,7 @@ from this list.)
 
 ## Note on the trajectory
 
-CR-9's addendum to `CODE-REVIEW-THOUGHTS.md` drew the right lesson and the
+CR-9's addendum to `CODE-REVIEW-HISTORY.md` (Part I) drew the right lesson and the
 remediation acted on it properly: the fix relocated an invariant into the core
 rather than adding guards at the sites a review happened to name. That is the
 first structural fix in this series, and it works — F1 does not report a single

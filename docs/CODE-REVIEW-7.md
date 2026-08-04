@@ -392,7 +392,7 @@ the async subsystem, at high severity, in code every prior pass read. The
 matrix-and-sanitizer strategy works exactly as far as it is driven: the ASan
 harness reported F1 flawlessly *once a reproduction exercised the path*, while
 454 green tests under the same harness said nothing. The durable lesson matches
-`CODE-REVIEW-THOUGHTS.md`: each lifetime-bearing crossing (today: function
+`CODE-REVIEW-HISTORY.md` (Part I): each lifetime-bearing crossing (today: function
 handles, table handles, workers, await cookies) needs both the liveness
 convention *and* an adversarial teardown test — created-then-killed-then-used —
 in the suite the sanitizers run. F1's test is the template; the crossing

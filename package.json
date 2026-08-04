@@ -42,6 +42,8 @@
     "exception-matrix": "node tools/exception-matrix/run.mjs",
     "roundtrip-matrix": "node tools/roundtrip-matrix/run.mjs",
     "exec-parity": "node tools/exec-parity/run.mjs",
+    "lifecycle-matrix": "node tools/lifecycle-matrix/run.mjs",
+    "cross-context": "node tools/cross-context/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib"
   },

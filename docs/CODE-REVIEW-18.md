@@ -2,7 +2,7 @@
 
 **Date:** August 3, 2026
 **Scope:** Eighteenth pass, against commit `8b9bfbd` — the CR-17 remediation —
-executing the programme `docs/CODE-REVIEW-NEXT-STEPS.md` set out, minus §3
+executing the programme `docs/CODE-REVIEW-HISTORY.md` set out, minus §3
 (cross-platform verification and CI), which is deferred by decision: this stays
 a macOS/arm64 project for now, so CR-18 leads as that document says it should.
 
@@ -232,7 +232,7 @@ un-released handle keeps alive. Pinned.
 
 ## §4 — the comment-enforced invariants, mechanized
 
-`CODE-REVIEW-NEXT-STEPS.md` called this "the only intervention in seventeen
+`CODE-REVIEW-HISTORY.md` called this "the only intervention in seventeen
 passes that has demonstrably stopped a class from recurring". It is done, and
 the three named candidates were all found to have drifted again in the interval:
 
@@ -289,7 +289,7 @@ name.
 
 ## §5 — the differential oracle
 
-The strategic gap `CODE-REVIEW-NEXT-STEPS.md` identified: **no harness checks
+The strategic gap `CODE-REVIEW-HISTORY.md` identified: **no harness checks
 whether an answer is right.** Three matrices and 850 tests check that nothing
 crashed and that errors are clean. That was adequate while every finding
 announced itself with a segfault, and stopped being adequate at CR-17.
@@ -370,7 +370,7 @@ Verified by re-running each item's generator rather than by reading its list.
 | F1 | ✅ Correct. `lua_core::detail::OwningRuntime` and `LuaContext::RefForThisRuntime` are in place and all four mint sites in `CoreToNapiBuiltin` pass their ref through it. The CR-18 matrix drove `reset_then_throw` at all 27 frames — including `gc_finalizer_at_close`, which is F1's exact window — with no abort and no aliasing. |
 | F2 | ✅ Correct. `set_global` refuses a foreign table handle; the deep-copy policy for class instances and JS-created userdata is unchanged and its pin still passes. |
 | F3 | ✅ Correct. The `ContextLiveness` pair and single `DeadReason()` are in place; the five tightened assertions still read `/replaced by reset/`. |
-| Release deferrals | Unchanged, as decided. `MACOSX_DEPLOYMENT_TARGET` is still `"26.0"` and `prebuilds/` still contains `darwin-arm64` only. §3 of `CODE-REVIEW-NEXT-STEPS.md` is deferred by decision — macOS/arm64 only for now. |
+| Release deferrals | Unchanged, as decided. `MACOSX_DEPLOYMENT_TARGET` is still `"26.0"` and `prebuilds/` still contains `darwin-arm64` only. §3 of `CODE-REVIEW-HISTORY.md` is deferred by decision — macOS/arm64 only for now. **(Superseded: closed as out of scope, `CODE-REVIEW-NEXT-STEPS.md` §14.)** |
 
 ---
 

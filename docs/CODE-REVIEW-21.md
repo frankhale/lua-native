@@ -2,7 +2,7 @@
 
 **Date:** August 4, 2026
 **Scope:** Twenty-first pass. Primary target: **the first two of the three
-boundaries CODE-REVIEW-NEXT-STEPS A3 lists as never mechanically searched** —
+boundaries CODE-REVIEW-HISTORY A3 lists as never mechanically searched** —
 the async surface end-to-end (`execute_script_async`, `execute_async`) and the
 bytecode round trip (`compile` → `load_bytecode`) — plus verification of the
 CR-20 remediation commits and an audit of the open programme items (A1, A2,
@@ -404,7 +404,7 @@ boundaries; this pass searched two (async, bytecode) and both came back clean
 apart from F1's single root cause. What remains is the userdata/class-object
 lifecycle across `reset` and GC — the medium-cost one, closest in shape to
 CR-17's lifetime matrices. When that instrument exists and runs clean, the
-enumeration CODE-REVIEW-NEXT-STEPS §10 requires can be recorded as complete,
+enumeration CODE-REVIEW-HISTORY §10 requires can be recorded as complete,
 and "nothing serious" starts being a statement about the code rather than
 about coverage.
 

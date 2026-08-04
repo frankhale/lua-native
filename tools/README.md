@@ -19,6 +19,8 @@ tools/
   diff-oracle/            does lua-native agree with stock Lua?
   roundtrip-matrix/       does a JS value survive the crossing into Lua and back?
   exec-parity/            do the async and bytecode doors agree with execute_script?
+  lifecycle-matrix/       what happens to a handle held across reset / GC?
+  cross-context/          what happens when two contexts exchange values?
 ```
 
 | Harness | Run | What it searches | Docs |
@@ -28,6 +30,8 @@ tools/
 | **diff-oracle** | `npm run oracle` | 2678 cases against stock Lua 5.5: does the embedded VM behave like the reference (mode A), and do values coming *out* survive (mode B) | `docs/DIFFERENTIAL-ORACLE.md` |
 | **roundtrip-matrix** | `npm run roundtrip-matrix` | 12 entry points × 50 values: does a value survive the crossing *in*, and do all twelve doors agree with each other | `docs/CODE-REVIEW-20.md` |
 | **exec-parity** | `npm run exec-parity` | 1339 corpus cases × 3 doors: do `execute_script_async`, `execute_async` and `compile`→`load_bytecode` agree with `execute_script` — values *and* error messages | `docs/CODE-REVIEW-21.md` |
+| **cross-context** | `npm run cross-context` | Two contexts in one process: handles are refused, data crosses intact, contexts stay independent. The boundary CR-22 F2 found missing from every earlier list — where CR-20 F5 and CR-22 F1 both live | `docs/CODE-REVIEW-22.md` |
+| **lifecycle-matrix** | `npm run lifecycle-matrix` | 10 handle kinds × lifecycle events (reset, double reset, re-alias, GC, churn, release, double release), one process per cell: a handle must stay valid or refuse — never answer with another state's data | `docs/CODE-REVIEW-22.md` |
 
 ## Conventions every harness follows
 
@@ -36,7 +40,7 @@ that reported clean while measuring nothing.
 
 - **Positive controls run first, and the harness refuses to proceed if they
   fail.** An exhaustive search that reports clean must first demonstrate it can
-  report dirty (CR-17). Three of the four have caught a real vacuity in
+  report dirty (CR-17). Four of the six have caught a real vacuity in
   themselves this way.
 - **Per-cell vacuity checks, not just per-run.** The run-level controls pass
   while an individual cell measures nothing — two frames of the exception matrix
@@ -52,6 +56,26 @@ that reported clean while measuring nothing.
 - **Report the value, not just survival.** A swallowed error and a correct
   result are the same row unless the cell checks what actually happened
   (CR-17/CR-18).
+- **A search that reports *dirty* must show the dirt is in the subject.** The
+  converse of the control rule, and it cost more than the original: the
+  lifecycle matrix's first three drafts produced seven findings and every one
+  was the harness misreading its own probe — a registry key count read as a
+  live-reference count (twice, in different ways) and a mis-typed API silently
+  producing vacuous cells. All three drafts had passing positive controls at the
+  time, because a control proves an instrument *can* fire, not that what made it
+  fire was real. Drive every reported finding to a hand-run reproduction before
+  believing it, and keep the reproduction — it is what the review writes up
+  (CR-22).
+- **…and then check that the thing you think is a handle *is* one.** The second
+  half, learned the same day at the cost of an eighth false finding. CR-22 F1
+  reproduced perfectly — an "opaque" userdata really did read as a plain table
+  in a second context — and was still wrong, because `set_userdata` returns the
+  caller's *own JS object* with no marker on it, so nothing had been lost and no
+  handle had failed. A reproduction proves a behaviour; it does not prove the
+  behaviour is a defect. Before concluding that a value was degraded, look at
+  what it actually carries (`Object.getOwnPropertyNames`) and at whether the
+  behaviour is already someone's deliberate, pinned decision — CR-22's first
+  fix draft would have reversed deferred-ledger M6 without noticing.
 
 ## Re-freezing the invariants
 
@@ -72,5 +96,5 @@ The differential oracle needs stock Lua from the same vcpkg port that supplies
 vcpkg install lua[tools]
 ```
 
-Nothing else here needs anything the addon build does not already need. All four
+Nothing else here needs anything the addon build does not already need. All seven
 expect a current `npm run build-debug`.

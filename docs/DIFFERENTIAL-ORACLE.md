@@ -1,6 +1,6 @@
 # The differential oracle
 
-**Added:** August 3, 2026 (CODE-REVIEW-18, §5 of `CODE-REVIEW-NEXT-STEPS.md`)
+**Added:** August 3, 2026 (CODE-REVIEW-18, §5 of `CODE-REVIEW-HISTORY.md`)
 
 ```bash
 npm run oracle              # the whole corpus, both modes
