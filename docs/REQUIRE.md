@@ -821,7 +821,7 @@ Add a new section for Module / Require Integration following the existing format
 - Architecture details (core layer methods, N-API layer methods)
 - Design decisions (why `package.loaded` for JS modules, why `?` placeholder validation)
 
-#### `docs/FUTURE.md`
+#### `docs/FEATURE-HISTORY.md`
 
 Mark the "Module / Require Integration" section as completed, consistent with how "File Execution" and "Selective Standard Library Loading" are marked.
 
@@ -842,7 +842,7 @@ Already covered in Phase 3.
 | `types.d.ts` | Add `add_search_path` and `register_module` to `LuaContext` interface |
 | `tests/ts/lua-native.spec.ts` | Add module/require test section (~15-20 test cases) |
 | `docs/FEATURES.md` | Add Module / Require Integration section |
-| `docs/FUTURE.md` | Mark section as completed |
+| `docs/FEATURE-HISTORY.md` | Mark section as completed |
 
 ---
 
@@ -852,7 +852,7 @@ Already covered in Phase 3.
 2. **N-API layer methods** — `AddSearchPath`, `RegisterModule`, register in `Init`
 3. **TypeScript types** — Add declarations to `types.d.ts`
 4. **Tests** — Add test section with all test cases
-5. **Documentation** — Update `FEATURES.md` and `FUTURE.md`
+5. **Documentation** — Update `FEATURES.md` and `FEATURE-HISTORY.md`
 
 Each step can be validated independently:
 - After step 1: C++ unit tests (if available) can exercise the core methods directly

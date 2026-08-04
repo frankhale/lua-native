@@ -1,9 +1,21 @@
-# CODE-REVIEW-DEFERRED
+# CODE-REVIEW-LEDGER
 
-Consolidated tracker for findings across **all code reviews (CODE-REVIEW-1
-through CODE-REVIEW-14)** that were **deferred, only partially resolved,
-deliberately not applied, or resolved by documentation** — the standing
-backlog the reviews' priority lists point at. Items are grouped by their source
+**A disposition ledger, not a backlog.** Was `CODE-REVIEW-DEFERRED.md`; renamed
+August 4, 2026 because "deferred" reads as *still open, revisit next pass* —
+the exact word `CORRECTNESS.md` §14 identifies as the reason a closed question
+kept regenerating. Most entries here are marked ✅ RESOLVED.
+
+> **Scope and staleness, stated plainly:** this covers **CODE-REVIEW-1 through
+> CODE-REVIEW-14** and was last audited July 22, 2026, against the tree at the
+> CR-8 remediation. It does **not** cover CR-15 through CR-22. It is kept
+> because individual entries (notably M6) are cited from source comments as the
+> record of a deliberate decision — not because it is a current view of
+> anything. For the current position see `CORRECTNESS.md` §15.
+
+Consolidated tracker for findings across **CODE-REVIEW-1 through
+CODE-REVIEW-14** that were **deferred, only partially resolved, deliberately
+not applied, or resolved by documentation** — what the reviews' priority lists
+pointed at. Items are grouped by their source
 review and tagged with the original finding ID so they can be traced back.
 Severity labels are carried over from the originating review.
 
@@ -569,7 +581,7 @@ What remains, in the order it should be acted on:
 
 - **Execution Time Limits (`maxInstructions`)** — ✅ **fully complete (A3b
   closed).** The tier-1 `lua_sethook` / `LUA_MASKCOUNT` count-hook from
-  `FUTURE.md` (gap **A3b**) is implemented. A
+  `FEATURE-HISTORY.md` (gap **A3b**) is implemented. A
   per-execution VM-instruction budget aborts runaway scripts with
   `"instruction limit exceeded"`; the budget is reset per execution call at every
   entry point (`ProtectedCall`, `ResumeCoroutine`, `ResumeAsyncStep`), the hook

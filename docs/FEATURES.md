@@ -1,5 +1,9 @@
 # Feature Implementation Details
 
+> **What this does *not* do** — the sandbox's actual reach, binary-string
+> fidelity, and the documented conversion losses — is
+> [`LIMITATIONS.md`](LIMITATIONS.md), verified August 4, 2026.
+
 This document describes every feature in lua-native with architecture details and design decisions. The codebase is organized into two layers: a pure C++ Lua runtime wrapper (`src/core/lua-runtime.h/cpp`) and an N-API binding layer (`src/lua-native.h/cpp`) that bridges the runtime to Node.js.
 
 ---
@@ -1110,7 +1114,7 @@ allocating operations elsewhere in the core it needs no `RunProtected` frame.
 
 ### Lua 5.5 specifics
 
-The plan in `FUTURE.md` was written against 5.4's `lua_gc`. In 5.5:
+The plan in `FEATURE-HISTORY.md` was written against 5.4's `lua_gc`. In 5.5:
 
 - `LUA_GCSTEP` takes a `size_t` vararg (bytes to treat as newly allocated; 0 =
   one basic step) and returns whether the step finished a cycle.
@@ -1234,7 +1238,7 @@ state's extra space — a use-after-free on a closed state). With no outstanding
 handles, the old runtime is destroyed synchronously inside `reset()`, which is
 the common case and the one the feature exists for.
 
-This is why the FUTURE.md sketch's `LuaRuntime::Reset()` (close + recreate
+This is why the FEATURE-HISTORY.md sketch's `LuaRuntime::Reset()` (close + recreate
 in place) was **not** implemented: it would hand every ref-holding wrapper a
 dangling state with no way to detect it.
 
@@ -1437,7 +1441,7 @@ Lua states cannot share memory — two `lua_State*`s have no common heap, and th
 ## Interop Completeness (July 2026)
 
 The five items below closed the last of the interop gaps tracked in
-`BRIDGE-GAP-ANALYSIS.md`. They are small and independent, and each removes a
+`BRIDGE-COMPARISON.md`. They are small and independent, and each removes a
 place where the API forced a round-trip through `execute_script`.
 
 ### Calling a Lua global by name — `call()` (F2)

@@ -76,8 +76,10 @@ preload mechanics, and the July 2026 stress-test results are in
 `docs/SANITIZERS.md`. These sanitizers do **not** catch the exception-abort class
 (a `std::runtime_error` reaching `std::terminate`, e.g. CR-6 F1) — that is now
 the job of `npm run exception-matrix`, the generated search for that class
-(`docs/CODE-REVIEW-18.md`), alongside the CODE-REVIEW-6 behavioral matrix in the
-suite. See also `docs/CODE-REVIEW-HISTORY.md` (Part I).
+(`docs/reviews/CODE-REVIEW-18.md`), alongside the CODE-REVIEW-6 behavioral matrix in the
+suite. The judgment behind the four harnesses — what each is worth, and why
+`test-ts-asan` is the one to run before shipping — is `docs/reviews/CODE-REVIEW-HISTORY.md`
+Part III (archive; superseded on its "no more tooling needed" conclusion).
 
 **Correctness harnesses (`tools/`).** Seven instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
 
@@ -99,27 +101,27 @@ suite. See also `docs/CODE-REVIEW-HISTORY.md` (Part I).
   for values coming out of Lua. See `docs/DIFFERENTIAL-ORACLE.md`.
 - `npm run roundtrip-matrix` — the other direction: 12 entry points × 50 values,
   checking that a JS value survives the crossing *into* Lua and that all twelve
-  doors agree with each other. See `docs/CODE-REVIEW-20.md`.
+  doors agree with each other. See `docs/reviews/CODE-REVIEW-20.md`.
 - `npm run exec-parity` — the oracle's 1339-case corpus through each alternate
   execution door (`execute_script_async`, `execute_async`,
   `compile`→`load_bytecode`), compared against `execute_script` — values *and*
-  error messages. See `docs/CODE-REVIEW-21.md`.
+  error messages. See `docs/reviews/CODE-REVIEW-21.md`.
 - `npm run lifecycle-matrix` — 10 handle kinds held across `reset`, double
   reset, re-alias, GC, churn and release, one process per cell. A handle must
   stay valid or refuse; answering with another state's data is the defect it
-  looks for. See `docs/CODE-REVIEW-22.md`.
+  looks for. See `docs/reviews/CODE-REVIEW-22.md`.
 - `npm run cross-context` — the context ↔ context boundary: a handle from one
   context must be refused by another, a plain value must cross unchanged, and
   neither context may observe the other. The boundary no earlier list contained
-  (CR-22 F2). See `docs/CODE-REVIEW-22.md`.
+  (CR-22 F2). See `docs/reviews/CODE-REVIEW-22.md`.
 
 **The review programme is closed** (August 4, 2026). All seven boundaries have a
 generated search, the enumeration is derived from a stated criterion, and review
 is now **triggered by new surface rather than by the calendar**. Before adding a
 public entry point, a handle kind, a marker, an `ObjectWrap` subclass, a Lua C
-callback frame, or bumping Lua, read **`docs/CODE-REVIEW-NEXT-STEPS.md` §15** —
+callback frame, or bumping Lua, read **`docs/CORRECTNESS.md` §15** —
 §15.6 maps each of those to the instrument to extend, and §15.7 is the
-regression-run matrix. (`docs/CODE-REVIEW-HISTORY.md` is the reasoning trail for
+regression-run matrix. (`docs/reviews/CODE-REVIEW-HISTORY.md` is the reasoning trail for
 CR-17–22 — history, not instructions.) Four classes now fail closed on their own (a new tag, a
 new `ObjectWrap`, a new occupancy policy, a bare `.toThrow()`), so the check
 happens whether or not anyone remembers.
@@ -178,9 +180,9 @@ Lua objects that cross the C++ boundary (functions, coroutines, userdata, metata
 
 ## Documentation
 
-Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, `FUTURE.md`, `REQUIRE.md`, `USERDATA.md`, `USERDATA-METHOD-BINDING.md`. Consult these before implementing features on the roadmap.
+Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, `REQUIRE.md`, `USERDATA.md`, `USERDATA-METHOD-BINDING.md`. Consult these before implementing a feature. **There is no roadmap document** — `FEATURE-HISTORY.md` and `BRIDGE-COMPARISON.md` read like backlogs but are *records*: every item in both is implemented apart from A5 (worker pool), which is a scope decision. New work should start from a concrete need, not from either survey.
 
-**`docs/README.md` is the index.** It says which documents are **live** (six) and which are **archive** (the 22 numbered review passes plus the merged history). Read it before citing or updating anything under `docs/` — the distinction is not inferable from filenames, and getting it wrong is how the programme's stale-marker defects happened.
+**`docs/README.md` is the index.** Everything at the top level of `docs/` is current; everything in `docs/reviews/` is frozen and is never an instruction. Two rules are recorded there and are worth following: a **filename states what a document is, never what state the work is in** (four files were renamed on August 4, 2026 because their names claimed open work that was finished), and anything that stops being current gets a superseded banner in its first screen **and** moves to `docs/reviews/`.
 
 ## Conventions
 
@@ -189,10 +191,10 @@ Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, 
 - Platform targets declared in `binding.gyp`: macOS (arm64, x64), Windows (x64).
   **In practice this is a macOS project and there is no CI, and both are settled
   decisions — not gaps.** Do not raise the untested targets, the absence of CI,
-  pre-push hooks, or `CODE-REVIEW-DEFERRED` M5 as findings, risks, action items,
+  pre-push hooks, or `CODE-REVIEW-LEDGER` M5 as findings, risks, action items,
   or caveats on a "clean"/"complete" conclusion, and do not propose narrowing
   `binding.gyp` either. The review programme re-derived this every pass until it
-  was closed on August 4, 2026; see `docs/CODE-REVIEW-NEXT-STEPS.md` §14.
+  was closed on August 4, 2026; see `docs/CORRECTNESS.md` §14.
   Revocable by the owner, but nothing should reopen it implicitly.
 - All public `LuaRuntime` methods that can fail return `ScriptResult` (`variant<vector<LuaPtr>, string>`) where the string variant is an error message
 - `LuaValue` uses `std::variant` with `std::monostate` for nil — use the `LuaValue::from()` factory functions

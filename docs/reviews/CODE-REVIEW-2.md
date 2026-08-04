@@ -83,8 +83,8 @@ reserved-metamethod, `2^63`, `_G`-metatable, and bytecode-re-enable paths.
   accumulation on non-`CallScope` paths, `cancel()` being a no-op for
   worker-thread async, and the stored-`env` documentation items — left as-is
   per their low severity. **Update (Execution Time Limits landed):** the
-  `lua_sethook` count-hook this L8 note referred to (`FUTURE.md` /
-  `BRIDGE-GAP-ANALYSIS.md` A3b) now exists — see `maxInstructions`. The hook
+  `lua_sethook` count-hook this L8 note referred to (`FEATURE-HISTORY.md` /
+  `BRIDGE-COMPARISON.md` A3b) now exists — see `maxInstructions`. The hook
   polls `IsCancelRequested()`, so compute-bound loops are now cooperatively
   interruptible *once a cancel is signalled*; the remaining L8 piece is wiring
   the worker-thread `cancel()` path to call `RequestCancel()`.
@@ -590,7 +590,7 @@ cleared until an unrelated guarded call runs.
 ### L8. `cancel()` is a silent no-op for worker-thread async; `IsCancelRequested` branch in `OnAwaitSettled` is dead  [Confirmed]
 `src/lua-native.cpp:1497-1502, 1556-1565`. Nothing ever calls
 `RequestCancel()`; worker runs cannot be interrupted at all. (Tracked as gap
-A3b in `BRIDGE-GAP-ANALYSIS.md` — hook-based cancellation.)
+A3b in `BRIDGE-COMPARISON.md` — hook-based cancellation.)
 
 > **Partially addressed** (Execution Time Limits): the A3b count-hook now
 > exists (`maxInstructions`) and polls `IsCancelRequested()`, so a compute-bound

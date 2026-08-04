@@ -43,7 +43,7 @@ against the fixed build and are clean.
 | F3 | ✅ Done | All three sites reordered to the N5 discipline: the core call runs first and the `js_callbacks_`/`host_functions_` pairs are registered only on success (`set_metatable`, `register_module` collect their function entries into a deferred list; `register_class` defers the constructor, methods, and metamethods likewise). Safe for the same reason as `add_searcher` (CR-7 F4): the installed closures carry the names only as upvalues, nothing resolves them until Lua later calls them, and no Lua runs between the core call and the registration. Three WeakRef regression tests pin collectability after each failure mode (typo'd global, missing `package`, raising `_G`) and that the follow-up registration works — including `register_class` retrying the same name after the reservation rollback. |
 | F4 | ✅ Done | Both workers' `OnOK` wrap the `ResultsToJs` marshal in try/catch and reject the deferred with `failed to convert async result: …`, mirroring `DriveAsync`. Verified with the oversized-string reproduction: uncaughtException + unsettled promise before; ordinary rejection with the context usable after. Regression test (with an explicit timeout for the sanitizer harness, where the 600 MB allocation outruns the 5 s default). |
 | F5 | ✅ Done | `CallScope` added to the five metamethod-capable handle methods (`get`, `set`, `has`, `length`, `ipairs`; `pairs` is raw traversal, `release` touches no Lua). A staged entry is now cleared at the next handle call's outermost scope instead of accumulating. Regression test: two failing `handle.get`s; the first call's staged Error must be collectable after the second. |
-| F6 | ✅ Done (July 23, 2026 — initially resolved by documentation, then fixed in code) | Every bridge value push (`LuaCallHostFunction` / `UserdataMethodCall` result and staged-`errVal` pushes, `UserdataIndex` / `ClassIndex` property-getter pushes) now runs in its own `lua_pcall` frame via `PushLuaValueProtected`: an ERRMEM comes back as a status code with the message on top, the bridge's locals are destroyed normally, and only then does it `lua_error`. The descriptor rides as a light-userdata pcall argument, so the helper works on any calling thread without a registry read. Two `use_count`-sentinel regression tests (LSan is unavailable under Apple clang) — **verified to fail without the fix**, which also upgrades this finding from code-reading-only to reproduced. Two narrowed residuals (error-message staging allocations; the stranded constructor `js_userdata_` entry) stay documented in `CODE-REVIEW-DEFERRED.md`. |
+| F6 | ✅ Done (July 23, 2026 — initially resolved by documentation, then fixed in code) | Every bridge value push (`LuaCallHostFunction` / `UserdataMethodCall` result and staged-`errVal` pushes, `UserdataIndex` / `ClassIndex` property-getter pushes) now runs in its own `lua_pcall` frame via `PushLuaValueProtected`: an ERRMEM comes back as a status code with the message on top, the bridge's locals are destroyed normally, and only then does it `lua_error`. The descriptor rides as a light-userdata pcall argument, so the helper works on any calling thread without a registry read. Two `use_count`-sentinel regression tests (LSan is unavailable under Apple clang) — **verified to fail without the fix**, which also upgrades this finding from code-reading-only to reproduced. Two narrowed residuals (error-message staging allocations; the stranded constructor `js_userdata_` entry) stay documented in `CODE-REVIEW-LEDGER.md`. |
 | F7 | ✅ Done | Both nits fixed: `SetOutputHandler` installs the redirection before committing the handler (and the binding's `InstallPrintHandler` commits `print_handler_` after the runtime install succeeds), so a throw leaves the previous, consistent state; `set_userdata` records each method name in `registered_method_fns` *before* registering the pair, so the rollback always sees it (erase/remove are no-ops for unregistered names). |
 
 The original findings follow unchanged for reference.
@@ -310,7 +310,7 @@ leak in an OOM window — not the panic/abort of the documented M5 residual, and
 not memory corruption (nothing dangles; things merely never free).
 
 **Recommendation.** Document it next to the M5 residual in
-`CODE-REVIEW-DEFERRED.md` as the accepted floor (recommended — the fix would
+`CODE-REVIEW-LEDGER.md` as the accepted floor (recommended — the fix would
 mean restructuring every bridge's result push into a pre-staged protected
 frame, disproportionate to a leak-under-OOM), or restructure if the OOM story
 ever hardens. Either way the code and the docs should agree on what an ERRMEM
@@ -386,7 +386,7 @@ during result-push costs.
    `register_module`, and `register_class`.
 5. **F5** — `CallScope` on the five metamethod-capable table-handle methods.
 6. **F6** — document the ERRMEM-longjmp leak residual in
-   `CODE-REVIEW-DEFERRED.md` (or decide to restructure); F7 nits alongside.
+   `CODE-REVIEW-LEDGER.md` (or decide to restructure); F7 nits alongside.
 
 (The M5 result-conversion residual and CR-3 M5 remain deferred by decision;
 intentionally absent from this list.)

@@ -1,4 +1,10 @@
-# Modern Lua Bridge — Competitive Gap Analysis
+# BRIDGE-COMPARISON
+
+**A competitive survey of `lua-native` against other modern Lua bridges. Every
+gap it identified is implemented.**
+
+*Was `BRIDGE-GAP-ANALYSIS.md`; renamed August 4, 2026 — "gap analysis" claimed
+open gaps that no longer exist. The survey framing is what still has value.*
 
 **Status:** Complete — every gap this survey identified is implemented
 **Date:** July 2026
@@ -7,7 +13,7 @@ re-verified against `src/` (see [Verification audit](#verification-audit-july-14
 for the July 14 pass and [Closing the remainder](#closing-the-remainder-july-24-2026)
 for the final five)
 **Purpose:** Identify the features that mature Lua bridges provide but `lua-native`
-does not yet cover — including gaps *not* already tracked in [`FUTURE.md`](./FUTURE.md).
+does not yet cover — including gaps *not* already tracked in [`FEATURE-HISTORY.md`](./FEATURE-HISTORY.md).
 
 This document is deliberately scoped to **feature parity**, not incremental polish.
 It answers one question: *if a developer picks `lua-native` over an established
@@ -70,7 +76,7 @@ each decision can be read against the problem it was answering.
 
 ---
 
-## Already on the roadmap (`FUTURE.md`) — not re-planned here
+## Already on the roadmap (`FEATURE-HISTORY.md`) — not re-planned here
 
 These real gaps are already tracked and should not be duplicated. Cross-referenced
 so this document stands alone:
@@ -96,21 +102,24 @@ so this document stands alone:
   ~~Shared state between contexts (Tier 4)~~ — **done** (July 24, 2026:
   `createSharedTable()` + the `shared` init option)
 
-The remainder of this document covers **gaps that are NOT in `FUTURE.md`** — the
+The remainder of this document covers **gaps that are NOT in `FEATURE-HISTORY.md`** — the
 net-new findings.
 
 ---
 
 ## Net-new gaps (not currently tracked anywhere)
 
-### A. Asynchronous & concurrency interop — ✅ A1–A3 implemented (July 2026)
+### A. Asynchronous & concurrency interop — ✅ A1–A4 implemented (July 2026)
 
 > **Status:** A1 (await JS Promises from Lua), A2 (callbacks during async), and
 > A3 (cancellation) are implemented via `execute_async()` + `cancel()` — a
 > main-thread coroutine driver that suspends on host Promises via `lua_yieldk`.
-> A4 (coroutine-as-async-iterator) and A5 (worker pool) remain deferred (both
-> have workarounds; A5 is deferred by design). See the "Coroutine-Driven Async
-> Execution" section in [`FEATURES.md`](./FEATURES.md) and `execute_async()` in
+> A4 (coroutine-as-async-iterator) is also implemented — `Symbol.iterator` on a
+> coroutine, plus `create_coroutine(fn)` (July 24, 2026); this note said it
+> "remains deferred" for weeks after it shipped. A5 (worker pool) is a **scope
+> decision, not a pending item** — see the note under the priority matrix. See
+> the "Coroutine-Driven Async
+> Execution" section in [`FEATURES.md`](../FEATURES.md) and `execute_async()` in
 > the API. The original gap analysis is retained below.
 
 The single biggest divergence from modern bridges. Today `lua-native` async is
@@ -142,7 +151,7 @@ coroutine-driven async model (A1) removes this restriction entirely.
 #### A3. Cancellation of a running execution
 
 No way to abort a runaway or no-longer-needed async run from JS
-(`lua.cancel()` / `AbortSignal`). `FUTURE.md` covers *timeouts* but not
+(`lua.cancel()` / `AbortSignal`). `FEATURE-HISTORY.md` covers *timeouts* but not
 *caller-initiated* cancellation. Implementable via the same `lua_sethook`
 infrastructure as instruction limits — set a "cancel requested" flag the hook
 checks.
@@ -152,7 +161,7 @@ checks.
 > only — there is no `lua_sethook` component. A script that calls host
 > functions or awaits Promises cancels promptly; a pure-Lua compute loop
 > (`while true do end`) does not. Full cancellation coverage is blocked on the
-> Tier 1 instruction-limit hook in `FUTURE.md` (tracked below as **A3b**).
+> Tier 1 instruction-limit hook in `FEATURE-HISTORY.md` (tracked below as **A3b**).
 >
 > **Update (July 2026): A3b is closed.** The `maxInstructions` count-hook now
 > also polls `IsCancelRequested()` and raises `"execution cancelled"`, and the
@@ -170,7 +179,7 @@ checks.
 > `[Symbol.iterator]()` is a *cursor* over the one Lua thread, so a loop that
 > `break`s leaves the coroutine suspended where it stopped. `create_coroutine()`
 > now also accepts a `LuaFunction` this context produced, closing the related
-> ergonomic gap. See "Interop Completeness" in [`FEATURES.md`](./FEATURES.md).
+> ergonomic gap. See "Interop Completeness" in [`FEATURES.md`](../FEATURES.md).
 
 Bridges commonly expose a Lua coroutine as a JS `Iterator`/`AsyncIterator` so
 `for (const v of coro)` / `for await` works. Today the consumer must hand-loop
@@ -180,10 +189,10 @@ Related ergonomic gap to fold into the same work: `create_coroutine()` accepts
 only a script **string** — a `LuaFunction` ref already held on the JS side
 cannot be turned into a coroutine without re-sourcing it as text.
 
-#### A5. True parallelism / worker pool
+#### A5. True parallelism / worker pool (DEFERRED)
 
 Each context is single-threaded and one-op-at-a-time. Server workloads want a
-pool of contexts. `FUTURE.md` notes multi-context isolation exists but there is
+pool of contexts. `FEATURE-HISTORY.md` notes multi-context isolation exists but there is
 no pooling/scheduling abstraction. (Lower priority — userland can build it.)
 
 ---
@@ -191,7 +200,7 @@ no pooling/scheduling abstraction. (Lower priority — userland can build it.)
 ### B. Type-system fidelity — ✅ Implemented (July 2026)
 
 > **Status:** Both B1 and B2 are implemented. See the "Type-System Fidelity"
-> section in [`FEATURES.md`](./FEATURES.md) for the architecture and
+> section in [`FEATURES.md`](../FEATURES.md) for the architecture and
 > `register_type_converter()` in the API. The original gap analysis is retained
 > below for context.
 >
@@ -255,7 +264,7 @@ the built-in fallback.
 > still supplies its own `construct`, and `readable`/`writable` stay per-class,
 > since both are instance-construction concerns rather than name resolution. See
 > the "Class / Usertype Binding" and "Interop Completeness" sections in
-> [`FEATURES.md`](./FEATURES.md) and `register_class()` in the API. The original
+> [`FEATURES.md`](../FEATURES.md) and `register_class()` in the API. The original
 > gap analysis is retained below.
 
 `set_userdata` binds an **existing instance**. There is no way to register a JS
@@ -292,7 +301,7 @@ Sub-capabilities, roughly in dependency order:
 
 > **Status:** D1 (JS Error fidelity round-trip), D2 (stack traces + structured
 > surfacing), and D3 (protected calls from JS via `pcall()`) are implemented.
-> See the "Error Fidelity" section in [`FEATURES.md`](./FEATURES.md). The
+> See the "Error Fidelity" section in [`FEATURES.md`](../FEATURES.md). The
 > original gap analysis is retained below.
 
 #### D1. JS `Error` objects lose all structure crossing into Lua
@@ -309,7 +318,7 @@ least type + message + stack.
 
 #### D2. Structured error results, not just thrown strings
 
-Complements `FUTURE.md`'s stack-trace item: return errors as objects
+Complements `FEATURE-HISTORY.md`'s stack-trace item: return errors as objects
 `{ message, traceback, luaStack }` rather than string-only exceptions, so callers
 can inspect the Lua call chain programmatically.
 
@@ -326,7 +335,7 @@ useful when the caller wants to branch on failure without try/catch.
 > **Status:** E1 (`print`/`io.write` redirection via `set_print_handler` and the
 > `print` option), E2 (dynamic `require` via `add_searcher`), and E3 (bytecode
 > guard via the `allowBytecode` option) are implemented. See the "I/O, Output &
-> Module Resolution" section in [`FEATURES.md`](./FEATURES.md). The original gap
+> Module Resolution" section in [`FEATURES.md`](../FEATURES.md). The original gap
 > analysis is retained below.
 
 #### E1. `print` / stdout redirection to a JS callback ⭐ (common, cheap, absent)
@@ -381,7 +390,7 @@ exists despite the sandboxing emphasis.
   environment table, and accepts any live table reference — a `create_table()`
   handle or a `get_global_ref()` reference works, so the lighter-weight form
   needs none of the `create_environment` machinery. Shipped together with
-  `FUTURE.md` Environment Tables.
+  `FEATURE-HISTORY.md` Environment Tables.
 
 ---
 
@@ -405,7 +414,7 @@ matrix below:
 - **A3b — cancellation is boundary-only.** `cancel()` sets a flag checked at
   host-call/await boundaries; there is no `lua_sethook` interrupt, so a
   compute-bound Lua loop is uncancellable. Fixing this is the same work as
-  `FUTURE.md`'s Tier 1 instruction limits — implement them together.
+  `FEATURE-HISTORY.md`'s Tier 1 instruction limits — implement them together.
   *(Since closed — see the update note under A3 and the completed matrix.)*
 - **B3 — no Lua→JS custom conversion.** The converter registry only covers
   JS→Lua. wasmoon's `TypeExtension` is bidirectional.
@@ -414,11 +423,11 @@ matrix below:
   cannot take an existing `LuaFunction` ref.
   *(Since closed — July 24, 2026: `create_coroutine(fn)`.)*
 
-Also noted while auditing (already tracked in `FUTURE.md`, status updated
+Also noted while auditing (already tracked in `FEATURE-HISTORY.md`, status updated
 there): stack traces are done; reference lifecycle is partially done
 (`LuaTableHandle.release()` exists, function/coroutine refs have none).
 *(Since closed — July 23, 2026: context-level `release(value)` now covers
-function, coroutine, and table refs. See `FUTURE.md`.)*
+function, coroutine, and table refs. See `FEATURE-HISTORY.md`.)*
 
 ---
 
@@ -453,9 +462,9 @@ with no reasonable JS-side workaround and broad demand.
 
 | # | Gap | Impact | Workaround exists? | Rec. tier |
 |---|---|---|---|---|
-| A5 | Worker pool / true parallelism | Low | Multiple contexts | **4** (by design) |
+| A5 | Worker pool / true parallelism | Low | Multiple contexts | **Scope decision** |
 
-**A5 is deferred deliberately, not pending.** A `LuaRuntime` is single-threaded
+**A5 is a scope decision, not a pending item.** A `LuaRuntime` is single-threaded
 by construction and the async model assumes one owner at a time, so "true
 parallelism" means N independent contexts plus a scheduler — which is exactly
 what userland can build over `execute_script_async` without any native support.
@@ -492,25 +501,25 @@ Every phase is **complete**:
 
 1. ~~**Correctness quick-wins → async overhaul → class binding**~~ — done
    (July 2026).
-2. ~~**Sandboxing completion (A3b + `FUTURE.md` Tier 1)**~~ — **done (July
+2. ~~**Sandboxing completion (A3b + `FEATURE-HISTORY.md` Tier 1)**~~ — **done (July
    2026):** instruction limits (`maxInstructions`) and hook-based cancellation
    shipped together, closing the last no-workaround hole in the untrusted-code
    story (`safe` preset + memory limits + instruction limits +
    `allowBytecode: false` are all in place). The optional wall-clock timeout
    followed on July 24, 2026 (`timeout`), sharing the same hook.
-3. ~~**Operational control (`FUTURE.md` Tier 2):** GC control, context reset,
+3. ~~**Operational control (`FEATURE-HISTORY.md` Tier 2):** GC control, context reset,
    plus extending `release()` from table handles to function/coroutine refs.~~
    *(Done — July 23, 2026.)*
 4. ~~**Interop polish:** B3, A4, F1, C4, F2.~~ *(Done — July 24, 2026; see
    "Closing the remainder" above.)* ~~Environment tables / F3~~ *(Done — July 24,
    2026.)* ~~Debug hooks~~ *(Done — July 24, 2026.)*
-5. **Deferred by design:** A5 (worker pool) — see the note under the matrix.
+5. **Scope decision (not pending):** A5 (worker pool) — see the note under the matrix.
 
 ---
 
-## Relationship to `FUTURE.md`
+## Relationship to `FEATURE-HISTORY.md`
 
-`FUTURE.md` remains the authoritative plan for the sandboxing/operational-control
+`FEATURE-HISTORY.md` remains the authoritative plan for the sandboxing/operational-control
 features it lists (limits, traces, GC, reset, hooks, environments, ref lifecycle).
 This document adds the **interop-completeness** dimension those items don't
 address: async, type fidelity, class binding, error fidelity, and I/O hooks. The

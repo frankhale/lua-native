@@ -108,7 +108,7 @@ export const HANDLES = [
   },
   {
     // Carries markers *and* its own data, so a foreign one deep-copies the data
-    // intact. That is deferred-ledger M6's deliberate resolution and is pinned;
+    // intact. That is the review ledger's M6 resolution, deliberate and pinned;
     // it is the one marker that is not refused, and the reason is that unlike
     // the two above it actually delivers the data.
     id: 'class-instance',

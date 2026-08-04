@@ -257,7 +257,7 @@ recommended:
 1. **Site fix, one line.** Give `TableHandlePairs` the `CallScope` its eleven
    siblings have. Verified: the probe flips from `RESET RAN` to the rejection
    message, and the full suite still passes. This also closes a second, smaller
-   thing — `docs/CODE-REVIEW-DEFERRED.md`'s **L7** records its own resolution as
+   thing — `docs/CODE-REVIEW-LEDGER.md`'s **L7** records its own resolution as
    covering "table traps", and `pairs()` is a handle *method*, so a staged
    `js_error_registry_` entry from a raising converter still accumulates there.
 

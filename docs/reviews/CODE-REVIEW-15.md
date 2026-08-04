@@ -302,7 +302,7 @@ Only the standing release-time deferrals, unchanged by decision as in every pass
 since CR-3: `MACOSX_DEPLOYMENT_TARGET` is still `"26.0"` (`binding.gyp:142`,
 `:306`, CR-3 M5) and `prebuilds/` still contains `darwin-arm64` only (CR-5 F8).
 These are packaging decisions, not correctness items, and they stay in this
-review rather than moving to `CODE-REVIEW-DEFERRED.md` for the reason CR-2
+review rather than moving to `CODE-REVIEW-LEDGER.md` for the reason CR-2
 established: the deferred ledger is a record of *triaged, accepted risk*, and an
 item nobody has decided about does not belong in it.
 

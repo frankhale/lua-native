@@ -4248,7 +4248,7 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
       // The class-instance marker below is the deliberate exception to that
       // rule, and it stays one. A foreign instance carries **both** the markers
       // and its own data (`["hidden", "__luaClassRef", …]`), so the deep copy
-      // moves the data across intact — which is what deferred-ledger M6 chose
+      // moves the data across intact — which is what the review ledger's M6 chose
       // and pins (`foreign.x, foreign.y` survive, methods and metatable do
       // not). Refusing it would reverse a decision that is documented, pinned,
       // and — unlike the two cases above — actually delivers the data.

@@ -446,7 +446,7 @@ this pass's baseline was red on arrival.
 
 *(Added August 4, 2026: this paragraph originally continued into a
 recommendation for CI. **Platform coverage and CI are now closed as out of
-scope** — see `CODE-REVIEW-NEXT-STEPS` §14 — so the note stands only as the
+scope** — see `CORRECTNESS` §14 — so the note stands only as the
 explanation for the red baseline, not as an argument for automating anything.)*
 
 **The boundary enumeration, updated.** With this pass A3 has one entry left:

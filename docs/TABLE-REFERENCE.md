@@ -934,7 +934,7 @@ cleanup (release the registry ref when the JS object is GC'd). However:
 4. Users should call `release()` explicitly for deterministic cleanup — relying
    on GC for registry refs is a footgun in long-lived contexts.
 
-If the Reference Lifecycle Management feature (tier 3 in FUTURE.md) is
+If the Reference Lifecycle Management feature (tier 3 in FEATURE-HISTORY.md) is
 implemented later, it can provide a unified `release()` mechanism for all
 reference types.
 

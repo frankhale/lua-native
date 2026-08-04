@@ -76,7 +76,7 @@ So the rule the code now states, and the one the instrument encodes:
 
 **The three markers are not one class, and forcing them to be one would have
 been wrong.** The first draft of the fix refused all of them — including class
-instances — which would have reversed deferred-ledger M6's deliberate,
+instances — which would have reversed the review ledger's M6, a deliberate,
 documented, pinned resolution. It was caught by reading M6 before believing the
 finding.
 

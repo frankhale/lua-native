@@ -1,11 +1,13 @@
-# CODE-REVIEW-NEXT-STEPS
+# CORRECTNESS
 
 **Date:** August 4, 2026
 **Status:** ⛳ **The correctness programme is closed.** Review is triggered by
 **new surface, not by the calendar.**
 
 **Scope:** what is in force. This document is the operational reference for the
-correctness programme; `FUTURE.md` is the feature roadmap and is separate.
+correctness programme. Feature work is separate and has no roadmap document —
+`FEATURE-HISTORY.md` and `BRIDGE-COMPARISON.md` are records of completed work (see
+`docs/README.md`).
 
 > **Read §15 first.** It is the exit record: the boundary enumeration and the
 > criterion it was derived from, what is *not* covered, the closure assertions,
@@ -20,7 +22,7 @@ correctness programme; `FUTURE.md` is the feature roadmap and is separate.
 >
 > **The history — §§1–12, the CR-17 assessment and the CR-20 revision, including
 > the A1–A6 action items referenced below — is in
-> [`CODE-REVIEW-HISTORY.md`](CODE-REVIEW-HISTORY.md).** It was split out on
+> [`CODE-REVIEW-HISTORY.md`](reviews/CODE-REVIEW-HISTORY.md).** It was split out on
 > August 4, 2026 because a 900-line document with its operative content at the
 > end is itself a drift hazard: five places to miss when updating a status, and
 > this programme spent twenty-two passes on exactly that class of decay. Every
@@ -172,7 +174,7 @@ document, in `CODE-REVIEW-18`, and in any earlier pass, on these two subjects.**
   proposal itself is part of what was closed.
 - CI, in every form: hosted runners, pre-push hooks, "runs without anyone
   remembering to run it" automation.
-- `CODE-REVIEW-DEFERRED` M5 (`MACOSX_DEPLOYMENT_TARGET`). Not a blocker.
+- `CODE-REVIEW-LEDGER` M5 (`MACOSX_DEPLOYMENT_TARGET`). Not a blocker.
 - HISTORY §1 point 5, §3 in full, §10 criterion 5, §12 row A4, and A4 itself. Where
   those still argue the case, they are historical record, not live advice.
 
@@ -271,6 +273,34 @@ programme spent twenty-two passes correcting.
 | Data races | 4 sanitizer harnesses, `test-ts-tsan` explicitly best-effort | TSan cannot see libuv/V8/Lua synchronization, so a clean run is not a proof. Stated as a limitation in `CLAUDE.md`, not as coverage. |
 
 ## 15.3 The closure assertions
+
+**The principle underneath them, which is the one lesson the whole programme
+reduces to:**
+
+> **Fix classes, not sites.**
+
+CODE-REVIEW-1 fixed the instances it found; CODE-REVIEW-2 found more instances
+of the same hazard classes and observed that "several of the underlying hazard
+classes have additional sites the first review didn't enumerate". Every high
+from CR-6 onward was a version of that — a class fixed across the members
+someone could enumerate, short by one. CR-17 F2 fixed one of four round-trip
+markers; CR-21 F2 covered arrays and objects but not the two recursing
+builtins; CR-22 F1 fixed one marker and the cross-context instrument
+immediately found a fifth.
+
+The corollary is what turned it into working code: **an enumeration decays, so
+compute the closure and assert it.** A list in a comment is wrong within a
+commit here — that is measured, not felt (the `CallScope` enumeration was
+repaired in CR-13, CR-14 and CR-15 and was wrong each time). The invariants
+below exist so that a new member of a closed class cannot arrive outside it
+without turning the suite red.
+
+This is stated here rather than left in `reviews/CODE-REVIEW-HISTORY.md`
+because it is the *why* behind everything in this section, and a rule whose
+rationale lives only in an archive is a rule that gets simplified away. This
+codebase has the receipt: CR-11 F1 was a use-after-free reintroduced when a
+later modernization pass reverted a `NOLINT`ed loop whose reason was not
+attached to it. The comment now says "The NOLINT is load-bearing."
 
 Nine invariants, each computing a universe from the source and comparing it to a
 frozen answer. The ones that close a defect *class* rather than track a count:

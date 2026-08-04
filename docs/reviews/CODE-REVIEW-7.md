@@ -262,7 +262,7 @@ failed — is reachable only via the OOM trigger, which the matrix doesn't drive
 the maps: raw-set `_G[name] = nil` inside its own try/catch (raw, so a hostile
 `__newindex` can't re-raise; guarded, because the key push can itself OOM — if
 that fails, the inert global is the accepted floor). Alternatively, document the
-residual in `CODE-REVIEW-DEFERRED.md` alongside the M5 remainder; either
+residual in `CODE-REVIEW-LEDGER.md` alongside the M5 remainder; either
 resolution is defensible, but today the code and CR-6's "strands nothing" claim
 disagree.
 
@@ -334,7 +334,7 @@ matters most) fails correctly via `abort_on_error=1` — hence low.
   any function/thread/table-ref **result** after `ProtectedCall` returns — runs
   `luaL_ref` outside any protected frame, so an ERRMEM longjmp there under an
   exhausted `maxMemory` remains an unprotected panic. Same accepted class as the
-  `CODE-REVIEW-DEFERRED.md` M5 entry; ASan cannot see it — it is a longjmp, not
+  `CODE-REVIEW-LEDGER.md` M5 entry; ASan cannot see it — it is a longjmp, not
   a memory error.)
 - **`CreateConstructorWrapper` vs. a frozen `construct()` return:**
   `DefineHiddenProp` on a frozen/sealed instance throws `Napi::Error` outside
@@ -374,7 +374,7 @@ matters most) fails correctly via `abort_on_error=1` — hence low.
    discipline); closes an unbounded accumulation on a trivially-reachable
    failure.
 4. **F3** — best-effort global removal in `set_userdata`'s rollback, or
-   document the inert-global residual in `CODE-REVIEW-DEFERRED.md`.
+   document the inert-global residual in `CODE-REVIEW-LEDGER.md`.
 5. **F5** — make UBSan findings fail `test-ts-asan`; fix or narrow the Linux
    runtime probe.
 

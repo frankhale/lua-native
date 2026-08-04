@@ -370,7 +370,7 @@ Verified by re-running each item's generator rather than by reading its list.
 | F1 | ✅ Correct. `lua_core::detail::OwningRuntime` and `LuaContext::RefForThisRuntime` are in place and all four mint sites in `CoreToNapiBuiltin` pass their ref through it. The CR-18 matrix drove `reset_then_throw` at all 27 frames — including `gc_finalizer_at_close`, which is F1's exact window — with no abort and no aliasing. |
 | F2 | ✅ Correct. `set_global` refuses a foreign table handle; the deep-copy policy for class instances and JS-created userdata is unchanged and its pin still passes. |
 | F3 | ✅ Correct. The `ContextLiveness` pair and single `DeadReason()` are in place; the five tightened assertions still read `/replaced by reset/`. |
-| Release deferrals | Unchanged, as decided. `MACOSX_DEPLOYMENT_TARGET` is still `"26.0"` and `prebuilds/` still contains `darwin-arm64` only. §3 of `CODE-REVIEW-HISTORY.md` is deferred by decision — macOS/arm64 only for now. **(Superseded: closed as out of scope, `CODE-REVIEW-NEXT-STEPS.md` §14.)** |
+| Release deferrals | Unchanged, as decided. `MACOSX_DEPLOYMENT_TARGET` is still `"26.0"` and `prebuilds/` still contains `darwin-arm64` only. §3 of `CODE-REVIEW-HISTORY.md` is deferred by decision — macOS/arm64 only for now. **(Superseded: closed as out of scope, `CORRECTNESS.md` §14.)** |
 
 ---
 

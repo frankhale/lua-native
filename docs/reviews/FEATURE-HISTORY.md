@@ -1,15 +1,23 @@
-# Future Feature Considerations
+# FEATURE-HISTORY
 
-Potential enhancements for lua-native, organized by priority.
+**A record of the planned feature work — all of it implemented. Not a backlog.**
+
+*Was `FUTURE.md`; renamed August 4, 2026 because the name claimed a status the
+contents contradicted. Kept for what each feature was for and how the as-built
+design differed from the plan.*
+
+Enhancements for lua-native, in the priority order they were originally
+assessed.
 
 > Statuses in this document were verified against the source
 > (`src/lua-native.cpp`, `src/core/lua-runtime.cpp`, `types.d.ts`) on
 > July 24, 2026.
 >
 > **Every feature in this document is implemented**, as is every interop gap in
-> `BRIDGE-GAP-ANALYSIS.md` apart from A5 (worker pool), which is deferred by
-> design. The document is kept as a record of what each feature was for and how
-> the as-built design differed from the plan — not as a backlog.
+> `BRIDGE-COMPARISON.md` apart from A5 (worker pool), which is a **scope
+> decision rather than a pending item** — see `docs/README.md`. The document is
+> kept as a record of what each feature was for and how the as-built design
+> differed from the plan — **not as a backlog**, despite the name.
 
 ## Priority Assessment
 
@@ -21,7 +29,7 @@ workarounds rank lowest.
 | Tier | Feature | Status | Rationale |
 |---|---|---|---|
 | 1 | ~~Memory Limits~~ | Completed | No workaround — a script can OOM the process |
-| 1 | ~~Execution Time Limits~~ | Completed | No workaround — an infinite loop hangs the process. See `maxInstructions` in `LuaInitOptions`. The count-hook also polls `IsCancelRequested()`; with the worker-`cancel()` wiring now in place, hook-based `cancel()` (`BRIDGE-GAP-ANALYSIS.md` A3b) is fully complete |
+| 1 | ~~Execution Time Limits~~ | Completed | No workaround — an infinite loop hangs the process. See `maxInstructions` in `LuaInitOptions`. The count-hook also polls `IsCancelRequested()`; with the worker-`cancel()` wiring now in place, hook-based `cancel()` (`BRIDGE-COMPARISON.md` A3b) is fully complete |
 | 2 | ~~Error Stack Traces~~ | Completed | Universal in bridges (6/7); no workaround for useful errors |
 | 2 | ~~Userdata Method Binding~~ | Completed | Standard in bridges (6/7); no clean workaround |
 | 2 | ~~GC Control~~ | Completed | `lua.gc()` covers collect/stop/restart/count/step/isrunning/mode/param (July 23, 2026) |
@@ -45,9 +53,9 @@ together as "sandboxing." Tier 2 follows naturally — error stack traces and
 userdata methods are standard across Lua bridges and relatively straightforward.
 Tier 3 and 4 can be driven by actual user requests.
 
-### Interop gaps tracked in `BRIDGE-GAP-ANALYSIS.md`
+### Interop gaps tracked in `BRIDGE-COMPARISON.md`
 
-The bridge-parity survey in `BRIDGE-GAP-ANALYSIS.md` tracks the interop
+The bridge-parity survey in `BRIDGE-COMPARISON.md` tracks the interop
 dimension this document doesn't (async, type fidelity, class binding, error
 fidelity, I/O). **Every item in it is now implemented**, except A5, which is
 deferred by design. In that document's numbering:
@@ -59,7 +67,7 @@ deferred by design. In that document's numbering:
 | F1 | Metatables on non-global tables (table handles / `create_table`) | Completed — `set_metatable(handle, mt)` (July 24, 2026) |
 | C4 | Class inheritance / `__index` chaining | Completed — `register_class({ extends })` (July 24, 2026) |
 | F2 | Call a Lua global by name (`lua.call('fn', ...args)`) | Completed — `call()` (July 24, 2026) |
-| A5 | Worker pool / true parallelism | Deferred by design — a pool over N independent contexts belongs in userland |
+| A5 | Worker pool / true parallelism | **Scope decision, not pending** — a pool over N independent contexts belongs in userland |
 
 Everything else in that survey (Promise await, cancellation incl. A3b,
 type fidelity, converter registry, class binding, error fidelity/`pcall`,
@@ -123,7 +131,7 @@ Prevents infinite loops from hanging the process. The hook function checks the i
 **Synergy with `cancel()`:** the July 2026 async driver's `cancel()` only takes
 effect at host-call/await boundaries. The same `lua_sethook` hook that enforces
 instruction limits should also check `IsCancelRequested()` so compute-bound
-loops become cancellable (see `BRIDGE-GAP-ANALYSIS.md` A3b). Implement both in
+loops become cancellable (see `BRIDGE-COMPARISON.md` A3b). Implement both in
 one pass.
 
 #### Implementation Plan
@@ -302,7 +310,7 @@ with no easy workaround.
 
 ### ~~Error Stack Traces~~ (Completed — July 2026)
 
-Implemented as part of the error-fidelity work (see `BRIDGE-GAP-ANALYSIS.md`
+Implemented as part of the error-fidelity work (see `BRIDGE-COMPARISON.md`
 D2 and the "Error Fidelity" section in `FEATURES.md`). A `luaL_traceback`
 message handler is installed for `lua_pcall` in `lua-runtime.cpp`, and
 coroutine resume errors get tracebacks as well. The original plan is retained

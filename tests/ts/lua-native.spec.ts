@@ -5657,7 +5657,7 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
-  // DEFERRED-REVIEW FINDINGS (CODE-REVIEW-DEFERRED.md)
+  // DEFERRED-REVIEW FINDINGS (docs/reviews/CODE-REVIEW-LEDGER.md)
   // ============================================
   describe('deferred-review regressions', () => {
     it('L6: the hidden __luaFnOwner on a returned Lua function cannot be deleted or reassigned', () => {
@@ -10470,6 +10470,62 @@ describe('lua-native Node adapter', () => {
         lua.set_global('rows', [1, false, 3, 4]);
         expect(lua.execute_script('return #rows')).toBe(4);
       });
+    });
+  });
+
+  describe('LIMITATIONS.md — pinned so the documented claims stay true', () => {
+    it("§1: 'safe' does NOT seal the filesystem (documented, not a surprise)", () => {
+      // Pinned in the direction it actually behaves. If a future change seals
+      // 'safe', this test fails and LIMITATIONS.md §1 must be rewritten — which
+      // is the point: the doc and the code cannot drift apart silently.
+      const lua: any = new lua_native.init({}, { libraries: 'safe' });
+      expect(lua.execute_script('return type(dofile)')).toBe('function');
+      expect(lua.execute_script('return type(loadfile)')).toBe('function');
+      expect(lua.execute_script('return type(require)')).toBe('function');
+      // ...while the three it does remove stay removed.
+      expect(lua.execute_script('return type(io)')).toBe('nil');
+      expect(lua.execute_script('return type(os)')).toBe('nil');
+      expect(lua.execute_script('return type(debug)')).toBe('nil');
+    });
+
+    it('§1: the documented sealed configuration actually seals', () => {
+      // The recipe LIMITATIONS.md gives. If any line of this stops working the
+      // doc is handing out a broken remedy, which is worse than no remedy.
+      const lua: any = new lua_native.init({}, {
+        libraries: ['base', 'coroutine', 'table', 'string', 'math', 'utf8'],
+        allowBytecode: false,
+      });
+      lua.execute_script('dofile = nil loadfile = nil');
+      expect(lua.execute_script('return type(dofile)')).toBe('nil');
+      expect(lua.execute_script('return type(loadfile)')).toBe('nil');
+      expect(lua.execute_script('return type(require)')).toBe('nil');
+      expect(lua.execute_script('return type(package)')).toBe('nil');
+      expect(lua.execute_script('return type(io)')).toBe('nil');
+      expect(lua.execute_script('return type(os)')).toBe('nil');
+      // `load` reports failure by returning nil + a message; it does not raise.
+      expect(lua.execute_script(
+        'local f, err = load(string.dump(function() end)) return tostring(f) .. "|" .. tostring(err)'))
+        .toMatch(/^nil\|.*binary chunk/);
+      // ...and ordinary scripting still works, or the sandbox is useless.
+      expect(lua.execute_script('return math.floor(3.7) .. "/" .. ("x"):rep(2)')).toBe('3/xx');
+    });
+
+    it('checked-not-a-limitation: for await works without Symbol.asyncIterator', async () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const co = lua.create_coroutine(
+        'return function() coroutine.yield(1) coroutine.yield(2) end');
+      expect(co[Symbol.asyncIterator]).toBeUndefined();
+      const seen: any[] = [];
+      for await (const v of co) seen.push(v);
+      expect(seen).toEqual([1, 2]);   // JS falls back to Symbol.iterator
+    });
+
+    it('checked-not-a-limitation: __close works via set_metatable', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('res = {}');
+      lua.set_metatable('res', { __close: () => undefined });
+      expect(lua.execute_script(
+        'local ok = pcall(function() local x <close> = res end) return ok')).toBe(true);
     });
   });
 

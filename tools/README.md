@@ -26,12 +26,12 @@ tools/
 | Harness | Run | What it searches | Docs |
 |---|---|---|---|
 | **invariants** | `npm run check-invariants` | Enumerations that decay: the `CallScope` classification, `lua_next` traversal sites, occupancy policies, greppable counts, the exception surface, whether every binding path to a throwing core call is guarded, and the scanner's own coverage | CODE-REVIEW-18 §4, CODE-REVIEW-19 F1/F2 |
-| **exception-matrix** | `npm run exception-matrix` | 27 Lua C frames × 11 throw kinds, one process per cell — a `std::runtime_error` reaching `std::terminate`, which the sanitizers are blind to | `docs/CODE-REVIEW-18.md` |
+| **exception-matrix** | `npm run exception-matrix` | 27 Lua C frames × 11 throw kinds, one process per cell — a `std::runtime_error` reaching `std::terminate`, which the sanitizers are blind to | `docs/reviews/CODE-REVIEW-18.md` |
 | **diff-oracle** | `npm run oracle` | 2678 cases against stock Lua 5.5: does the embedded VM behave like the reference (mode A), and do values coming *out* survive (mode B) | `docs/DIFFERENTIAL-ORACLE.md` |
-| **roundtrip-matrix** | `npm run roundtrip-matrix` | 12 entry points × 50 values: does a value survive the crossing *in*, and do all twelve doors agree with each other | `docs/CODE-REVIEW-20.md` |
-| **exec-parity** | `npm run exec-parity` | 1339 corpus cases × 3 doors: do `execute_script_async`, `execute_async` and `compile`→`load_bytecode` agree with `execute_script` — values *and* error messages | `docs/CODE-REVIEW-21.md` |
-| **cross-context** | `npm run cross-context` | Two contexts in one process: handles are refused, data crosses intact, contexts stay independent. The boundary CR-22 F2 found missing from every earlier list — where CR-20 F5 and CR-22 F1 both live | `docs/CODE-REVIEW-22.md` |
-| **lifecycle-matrix** | `npm run lifecycle-matrix` | 10 handle kinds × lifecycle events (reset, double reset, re-alias, GC, churn, release, double release), one process per cell: a handle must stay valid or refuse — never answer with another state's data | `docs/CODE-REVIEW-22.md` |
+| **roundtrip-matrix** | `npm run roundtrip-matrix` | 12 entry points × 50 values: does a value survive the crossing *in*, and do all twelve doors agree with each other | `docs/reviews/CODE-REVIEW-20.md` |
+| **exec-parity** | `npm run exec-parity` | 1339 corpus cases × 3 doors: do `execute_script_async`, `execute_async` and `compile`→`load_bytecode` agree with `execute_script` — values *and* error messages | `docs/reviews/CODE-REVIEW-21.md` |
+| **cross-context** | `npm run cross-context` | Two contexts in one process: handles are refused, data crosses intact, contexts stay independent. The boundary CR-22 F2 found missing from every earlier list — where CR-20 F5 and CR-22 F1 both live | `docs/reviews/CODE-REVIEW-22.md` |
+| **lifecycle-matrix** | `npm run lifecycle-matrix` | 10 handle kinds × lifecycle events (reset, double reset, re-alias, GC, churn, release, double release), one process per cell: a handle must stay valid or refuse — never answer with another state's data | `docs/reviews/CODE-REVIEW-22.md` |
 
 ## Conventions every harness follows
 
@@ -75,7 +75,7 @@ that reported clean while measuring nothing.
   behaviour is a defect. Before concluding that a value was degraded, look at
   what it actually carries (`Object.getOwnPropertyNames`) and at whether the
   behaviour is already someone's deliberate, pinned decision — CR-22's first
-  fix draft would have reversed deferred-ledger M6 without noticing.
+  fix draft would have reversed the review ledger's M6 without noticing.
 
 ## Re-freezing the invariants
 

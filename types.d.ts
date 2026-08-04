@@ -189,6 +189,16 @@ export interface LuaCallbacks {
  * Functions become Lua C closures; other values are set directly.
  */
 export interface MetatableDefinition {
+  /**
+   * Any Lua metamethod name, or a plain value to place on the metatable.
+   *
+   * The commonly used ones are `__index`, `__newindex`, `__call`, `__tostring`,
+   * the arithmetic and comparison metamethods (`__add`, `__eq`, `__lt`, …),
+   * `__len`, `__gc`, and **`__close`** — a to-be-closed variable
+   * (`local x <close> = obj`) runs it on scope exit, and it works both in pure
+   * Lua and when installed from here. `__close` is called out because it is
+   * easy to assume Lua 5.4+ scoping features stop at the binding; it does not.
+   */
   [key: string]: LuaCallback | LuaInput;
 }
 
@@ -1487,7 +1497,9 @@ export type LuaLibrary =
 /**
  * Preset names for loading groups of standard libraries
  * - 'all': Load all 10 standard libraries
- * - 'safe': Load all except io, os, and debug (for sandboxing)
+ * - 'safe': Load all except io, os, and debug. **Not a sandbox for untrusted
+ *   code** — `base` still provides `dofile`/`loadfile` and `package` provides
+ *   `require`, so the filesystem is reachable. See docs/LIMITATIONS.md §1.
  */
 export type LuaLibraryPreset = 'all' | 'safe';
 
@@ -1499,7 +1511,15 @@ export interface LuaInitOptions {
    * Which Lua standard libraries to load. If omitted, NO libraries are loaded (bare state).
    *
    * - `'all'` — load all 10 standard libraries
-   * - `'safe'` — load all except io, os, and debug (for sandboxing)
+   * - `'safe'` — load all except io, os, and debug.
+   *
+   *   **This is not a sandbox for untrusted code, despite the name.** It keeps
+   *   `base` (which provides `dofile` and `loadfile`) and `package` (which
+   *   provides `require`, with a writable `package.path`), so a script can
+   *   execute any readable `.lua` file on the host. Driven and documented in
+   *   `docs/LIMITATIONS.md` §1, which also gives the sealed configuration:
+   *   pass an explicit array without `package`, set `allowBytecode: false`,
+   *   and clear the two base globals.
    * - `LuaLibrary[]` — load specific libraries by name
    * - `[]` — bare state with no standard libraries
    *
@@ -1507,7 +1527,7 @@ export interface LuaInitOptions {
    * // Load all libraries
    * { libraries: 'all' }
    *
-   * // Safe sandboxed environment
+   * // Most of the standard library, without io/os/debug
    * { libraries: 'safe' }
    *
    * // Only load string and math
@@ -1553,8 +1573,16 @@ export interface LuaInitOptions {
    * // Abort runaway scripts after ~10 million instructions
    * { maxInstructions: 10_000_000 }
    *
-   * // Tight sandbox for untrusted code
+   * // Resource-limited, but NOT sealed — see docs/LIMITATIONS.md §1
    * { libraries: 'safe', maxMemory: 256 * 1024, maxInstructions: 1_000_000 }
+   *
+   * // Actually sealed against untrusted code: no package (so no require),
+   * // no bytecode, and dofile/loadfile cleared after construction.
+   * const lua = new lua_native.init({}, {
+   *   libraries: ['base', 'coroutine', 'table', 'string', 'math', 'utf8'],
+   *   allowBytecode: false, maxMemory: 256 * 1024, maxInstructions: 1_000_000,
+   * });
+   * lua.execute_script('dofile = nil loadfile = nil');
    */
   maxInstructions?: number;
 
