@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -11,6 +11,38 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** Load all standard libraries (opt-in since bare state is the default) */
 const ALL_LIBS = { libraries: 'all' as const };
+
+/**
+ * Process-global leak guard (NEXT-STEPS A2).
+ *
+ * A test that patches shared state and forgets to restore it corrupts every
+ * test after it, and in a single-file suite this size that is the whole run.
+ * It has happened: CR-15 F5 patched `Symbol.hasInstance` on the `SharedTable`
+ * constructor and never restored it, so `AsSharedTable`'s filter accepted every
+ * object for the remainder of the run. It stayed latent for **five passes**
+ * because that test happened to be the last one to construct a shared context —
+ * the leak was real from the moment it landed and simply had nothing after it
+ * to break.
+ *
+ * CR-20 restored it in a `finally`. This asserts the restoration rather than
+ * trusting it, and — the point of a suite-level check — it also covers the
+ * *next* test to try the same trick, which is the one nobody has written yet.
+ *
+ * The constructor is reachable exactly the way user code reaches it, which is
+ * the same route CR-15 F5 used to defeat the filter in the first place.
+ */
+const SHARED_TABLE_CTOR = Object.getPrototypeOf(
+  (lua_native as any).createSharedTable({}),
+).constructor;
+
+afterEach(() => {
+  expect(
+    Object.getOwnPropertyDescriptor(SHARED_TABLE_CTOR, Symbol.hasInstance),
+    'a test patched Symbol.hasInstance on the SharedTable constructor and did not '
+    + 'restore it — this is process-global and silently corrupts every later test '
+    + '(CR-15 F5 / CR-20 F5). Restore it in a `finally`.',
+  ).toBeUndefined();
+});
 
 describe('lua-native Node adapter', () => {
   // ============================================
@@ -408,7 +440,7 @@ describe('lua-native Node adapter', () => {
 
     it('handles Lua syntax errors', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      expect(() => lua.execute_script('this is not valid lua!')).toThrow();
+      expect(() => lua.execute_script('this is not valid lua!')).toThrow(/syntax error/);
     });
 
     it('handles undefined variable access', () => {
@@ -420,7 +452,7 @@ describe('lua-native Node adapter', () => {
 
     it('handles calling nil as function', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      expect(() => lua.execute_script('local x = nil; return x()')).toThrow();
+      expect(() => lua.execute_script('local x = nil; return x()')).toThrow(/attempt to call a nil value \(local 'x'\)/);
     });
 
     it('propagates JS callback errors, preserving the original Error', () => {
@@ -440,7 +472,7 @@ describe('lua-native Node adapter', () => {
 
     it('handles type errors in Lua operations', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      expect(() => lua.execute_script('return "string" + 5')).toThrow();
+      expect(() => lua.execute_script('return "string" + 5')).toThrow(/attempt to add/);
     });
 
     it('handles errors in returned Lua functions', () => {
@@ -1155,7 +1187,7 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
       expect(() => {
         lua.create_coroutine('invalid lua syntax @@@@');
-      }).toThrow();
+      }).toThrow(/syntax error/);
     });
 
     it('throws error for non-function return', () => {
@@ -2125,7 +2157,7 @@ describe('lua-native Node adapter', () => {
         // Accessing properties on opaque userdata should error
         expect(() => {
           lua.execute_script('return obj.x');
-        }).toThrow();
+        }).toThrow(/attempt to index/);
       });
     });
 
@@ -2437,12 +2469,12 @@ describe('lua-native Node adapter', () => {
 
     it('throws on file not found', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      expect(() => lua.execute_file('/nonexistent/path/to/file.lua')).toThrow();
+      expect(() => lua.execute_file('/nonexistent/path/to/file.lua')).toThrow(/cannot open/);
     });
 
     it('throws on syntax error in file', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      expect(() => lua.execute_file(fixturesDir + 'syntax-error.lua')).toThrow();
+      expect(() => lua.execute_file(fixturesDir + 'syntax-error.lua')).toThrow(/syntax error/);
     });
 
     it('throws on empty file path', () => {
@@ -2470,8 +2502,8 @@ describe('lua-native Node adapter', () => {
       expect(lua.execute_script('return 1 + 2')).toBe(3);
       expect(lua.execute_script('return "hello"')).toBe('hello');
       // Standard library functions are not available
-      expect(() => lua.execute_script('return type(math)')).toThrow();
-      expect(() => lua.execute_script('return print("hi")')).toThrow();
+      expect(() => lua.execute_script('return type(math)')).toThrow(/attempt to call a nil value \(global 'type'\)/);
+      expect(() => lua.execute_script('return print("hi")')).toThrow(/attempt to call a nil value \(global 'print'\)/);
     });
 
     it('loads all libraries with preset "all"', () => {
@@ -2519,8 +2551,8 @@ describe('lua-native Node adapter', () => {
 
     it('empty libraries array creates a bare Lua state', () => {
       const lua = new lua_native.init({}, { libraries: [] });
-      expect(() => lua.execute_script('return type(math)')).toThrow();
-      expect(() => lua.execute_script('return print("hi")')).toThrow();
+      expect(() => lua.execute_script('return type(math)')).toThrow(/attempt to call a nil value \(global 'type'\)/);
+      expect(() => lua.execute_script('return print("hi")')).toThrow(/attempt to call a nil value \(global 'print'\)/);
       expect(lua.execute_script('return 1 + 2')).toBe(3);
       expect(lua.execute_script('return "hello"')).toBe('hello');
     });
@@ -2596,7 +2628,7 @@ describe('lua-native Node adapter', () => {
 
     it('rejects on syntax errors', async () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      await expect(lua.execute_script_async('return %%%')).rejects.toThrow();
+      await expect(lua.execute_script_async('return %%%')).rejects.toThrow(/unexpected symbol/);
     });
 
     it('rejects when calling JS callbacks', async () => {
@@ -2648,7 +2680,7 @@ describe('lua-native Node adapter', () => {
 
     it('execute_file_async rejects on file not found', async () => {
       const lua = new lua_native.init({}, ALL_LIBS);
-      await expect(lua.execute_file_async('/nonexistent/file.lua')).rejects.toThrow();
+      await expect(lua.execute_file_async('/nonexistent/file.lua')).rejects.toThrow(/cannot open/);
     });
 
     it('concurrent execution across contexts', async () => {
@@ -2739,7 +2771,7 @@ describe('lua-native Node adapter', () => {
 
       it('throws on non-string argument', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
-        expect(() => (lua as any).add_search_path(42)).toThrow();
+        expect(() => (lua as any).add_search_path(42)).toThrow(/Expected string argument/);
       });
 
       it('require caches the module (loaded once)', () => {
@@ -2832,8 +2864,8 @@ describe('lua-native Node adapter', () => {
 
       it('throws on invalid arguments', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
-        expect(() => (lua as any).register_module(42, {})).toThrow();
-        expect(() => (lua as any).register_module('mod')).toThrow();
+        expect(() => (lua as any).register_module(42, {})).toThrow(/Expected \(string, object\)/);
+        expect(() => (lua as any).register_module('mod')).toThrow(/Expected \(string, object\)/);
       });
 
       it('module functions receive correct arguments from Lua', () => {
@@ -2851,7 +2883,7 @@ describe('lua-native Node adapter', () => {
 
       it('requiring an unknown module still errors', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
-        expect(() => lua.execute_script("require('nonexistent')")).toThrow();
+        expect(() => lua.execute_script("require('nonexistent')")).toThrow(/module 'nonexistent' not found/);
       });
 
       it('registered module does not pollute global namespace', () => {
@@ -2909,7 +2941,7 @@ describe('lua-native Node adapter', () => {
 
       it('throws on syntax error', () => {
         const lua = new lua_native.init();
-        expect(() => lua.compile('return +')).toThrow();
+        expect(() => lua.compile('return +')).toThrow(/unexpected symbol/);
       });
 
       it('supports stripDebug option', () => {
@@ -2976,18 +3008,18 @@ describe('lua-native Node adapter', () => {
       it('throws on invalid bytecode', () => {
         const lua = new lua_native.init();
         const garbage = Buffer.from([0x00, 0x01, 0x02, 0x03]);
-        expect(() => lua.load_bytecode(garbage)).toThrow();
+        expect(() => lua.load_bytecode(garbage)).toThrow(/attempt to load a text chunk/);
       });
 
       it('throws on empty bytecode', () => {
         const lua = new lua_native.init();
-        expect(() => lua.load_bytecode(Buffer.alloc(0))).toThrow();
+        expect(() => lua.load_bytecode(Buffer.alloc(0))).toThrow(/Bytecode cannot be empty/);
       });
 
       it('rejects raw source text (binary-only mode)', () => {
         const lua = new lua_native.init();
         const source = Buffer.from('return 42');
-        expect(() => lua.load_bytecode(source)).toThrow();
+        expect(() => lua.load_bytecode(source)).toThrow(/attempt to load a text chunk/);
       });
 
       it('loads the same bytecode multiple times', () => {
@@ -3053,7 +3085,7 @@ describe('lua-native Node adapter', () => {
 
       it('throws on nonexistent file', () => {
         const lua = new lua_native.init();
-        expect(() => lua.compile_file('./nonexistent.lua')).toThrow();
+        expect(() => lua.compile_file('./nonexistent.lua')).toThrow(/cannot open/);
       });
 
       it('supports stripDebug option', () => {
@@ -4035,7 +4067,7 @@ describe('lua-native Node adapter', () => {
       it('surfaces syntax and runtime errors', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         const env = lua.create_environment({ whitelist: ['error'] });
-        expect(() => lua.execute_script_in(env, 'this is not lua')).toThrow();
+        expect(() => lua.execute_script_in(env, 'this is not lua')).toThrow(/syntax error/);
         expect(() => lua.execute_script_in(env, 'error("boom")')).toThrow('boom');
       });
 
@@ -4236,7 +4268,7 @@ describe('lua-native Node adapter', () => {
         // Trigger OOM
         expect(() => {
           lua.execute_script("return string.rep('x', 1024 * 1024)");
-        }).toThrow();
+        }).toThrow(/not enough memory/);
 
         // Small script should still work
         const result = lua.execute_script('return 42');
@@ -5122,7 +5154,7 @@ describe('lua-native Node adapter', () => {
 
       it('rejects on a compile error', async () => {
         const lua = new lua_native.init({}, ALL_LIBS);
-        await expect(lua.execute_async('this is not lua !!!')).rejects.toThrow();
+        await expect(lua.execute_async('this is not lua !!!')).rejects.toThrow(/syntax error/);
       });
 
       it('rejects a top-level coroutine.yield (no resumer)', async () => {
@@ -5464,7 +5496,7 @@ describe('lua-native Node adapter', () => {
       it('reports source errors from the searcher', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         lua.add_searcher(() => 'this is not valid lua @@@');
-        expect(() => lua.execute_script('require("bad")')).toThrow();
+        expect(() => lua.execute_script('require("bad")')).toThrow(/error loading JS module 'bad'/);
       });
 
       it('throws when the package library is not loaded', () => {
@@ -5528,7 +5560,7 @@ describe('lua-native Node adapter', () => {
         { getBad: () => Promise.resolve(Symbol('nope')) },
         { libraries: 'safe' }
       );
-      await expect(lua.execute_async('local v = getBad(); return v')).rejects.toThrow();
+      await expect(lua.execute_async('local v = getBad(); return v')).rejects.toThrow(/failed to convert awaited value/);
       expect(lua.is_busy()).toBe(false);
       expect(lua.execute_script('return 1')).toBe(1);
     });
@@ -5555,11 +5587,11 @@ describe('lua-native Node adapter', () => {
     it('M4: a raising __index on the _G metatable surfaces as a JS error, not a crash', () => {
       const lua = new lua_native.init({}, { libraries: 'all' });
       lua.execute_script('setmetatable(_G, { __index = function() error("trap") end })');
-      expect(() => lua.get_global('definitely_missing')).toThrow();
+      expect(() => lua.get_global('definitely_missing')).toThrow(/trap/);
       // A metatable on _G with __newindex likewise routes through protection.
       const lua2 = new lua_native.init({}, { libraries: 'all' });
       lua2.execute_script('setmetatable(_G, { __newindex = function() error("no writes") end })');
-      expect(() => lua2.set_global('x', 1)).toThrow();
+      expect(() => lua2.set_global('x', 1)).toThrow(/no writes/);
     });
 
     it('M4 remainder: register_function / get_global_ref / set_metatable route _G access through protection', () => {
@@ -5567,13 +5599,13 @@ describe('lua-native Node adapter', () => {
       // _G must surface as a caught error, not a process abort.
       const lua = new lua_native.init({}, { libraries: 'all' });
       lua.execute_script('setmetatable(_G, { __newindex = function() error("no writes") end })');
-      expect(() => lua.set_global('fn', () => 1)).toThrow();
+      expect(() => lua.set_global('fn', () => 1)).toThrow(/no writes/);
 
       // get_global_ref and set_metatable read _G through the protected path.
       const lua2 = new lua_native.init({}, { libraries: 'all' });
       lua2.execute_script('setmetatable(_G, { __index = function() error("trap") end })');
-      expect(() => lua2.get_global_ref('definitely_missing')).toThrow();
-      expect(() => lua2.set_metatable('definitely_missing', { __index: () => 0 })).toThrow();
+      expect(() => lua2.get_global_ref('definitely_missing')).toThrow(/trap/);
+      expect(() => lua2.set_metatable('definitely_missing', { __index: () => 0 })).toThrow(/trap/);
     });
 
     it('M7: register_class rejects reserved metamethods but allows operator overloads', () => {
@@ -5632,10 +5664,10 @@ describe('lua-native Node adapter', () => {
       const lua = new lua_native.init({}, { libraries: 'safe' });
       const fn: any = lua.execute_script('return function(a, b) return a + b end');
       // Non-configurable: delete throws in strict mode (this file is an ES module).
-      expect(() => { delete fn.__luaFnOwner; }).toThrow();
+      expect(() => { delete fn.__luaFnOwner; }).toThrow(/Cannot delete property '__luaFnOwner'/);
       // Non-writable: reassigning throws too — neither vector can free the
       // backing data out from under the still-callable function.
-      expect(() => { fn.__luaFnOwner = null; }).toThrow();
+      expect(() => { fn.__luaFnOwner = null; }).toThrow(/read only property '__luaFnOwner'/);
       // The function still works and the owner is intact.
       expect(fn(2, 3)).toBe(5);
     });
@@ -5649,7 +5681,7 @@ describe('lua-native Node adapter', () => {
       });
       const a = lua.execute_script('return Pool.new()');
       // Marker is non-configurable (delete throws) ...
-      expect(() => { delete a.__luaClassRef; }).toThrow();
+      expect(() => { delete a.__luaClassRef; }).toThrow(/Cannot delete property '__luaClassRef'/);
       // ... but re-tagging the pooled object with a fresh ref must still succeed
       // (writable:true), not throw a "redefine non-configurable" error.
       expect(() => lua.execute_script('return Pool.new()')).not.toThrow();
@@ -5930,10 +5962,10 @@ describe('lua-native Node adapter', () => {
 
     it('validates create_coroutine and resume arguments', () => {
       const lua: any = new lua_native.init({}, ALL_LIBS);
-      expect(() => lua.create_coroutine()).toThrow();
-      expect(() => lua.create_coroutine(42)).toThrow();
-      expect(() => lua.resume()).toThrow();
-      expect(() => lua.resume(42)).toThrow();
+      expect(() => lua.create_coroutine()).toThrow(/Expected a script string that returns a function, or a Lua function/);
+      expect(() => lua.create_coroutine(42)).toThrow(/Expected a script string that returns a function, or a Lua function/);
+      expect(() => lua.resume()).toThrow(/Expected a coroutine object as first argument/);
+      expect(() => lua.resume(42)).toThrow(/Expected a coroutine object as first argument/);
       expect(() => lua.resume({})).toThrow(/coroutine/i);
       expect(() => lua.resume({ _coroutine: 'not-an-external' })).toThrow(/coroutine/i);
     });
@@ -6016,7 +6048,7 @@ describe('lua-native Node adapter', () => {
       // __newindex isn't reached here — but it must still surface as a throw,
       // not an abort.
       lua = withHostileG();
-      expect(() => lua.set_metatable('missing', { __index: () => 1 })).toThrow();
+      expect(() => lua.set_metatable('missing', { __index: () => 1 })).toThrow(/Global 'missing' does not exist/);
     });
 
     it('F1: a rejected set_userdata strands no state (name is reusable)', () => {
@@ -6299,8 +6331,8 @@ describe('lua-native Node adapter', () => {
       lua.execute_script(
         't = setmetatable({}, { __index = function() return boom() end })');
       const handle = lua.get_global_ref('t');
-      expect(() => handle.get('x')).toThrow(); // stages refs[0]
-      expect(() => handle.get('y')).toThrow(); // its CallScope clears refs[0], stages refs[1]
+      expect(() => handle.get('x')).toThrow(/boom 0/); // stages refs[0]
+      expect(() => handle.get('y')).toThrow(/boom 1/); // its CallScope clears refs[0], stages refs[1]
       await gcSettle();
       expect(refs[0].deref()).toBeUndefined();
     });
@@ -6800,7 +6832,7 @@ describe('lua-native Node adapter', () => {
         expect(lua.execute_script('return require("greeter").hello()')).toBe('hi');
         lua.reset();
         // register_module is bound to the old state and is not replayed.
-        expect(() => lua.execute_script('return require("greeter")')).toThrow();
+        expect(() => lua.execute_script('return require("greeter")')).toThrow(/module 'greeter' not found/);
       });
 
       it('leaves the context usable across repeated resets', () => {

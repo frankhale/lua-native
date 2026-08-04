@@ -90,6 +90,19 @@
     "LuaCallHostFunction closure pushes": 1,
     "napi_type_tag definitions": 6
   },
+  "objectwrap-branding": {
+    "ObjectWrap subclasses": "LuaContext, SharedTable",
+    "LuaContext: branded at construction": "no",
+    "SharedTable: branded at construction": "yes",
+    "unwrap: SharedTable::Unwrap in AsSharedTable": "TAG-CHECKED",
+    "unwrap sites found": 1
+  },
+  "assertion-strength": {
+    "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
+    "toThrow assertions examined": 362,
+    "negative (.not) — exempt by design": 29,
+    "BARE positive assertions": 0
+  },
   "exception-surface": {
     "throw sites (binding)": 23,
     "throw sites (core)": 28,

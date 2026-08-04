@@ -8,12 +8,14 @@ remediation.
 *correctness programme* — what to search and how. `FUTURE.md` is the feature
 roadmap and is a separate document.
 
-> **Status (revised August 3, 2026, after CODE-REVIEW-20).** §§1–5 below are the
+> **Status (revised August 4, 2026, after CODE-REVIEW-21).** §§1–5 below are the
 > assessment as of CR-17 and are kept unedited as the record. **Everything they
-> recommended has been executed** except §3, which was deferred by decision.
-> Read them for the reasoning; read **the revision beginning at §6** for where
-> the programme stands now and what to do next. §6 also states, for the first
-> time in the series, what an **end state** would consist of.
+> recommended has been executed** except §3 (platform verification + CI), which
+> is now **closed as out of scope** — see **§14**, which supersedes this whole
+> document on that subject and should be read before acting on §1.5, §3, §10
+> criterion 5, or A4. Read §§1–5 for the reasoning; read the revision beginning
+> at **§6** for where the programme stands, **§13** for the A1/A2/A5 execution
+> record, and **§14** for the scope decision.
 
 ---
 
@@ -274,7 +276,7 @@ building searches for the families that have never had one.
 | Item | Status | Outcome |
 |---|---|---|
 | §2 — CR-18 exception-escape matrix | ✅ Done | 297 cells (27 frames × 11 kinds), **zero aborts**. The family that produced CR-2 H8, CR-6 F1 and CR-8 F1/F4 is closed on evidence. It found three findings instead, all of a milder kind. |
-| §3 — CI + cross-platform verification | ⏸️ Deferred by decision | CR-18 recorded that this stays a macOS/arm64 project for now. **Still open, and still the largest un-searched risk in the project** — see A4. |
+| §3 — CI + cross-platform verification | ✅ **Closed, not deferred** (Aug 4, 2026) | Out of scope by decision. "Deferred" is what kept it being re-raised every pass; it is now closed. See §14. |
 | §4 — mechanize the comment invariants | ✅ Done | `tools/invariants/` + `tests/ts/invariants.spec.ts`. Seven frozen invariants today. CR-19 then found two of them wrong, which is its own lesson (§8). |
 | §5 — differential oracle | ✅ Done | `tools/diff-oracle/`, 2678 cases against stock Lua 5.5. The first harness in the series whose failure mode is "this answer is wrong". |
 | — | ✅ Added, unplanned | `tools/roundtrip-matrix/` (CR-20): 12 doors × 50 values, the first mechanical search of the JS → Lua direction. |
@@ -416,8 +418,11 @@ The programme is complete when all five hold:
    instrument can fire; it does not prove it is pointed at the whole subject.
 4. **The tests can distinguish the failure they exist to catch** from an
    incidental one (A2). Seventy assertions currently cannot.
-5. **All of it runs without anyone remembering to run it**, on every platform
-   the project claims to support (A4).
+5. ~~**All of it runs without anyone remembering to run it**, on every platform
+   the project claims to support (A4).~~ **Struck, August 4, 2026 (§14).** This
+   criterion was the platform/CI question wearing a different hat, and it is
+   closed. The end state does **not** require CI or any platform beyond
+   macOS/arm64; four criteria remain, not five.
 
 At that point a pass that finds a documentation nit is the *expected* result and
 the programme moves to regression maintenance. Until then, a clean pass is
@@ -433,6 +438,12 @@ confusion) and one borderline (F1, the array hole, now specified).
 ---
 
 ## 11. Action items
+
+> **Status (August 4, 2026).** **A1, A2 and A5 are done**, along with CR-21's
+> F4a. A3 is two-thirds done (CR-21). A4 is still an open decision and is the
+> only item nobody can execute without the project owner. See §13 for what each
+> turned out to be — three of them were not quite what this section described,
+> and the differences are the interesting part.
 
 Ordered. A1 and A2 come before another review pass: they target the mechanism
 that produced the last high, and together they are under three days.
@@ -488,7 +499,13 @@ harness. Two of the three are cheap because the corpus already exists:
 enumeration as complete. The enumeration being written down is the deliverable,
 not the clean runs.
 
-### A4 — Resolve the platform question *(decision, then medium)*
+### A4 — Resolve the platform question — ✅ **CLOSED, August 4, 2026. Do not reopen.**
+
+> **Decided by the project owner: neither branch. macOS-only scope and the
+> absence of CI are settled, and are not to be raised again as gaps, risks,
+> action items, or caveats.** See §14. The text below is kept as the record of
+> what was weighed; it is no longer a live recommendation, and nothing in it
+> should be carried into a future pass.
 
 The only item here that is a decision rather than work, and the only one that
 can invalidate the end state. Two of three targets declared in `binding.gyp`
@@ -539,7 +556,7 @@ one** — which is also why A2 comes first.
 | **1** | A2 — pattern the 70 bare `.toThrow()`s; invariant against new ones | ~½ day | Cheapest item with a direct causal link to the last high; makes every later fix safer |
 | **1** | A1 — close classes over computed closures; assert them | 1–2 days | Targets the failure mode still producing highs: a class boundary drawn slightly too small |
 | **2** | A3 — async / bytecode / lifecycle boundaries, then declare the list empty | Medium (2 low, 1 medium) | The last three unsearched crossings; the recorded enumeration is what converts "clean" into "complete" |
-| **2** | A4 — narrow `binding.gyp` **or** stand up CI (+ M5) | Decision, then medium | An end state cannot be declared over a platform nothing has executed |
+| — | ~~A4 — narrow `binding.gyp` **or** stand up CI (+ M5)~~ | ✅ Closed | Out of scope by decision, Aug 4 2026 (§14). Not a gap; do not re-raise. |
 | **3** | A5 — remove the superseded `AsSharedTable` comment | Minutes | Rides along |
 | **4** | A6 — record the exit criteria; switch to regression mode | — | The end state itself |
 
@@ -552,3 +569,183 @@ resets with each new one**, so "nothing serious" is still a claim about coverage
 rather than about the code. A1–A4 are what convert it into a claim about the
 code, and they are bounded — this is a few weeks of work, not another eleven
 passes.
+
+---
+
+# 13. Execution record — A1, A2, A5 (August 4, 2026)
+
+**Done:** A1, A2, A5, and CR-21 F4a. **Two-thirds done:** A3. **Open decision:**
+A4. Verified after each change and again at the end: **936 TypeScript tests**
+(up from 934), **285 C++ tests**, nine invariants clean, `test-ts-asan` clean,
+and all five harnesses clean (exec-parity 4015/2/0, exception matrix 297/297,
+oracle 0 disagreements, round-trip 456 identical / 0 undocumented / parity 50
+of 50).
+
+**Every one of the three was measured before it was fixed, and all three turned
+out to be stated slightly wrong.** That is the finding of this round, and it is
+the same one the programme keeps producing about itself — an action item is a
+hypothesis, and prose is where the boundary gets drawn too small.
+
+## A1 — done, and the claim it rested on is now verified rather than asserted
+
+§11 said the provenance closure was "checked against the source, **already
+correct**", and it is. Re-verified: two `ObjectWrap` subclasses, six
+`napi_type_tag`s, `InstanceOf` at **zero** live uses (every remaining mention is
+a comment saying it is *not* the mechanism — see A5), and `SharedTable::Unwrap`
+the only unwrap of a JS-supplied value.
+
+**What §11 did not say is *why* the unbranded class is safe, and that gap was
+worth closing by experiment.** `LuaContext` carries no brand. The obvious worry
+is the CR-20 F5 shape one door over: `Object.getPrototypeOf(ctx).execute_script
+.call(sharedTable, …)` reaches an ObjectWrap method with a foreign receiver, and
+node-addon-api unwraps `this` internally. Driven, in both directions and with a
+plain object:
+
+```
+LuaContext.execute_script.call(sharedTable)  -> TypeError: Illegal invocation
+SharedTable.set.call(luaContext)             -> TypeError: Illegal invocation
+init({}, { shared: { s: luaContext } })      -> TypeError: shared.s must be a
+                                                shared table created with
+                                                createSharedTable()
+init({}, { shared: { s: genuine } })         -> constructed
+```
+
+All refused, and the *reasons differ*: `napi_define_class` gives instance
+methods a V8 signature, so a foreign **receiver** is rejected before any unwrap
+runs, while an **argument** has no such check and is what the type tag exists
+for. That receiver/argument split is the real closure, and it is now written
+down where the next person will look instead of being rediscovered.
+
+**The invariant** (`objectwrap-branding`, the ninth) computes it: the ObjectWrap
+subclasses, whether each brands itself at construction, and every `X::Unwrap(`
+scored `TAG-CHECKED` or `UNGUARDED` by whether a `CheckTypeTag` precedes it in
+the same function. Shown able to report dirty in both failure modes — deleting
+the `CheckTypeTag` flips the row to `UNGUARDED`, and a third `ObjectWrap`
+subclass appears as `branded: no`. The unwrap-site *count* is frozen too, so a
+regex that goes blind cannot report a clean sheet.
+
+**The audit of the other invariants came back better than expected**, and the
+reason is structural rather than lucky. §11 asked whether each frozen universe
+is a closure or an enumeration. The answer splits by shape:
+
+- **Row-shaped** (`callscope-classification`, `lua-next-sites`,
+  `occupancy-policy-sites`, `core-call-guarding`): the frozen key set *is* the
+  universe, and `diffInvariant` reports a vanished key as `(gone)`. Verified by
+  renaming a classified function: the row disappeared and was reported. These
+  need no added coverage number — they already have one, in a form nobody had
+  named.
+- **Count-shaped** (`greppable-counts`, `exception-surface`, plus the two new
+  ones): a count that goes blind reports `0`, which is a value and not a missing
+  key, so it needs its own total. Each has one. This is the distinction CR-21 F3
+  ran into the hard way, and it is now a comment on `diffInvariant`.
+
+## A2 — done; its central number was wrong in a way that mattered
+
+§11: "**70 bare `.toThrow()` / `.toThrowError()` call sites** … Give each a
+pattern." Measured: **71**, of which **28 are `.not.toThrow()`**. The real
+target was **43**.
+
+**Patterning the 28 would have made the suite weaker, not stronger.** There is
+no message to match on a negative assertion, and `expect(f).not.toThrow(/x/)`
+asserts only "did not throw *this*" — it permits every other throw. So the
+action item, followed literally, would have introduced 28 holes while closing
+43. The invariant exempts `.not.` by design and says why.
+
+All 43 now carry patterns, and none was guessed: each site's real message was
+**harvested** by running the suite with a regex whose `test` was intercepted, so
+the patterns match what the code actually produces rather than what it was
+assumed to produce. (Three rounds were needed — a site sitting after another
+failing assertion in the same test never executes, so those had to be
+instrumented alone.) The suite is green on all 936.
+
+`assertion-strength` (the eighth invariant) freezes **0 bare positive
+assertions** and, alongside it, the **362 assertions examined** — because "0
+bare" is exactly what a broken scanner reports too. It names an offender by its
+`it(...)` title rather than by line number, and was shown to fire.
+
+**The process-global guard is the part with the most leverage.** An `afterEach`
+now asserts that no test left `Symbol.hasInstance` patched on the `SharedTable`
+constructor. Proven dirty by deleting the `finally` that CR-20 added: the guard
+fires immediately — and **94 tests fail**, which is the measured blast radius of
+the leak that hid CR-20 F5 for five passes. It was latent only because the
+offending test happened to be the last one to construct a shared context.
+
+## A5 — done, and it was three comments, not one
+
+§11 named `lua-native.cpp:866–881`. Two more said the same wrong thing:
+
+| Site | Claimed | Actually |
+|---|---|---|
+| `lua-native.cpp` `AsSharedTable` header | "the load-bearing guard is one line lower" (`Unwrap`) | `CheckTypeTag`; the `Unwrap` claim is what CR-20 F5 aborted the process through |
+| `lua-native.cpp` `CreateSharedTable` | "identified by an InstanceOf check that no user object can satisfy" | a type tag — and "no user object can satisfy" is precisely what CR-15 F5 disproved |
+| `lua-native.h` `SharedTable` class doc | "identified by an InstanceOf check against the stored constructor" | same |
+
+All three now describe the brand, and each records both superseded claims so
+neither can be reinstated by someone reading only one of them. The
+`AsSharedTable` body lost a redundant third explanation. Every surviving mention
+of `InstanceOf` in `src/` is now a statement that it is *not* the mechanism.
+
+## What remains
+
+- **A3** — one boundary left: the userdata/class lifecycle across `reset` and
+  GC. The enumeration is in `docs/CODE-REVIEW-21.md`; when that row has an
+  instrument, §10's criterion 1 is met.
+- **A4** — ✅ **closed the same day by the project owner: out of scope.** See
+  §14. Not a gap, not deferred, not a caveat.
+- **A6** — blocked on A3 alone.
+
+---
+
+# 14. Scope decision: platform coverage and CI are closed (August 4, 2026)
+
+**Decided by the project owner. This supersedes every recommendation in this
+document, in `CODE-REVIEW-18`, and in any earlier pass, on these two subjects.**
+
+> **This project is macOS-only and has no CI, and neither is a gap.**
+> Do not raise either as a finding, a risk, an action item, a release blocker,
+> or a caveat on a "clean" or "complete" conclusion. Until the owner says
+> otherwise, they are settled.
+
+### What is closed
+
+- The untested targets declared in `binding.gyp` (mac x64, win x64). Not a
+  correctness gap. **Do not propose narrowing `binding.gyp` either** — the
+  proposal itself is part of what was closed.
+- CI, in every form: hosted runners, pre-push hooks, "runs without anyone
+  remembering to run it" automation.
+- `CODE-REVIEW-DEFERRED` M5 (`MACOSX_DEPLOYMENT_TARGET`). Not a blocker.
+- §1 point 5, §3 in full, §10 criterion 5, §12 row A4, and A4 itself. Where
+  those still argue the case, they are historical record, not live advice.
+
+### Why this is written down as forcefully as it is
+
+Because it kept coming back. The platform/CI question was raised in §1.5, argued
+at length in §3, promoted to "the largest un-searched risk in the project" in
+§6, embedded as one of the five end-state criteria in §10, and listed as A4 in
+both §11 and §12 — and it was carried forward each time under the word
+**"deferred"**, which reads as *still open, revisit next pass*. Every pass then
+paid to re-derive a conclusion the owner had already reached, and the owner
+named it as time wasting.
+
+**The lesson generalizes past this one item, and is the reason for the emphasis:
+"deferred" is not a resolution.** An item parked with that word has no owner and
+no closing condition, so it regenerates on every review. A decision the owner
+has made should be recorded as *closed* with the reasoning frozen behind it —
+which is what this section does. If a future pass finds itself weighing macOS
+versus Windows, or arguing that habit is a fragile substitute for automation, it
+has rediscovered a closed question and should stop.
+
+### What the end state now requires
+
+§10's criteria drop from five to four: the boundary enumeration (§10.1), closure
+over computed closures (§10.2), instruments that state their own universe
+(§10.3), and tests that can distinguish the failure they exist to catch (§10.4).
+Criterion 5 is struck. **A6 is therefore blocked on A3 alone** — the single
+remaining boundary, the userdata/class lifecycle across `reset` and GC.
+
+### Revocability
+
+The owner's phrasing was "until further notice", so this is a decision rather
+than a permanent property of the project. If cross-platform support or CI is
+ever wanted, reopen it deliberately — but nothing should reopen it implicitly,
+and no review pass should reopen it at all.

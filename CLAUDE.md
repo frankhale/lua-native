@@ -159,7 +159,14 @@ Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, 
 
 - C++17 standard, compiled via node-gyp (`binding.gyp`)
 - N-API version 8, with `NODE_ADDON_API_CPP_EXCEPTIONS` enabled
-- Platform targets: macOS (arm64, x64), Windows (x64)
+- Platform targets declared in `binding.gyp`: macOS (arm64, x64), Windows (x64).
+  **In practice this is a macOS project and there is no CI, and both are settled
+  decisions — not gaps.** Do not raise the untested targets, the absence of CI,
+  pre-push hooks, or `CODE-REVIEW-DEFERRED` M5 as findings, risks, action items,
+  or caveats on a "clean"/"complete" conclusion, and do not propose narrowing
+  `binding.gyp` either. The review programme re-derived this every pass until it
+  was closed on August 4, 2026; see `docs/CODE-REVIEW-NEXT-STEPS.md` §14.
+  Revocable by the owner, but nothing should reopen it implicitly.
 - All public `LuaRuntime` methods that can fail return `ScriptResult` (`variant<vector<LuaPtr>, string>`) where the string variant is an error message
 - `LuaValue` uses `std::variant` with `std::monostate` for nil — use the `LuaValue::from()` factory functions
 - Max recursion depth for table conversion: `kMaxDepth = 100`

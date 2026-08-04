@@ -345,8 +345,12 @@ struct UserdataEntry {
 class SharedTable final : public Napi::ObjectWrap<SharedTable> {
 public:
     // Builds the class. The constructor is not exported — `createSharedTable`
-    // is the only way to mint one, so an object reaching the `shared` option
-    // can be identified by an InstanceOf check against the stored constructor.
+    // is the only way to mint one, and it brands each instance with
+    // `lua_tags::kSharedTable`. An object reaching the `shared` option is
+    // identified by that brand, **not** by an InstanceOf check against the
+    // stored constructor: the constructor is reachable from JS via
+    // `createSharedTable().constructor`, so `instanceof` is user-defeatable
+    // (CR-15 F5, CR-20 F5). See AsSharedTable.
     static Napi::Function DefineSharedTable(Napi::Env env);
 
     explicit SharedTable(const Napi::CallbackInfo& info);

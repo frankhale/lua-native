@@ -441,11 +441,13 @@ running it. That is the same finding CR-18 recorded about its own remediation
 produced it.
 
 One process note, stated without ceremony: the F3 drift means the last commit
-landed without `npm run check-invariants` or the suite being run. The
-programme's §10 criterion 5 — "all of it runs without anyone remembering to
-run it" — is not hypothetical; this pass's baseline was red on arrival for
-exactly that reason. A4 (CI, or a pre-push hook at minimum) converts that from
-a habit back into a property.
+landed without `npm run check-invariants` or the suite being run, which is why
+this pass's baseline was red on arrival.
+
+*(Added August 4, 2026: this paragraph originally continued into a
+recommendation for CI. **Platform coverage and CI are now closed as out of
+scope** — see `CODE-REVIEW-NEXT-STEPS` §14 — so the note stands only as the
+explanation for the red baseline, not as an argument for automating anything.)*
 
 **The boundary enumeration, updated.** With this pass A3 has one entry left:
 

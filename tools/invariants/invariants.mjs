@@ -413,6 +413,140 @@ function allMatches(text, re) {
 // looks like a definition is either attributed to a function or explicitly
 // classified as a declaration or a macro invocation. `UNATTRIBUTED` is a
 // scanner bug and turns the suite red.
+// ---------------------------------------------------------------------------
+// 9. Provenance is not kind: every ObjectWrap unwrapped from a JS-supplied
+//    value must be brand-checked first (CR-15 F6, CR-20 F5; NEXT-STEPS A1)
+// ---------------------------------------------------------------------------
+//
+// CR-20 F5: `AsSharedTable` was `InstanceOf` + `Unwrap`, and both halves are
+// forgeable. `InstanceOf` consults `Symbol.hasInstance`; `napi_unwrap` is **not
+// a type check** — handed an object wrapped by a *different* `ObjectWrap`
+// subclass it succeeds and returns that pointer, which is then reinterpreted.
+// A `LuaContext*` was accepted as a `SharedTable*` and the process aborted.
+// The remedy was a `napi_type_tag`, and CR-15 F6 had already established the
+// same rule for the five marker Externals — it simply was not re-asked of the
+// one wrapped class.
+//
+// **The distinction that makes this tractable is receiver vs argument**, and it
+// was verified by driving it rather than reasoned about:
+//
+//   * As a **receiver** (`LuaContext.prototype.execute_script.call(x)`) the
+//     confusion is already impossible. `napi_define_class` builds the methods
+//     with a V8 signature, so a foreign receiver is rejected as
+//     `TypeError: Illegal invocation` before any unwrap runs. Driven in both
+//     directions and with a plain object; all refused.
+//   * As an **argument** there is no such check, because nothing about a
+//     parameter says which class it should be. That is the door CR-20 F5 came
+//     through, and it is the one this invariant watches.
+//
+// So the computed closure is: for every `X::Unwrap(` in the binding, is a
+// `CheckTypeTag` reached earlier in the same function? A new wrapped class, or
+// a new unwrap of an argument, appears here as a row — UNGUARDED if it forgot
+// the brand. An unbranded class is only safe while nothing unwraps it from a
+// JS-supplied value, and that condition is exactly what the `unwrap sites` row
+// tracks.
+export function objectWrapBranding() {
+  const src = readSource(BINDING);
+  const header = readSource(join(ROOT, 'src/lua-native.h'));
+  const clean = stripCommentsAndStrings(src);
+  const out = {};
+
+  // The universe: every ObjectWrap subclass declared in the header.
+  const classes = [...stripCommentsAndStrings(header)
+    .matchAll(/class\s+(\w+)\s+final\s*:\s*public\s+Napi::ObjectWrap<\s*\1\s*>/g)]
+    .map((m) => m[1]).sort();
+  out['ObjectWrap subclasses'] = classes.join(', ');
+
+  // Does each brand itself at construction?
+  for (const cls of classes) {
+    const ctor = topLevelFunctions(src).find((f) => f.name === `${cls}::${cls}`);
+    const brands = ctor ? /\.TypeTag\(&lua_tags::/.test(stripCommentsAndStrings(ctor.body)) : false;
+    out[`${cls}: branded at construction`] = brands ? 'yes' : 'no';
+  }
+
+  // Every unwrap of a JS-supplied value, scored by whether the enclosing
+  // function brand-checks first. Keyed by class+function, never by line.
+  let sites = 0;
+  for (const fn of topLevelFunctions(src)) {
+    const body = stripCommentsAndStrings(fn.body);
+    for (const m of body.matchAll(/(\w+)::Unwrap\s*\(/g)) {
+      sites += 1;
+      const before = body.slice(0, m.index);
+      const guarded = /CheckTypeTag\s*\(&lua_tags::/.test(before);
+      out[`unwrap: ${m[1]}::Unwrap in ${fn.name}`] = guarded ? 'TAG-CHECKED' : 'UNGUARDED';
+    }
+  }
+  // Frozen so the scanner cannot go blind and report a clean sheet: zero sites
+  // is what a broken regex reports too (CR-19 F2, CR-21 F3).
+  out['unwrap sites found'] = sites;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 8. Assertion strength in the TypeScript suite (CR-20 F5; NEXT-STEPS A2)
+// ---------------------------------------------------------------------------
+//
+// A bare `.toThrow()` asserts only that *something* threw. Two of them hid
+// CR-20 F5 for five passes: the tests for `AsSharedTable`'s refusal passed
+// identically whether the error was the intended refusal or the raw
+// `"Invalid argument"` that meant the type filter had been defeated — so the
+// assertion for the behaviour was the thing concealing its absence.
+//
+// **`.not.toThrow()` is exempt, and that is not a loophole.** A pattern on a
+// negative assertion is meaningless: there is no message to match, and
+// `expect(f).not.toThrow(/x/)` would assert the weaker "did not throw *this*",
+// silently permitting every other throw. A2 said "give each of the 70 a
+// pattern"; 28 of those 70 are `.not.` forms, and doing that to them would have
+// made the suite weaker. The count in the action item conflated the two.
+//
+// **The universe is computed, not enumerated** (CR-19 F1): every `*.spec.ts`
+// under tests/ts is scanned, discovered by readdir, and the file list is part
+// of the frozen answer — so a new spec file is a review item rather than an
+// unscanned blind spot.
+//
+// **The totals are frozen alongside the zero, and that is the load-bearing
+// part** (CR-19 F2, CR-21 F3). "0 bare assertions" is exactly what a scanner
+// that has stopped matching anything also reports. Freezing the number of
+// assertions actually examined means going blind shows up as a drop to zero
+// *there*, where it reads as broken instead of as clean.
+export function assertionStrength() {
+  const dir = join(ROOT, 'tests/ts');
+  const files = readdirSync(dir).filter((f) => f.endsWith('.spec.ts')).sort();
+  const out = { 'spec files scanned': files.join(', ') };
+
+  let examined = 0;
+  let negative = 0;
+  const bare = [];
+  for (const file of files) {
+    const src = readSource(join(dir, file));
+    const re = /(\.not)?\.toThrow(Error)?\s*\(/g;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      examined += 1;
+      const isNegative = m[1] !== undefined;
+      if (isNegative) negative += 1;
+      // Empty argument list == bare. Look at the first non-space character
+      // after the paren the match ended on.
+      const rest = src.slice(re.lastIndex);
+      const isBare = /^\s*\)/.test(rest);
+      if (isBare && !isNegative) {
+        // Named by the enclosing `it(...)` title rather than by line number: a
+        // line number churns on every edit above it, and an invariant that
+        // cries wolf gets re-frozen without being read (see scannerCoverage).
+        const before = src.slice(0, m.index);
+        const title = [...before.matchAll(/\b(?:it|test)\s*\(\s*(['"`])(.*?)\1/g)].pop();
+        bare.push(`${file}: ${title ? title[2] : '<unknown test>'}`);
+      }
+    }
+  }
+
+  out['toThrow assertions examined'] = examined;
+  out['negative (.not) — exempt by design'] = negative;
+  out['BARE positive assertions'] = bare.length;
+  for (const b of bare) out[`bare: ${b}`] = 'NEEDS A PATTERN';
+  return out;
+}
+
 export function scannerCoverage() {
   const out = {};
   for (const [label, path] of [['binding', BINDING], ['core', CORE]]) {
@@ -452,6 +586,18 @@ export const INVARIANTS = [
     id: 'greppable-counts',
     title: 'Counts that were previously written into comments as literals',
     compute: greppableCounts,
+  },
+  {
+    id: 'objectwrap-branding',
+    title: 'Every ObjectWrap unwrapped from a JS-supplied value is brand-checked',
+    compute: objectWrapBranding,
+    note: 'An UNGUARDED row is the CR-20 F5 defect (a LuaContext accepted as a SharedTable, SIGABRT). A class may be unbranded only while nothing unwraps it from an argument — as a receiver, napi_define_class\'s V8 signature already refuses a foreign `this`.',
+  },
+  {
+    id: 'assertion-strength',
+    title: 'Bare .toThrow() assertions in the TypeScript suite',
+    compute: assertionStrength,
+    note: 'BARE positive assertions must stay 0 — a bare .toThrow() passes on the wrong error, which is how CR-20 F5 stayed hidden for five passes. `.not.toThrow()` is exempt by design. If "toThrow assertions examined" drops sharply, suspect the scanner before believing the zero.',
   },
   {
     id: 'exception-surface',
@@ -496,10 +642,17 @@ export function diffInvariant(actual, expected) {
       drift.push(`~ ${k}: ${JSON.stringify(expected[k])} -> ${JSON.stringify(actual[k])}`);
     }
   }
+  // A key present in the frozen answer and absent from the computed one is
+  // reported, and that is what gives the row-shaped invariants their coverage
+  // assertion (NEXT-STEPS A1): for `callscope-classification`, `lua-next-sites`,
+  // `occupancy-policy-sites` and `core-call-guarding` the frozen key set *is*
+  // the universe, so a scanner that stops seeing a function drops its row and
+  // says so, rather than quietly shrinking what it claims to cover. The
+  // count-shaped invariants cannot rely on that — a count that goes blind
+  // reports 0, which is a value and not a missing key — which is why each of
+  // those freezes its own total alongside its answer.
   for (const k of eKeys) {
     if (!(k in actual)) drift.push(`- ${k}: ${JSON.stringify(expected[k])}   (gone)`);
   }
   return drift.sort();
 }
-
-void readdirSync;

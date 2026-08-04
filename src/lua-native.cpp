@@ -866,36 +866,32 @@ Napi::Value SharedTable::Sync(const Napi::CallbackInfo& info) {
 // Resolves a `shared` option entry to its SharedTable, or nullptr if the value
 // wasn't minted by createSharedTable().
 //
-// **The InstanceOf check is not what makes this safe, and the earlier comment
-// here said it was (CR-15 F5).** `Napi::Object::InstanceOf` is `napi_instanceof`,
-// which is the JS `instanceof` operator and therefore consults
-// `Symbol.hasInstance` — and the constructor, though never exported, is reachable
-// from JS as `createSharedTable().constructor`. Driven: defining
-// `Symbol.hasInstance` on it makes this check pass for a plain object and for a
-// LuaContext. What actually holds the line is the `Unwrap` below: `napi_unwrap`
-// rejects both (they carry no SharedTable wrap), and node-addon-api turns that
-// into a thrown `Napi::Error` rather than a garbage pointer. So the check is a
-// filter that produces a good error message, and the load-bearing guard is one
-// line lower. Do not "simplify" by trusting InstanceOf and skipping Unwrap's
-// failure path, and do not replace Unwrap with a raw `napi_unwrap` whose status
-// is ignored.
+// **The guard is the type tag, and two earlier comments here each named a
+// different wrong thing (CR-15 F5, CR-20 F5, CR-21 A5).** The history is worth
+// three lines because both wrong answers were argued for in prose and believed:
+//
+//   1. "`InstanceOf` identifies it." False: `napi_instanceof` is the JS
+//      `instanceof` operator, so it consults `Symbol.hasInstance` — and the
+//      constructor, though never exported, is reachable as
+//      `createSharedTable().constructor`. Four lines of JS defeat it.
+//   2. "Then `Unwrap` is what holds the line." Also false, and this one aborted
+//      the process. `napi_unwrap` is **not a type check**: it returns whatever
+//      pointer was attached, so an object wrapped by a *different* ObjectWrap
+//      subclass unwraps "successfully" into a wrongly-typed pointer. A
+//      LuaContext was accepted as a SharedTable and reinterpreted (SIGABRT).
+//
+// What actually holds is `CheckTypeTag` below — a 128-bit brand written at mint
+// time, which JS cannot reach at all. `Unwrap` stays, but as the accessor it is
+// (contained, see below), not as a guard. Do not reinstate either claim above.
 static SharedTable* AsSharedTable(const Napi::Env env, const Napi::Value& value) {
   if (!value.IsObject() || value.IsFunction()) return nullptr;
   const auto* data = env.GetInstanceData<AddonData>();
   if (!data || data->sharedTableConstructor.IsEmpty()) return nullptr;
   const auto obj = value.As<Napi::Object>();
-  // The brand first, and it is the load-bearing check: `InstanceOf` consults
-  // `Symbol.hasInstance` and so answers whatever user JS wants it to, while
-  // `napi_unwrap` is not a type check either — it hands back whatever pointer
-  // was attached, so a different ObjectWrap subclass unwraps "successfully"
-  // into a wrongly-typed pointer. `CheckTypeTag` compares a 128-bit brand
-  // applied at mint time and cannot be reached from JS at all.
+  // The brand, and it is the whole type check (see the header).
   if (!obj.CheckTypeTag(&lua_tags::kSharedTable)) return nullptr;
-  // `InstanceOf` consults `Symbol.hasInstance`, so it is user-defeatable — CR-15
-  // F5 established that, and that what actually holds is `napi_unwrap` refusing
-  // an object it never wrapped. What CR-15 did not note is that `Unwrap`
-  // *throws* on that refusal, and this function's callers are written for a
-  // nullptr. Two consequences, both fixed by containing it here:
+  // `Unwrap` *throws* when it refuses, and this function's callers are written
+  // for a nullptr. Two consequences, both fixed by containing it here:
   //
   //   * the raw N-API message ("Invalid argument") escaped in place of the
   //     caller's own — "shared.s must be a shared table created with
@@ -3993,9 +3989,15 @@ void LuaFileAsyncWorker::OnError(const Napi::Error& error) {
   deferred_.Reject(error.Value());
 }
 
-// createSharedTable(initial?) — the only way to mint a SharedTable. The class
-// constructor itself stays unexported so `shared` entries can be identified by
-// an InstanceOf check that no user object can satisfy.
+// createSharedTable(initial?) — the only way to mint a SharedTable, and so the
+// only place the `kSharedTable` brand is applied.
+//
+// The class constructor stays unexported, but that is a convenience rather than
+// the security property: it is still reachable as
+// `createSharedTable().constructor`, which is exactly how CR-15 F5 defeated the
+// `InstanceOf` check this comment used to credit. What makes a `shared` entry
+// identifiable is the type tag applied in the constructor and checked in
+// AsSharedTable — see there.
 static Napi::Value CreateSharedTable(const Napi::CallbackInfo& info) {
   const Napi::Env env = info.Env();
   const auto* data = env.GetInstanceData<AddonData>();

@@ -73,9 +73,15 @@ export const ACCEPTED_DIVERGENCES = [
       + 'on it: `error({code=7})` reports "(error object is a table value)" where '
       + 'stock Lua reports "table: 0x...", and `error(nil)` reports "(error object '
       + 'is a nil value)" where stock Lua reports "<no error object>". Both are '
-      + 'deliberate and strictly more informative than an address; the structured '
-      + 'value is still reachable through the thrown JS Error. A difference in '
-      + 'wording, not in what happened.',
+      + 'deliberate and strictly more informative than an address: an address is '
+      + 'not actionable, and it differs between runs. A difference in wording, '
+      + 'not in what happened. '
+      + 'NOTE (CR-21 F4a): this reason used to end "the structured value is still '
+      + 'reachable through the thrown JS Error", which is false for a Lua-origin '
+      + 'table error — the thrown Error carries only `message` and `stack`. '
+      + 'Reconstruction applies to JS-origin errors (the __jsErrorId path), not '
+      + 'to a table a Lua script raised. The wording difference is still '
+      + 'acceptable; the consolation offered for it was not true.',
   },
 ];
 
