@@ -73,11 +73,11 @@ class LuaContext;
 // Changing an existing one is harmless (tags live only for the process), but
 // pointless.
 namespace lua_tags {
-inline constexpr napi_type_tag kTableRefData = {0x6698902f38bc485d, 0x9b90643c0fd512d3};
-inline constexpr napi_type_tag kFunctionData = {0x667131e920a749af, 0xbb1c4846120ea2f7};
-inline constexpr napi_type_tag kUserdataData = {0xa8b9ebcda2c3425c, 0xb7e95102192dfc6d};
-inline constexpr napi_type_tag kThreadData   = {0x03c9d2fd69544592, 0x96fef3e10b2ceb0b};
-inline constexpr napi_type_tag kRuntimeOwner = {0x4407ac2239054ac1, 0xbd118c5dfb000daf};
+inline constexpr napi_type_tag kTableRefData = {.lower = 0x6698902f38bc485d, .upper = 0x9b90643c0fd512d3};
+inline constexpr napi_type_tag kFunctionData = {.lower = 0x667131e920a749af, .upper = 0xbb1c4846120ea2f7};
+inline constexpr napi_type_tag kUserdataData = {.lower = 0xa8b9ebcda2c3425c, .upper = 0xb7e95102192dfc6d};
+inline constexpr napi_type_tag kThreadData   = {.lower = 0x03c9d2fd69544592, .upper = 0x96fef3e10b2ceb0b};
+inline constexpr napi_type_tag kRuntimeOwner = {.lower = 0x4407ac2239054ac1, .upper = 0xbd118c5dfb000daf};
 // The SharedTable ObjectWrap itself, not a marker External (CR-20 follow-up).
 // `InstanceOf` consults Symbol.hasInstance and is user-defeatable, and
 // `napi_unwrap` is **not** a type check — it returns whatever pointer was
@@ -97,9 +97,9 @@ constexpr bool SameTag(const napi_type_tag& a, const napi_type_tag& b) {
   return a.lower == b.lower && a.upper == b.upper;
 }
 constexpr bool AllTagsDistinct() {
-  const napi_type_tag all[] = {kTableRefData, kFunctionData, kUserdataData,
+  constexpr napi_type_tag all[] = {kTableRefData, kFunctionData, kUserdataData,
                                kThreadData, kRuntimeOwner, kSharedTable};
-  constexpr size_t n = sizeof(all) / sizeof(all[0]);
+  constexpr size_t n = std::size(all);
   for (size_t i = 0; i < n; ++i) {
     for (size_t j = i + 1; j < n; ++j) {
       if (SameTag(all[i], all[j])) return false;
@@ -284,7 +284,7 @@ struct LuaThreadData {
 // `context` + `contextAlive` pair the *Data structs carry, so a callback
 // invoked after its LuaContext was collected fails cleanly.
 struct LuaContextBinding {
-  LuaContext* context;
+  LuaContext* context{};
   ContextLiveness liveness;
 
   [[nodiscard]] bool ContextLive() const {
