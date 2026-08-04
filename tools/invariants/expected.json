@@ -96,7 +96,7 @@
     "catch sites (binding)": 67,
     "catch sites (core)": 38,
     "RunProtected calls (core)": 32,
-    "lua_pcall calls (core)": 7
+    "lua_pcall calls (core)": 8
   },
   "scanner-coverage": {
     "binding: functions found": 118,

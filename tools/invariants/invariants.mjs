@@ -155,14 +155,28 @@ export function occupancyPolicySites() {
 export function greppableCounts() {
   const binding = stripCommentsAndStrings(readSource(BINDING));
   const core = stripCommentsAndStrings(readSource(CORE));
+  const header = stripCommentsAndStrings(readSource(join(ROOT, 'src/lua-native.h')));
   const count = (text, re) => (text.match(re) || []).length;
   return {
     // The kSyncApi policy's call sites. Written as 33 in four places; was 31.
     'RejectIfBusy() call sites': count(binding, /if \(RejectIfBusy\(\)\)/g),
     // CR-12 F2's "single place that pushes the host-function closure" claim.
     'LuaCallHostFunction closure pushes': count(core, /lua_pushcclosure\([^;]*LuaCallHostFunction/g),
-    // The tagged-External kinds the static_assert on tag distinctness covers.
-    'napi_type_tag definitions': count(readSource(join(ROOT, 'src/lua-native.h')).replace(/\/\/[^\n]*/g, ''), /constexpr napi_type_tag/g),
+    // The tag kinds the static_assert on tag distinctness covers.
+    //
+    // Anchored to the *definitional* form — `inline constexpr napi_type_tag k…`
+    // at namespace scope — and not to a bare `constexpr napi_type_tag`, which
+    // is one declaration-form too wide: it also matched the local array inside
+    // `AllTagsDistinct()`, so changing that array's `const` to `constexpr`
+    // (a correct cleanup, commit d72a1dd) reported a seventh tag that does not
+    // exist and turned the suite red for a week (CR-21 F3).
+    //
+    // The lesson is the one CR-19 F1 recorded and this pattern then repeated:
+    // a computed universe is still a hand-drawn boundary, and "count the
+    // mentions" is a different question from "count the definitions". If a tag
+    // is ever defined in another file or another form, this count *falls* — so
+    // pair any such move with a look at this line.
+    'napi_type_tag definitions': count(header, /inline\s+constexpr\s+napi_type_tag\s+k\w+/g),
   };
 }
 

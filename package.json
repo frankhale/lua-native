@@ -41,6 +41,7 @@
     "oracle": "node tools/diff-oracle/run.mjs",
     "exception-matrix": "node tools/exception-matrix/run.mjs",
     "roundtrip-matrix": "node tools/roundtrip-matrix/run.mjs",
+    "exec-parity": "node tools/exec-parity/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib"
   },

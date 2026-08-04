@@ -44,6 +44,9 @@ npm run oracle
 # JS -> Lua -> JS round-trip and entry-point parity (12 doors x 50 values)
 npm run roundtrip-matrix
 
+# Execution-door parity: async + bytecode doors vs execute_script (1339 cases x 3 doors)
+npm run exec-parity
+
 # Clean build artifacts
 npm run clean
 ```
@@ -70,7 +73,7 @@ the job of `npm run exception-matrix`, the generated search for that class
 (`docs/CODE-REVIEW-18.md`), alongside the CODE-REVIEW-6 behavioral matrix in the
 suite. See also `docs/CODE-REVIEW-THOUGHTS.md`.
 
-**Correctness harnesses (`tools/`).** Four instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
+**Correctness harnesses (`tools/`).** Five instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
 
 - `npm run check-invariants` — lists that used to live in comments (the
   `CallScope` classification, the `lua_next` traversal sites, the occupancy
@@ -91,8 +94,12 @@ suite. See also `docs/CODE-REVIEW-THOUGHTS.md`.
 - `npm run roundtrip-matrix` — the other direction: 12 entry points × 50 values,
   checking that a JS value survives the crossing *into* Lua and that all twelve
   doors agree with each other. See `docs/CODE-REVIEW-20.md`.
+- `npm run exec-parity` — the oracle's 1339-case corpus through each alternate
+  execution door (`execute_script_async`, `execute_async`,
+  `compile`→`load_bytecode`), compared against `execute_script` — values *and*
+  error messages. See `docs/CODE-REVIEW-21.md`.
 
-All four follow the same conventions, and `tools/README.md` states them with the
+All five follow the same conventions, and `tools/README.md` states them with the
 reason each exists — chiefly: **an exhaustive search that reports clean must
 first demonstrate it can report dirty**, so each runs positive controls before
 its real work and refuses to proceed if they fail; each checks per-cell vacuity,

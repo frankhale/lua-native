@@ -4266,21 +4266,35 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
       }
     }
 
-    // B1: common built-in JS types (binary data, Date, Map, Set, RegExp)
-    if (auto builtin = ConvertBuiltinType(value, depth,
-          [this](const Napi::Value& v, const int d) { return NapiToCoreInstance(v, d); })) {
-      return std::move(*builtin);
-    }
-
     // Cycle check before descending, so an object that is its own ancestor is
     // named as one at the first repeat instead of after a hundred levels of
     // conversion work that then reports the wrong cause (CR-20 F2).
+    //
+    // **Above ConvertBuiltinType, not below it (CR-21 F2).** `Map` and `Set`
+    // recurse into their entries, and while this sat below the builtin branch
+    // those two containers were converted without ever joining the path they
+    // are compared against — so a self-containing Map still reported the depth
+    // limit, which is precisely the wrong message CR-20 F2 existed to remove.
+    // The fix is placement rather than a second check in each container branch,
+    // because "recurses" is a property of the builtin *set*, and a new
+    // recursing builtin added below would otherwise be short by the same
+    // member a third time.
+    //
+    // Pushing the non-recursing builtins (Date, RegExp, the binary views) is
+    // inert: they never descend, so they cannot meet themselves, and the entry
+    // is popped before any sibling is converted.
     if (IsOnConversionPath(value)) {
       throw std::runtime_error(
         "Value contains a circular reference, which Lua tables cannot represent; "
         "break the cycle before passing it in");
     }
     ConversionPathEntry on_path(this, value);
+
+    // B1: common built-in JS types (binary data, Date, Map, Set, RegExp)
+    if (auto builtin = ConvertBuiltinType(value, depth,
+          [this](const Napi::Value& v, const int d) { return NapiToCoreInstance(v, d); })) {
+      return std::move(*builtin);
+    }
 
     if (value.IsArray()) {
       const auto arr = value.As<Napi::Array>();

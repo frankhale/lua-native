@@ -10441,4 +10441,158 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  describe('CODE-REVIEW-21 regressions', () => {
+    describe('F2: the cycle check covers the recursing builtin containers', () => {
+      // CR-20 F2 put the check below ConvertBuiltinType, so Map and Set —
+      // the two builtins that recurse — were converted without ever joining
+      // the path they are compared against, and a self-containing Map still
+      // reported the depth limit. These are the members that boundary missed.
+      it('a cyclic Map reports a cycle, not depth', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const m = new Map();
+        m.set('self', m);
+        expect(() => lua.set_global('x', m)).toThrow(/circular reference/);
+        try { lua.set_global('x', m); } catch (e: any) {
+          expect(e.message).not.toMatch(/nesting depth/);
+        }
+      });
+
+      it('a cyclic Set reports a cycle, not depth', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const s = new Set();
+        s.add(s);
+        expect(() => lua.set_global('x', s)).toThrow(/circular reference/);
+        try { lua.set_global('x', s); } catch (e: any) {
+          expect(e.message).not.toMatch(/nesting depth/);
+        }
+      });
+
+      it('a cycle closed through a Map reports a cycle', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const m = new Map();
+        const o: any = {};
+        m.set('o', o);
+        o.m = m;
+        expect(() => lua.set_global('x', m)).toThrow(/circular reference/);
+      });
+
+      it('a cycle closed through a Set and an array reports a cycle', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const s = new Set();
+        const a: any[] = [];
+        s.add(a);
+        a.push(s);
+        expect(() => lua.set_global('x', s)).toThrow(/circular reference/);
+      });
+
+      it('a DAG through a Map is still not a cycle', () => {
+        // CR-20's control, restated for the containers: moving the check up
+        // must not turn sharing into a cycle.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const shared = { x: 1 };
+        expect(() => lua.set_global('g', new Map([['a', shared], ['b', shared]]))).not.toThrow();
+        expect(lua.execute_script('return g.a.x + g.b.x')).toBe(2);
+      });
+
+      it('the non-recursing builtins stay inert on the path', () => {
+        // Date, RegExp and the binary views now join the conversion path too.
+        // They never descend, so they cannot meet themselves — and the same
+        // instance used twice in one object must still convert twice.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        const d = new Date(1000);
+        const u = new Uint8Array([65, 66]);
+        lua.set_global('x', { a: d, b: d, u1: u, u2: u, r: /ab+c/g });
+        expect(lua.execute_script('return x.a + x.b')).toBe(2000);
+        expect(lua.execute_script('return x.u1 .. x.u2')).toBe('ABAB');
+        expect(lua.execute_script('return x.r')).toBe('ab+c');
+      });
+
+      it('nested container data still survives the crossing', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_global('x', new Map([['s', new Set([1, 2])]]));
+        expect(lua.execute_script('return x.s[1] + x.s[2]')).toBe(3);
+      });
+    });
+
+    describe('F1: every execution door describes a non-string error value alike', () => {
+      // execute_async drives the script with lua_resume, which takes no message
+      // handler — so the description MessageHandler produces for a non-string
+      // error was absent at that one door, and `error({code=7})` surfaced as a
+      // bare `table: 0x...`. Fixed by running the same handler under its own
+      // protected call rather than mirroring its rule.
+      const NON_STRING_ERRORS: ReadonlyArray<readonly [string, string, RegExp]> = [
+        ['a table', 'error({code=7})', /\(error object is a table value\)/],
+        ['a boolean', 'error(true)', /\(error object is a boolean value\)/],
+        ['a number', 'error(5)', /^5\n/],
+      ];
+
+      for (const [what, script, expected] of NON_STRING_ERRORS) {
+        it(`execute_script describes ${what}`, () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          expect(() => lua.execute_script(script)).toThrow(expected);
+        });
+
+        it(`execute_async describes ${what} the same way`, async () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          await expect(lua.execute_async(script)).rejects.toThrow(expected);
+        });
+
+        it(`execute_script_async describes ${what} the same way`, async () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          await expect(lua.execute_script_async(script)).rejects.toThrow(expected);
+        });
+      }
+
+      it('execute_async appends a traceback to a non-string error too', async () => {
+        // The asymmetry inside the door: only the string branch tracebacked,
+        // so error(nil) carried one and error({...}) did not.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        await expect(lua.execute_async('error({code=7})')).rejects.toThrow(/stack traceback:/);
+      });
+
+      it('error(nil) differs at the driver door because Lua makes it differ', async () => {
+        // NOT a binding defect, and pinned so it is not "fixed" by matching on
+        // liblua's internal string. lua_resume replaces a nil error object with
+        // the string "<no error object>" before returning, so what arrives is
+        // already a string and no formatting rule can recover the nil. Proven
+        // here from inside Lua itself, where no lua-native code is involved.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.execute_script(`
+          local co = coroutine.create(function() error(nil) end)
+          local ok, e = coroutine.resume(co)
+          return type(e)`)).toBe('string');
+
+        const driver: any = new lua_native.init({}, ALL_LIBS);
+        await expect(driver.execute_async('error(nil)')).rejects.toThrow(/<no error object>/);
+        // The pcall doors, which see the real nil, still describe it.
+        const sync: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => sync.execute_script('error(nil)')).toThrow(/\(error object is a nil value\)/);
+      });
+
+      it('a __tostring on the error object still wins at every door', async () => {
+        const script = 'error(setmetatable({}, {__tostring = function() return "custom!" end}))';
+        const sync: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => sync.execute_script(script)).toThrow(/custom!/);
+        const driver: any = new lua_native.init({}, ALL_LIBS);
+        await expect(driver.execute_async(script)).rejects.toThrow(/custom!/);
+      });
+
+      it('a JS callback error still reconstructs through execute_async', async () => {
+        // The structured-error path (__jsErrorId) must pass through untouched;
+        // it is the case MessageHandler returns early for.
+        const boom = new Error('from js');
+        const lua: any = new lua_native.init(
+          { thrower: () => { throw boom; } }, ALL_LIBS);
+        await expect(lua.execute_async('thrower()')).rejects.toThrow(/from js/);
+      });
+
+      it('a string error is unchanged at every door', async () => {
+        const sync: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => sync.execute_script('error("plain")')).toThrow(/plain/);
+        const driver: any = new lua_native.init({}, ALL_LIBS);
+        await expect(driver.execute_async('error("plain")')).rejects.toThrow(/plain/);
+      });
+    });
+  });
+
 });

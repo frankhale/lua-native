@@ -18,6 +18,7 @@ tools/
   exception-matrix/       can a C++ exception escape into the process?
   diff-oracle/            does lua-native agree with stock Lua?
   roundtrip-matrix/       does a JS value survive the crossing into Lua and back?
+  exec-parity/            do the async and bytecode doors agree with execute_script?
 ```
 
 | Harness | Run | What it searches | Docs |
@@ -26,6 +27,7 @@ tools/
 | **exception-matrix** | `npm run exception-matrix` | 27 Lua C frames × 11 throw kinds, one process per cell — a `std::runtime_error` reaching `std::terminate`, which the sanitizers are blind to | `docs/CODE-REVIEW-18.md` |
 | **diff-oracle** | `npm run oracle` | 2678 cases against stock Lua 5.5: does the embedded VM behave like the reference (mode A), and do values coming *out* survive (mode B) | `docs/DIFFERENTIAL-ORACLE.md` |
 | **roundtrip-matrix** | `npm run roundtrip-matrix` | 12 entry points × 50 values: does a value survive the crossing *in*, and do all twelve doors agree with each other | `docs/CODE-REVIEW-20.md` |
+| **exec-parity** | `npm run exec-parity` | 1339 corpus cases × 3 doors: do `execute_script_async`, `execute_async` and `compile`→`load_bytecode` agree with `execute_script` — values *and* error messages | `docs/CODE-REVIEW-21.md` |
 
 ## Conventions every harness follows
 

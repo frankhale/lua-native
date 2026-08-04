@@ -3709,19 +3709,52 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
     result.state = AsyncStepResult::State::Finished;
   } else {
     lua_State* co = threadRef.thread;
-    // Append a traceback for string errors; structured JS-error tables pass
-    // through and are captured as-is.
-    if (lua_type(co, -1) == LUA_TSTRING) {
-      const char* m = lua_tostring(co, -1);
-      // Bracketed for the same reason the resume above is: building the
-      // traceback string allocates (unboundedly — the message is copied into
-      // it), and an allocation can drive a GC step whose __gc finalizers are
-      // Lua. Nothing else guards this path: DriveAsync opens no CallScope, so
-      // without the scope a finalizer here would see the runtime reporting
-      // depth 0 and could reset() the state it is running on (CR-12 F3).
+    // Format the error exactly as the three `lua_pcall` doors do (CR-21 F1).
+    //
+    // `lua_resume` has no message-handler slot, so this path used to traceback
+    // *string* errors only and hand everything else straight to
+    // ErrorValueToString — which stringifies a table to its address. The doors
+    // that go through ProtectedCall run MessageHandler, which describes it
+    // instead ("(error object is a table value)") and tracebacks it, so
+    // `execute_async` was the one door reporting a bare `table: 0x...` for
+    // `error({code=7})`.
+    //
+    // **Running the same handler rather than mirroring its rule is the point.**
+    // A mirror is what left this short: the rule lived in MessageHandler and
+    // this path re-implemented half of it. A second copy would have to be kept
+    // in step by whoever edits the first, which is the failure this codebase
+    // keeps repeating.
+    //
+    // It runs under its own `lua_pcall` because that is the environment it was
+    // written for: it calls `__tostring`, which is user Lua, and a raising
+    // `__tostring` reaching this otherwise-unprotected frame would panic the
+    // state. ErrorValueToString guards the same hazard the same way, on this
+    // same thread, two lines below — so pcall-ing a dead coroutine's stack is
+    // the established practice here rather than something new.
+    //
+    // `error(nil)` is deliberately *not* converged: Lua replaces a nil error
+    // object with the string "<no error object>" before returning from
+    // lua_resume, so the value that arrives here is already a string and the
+    // difference from the pcall doors is the language's, not the binding's.
+    // Ledgered in tools/exec-parity/accepted.mjs with that reason.
+    //
+    // ExecutionScope for the reason the resume above has one: the traceback and
+    // the metamethod allocate, an allocation can drive a GC step, and a __gc
+    // finalizer is Lua re-entering the host. DriveAsync opens no CallScope, so
+    // without the scope a finalizer here would see the runtime reporting depth
+    // 0 and could reset() the state it is running on (CR-12 F3).
+    {
       ExecutionScope exec(this);
-      luaL_traceback(co, co, m, 1);
-      lua_remove(co, -2);  // drop the original string, keep the traceback'd one
+      const int err_idx = lua_gettop(co);
+      lua_pushcfunction(co, MessageHandler);
+      lua_pushvalue(co, err_idx);
+      if (lua_pcall(co, 1, 1, 0) == LUA_OK) {
+        lua_replace(co, err_idx);  // the report replaces the raw error value
+      } else {
+        // Formatting failed (OOM, or a __tostring that raised). Keep the
+        // original error: a failure to describe an error must not replace it.
+        lua_pop(co, 1);
+      }
     }
     result.error = CaptureError(co);
     lua_settop(co, 0);

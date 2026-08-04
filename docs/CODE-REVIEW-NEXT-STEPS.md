@@ -8,6 +8,13 @@ remediation.
 *correctness programme* — what to search and how. `FUTURE.md` is the feature
 roadmap and is a separate document.
 
+> **Status (revised August 3, 2026, after CODE-REVIEW-20).** §§1–5 below are the
+> assessment as of CR-17 and are kept unedited as the record. **Everything they
+> recommended has been executed** except §3, which was deferred by decision.
+> Read them for the reasoning; read **the revision beginning at §6** for where
+> the programme stands now and what to do next. §6 also states, for the first
+> time in the series, what an **end state** would consist of.
+
 ---
 
 ## 1. Where the code actually stands
@@ -251,3 +258,297 @@ per-pass high count, which has been flat for eleven passes and will likely stay
 flat as long as each pass brings a new instrument. The marginal value of another
 review pass *in the CR-9-through-CR-15 style* is now low; the value is in
 building searches for the families that have never had one.
+
+---
+
+# Revision — after CODE-REVIEW-20
+
+**Date:** August 3, 2026
+**Written after:** CODE-REVIEW-18, 19 and 20 and their remediations.
+**Supersedes:** §§2–5 above, all of which have been executed.
+
+---
+
+## 6. What the CR-17 programme produced
+
+| Item | Status | Outcome |
+|---|---|---|
+| §2 — CR-18 exception-escape matrix | ✅ Done | 297 cells (27 frames × 11 kinds), **zero aborts**. The family that produced CR-2 H8, CR-6 F1 and CR-8 F1/F4 is closed on evidence. It found three findings instead, all of a milder kind. |
+| §3 — CI + cross-platform verification | ⏸️ Deferred by decision | CR-18 recorded that this stays a macOS/arm64 project for now. **Still open, and still the largest un-searched risk in the project** — see A4. |
+| §4 — mechanize the comment invariants | ✅ Done | `tools/invariants/` + `tests/ts/invariants.spec.ts`. Seven frozen invariants today. CR-19 then found two of them wrong, which is its own lesson (§8). |
+| §5 — differential oracle | ✅ Done | `tools/diff-oracle/`, 2678 cases against stock Lua 5.5. The first harness in the series whose failure mode is "this answer is wrong". |
+| — | ✅ Added, unplanned | `tools/roundtrip-matrix/` (CR-20): 12 doors × 50 values, the first mechanical search of the JS → Lua direction. |
+
+Three of the four §-items shipped, the fourth was a decision rather than a
+slip, and the programme added a fifth instrument nobody had scheduled.
+
+---
+
+## 7. The finding curve, extended
+
+| Pass | Findings | Highs | | Pass | Findings | Highs |
+|---|---|---|---|---|---|---|
+| CR-1 | 29 | 6 | | CR-11 | 5 | 2 |
+| CR-2 | 34 | 10 | | CR-12 | 5 | 0 |
+| CR-3 | 15 | 3 | | CR-13 | 3 | 1 |
+| CR-4 | 5 | 0 | | CR-14 | 5 | 1 |
+| CR-5 | 10 | 0 | | CR-15 | 6 | 1 |
+| CR-6 | 2 | 1 | | CR-16 | 5 | 1 |
+| CR-7 | 5 | 1 | | CR-17 | 3 | 1 |
+| CR-8 | 7 | ~1 | | **CR-18** | **3** | **0** |
+| CR-9 | 4 | 1 | | **CR-19** | **5** | **0** |
+| CR-10 | 3 | 2 | | **CR-20** | **4 + 1** | **1\*** |
+
+\* CR-20 F5 (`AsSharedTable` type confusion → SIGABRT) was **not found by this
+pass's instrument.** It surfaced when a five-pass-old test-hygiene defect
+collided with a new pin. See §9.
+
+---
+
+## 8. What the last three passes establish
+
+**The count was never the signal, and now it is not even flat.** §1 said the
+evidence for progress was family retirement and defect density rather than the
+per-pass high count. Three passes later the high count moved too:
+
+1. **The crash era is over.** CR-18 pointed a 297-cell generated search at the
+   last hazard family that had never had one, and **nothing aborted** — not at
+   `__gc`-inside-`lua_close`, where there is no Lua error handler above the
+   frame at all. Every high from CR-1 to CR-16 announced itself with a segfault
+   or an abort. That discovery method now returns nothing, which is what closing
+   a class looks like at the level of a whole era rather than a single family.
+
+2. **CR-19 found no defect an ordinary caller can reach.** F1, F2 and F4 are
+   defects in test infrastructure; F3 is a diagnostic string behind a
+   deliberately-shadowed method. Nothing crashed, corrupted, leaked or returned
+   a wrong value. Nineteen passes in, that had never happened before.
+
+3. **API coherence was measured instead of assumed, and came back clean.**
+   CR-20's parity result — 12 doors, 50 values, **zero disagreements**, including
+   for the values that fail, which fail identically — retires CR-17 F2's whole
+   worry. A negative result over a property nobody had checked is the only kind
+   of search that can retire a worry, and this is the first one the series has
+   produced.
+
+4. **The remaining product findings are small and cheap.** CR-20 F2 (a cycle
+   reported as a depth-limit error) and F3 (`-0` losing its sign) were each one
+   condition. F1 was resolved by documenting, which is a legitimate resolution
+   now that `types.d.ts` is load-bearing for the round-trip ledger.
+
+**So: yes, the trend is real, and the direction is legible.** Crashing → lying →
+losing data quietly → documenting the loss unevenly. Each step down that ladder
+is a genuine reduction in what a user can be hurt by.
+
+---
+
+## 9. What they do not establish
+
+Three things cut against declaring this finished, and they are the substance of
+the action items.
+
+**The yield falls per-instrument, not globally.** CR-20's own closing note is
+the honest reading and it should be carried forward as the programme's central
+caveat:
+
+> Every pass that built a genuinely new instrument found something, and every
+> pass that reused an existing one found less. The yield is not falling because
+> the code is converging — it is falling per-instrument, and each new instrument
+> resets it.
+
+CR-16's injection matrix found one crash in 1242 cells; CR-17's lifetime
+matrices one root cause in 573; CR-18's exception matrix no crashes but three
+wrong answers; CR-20's round-trip matrix three more at a seam nothing had ever
+looked at. **"Nothing serious" is currently a statement about which boundaries
+have been searched, not about the code.** It becomes a statement about the code
+only when the boundary list is exhausted *and written down as exhausted* — which
+is the concrete path to an end state and is A3.
+
+**The last high arrived sideways, and it had been latent for five passes.**
+CR-20 F5 is the load-bearing counterexample to any claim of saturation.
+`AsSharedTable` accepted a `LuaContext*` reinterpreted as a `SharedTable*` and
+the process aborted — reachable from four lines of ordinary JavaScript. Three
+things about how it was found matter more than the defect:
+
+- **No instrument found it.** A test-hygiene bug from CR-15 finally collided
+  with a pin placed after it. Serendipity is still producing highs.
+- **It was a class recurrence.** CR-15 F6 established *provenance is not kind*
+  and applied the remedy to five `External`s and not to the one wrapped class,
+  which nobody re-asked the question of.
+- **Two loose assertions hid it.** CR-15 F5's checks were bare `.toThrow()` with
+  no pattern, so they passed identically whether the error was the intended
+  refusal or the `"Invalid argument"` that meant the filter was defeated — the
+  exact hazard CR-17 F3 had already recorded, sitting in the test for the very
+  behaviour it was concealing.
+
+**The recurring failure is a class boundary drawn slightly too small — and it is
+now recurring inside the instruments.** CR-19 named it:
+
+> The recurring failure in this codebase is not fixing the site instead of the
+> class. It is being confident about the boundary of the class. […] Every one of
+> those was a considered boundary, argued for in prose, and short by a little.
+
+CR-19 F1 (the guarding check that was one level deep) and CR-19 F2 (the scanner
+that silently swallowed a function) are that failure inside the checks written
+to prevent it. And CR-19's other observation stands: mechanization **moves** the
+decay into the generator's own coverage, where it is harder to see because the
+output looks authoritative and nobody re-derives it by hand.
+
+---
+
+## 10. What an end state consists of
+
+The series has never defined a termination criterion — every pass ends with
+"what should CR-N+1 search", which is why it reads as open-ended. It is
+definable. `CODE-REVIEW-THOUGHTS.md` is right that "zero findings" is the wrong
+target; the right one is **a bounded, stated, and enforced search**, after which
+review becomes triggered by new surface rather than by the calendar.
+
+The programme is complete when all five hold:
+
+1. **Every boundary has been searched once, and the list is recorded as empty.**
+   Not "we found nothing" but "here is the enumeration of crossings, and each
+   has an instrument". CR-20 leaves three (A3).
+2. **Every class declared closed has been closed over its computed closure**,
+   not over an enumeration someone wrote, and the closure is asserted so a new
+   member cannot arrive outside it (A1).
+3. **Every instrument states its own universe and asserts its own coverage** —
+   the `scanner-coverage` pattern, generalized. A positive control proves an
+   instrument can fire; it does not prove it is pointed at the whole subject.
+4. **The tests can distinguish the failure they exist to catch** from an
+   incidental one (A2). Seventy assertions currently cannot.
+5. **All of it runs without anyone remembering to run it**, on every platform
+   the project claims to support (A4).
+
+At that point a pass that finds a documentation nit is the *expected* result and
+the programme moves to regression maintenance. Until then, a clean pass is
+ambiguous between "clean" and "not looked at".
+
+**A working definition of "serious", so the exit is falsifiable:** a finding is
+serious if an ordinary caller — one writing plausible JavaScript, without
+forging engine internals — can reach a crash, a memory error, a silent wrong
+value, or a leak. By that definition CR-18 and CR-19 found nothing serious;
+CR-20 found one (F5, which needs no forgery to reach the underlying type
+confusion) and one borderline (F1, the array hole, now specified).
+
+---
+
+## 11. Action items
+
+Ordered. A1 and A2 come before another review pass: they target the mechanism
+that produced the last high, and together they are under three days.
+
+### A1 — Close the classes over their closures, and assert the closure *(1–2 days)*
+
+The last several highs are all one shape: a class fixed across the members
+someone could enumerate. Stop enumerating; compute.
+
+- **Provenance / kind.** The closure here is small and, checked against the
+  source, **already correct**: two `ObjectWrap` subclasses (`LuaContext`,
+  `SharedTable`), six `napi_type_tag`s, `InstanceOf` now at **zero** uses in
+  `src/`, and `SharedTable::Unwrap` (`lua-native.cpp:911`) the only `Unwrap` of
+  a JS-supplied value. So the work is not a hunt — it is an **eighth invariant**
+  asserting that every `ObjectWrap` subclass reachable as a JS value is
+  tag-checked before unwrap, so that a third wrapped class cannot arrive
+  untagged the way `SharedTable` did.
+- **The other six invariants.** Ask each the CR-19 F1 question: *is the frozen
+  universe the closure, or an enumeration?* `core-call-guarding` was rebuilt as
+  a fixpoint after CR-19; `exception-surface`, `occupancy-policy-sites`,
+  `lua-next-sites`, `callscope-classification` and `greppable-counts` have not
+  been re-asked.
+- **Done when:** each of the seven-plus invariants carries a documented universe
+  **and** a coverage assertion in the `scanner-coverage` mould, so an
+  unclassified input turns the suite red rather than shrinking the universe
+  silently.
+
+### A2 — Make the suite able to see the failures it exists to catch *(~half a day)*
+
+- **70 bare `.toThrow()` / `.toThrowError()` call sites** in
+  `tests/ts/lua-native.spec.ts` assert only that *something* threw. Two of them
+  concealed CR-20 F5 for five passes. Give each a pattern.
+- **Add an invariant that a bare `.toThrow()` fails the check**, so new ones
+  cannot land. This is the cheapest item on the list with the clearest causal
+  link to a real high.
+- **Guard process-global state between tests.** One such mutation exists (the
+  `Symbol.hasInstance` patch, now restored in a `finally` per CR-20) — a
+  suite-level assertion beats trusting the next one to remember, particularly in
+  a single 434 kB spec file where a leak propagates to every test after it.
+
+### A3 — Search the three remaining boundaries, then declare the list empty *(CR-21–23)*
+
+From CR-20's own enumeration. Each has an obvious metamorphic property and no
+harness. Two of the three are cheap because the corpus already exists:
+
+| Boundary | Property | Cost |
+|---|---|---|
+| Async surface end-to-end | `execute_script_async(s)` ≡ `execute_script(s)` | **Low** — reuse the oracle's 2678-case corpus |
+| Bytecode round-trip | `compile → load_bytecode` ≡ `execute_script` | **Low** — same corpus |
+| Userdata / class lifecycle across `reset` and GC | no stale handle, no stranded registry slot, no aliasing | **Medium** — new cells; closest to CR-17's lifetime matrices |
+
+**Done when:** all three run clean *and* this document records the boundary
+enumeration as complete. The enumeration being written down is the deliverable,
+not the clean runs.
+
+### A4 — Resolve the platform question *(decision, then medium)*
+
+The only item here that is a decision rather than work, and the only one that
+can invalidate the end state. Two of three targets declared in `binding.gyp`
+have never had a test executed against them, there is no CI, and
+`CODE-REVIEW-DEFERRED` M5 (`MACOSX_DEPLOYMENT_TARGET` at `"26.0"`, a documented
+release blocker) sits in the same decision. Pick one:
+
+- **Narrow.** Drop the untested targets from `binding.gyp`, and the end state is
+  honest and small: verified on macOS/arm64, which is what has actually been
+  tested.
+- **Broaden.** CI on macOS arm64 + x64 and Windows x64, plus `test-ts-asan` on
+  one runner, and resolve M5.
+
+Doing neither means everything §§8–10 bought stays protected by habit.
+
+### A5 — One live comment drift, cheap *(minutes)*
+
+`src/lua-native.cpp:866–881` still argues that `InstanceOf` is not what makes
+`AsSharedTable` safe and that "the load-bearing guard is one line lower"
+(`Unwrap`) — a claim CR-20 F5 disproved by aborting the process with it. The
+function contains no `InstanceOf`, and its actual guard is `CheckTypeTag` at
+`:893`, described by a *second* comment at `:887`. Two comments on one function,
+the first now wrong. This is the class the whole §4 mechanization effort exists
+to fight, sitting on the function that produced the most recent high.
+
+### A6 — Write the exit down, then switch modes
+
+When A1–A4 are done, record it here: the boundary enumeration, the closure
+assertions, the platform scope, and the definition of "serious" from §10.
+Thereafter review is triggered by **new surface** — a new entry point, a new
+callback frame, a new Lua version — not by a schedule.
+
+### Standing rule for the run-in
+
+Six consecutive passes found that a structural fix introduced a fresh defect,
+and CR-18's was the most pointed: the fix for the exception class was itself an
+instance of the exception class, written by the person who had spent the day
+characterising it. What caught it was the pre-existing suite, not the new matrix
+and not the reasoning. **Make each fix small and keep the suite green after each
+one** — which is also why A2 comes first.
+
+---
+
+## 12. Summary
+
+| Priority | Task | Effort | Rationale |
+|---|---|---|---|
+| **1** | A2 — pattern the 70 bare `.toThrow()`s; invariant against new ones | ~½ day | Cheapest item with a direct causal link to the last high; makes every later fix safer |
+| **1** | A1 — close classes over computed closures; assert them | 1–2 days | Targets the failure mode still producing highs: a class boundary drawn slightly too small |
+| **2** | A3 — async / bytecode / lifecycle boundaries, then declare the list empty | Medium (2 low, 1 medium) | The last three unsearched crossings; the recorded enumeration is what converts "clean" into "complete" |
+| **2** | A4 — narrow `binding.gyp` **or** stand up CI (+ M5) | Decision, then medium | An end state cannot be declared over a platform nothing has executed |
+| **3** | A5 — remove the superseded `AsSharedTable` comment | Minutes | Rides along |
+| **4** | A6 — record the exit criteria; switch to regression mode | — | The end state itself |
+
+**Direct answer to "are we trending toward lower-priority findings":** yes, and
+CR-18–20 are the first passes that show it in the high count rather than only in
+density — an era ended (no crashes in 297 cells), a pass landed with no
+product defect an ordinary caller can reach, and API coherence was measured
+clean for the first time. **The caveat is that yield falls per-instrument and
+resets with each new one**, so "nothing serious" is still a claim about coverage
+rather than about the code. A1–A4 are what convert it into a claim about the
+code, and they are bounded — this is a few weeks of work, not another eleven
+passes.
