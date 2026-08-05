@@ -953,7 +953,9 @@ private:
     // never had — output has been redirectable since July 2026 while input
     // still reached the process's real stdin.
     Napi::FunctionReference read_handler_;
-    void InstallReadHandler(const Napi::Function& fn);
+    // False when the core refused to wire io.read (a non-table global `io`); the
+    // handler is then not retained. See LuaRuntime::SetInputHandler.
+    bool InstallReadHandler(const Napi::Function& fn);
 
     // Virtual file access (P4b): JS reader backing dofile()/loadfile().
     Napi::FunctionReference file_reader_;

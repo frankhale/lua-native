@@ -10527,6 +10527,143 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  describe('strictConversion — refusing the silent losses (LIMITATIONS §5)', () => {
+    const strict = () => new lua_native.init({}, { libraries: 'all', strictConversion: true }) as any;
+    const lossy = () => new lua_native.init({}, ALL_LIBS) as any;
+
+    // The four losses §5 lists that are *silent*. Each is pinned twice: the
+    // default still performs it (so the option is genuinely opt-in and no
+    // existing caller changed), and strict mode refuses it.
+    describe('Lua -> JS: table keys', () => {
+      it('drops a non-string/number key by default, refuses under strict', () => {
+        expect(lossy().execute_script('return {[true]=1,[false]=2}')).toEqual({});
+        expect(() => strict().execute_script('return {[true]=1}'))
+          .toThrow(/strict conversion.*key of type 'boolean'.*would be dropped/s);
+      });
+
+      it('names the offending key type', () => {
+        expect(() => strict().execute_script('return {[{}]=1}'))
+          .toThrow(/key of type 'table'/);
+        expect(() => strict().execute_script('return {[print]=1}'))
+          .toThrow(/key of type 'function'/);
+      });
+
+      // The nastier of the two: which value survives depends on lua_next order,
+      // so the default is not merely lossy but unpredictably lossy.
+      it('collapses a colliding string/number key by default, refuses under strict', () => {
+        expect(lossy().execute_script('return {["1"]="s",[1]="i"}')).toEqual({ 1: 's' });
+        expect(() => strict().execute_script('return {["1"]="s",[1]="i"}'))
+          .toThrow(/strict conversion.*both become the JavaScript property "1".*one value would be lost/s);
+      });
+    });
+
+    describe('JS -> Lua: nil in a container', () => {
+      it('truncates a sequence at a null by default, refuses under strict', () => {
+        const l = lossy();
+        l.set_global('a', [1, null, 3, 4]);
+        expect(l.execute_script('return #a')).toBe(1);
+        expect(l.execute_script('return a[4]')).toBe(4);   // present, just not in the sequence
+        expect(() => strict().set_global('a', [1, null, 3, 4]))
+          .toThrow(/strict conversion.*array index 1.*ends the sequence/s);
+      });
+
+      it('removes a key for a null value by default, refuses under strict', () => {
+        const l = lossy();
+        l.set_global('o', { a: null, b: 1 });
+        expect(l.execute_script('return tostring(o.a)')).toBe('nil');
+        expect(() => strict().set_global('o', { a: null }))
+          .toThrow(/strict conversion.*key "a".*removes the key/s);
+      });
+
+      it('treats undefined the same as null — both are Lua nil', () => {
+        expect(() => strict().set_global('a', [1, undefined, 3]))
+          .toThrow(/strict conversion.*array index 1/);
+      });
+    });
+
+    // A mode that refused too much would be worse than the losses: these are the
+    // conversions that must keep working, including the documented workarounds
+    // §5 and types.d.ts tell callers to use.
+    describe('does not refuse what it should not', () => {
+      it('leaves ordinary values alone in both directions', () => {
+        const lua = strict();
+        expect(lua.execute_script('return {x=1,y="two",z={1,2}}')).toEqual({ x: 1, y: 'two', z: [1, 2] });
+        expect(lua.execute_script('return {10,20,30}')).toEqual([10, 20, 30]);
+        // a number key and a string key that do NOT collide are both fine
+        expect(lua.execute_script('return {[1]="a",b="c"}')).toEqual({ 1: 'a', b: 'c' });
+        lua.set_global('n', { a: [1, 2, { b: 3 }] });
+        expect(lua.execute_script('return n.a[3].b')).toBe(3);
+      });
+
+      it('accepts the documented workarounds', () => {
+        const lua = strict();
+        lua.set_global('f', [1, false, 3]);              // false is a present value
+        expect(lua.execute_script('return #f')).toBe(3);
+        expect(() => lua.set_global('g', [1, 3].filter((x: any) => x != null))).not.toThrow();
+      });
+
+      it('a top-level null is still nil — only a container loses information', () => {
+        const lua = strict();
+        lua.set_global('z', null);
+        expect(lua.execute_script('return tostring(z)')).toBe('nil');
+        expect(lua.execute_script('return tostring(nothing)')).toBe('nil');
+      });
+
+      it('a handle reads in place, which is what §5 says to do instead', () => {
+        const lua = strict();
+        lua.execute_script('t = {[true]="bool",[1]="int",["1"]="str"}');
+        const h = lua.get_global_ref('t');            // no conversion, so no loss
+        expect(h.get(1)).toBe('int');
+        expect(h.get('1')).toBe('str');
+        h.release();
+      });
+
+      it('leaves the BigInt widening alone — a type change, not a loss', () => {
+        expect(strict().execute_script('return 9007199254740993')).toBe(9007199254740993n);
+      });
+    });
+
+    it('refuses identically at every door a value can enter Lua through', () => {
+      // Uniformity is the property that matters: a mode honoured by set_global
+      // but not by a Lua function argument would be worse than no mode at all.
+      const lua = strict();
+      const f = lua.execute_script('return function(x) return x end');
+      const h = lua.create_table({});
+      expect(() => lua.set_global('a', [1, null])).toThrow(/strict conversion/);
+      expect(() => f([1, null])).toThrow(/strict conversion/);
+      expect(() => h.set('k', [1, null])).toThrow(/strict conversion/);
+      expect(() => lua.create_table({ k: [1, null] })).toThrow(/strict conversion/);
+      expect(() => lua.execute_script_in(lua.create_environment({}), 'return 1')).not.toThrow();
+    });
+
+    it('survives reset(), because it rides on the runtime config', () => {
+      const lua = strict();
+      lua.reset();
+      expect(() => lua.execute_script('return {[true]=1}')).toThrow(/strict conversion/);
+    });
+
+    it('is off by default and rejects a non-boolean rather than ignoring it', () => {
+      expect(lossy().execute_script('return {[true]=1}')).toEqual({});
+      expect(() => new lua_native.init({}, { strictConversion: 'yes' as any }))
+        .toThrow(/strictConversion must be a boolean/);
+      // explicit false is accepted and means off
+      const off: any = new lua_native.init({}, { libraries: 'all', strictConversion: false });
+      expect(off.execute_script('return {[true]=1}')).toEqual({});
+    });
+
+    it('leaves the already-loud refusals with their own messages', () => {
+      // §5's other two entries throw with or without the mode; strict must not
+      // relabel them, or the message stops naming the real cause.
+      const lua = strict();
+      const cyclic: any = {};
+      cyclic.self = cyclic;
+      expect(() => lua.set_global('c', cyclic)).toThrow(/circular reference/);
+      let deep: any = {};
+      for (let i = 0; i < 120; i++) deep = { n: deep };
+      expect(() => lua.set_global('d', deep)).toThrow(/nesting depth/);
+    });
+  });
+
   describe("libraries: 'sandbox' — the sealed preset (LIMITATIONS §1)", () => {
     it('removes every filesystem door', () => {
       const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
@@ -11615,9 +11752,108 @@ describe('lua-native Node adapter', () => {
         expect(lua.execute_script('return io.read()')).toBe('after-reset');
       });
 
-      it('is a documented no-op without the io library', () => {
+      it('reports that it wired io.read', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(lua.set_read_handler(() => 'x')).toBe(true);
+        expect(lua.set_read_handler(null)).toBe(true);
+      });
+
+      // LIMITATIONS §8. Until this worked, set_read_handler under 'sandbox'
+      // accepted the handler, retained it, wired nothing and returned undefined
+      // — an accept-and-retain no JS caller could detect.
+      describe('without the io library', () => {
+        const sealed = () => new lua_native.init({}, { libraries: 'sandbox' }) as any;
+
+        it('synthesizes a minimal io table and wires the handler', () => {
+          const lua = sealed();
+          expect(lua.execute_script('return tostring(io)')).toBe('nil');
+          expect(lua.set_read_handler((fmt: any) => (fmt === 'n' ? '42' : 'Ada'))).toBe(true);
+          expect(lua.execute_script('return io.read()')).toBe('Ada');
+          expect(lua.execute_script('return io.read("n")')).toBe(42);
+        });
+
+        it('works from a bare state too', () => {
+          const lua: any = new lua_native.init({}, {});
+          expect(lua.set_read_handler(() => 'bare')).toBe(true);
+          expect(lua.execute_script('return io.read()')).toBe('bare');
+        });
+
+        // The synthesized table is `read` and nothing else: the point of the
+        // entry is that a sealed context gains input, not that it gains io.
+        it('does not widen the seal', () => {
+          const lua = sealed();
+          lua.set_read_handler(() => 'x');
+          for (const name of ['open', 'lines', 'write', 'close', 'stdout', 'stdin', 'popen']) {
+            expect(lua.execute_script(`return tostring(io.${name})`)).toBe('nil');
+          }
+          // and nothing else the preset cleared came back with it
+          expect(lua.execute_script('return tostring(dofile)')).toBe('nil');
+          expect(lua.execute_script('return tostring(loadfile)')).toBe('nil');
+          expect(lua.execute_script('return tostring(require)')).toBe('nil');
+          expect(lua.execute_script('return tostring(os)')).toBe('nil');
+        });
+
+        it('survives reset()', () => {
+          const lua = sealed();
+          lua.set_read_handler(() => 'after-reset');
+          lua.reset();
+          expect(lua.execute_script('return io.read()')).toBe('after-reset');
+        });
+
+        // Otherwise a temporary handler would leave `io` a table forever, and a
+        // script's `if io then` would take a branch that was false before.
+        it('clearing takes the synthesized table back', () => {
+          const lua = sealed();
+          lua.set_read_handler(() => 'x');
+          expect(lua.execute_script('return type(io)')).toBe('table');
+          expect(lua.set_read_handler(null)).toBe(true);
+          expect(lua.execute_script('return tostring(io)')).toBe('nil');
+        });
+
+        it('re-installs after a clear', () => {
+          const lua = sealed();
+          lua.set_read_handler(() => 'first');
+          lua.set_read_handler(null);
+          expect(lua.set_read_handler(() => 'second')).toBe(true);
+          expect(lua.execute_script('return io.read()')).toBe('second');
+        });
+
+        it('does not stack wrappers on re-install', () => {
+          const lua = sealed();
+          lua.set_read_handler(() => 'a');
+          lua.set_read_handler(() => 'b');
+          expect(lua.execute_script('return io.read()')).toBe('b');
+          lua.set_read_handler(null);
+          expect(lua.execute_script('return tostring(io)')).toBe('nil');
+        });
+      });
+
+      // A real io library keeps the old semantics exactly: the wrapper stays
+      // installed on clear and falls through to the original io.read.
+      it('clearing leaves a real io library intact', () => {
+        const { lua } = mk(['x']);
+        lua.set_read_handler(null);
+        expect(lua.execute_script('return type(io)')).toBe('table');
+        expect(lua.execute_script('return type(io.read)')).toBe('function');
+        expect(lua.execute_script('return type(io.open)')).toBe('function');
+      });
+
+      it('refuses a non-table global io rather than overwriting it', () => {
         const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
-        expect(() => lua.set_read_handler(() => 'x')).not.toThrow();
+        lua.execute_script('io = 42');
+        expect(lua.set_read_handler(() => 'x')).toBe(false);
+        expect(lua.execute_script('return io')).toBe(42);
+      });
+
+      // The refusal must not retain the JS function: a handler that can never
+      // fire is the defect this whole group is about.
+      it('does not retain a handler it refused to wire', () => {
+        const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
+        expect(lua.set_read_handler(() => 'live')).toBe(true);
+        lua.execute_script('io = 42');
+        expect(lua.set_read_handler(() => 'refused')).toBe(false);
+        // reset() replays retained handlers; nothing should be replayed here.
+        lua.reset();
         expect(lua.execute_script('return tostring(io)')).toBe('nil');
       });
     });

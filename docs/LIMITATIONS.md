@@ -8,6 +8,13 @@ Every claim here was verified against the running addon on **August 4, 2026**,
 not inferred from the source. Where a limitation has a workaround, the
 workaround is given and has been driven.
 
+**Revised August 5, 2026.** Two entries gained mitigations: §5's four *silent*
+conversion losses can now be refused (`strictConversion`), and §8 turned out to
+be fixable after all — its own conclusion had ruled out one bad solution and
+stopped there. Both are marked below. The re-read that produced them is worth
+repeating: an entry that says "not fixable" is a claim with an argument attached,
+and the argument is the part to check.
+
 ---
 
 ## 1. `libraries: 'safe'` is not a sandbox for untrusted code
@@ -176,14 +183,54 @@ These are specified rather than surprising, and are listed here only so this
 document is a complete answer to "what should I not rely on". Full detail is on
 `LuaInput` (in) and `execute_script` (out) in `types.d.ts`.
 
-| Direction | Loss |
-|---|---|
-| JS → Lua | `null`/`undefined` in an **array** truncates the Lua sequence at that index |
-| JS → Lua | `null` as an object value removes the key |
-| JS → Lua | a circular reference is refused; nesting past 100 levels is refused |
-| Lua → JS | a table key that is neither string nor number is dropped |
-| Lua → JS | a string key and an integer key with the same text collide |
-| Lua → JS | an integer outside ±(2^53−1) arrives as a `BigInt`, so `typeof` is not stable |
+| Direction | Loss | Silent? |
+|---|---|---|
+| JS → Lua | `null`/`undefined` in an **array** truncates the Lua sequence at that index | **yes** |
+| JS → Lua | `null` as an object value removes the key | **yes** |
+| JS → Lua | a circular reference is refused; nesting past 100 levels is refused | no — throws |
+| Lua → JS | a table key that is neither string nor number is dropped | **yes** |
+| Lua → JS | a string key and an integer key with the same text collide | **yes** |
+| Lua → JS | an integer outside ±(2^53−1) arrives as a `BigInt`, so `typeof` is not stable | no — a type change, visible |
+
+### The fix: `strictConversion: true` (added August 5, 2026)
+
+The four **silent** rows can be refused instead of performed:
+
+```js
+const lua = new lua_native.init({}, { libraries: 'all', strictConversion: true });
+
+lua.set_global('rows', [1, null, 3]);
+// throws: null/undefined at array index 1 becomes a Lua nil, which ends the
+//         sequence there — #t and ipairs would stop before the later elements.
+//         Filter the array, or use false as a present placeholder.
+
+lua.execute_script('return {["1"]="a",[1]="b"}');
+// throws: the Lua table keys 1 (number) and "1" (string) both become the
+//         JavaScript property "1", so one value would be lost. Read the table
+//         in place with get_global_ref() to keep both.
+```
+
+Each message names what would have been lost and what to do instead. The two
+rows that already throw keep their own messages — strict mode does not relabel
+them — and the `BigInt` row is untouched, because a type change the caller can
+see is not the thing this option is for.
+
+**Refused uniformly at all eighteen entry points** a value can cross at, checked
+against `tools/roundtrip-matrix/doors.mjs`. A mode honoured by `set_global` but
+not by a Lua function argument would be worse than no mode at all.
+
+**All-or-nothing per context, deliberately** — the rule §2 states, for the reason
+§2 gives. A mode that refused only *some* lossy conversions would make behaviour
+depend on the data, which is the defect class it exists to surface.
+
+**The default is unchanged**, because turning it on makes previously-working
+programs throw. A non-boolean value is rejected rather than ignored, so
+`strictConversion: 'yes'` cannot quietly mean "off" — which for an option whose
+whole job is catching mistakes would be the exact failure it is meant to prevent.
+
+> The escape hatch that needs no option is still there and is still the better
+> answer when it fits: a handle from `get_global_ref` reads the real table in
+> place, so boolean keys and colliding keys survive because nothing is converted.
 
 ---
 
@@ -226,19 +273,53 @@ caller's hands.
 
 ---
 
-## 8. `set_read_handler` needs the `io` library
+## 8. ~~`set_read_handler` needs the `io` library~~ — fixed August 5, 2026
+
+**This entry was wrong twice over, and both halves are now fixed.**
 
 `set_print_handler` works everywhere because `print` lives in the base library.
 There is no base-library *input* function, so `io.read` is the only thing to
-redirect and a bare or `libraries: 'sandbox'` state has nothing to hook.
-`set_read_handler` is a no-op there, and does not throw.
+redirect — and a bare or `libraries: 'sandbox'` state has no `io` to hook.
 
-Inventing a non-standard global to fill the gap would be worse than the gap: a
-script written against it would not run on stock Lua.
+The old entry concluded that this was unfixable, on the grounds that *"inventing
+a non-standard global to fill the gap would be worse than the gap: a script
+written against it would not run on stock Lua."* That reasoning is sound and it
+ruled out a global nobody needed to invent. **`io.read` is the standard name.**
+When `io` is absent, `set_read_handler` now creates a minimal `io` table holding
+`read` and nothing else, so a script written against a sealed context still runs
+on stock Lua:
 
-**Workaround under `'sandbox'`:** pass input in as a global or a host callback
-before the script runs, which is the same shape every other host capability takes
-in a sealed context.
+```js
+const lua = new lua_native.init({}, { libraries: 'sandbox' });
+lua.set_read_handler(() => 'Ada');           // → true
+lua.execute_script('return io.read()');      // → 'Ada'
+lua.execute_script('return type(io.open)');  // → nil — still sealed
+```
+
+This is exactly what `set_file_reader` already did for `dofile`/`loadfile`, which
+`'sandbox'` also clears and which also come back host-backed (§1). **The seal is
+not widened**: no `open`, `lines`, `write`, `stdout` — only the one function the
+host just supplied. Passing `null` takes the synthesized table back, so `io`
+returns to `nil` and a script's `if io then` sees what it saw before. Where `io`
+is the real library, nothing changed: the wrapper stays installed on clear and
+falls through to the original `io.read`.
+
+### The second half: it was never a no-op
+
+The old entry said `set_read_handler` "is a no-op there, and does not throw".
+It did not throw, but it was not a no-op either — it **accepted the handler,
+stored it, wired nothing, and returned `undefined`**. The context held a strong
+reference to a JS closure that could never fire, and no caller could detect it.
+
+`set_read_handler` now **returns whether `io.read` is wired**. With the synthesis
+above the answer is almost always `true`; the one `false` case is a global `io`
+that exists and is not a table (`io = 42`), which belongs to the caller and is
+left alone rather than overwritten. A refused handler is not retained.
+
+> **Worth keeping as a lesson, not just a fix.** The entry recorded a real
+> constraint, drew a correct conclusion about one bad solution, and then let that
+> stand as a conclusion about *all* solutions — while a working precedent for the
+> right one sat in the neighbouring capability, documented three sections up.
 
 ---
 

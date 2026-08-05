@@ -1045,6 +1045,22 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
     // default allowBytecode to off. Both are part of what makes that preset
     // sealed; see LuaRuntime::SandboxLibraries.
     bool seal_base_filesystem = false;
+    // `strictConversion`: refuse the silent conversion losses instead of
+    // performing them (LIMITATIONS §5). A wrong *type* here is rejected rather
+    // than ignored, unlike `binaryStrings` below — the option exists to catch
+    // mistakes, so `strictConversion: 'yes'` quietly meaning "off" would be the
+    // exact failure it is meant to prevent.
+    bool strict_conversion = false;
+    if (options.Has("strictConversion")) {
+      const Napi::Value strictVal = options.Get("strictConversion");
+      if (strictVal.IsBoolean()) {
+        strict_conversion = strictVal.As<Napi::Boolean>().Value();
+      } else if (!strictVal.IsUndefined() && !strictVal.IsNull()) {
+        Napi::TypeError::New(env, "strictConversion must be a boolean")
+          .ThrowAsJavaScriptException();
+        return;
+      }
+    }
     if (options.Has("libraries")) {
       auto libsVal = options.Get("libraries");
       if (libsVal.IsArray()) {
@@ -1084,16 +1100,20 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
 
     // Create runtime with appropriate constructor
     try {
-      // `seal_base_filesystem` lives on RuntimeConfig, so the sandbox preset
-      // must take the config path even with no limits set — the libraries-only
-      // constructor would silently drop the seal.
-      if (has_max_memory || has_max_instructions || has_timeout || seal_base_filesystem) {
+      // `seal_base_filesystem` and `strict_conversion` live on RuntimeConfig, so
+      // either one must take the config path even with no limits set — the
+      // libraries-only constructor would silently drop them.
+      if (has_max_memory || has_max_instructions || has_timeout ||
+          seal_base_filesystem || strict_conversion) {
         lua_core::RuntimeConfig config;
         config.libraries = std::move(libraries);
         config.max_memory = max_memory;
         config.max_instructions = max_instructions;
         config.timeout_ms = timeout_ms;
         config.seal_base_filesystem = seal_base_filesystem;
+        // Carried on the config, so reset() — which rebuilds from GetConfig() —
+        // keeps the mode without a replay step.
+        config.strict_conversion = strict_conversion;
         runtime = std::make_shared<lua_core::LuaRuntime>(config);
       } else if (has_libraries) {
         runtime = std::make_shared<lua_core::LuaRuntime>(libraries);
@@ -1365,7 +1385,10 @@ void LuaContext::DetachRuntimeHandlers() const {
   runtime->SetHostFunctionGCCallback(nullptr);
   runtime->SetPropertyHandlers(nullptr, nullptr);
   runtime->SetOutputHandler(nullptr);
-  runtime->SetInputHandler(nullptr);
+  // DropInputHandler, not SetInputHandler(nullptr), for the reason spelled out
+  // for the file reader below: the latter removes a synthesized `io` through
+  // RunProtected and can therefore throw. Same UNGUARDED_AND_PROPAGATES shape.
+  runtime->DropInputHandler();
   // DropFileReader, not SetFileReader(nullptr): the latter removes the
   // dofile/loadfile globals through RunProtected, which can throw, and this
   // function is on the reset/teardown path where an escaping exception reaches
@@ -4391,11 +4414,11 @@ Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
-void LuaContext::InstallReadHandler(const Napi::Function& fn) {
+bool LuaContext::InstallReadHandler(const Napi::Function& fn) {
   // Same ordering as InstallPrintHandler (CR-8 F7): the runtime install can
   // throw, and read_handler_ must not be left pointing at a handler io.read was
   // never rewired to reach. The lambda reads read_handler_ at call time.
-  runtime->SetInputHandler(
+  const bool wired = runtime->SetInputHandler(
     [this](const lua_core::LuaPtr& format) -> std::optional<std::string> {
       if (read_handler_.IsEmpty()) return std::nullopt;
       // Inside Lua's C call frame (io.read). Scope the per-call handles so a
@@ -4422,28 +4445,44 @@ void LuaContext::InstallReadHandler(const Napi::Function& fn) {
       }
       return result.ToString().Utf8Value();
     });
+  // Not committed when the core refused to wire io.read: retaining the JS
+  // function would hold a closure alive for a handler that can never fire, and
+  // would make the reset replay above re-attempt the same refused install
+  // forever. Reporting false and keeping nothing is the honest pair.
+  //
+  // Any *previous* handler goes too. It is not collateral damage: the only way
+  // to reach here is a global `io` that is no longer a table, which means the
+  // wrapper the earlier handler was reached through is already gone.
+  if (!wired) {
+    read_handler_.Reset();
+    return false;
+  }
   read_handler_ = Napi::Persistent(fn);
+  return true;
 }
 
-// set_read_handler(handler | null) — P4a.
+// set_read_handler(handler | null) — P4a. Returns whether io.read is now wired.
 Napi::Value LuaContext::SetReadHandler(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
+  bool wired = true;
   try {
     // The io.read override is a protected write through a table a metatabled
     // `io` could trap, and it allocates a closure (CR-9 F1, M3).
     CallScope _cs(this);
     if (info.Length() >= 1 && info[0].IsFunction()) {
-      InstallReadHandler(info[0].As<Napi::Function>());
+      wired = InstallReadHandler(info[0].As<Napi::Function>());
     } else {
-      read_handler_.Reset();
+      // Order mirrors the install: the core removal runs first and can throw, and
+      // read_handler_ must not be cleared for a removal that did not happen.
       runtime->SetInputHandler(nullptr);
+      read_handler_.Reset();
     }
   } catch (const std::exception& e) {
     // A core throw must not unwind past N-API (the H1 class, CR-6 F1).
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  return env.Undefined();
+  return Napi::Boolean::New(env, wired);
 }
 
 void LuaContext::InstallFileReader(const Napi::Function& fn) {

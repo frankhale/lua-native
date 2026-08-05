@@ -209,6 +209,25 @@ struct RuntimeConfig {
   // so a caller who wants them gone cannot get there by omitting a library.
   // Set by the `sandbox` preset; see SandboxLibraries.
   bool seal_base_filesystem = false;
+
+  /// Refuse a conversion that would silently lose data, instead of performing it.
+  ///
+  /// The four losses in `docs/LIMITATIONS.md` §5 that are *silent* — the two
+  /// table-key losses on the way out of Lua, and the two nil-in-a-container
+  /// losses on the way in — become `std::runtime_error`s naming what would have
+  /// been lost. The two entries in §5 that are already loud (a circular
+  /// reference, nesting past kMaxDepth) throw regardless, and the BigInt
+  /// widening is a type change rather than a loss, so neither is affected.
+  ///
+  /// **All-or-nothing per context, deliberately** — the rule `binaryStrings`
+  /// states and for the same reason: a mode that refused only *some* lossy
+  /// conversions would make the behavior depend on the data, which is the defect
+  /// class these reviews keep finding. Either every lossy conversion is silent or
+  /// every one is refused, and the caller knows which.
+  ///
+  /// Default false, because turning it on would make previously-working programs
+  /// throw. It is an opt-in diagnostic for embedders who would rather find out.
+  bool strict_conversion = false;
 };
 
 struct MetatableEntry {
@@ -543,17 +562,44 @@ public:
   /// string like `"l"`/`"a"`/`"n"`, or a number of bytes) and returns the text,
   /// or nullopt for end-of-input, which reaches Lua as `nil`.
   ///
-  /// **`io.read` only, and only when the `io` library is loaded.** There is no
-  /// base-library input function to override the way `print` gave output a home,
-  /// so a bare or `'sandbox'` state has nothing to redirect — inventing a
-  /// non-standard global to fill the gap would be worse than the gap.
+  /// **`io.read` only** — there is no base-library input function to override
+  /// the way `print` gave output a home. When the `io` library *is* loaded the
+  /// wrapper keeps the original `io.read` as an upvalue and falls through to it
+  /// whenever no handler is set, so removing the handler restores real stdin
+  /// without an unwrap step.
   ///
-  /// Installing the wrapper keeps the original `io.read` as an upvalue and falls
-  /// through to it whenever no handler is set, so removing the handler restores
-  /// real stdin without an unwrap step.
+  /// **When `io` is absent — a bare or `'sandbox'` state — a minimal `io` table
+  /// holding only `read` is synthesized**, so the capability works in exactly
+  /// the contexts that need it most. This is not the "invent a non-standard
+  /// global" move the earlier doc ruled out and the LIMITATIONS §8 entry
+  /// described: `io.read` is the *standard* name, so a script written against a
+  /// sealed context still runs on stock Lua. It is the same move `SetFileReader`
+  /// already makes for `dofile`/`loadfile` (which are likewise cleared under
+  /// `'sandbox'` and likewise come back host-backed), and it does not widen the
+  /// seal — the synthesized table has no `open`, `lines`, `write` or `stdout`,
+  /// only the one function the host just supplied.
+  ///
+  /// Returns **true if `io.read` is now wired to the handler**. The one false
+  /// case is a global `io` that exists and is not a table: that value belongs to
+  /// the caller, so it is left alone rather than overwritten, and the handler is
+  /// not committed. Before the synthesis above, a bare state returned false the
+  /// same way — the accept-and-retain that LIMITATIONS §8 recorded, where the
+  /// handler was stored but `io.read` was never rewired to reach it and nothing
+  /// said so.
+  ///
+  /// `SetInputHandler(nullptr)` removes a synthesized `io` (see
+  /// `DropInputHandler` for the teardown variant) and always returns true.
   using InputHandler = std::function<std::optional<std::string>(const LuaPtr& format)>;
-  void SetInputHandler(InputHandler handler);
+  bool SetInputHandler(InputHandler handler);
   [[nodiscard]] bool HasInputHandler() const;
+
+  /// Drop the input handler **without touching Lua** — the non-throwing
+  /// counterpart to `SetInputHandler(nullptr)`, and the exact analogue of
+  /// `DropFileReader` (whose comment carries the full reasoning): the removal of
+  /// a synthesized `io` goes through RunProtected, which throws under an
+  /// exhausted maxMemory or a raising `__newindex` on `_G`, and on the
+  /// reset/teardown path that exception reaches N-API — the CR-6 F1 abort class.
+  void DropInputHandler();
 
   /// Virtual file access (P4b): resolve `dofile` and `loadfile` through a JS
   /// callback instead of the filesystem.
@@ -945,6 +991,21 @@ public:
 
   static LuaPtr ToLuaValue(lua_State* L, int index, int depth = 0);
   static void PushLuaValue(lua_State* L, const LuaPtr& value, int depth = 0);
+
+  /// Is `RuntimeConfig::strict_conversion` set for the state `L` belongs to?
+  ///
+  /// Both conversion routines are static and neither carries a runtime, so the
+  /// answer is fetched from the state — but only **after** a loss has already
+  /// been detected, never as a precondition. A table with no boolean key and no
+  /// colliding key, or an array with no hole, therefore pays nothing at all for
+  /// the mode existing: this is called once per loss, not once per value.
+  static bool StrictConversion(lua_State* L);
+
+  /// A LuaPtr that will push as nil — the null pointer PushLuaValue already
+  /// treats as nil, or a held `std::monostate`. This is what `null` and
+  /// `undefined` become on the way in, and inside a container it is a removal
+  /// rather than a stored value.
+  static bool IsNil(const LuaPtr& value);
   // The single place a host-function name becomes a Lua closure. Public so the
   // metatable / module / searcher builders share the reclaim accounting rather
   // than each pushing its own bare lua_pushcclosure (CR-11 F4).
@@ -1056,6 +1117,12 @@ private:
   // that clears itself mid-call must not destroy the std::function executing
   // right now (CR-9 F4).
   std::shared_ptr<InputHandler> input_handler_;    // null = real stdin
+  // True once InstallInputRedirection created the `io` table itself (a bare or
+  // 'sandbox' state). Gates the removal, so clearing the handler only ever takes
+  // back a table this class put there — the "only clear what is still ours" rule
+  // RemoveFileReaderOverrides states. A fresh LuaRuntime starts false, and
+  // reset() builds a fresh one, so it cannot survive a state it does not describe.
+  bool io_synthesized_ = false;
   std::shared_ptr<FileReader> file_reader_;        // null = real filesystem
   bool allow_bytecode_ = true;          // false = reject binary chunks
 
@@ -1273,7 +1340,10 @@ private:
   // io.read wrapper (P4a). Upvalue 1 is the original io.read, used whenever no
   // handler is installed.
   static int LuaIoRead(lua_State* L);
-  void InstallInputRedirection() const;
+  // Returns false only when a non-table global `io` blocks the install; see
+  // SetInputHandler. Sets io_synthesized_ when it creates the table itself.
+  bool InstallInputRedirection();
+  void RemoveInputRedirection();
   [[nodiscard]] std::optional<std::string> DispatchInput(const LuaPtr& format) const;
   // dofile / loadfile over the file reader (P4b).
   static int LuaLoadFile(lua_State* L);

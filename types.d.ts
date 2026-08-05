@@ -61,6 +61,10 @@ export type LuaValue =
  *    on. Nesting deeper than 100 levels is refused separately, with its own
  *    message.
  *
+ * **Losses 1 and 2 can be made loud.** `strictConversion: true` at init refuses
+ * them — with a message naming the index or key — instead of performing them.
+ * Loss 3 already throws. See {@link LuaContextOptions.strictConversion}.
+ *
  * 4. **Nothing else is lost.** Binary strings, embedded NULs, lone surrogates,
  *    negative zero, the 64-bit integer bounds, string keys that look numeric,
  *    and nested structures all cross exactly — verified by a round-trip matrix
@@ -637,6 +641,13 @@ export interface LuaContext {
    * from {@link get_global_ref} reads the real table in place, so binary
    * strings, boolean keys and colliding keys all stay intact as long as you do
    * not marshal them out.
+   *
+   * **Two of the three can be made loud.** `strictConversion: true` at init
+   * refuses losses 2 and 3 — naming the key type, or the property the two keys
+   * collide on — instead of performing them; `binaryStrings: true` fixes loss 1
+   * by handing back the exact bytes. See
+   * {@link LuaContextOptions.strictConversion} and
+   * {@link LuaContextOptions.binaryStrings}.
    *
    * **A note on integer width, which changes a type rather than losing data.**
    * A Lua integer outside ±(2^53 − 1) arrives as a **BigInt**, because a JS
@@ -1420,11 +1431,26 @@ export interface LuaContext {
    * since the installed wrapper simply falls through when no handler is set.
    * The handler is re-installed automatically across {@link reset}.
    *
-   * **Requires the `io` library.** There is no base-library input function to
-   * override the way `print` gave output a home, so a bare or
-   * `libraries: 'sandbox'` state has nothing to redirect and this is a no-op
-   * there. Inventing a non-standard global to fill the gap would be worse than
-   * the gap.
+   * **Works without the `io` library.** There is no base-library input function
+   * to override the way `print` gave output a home, so when `io` is absent — a
+   * bare state, or `libraries: 'sandbox'` — a minimal `io` table holding only
+   * `read` is created for the handler to live in. `io.read` is the *standard*
+   * name, so a script written against a sealed context still runs on stock Lua,
+   * and **the seal is not widened**: the table has no `open`, `lines`, `write`
+   * or `stdout`. This is the same thing {@link set_file_reader} does for
+   * `dofile`/`loadfile`, which `'sandbox'` also clears.
+   *
+   * Passing `null` removes a table created this way, so `io` goes back to `nil`
+   * and a script's `if io then` sees what it saw before. Where `io` was the real
+   * library, the wrapper stays and falls through to the original `io.read`, as
+   * before.
+   *
+   * **Returns whether `io.read` is now wired to the handler.** The only `false`
+   * case is a global `io` that exists and is not a table (`io = 42`): that value
+   * is the caller's, so it is left alone rather than overwritten, and the handler
+   * is not retained. Before the synthesis above, a bare or `'sandbox'` state
+   * accepted the handler, stored it, wired nothing, and said nothing — see
+   * `docs/LIMITATIONS.md` §8.
    *
    * Unlike the print handler, **a throwing read handler is not swallowed** — it
    * surfaces as a Lua error (`io.read handler failed: …`), because a read that
@@ -1432,15 +1458,22 @@ export interface LuaContext {
    * does.
    *
    * @param handler Called with each requested format, or `null` to clear
+   * @returns `true` if `io.read` now reaches the handler
    * @example
    * const lines = ['Ada', '42'];
    * let i = 0;
    * lua.set_read_handler(() => (i < lines.length ? lines[i++] : null));
    * lua.execute_script('return io.read()');        // 'Ada'
    * lua.execute_script('return io.read("n")');     // 42 (a number)
+   * @example
+   * // Works in a sealed context, where it matters most.
+   * const lua = new lua_native.init({}, { libraries: 'sandbox' });
+   * lua.set_read_handler(() => 'Ada');             // true
+   * lua.execute_script('return io.read()');        // 'Ada'
+   * lua.execute_script('return type(io.open)');    // nil — still sealed
    */
   set_read_handler(
-    handler?: ((format: string | number) => string | null | undefined) | null): void;
+    handler?: ((format: string | number) => string | null | undefined) | null): boolean;
 
   /**
    * Resolves `dofile` and `loadfile` through a JavaScript callback instead of
@@ -1948,6 +1981,43 @@ export interface LuaInitOptions {
    * // → Uint8Array(4) [7, 0, 0, 0]
    */
   binaryStrings?: boolean;
+
+  /**
+   * Refuse a conversion that would silently lose data, instead of performing it.
+   *
+   * The four losses in `docs/LIMITATIONS.md` §5 that happen **silently** become
+   * errors naming what would have been lost and what to do instead:
+   *
+   * | Direction | Refused under `strictConversion` |
+   * |---|---|
+   * | JS → Lua | `null`/`undefined` inside an **array** (it becomes a Lua nil, which ends the sequence there) |
+   * | JS → Lua | `null`/`undefined` as an **object value** (a nil removes the key rather than storing one) |
+   * | Lua → JS | a table key that is neither string nor number (dropped — JS cannot key an object by boolean, table or function) |
+   * | Lua → JS | a string key and a number key with the same text (`"1"` and `1` collapse to one property, and *which* value survives depends on table order) |
+   *
+   * Everything else is untouched. The two §5 entries that were already loud — a
+   * circular reference and nesting past 100 levels — still throw their own
+   * messages, and the BigInt widening past ±(2^53−1) is a *type* change rather
+   * than a loss, so it is not affected. Values kept on the Lua side behind a
+   * {@link LuaContext.get_global_ref} handle never convert and so never refuse.
+   *
+   * **All-or-nothing per context, deliberately** — the same rule
+   * {@link binaryStrings} states, for the same reason. A mode that refused only
+   * *some* lossy conversions would make behaviour depend on the data, which is
+   * the defect class this option exists to surface.
+   *
+   * **Off by default**, because turning it on makes previously-working programs
+   * throw. It is an opt-in diagnostic for embedders who would rather find out at
+   * the boundary than downstream. A non-boolean value is rejected rather than
+   * ignored, so a typo cannot quietly mean "off".
+   *
+   * @example
+   * const lua = new lua_native.init({}, { libraries: 'all', strictConversion: true });
+   * lua.set_global('rows', [1, null, 3]);         // throws: would truncate at index 1
+   * lua.set_global('rows', [1, false, 3]);        // fine — false is a present value
+   * lua.execute_script('return {["1"]="a",[1]="b"}');  // throws: keys collide
+   */
+  strictConversion?: boolean;
   allowBytecode?: boolean;
 
   /**

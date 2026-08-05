@@ -1759,20 +1759,31 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
 
 // --- Input redirection (P4a) ---
 
-void LuaRuntime::SetInputHandler(InputHandler handler) {
+bool LuaRuntime::SetInputHandler(InputHandler handler) {
   if (handler) {
     // Install before committing the handler, for the reason SetOutputHandler
     // gives (CR-8 F7): the protected _G/io writes can throw under maxMemory,
     // and assigning first would leave a handler io.read was never rewired to.
-    InstallInputRedirection();
+    //
+    // The same ordering is what makes the false return honest. It used to be a
+    // void call whose early "nothing to redirect" exit still fell through to the
+    // assignment below, so a bare state ended up holding a handler that could
+    // never fire and telling no one — LIMITATIONS §8's accept-and-retain. The
+    // handler is now committed only if io.read actually reaches it.
+    if (!InstallInputRedirection()) return false;
     input_handler_ = std::make_shared<InputHandler>(std::move(handler));
-  } else {
-    // Reset rather than clear, so a dispatch in flight keeps its own owner
-    // alive (CR-9 F4). The installed wrapper stays and simply falls through to
-    // the original io.read from now on.
-    input_handler_.reset();
+    return true;
   }
+  // Remove *before* dropping the handler, the ordering SetFileReader uses: in
+  // between, an io.read would otherwise find a synthesized wrapper with no
+  // handler behind it. Reset rather than clear, so a dispatch in flight keeps
+  // its own owner alive (CR-9 F4).
+  RemoveInputRedirection();
+  input_handler_.reset();
+  return true;
 }
+
+void LuaRuntime::DropInputHandler() { input_handler_.reset(); }
 
 bool LuaRuntime::HasInputHandler() const {
   const std::shared_ptr<InputHandler> handler = input_handler_;
@@ -1791,17 +1802,46 @@ std::optional<std::string> LuaRuntime::DispatchInput(const LuaPtr& format) const
   return (*handler)(format);
 }
 
-void LuaRuntime::InstallInputRedirection() const {
+bool LuaRuntime::InstallInputRedirection() {
+  bool wired = true;
+  bool synthesized = false;
   RunProtected([&]() {
     lua_getglobal(L_, "io");
-    if (!lua_istable(L_, -1)) {
+    if (lua_isnil(L_, -1)) {
+      // No io library — a bare state, or 'sandbox', which is where a read
+      // handler is most useful and where it used to silently do nothing.
+      // Synthesize the table with `read` alone: the standard name, so a script
+      // written against it still runs on stock Lua, and nothing else from io
+      // (no open/lines/write/stdout), so the seal is exactly as wide as the
+      // capability the host just granted. See SetInputHandler's doc comment.
+      //
+      // Upvalue 1 is nil rather than a real io.read: there is no original to
+      // fall through to here, and LuaIoRead already answers that case with
+      // "io.read is not available" instead of calling a non-function.
       lua_pop(L_, 1);
-      return;  // no io library: nothing to redirect (documented on SetInputHandler)
+      lua_createtable(L_, 0, 1);
+      lua_pushnil(L_);
+      lua_pushcclosure(L_, LuaIoRead, 1);
+      lua_setfield(L_, -2, "read");
+      lua_setglobal(L_, "io");
+      synthesized = true;
+      return;
+    }
+    if (!lua_istable(L_, -1)) {
+      // A global `io` that is not a table belongs to the caller — overwriting it
+      // would destroy a value this class never created. Refuse instead, and let
+      // SetInputHandler report it rather than retaining a handler that could
+      // never fire.
+      lua_pop(L_, 1);
+      wired = false;
+      return;
     }
     lua_getfield(L_, -1, "read");
     // Already wrapped: re-installing would nest a wrapper inside a wrapper and
     // make "the original" one level deeper each time — the stacking hazard
-    // SetAllowBytecode guards against by the same test.
+    // SetAllowBytecode guards against by the same test. This also covers
+    // re-installing over a table synthesized by an earlier call, which must not
+    // clear io_synthesized_ below.
     if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaIoRead) {
       lua_pop(L_, 2);
       return;
@@ -1810,6 +1850,36 @@ void LuaRuntime::InstallInputRedirection() const {
     lua_setfield(L_, -2, "read");
     lua_pop(L_, 1);  // pop io
   });
+  // Only ever set, never cleared here: an install that found the wrapper already
+  // present says nothing about who created the table it lives in.
+  if (synthesized) io_synthesized_ = true;
+  return wired;
+}
+
+void LuaRuntime::RemoveInputRedirection() {
+  if (!io_synthesized_) return;  // a real io library: the wrapper stays and falls through
+  RunProtected([&]() {
+    // Only take back what is still ours, the rule RemoveFileReaderOverrides
+    // states: the caller may have replaced `io` in the meantime, and removing a
+    // handler is not a licence to undo that. A script that added fields to the
+    // synthesized table does lose them, which is correct — the table's whole
+    // reason to exist was the handler being removed here.
+    lua_getglobal(L_, "io");
+    if (!lua_istable(L_, -1)) {
+      lua_pop(L_, 1);
+      return;
+    }
+    lua_getfield(L_, -1, "read");
+    const bool ours = lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaIoRead;
+    lua_pop(L_, 2);
+    if (!ours) return;
+    lua_pushnil(L_);
+    lua_setglobal(L_, "io");
+  });
+  // Cleared only after the removal succeeded. RunProtected throws rather than
+  // returning, so reaching this line means `io` is gone and a later install must
+  // synthesize afresh.
+  io_synthesized_ = false;
 }
 
 int LuaRuntime::LuaIoRead(lua_State* L) {
@@ -3081,6 +3151,15 @@ ScriptResult LuaRuntime::CallFunction(const LuaFunctionRef& funcRef,
 
 // --- Value conversion ---
 
+bool LuaRuntime::StrictConversion(lua_State* L) {
+  const LuaRuntime* runtime = detail::OwningRuntime(L);
+  return runtime && runtime->config_.strict_conversion;
+}
+
+bool LuaRuntime::IsNil(const LuaPtr& value) {
+  return !value || std::holds_alternative<std::monostate>(value->value);
+}
+
 LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
   if (depth > kMaxDepth) {
     std::string msg = "Value nesting depth exceeds the maximum of ";
@@ -3136,19 +3215,42 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
       lua_pushnil(L);
       while (lua_next(L, abs_index) != 0) {
         std::string key;
-        if (lua_type(L, -2) == LUA_TSTRING) {
+        const int key_type = lua_type(L, -2);
+        if (key_type == LUA_TSTRING) {
           size_t len;
           const char* str = lua_tolstring(L, -2, &len);
           key.assign(str, len);
-        } else if (lua_type(L, -2) == LUA_TNUMBER) {
+        } else if (key_type == LUA_TNUMBER) {
           lua_pushvalue(L, -2);
           key = lua_tostring(L, -1);
           lua_pop(L, 1);
         } else {
+          // LIMITATIONS §5: a boolean, table or function key has no JavaScript
+          // object-key equivalent, so the entry is dropped. StrictConversion
+          // makes that refusable; the check is here rather than before the loop
+          // so an unaffected table pays nothing for it.
+          if (StrictConversion(L)) {
+            throw std::runtime_error(
+              std::string("strict conversion: a Lua table key of type '")
+              + luaL_typename(L, -2)
+              + "' would be dropped converting this table to JavaScript, which "
+                "can only key an object by string or number. Read the table in "
+                "place with get_global_ref() to keep such keys.");
+          }
           lua_pop(L, 1);
           continue;
         }
-        map.emplace(std::move(key), ToLuaValue(L, -1, depth + 1));
+        // emplace does not overwrite, so on a collision it is the *later* entry
+        // that is discarded — and which one that is depends on lua_next order.
+        // The two keys are distinct in Lua and the same JS property name: the
+        // integer 1 and the string "1" both arrive as "1" (LIMITATIONS §5).
+        if (!map.emplace(key, ToLuaValue(L, -1, depth + 1)).second && StrictConversion(L)) {
+          throw std::runtime_error(
+            "strict conversion: the Lua table keys " + key + " (number) and \""
+            + key + "\" (string) both become the JavaScript property \"" + key
+            + "\", so one value would be lost. Read the table in place with "
+              "get_global_ref() to keep both.");
+        }
         lua_pop(L, 1);
       }
       return std::make_shared<LuaValue>(LuaValue::from(std::move(map)));
@@ -3293,12 +3395,34 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
           lua_newtable(L);
           int idx = 1;
           for (const auto& item : v) {
+            // LIMITATIONS §5: a nil at index i ends the sequence there, so
+            // `[1, null, 3, 4]` gives a table whose `#t` is 1 and whose ipairs
+            // yields one element — while `t[3]` and `t[4]` still hold their
+            // values. Nothing looks missing if you index and almost everything
+            // does if you iterate, which is what makes it worth refusing.
+            if (IsNil(item) && StrictConversion(L)) {
+              throw std::runtime_error(
+                "strict conversion: null/undefined at array index "
+                + std::to_string(idx - 1)
+                + " becomes a Lua nil, which ends the sequence there — #t and "
+                  "ipairs would stop before the later elements. Filter the array, "
+                  "or use false as a present placeholder.");
+            }
             PushLuaValue(L, item, depth + 1);
             lua_rawseti(L, -2, idx++);
           }
         } else if constexpr (std::is_same_v<T, LuaTable>) {
           lua_newtable(L);
           for (const auto& [k, val] : v) {
+            // LIMITATIONS §5: assigning nil to a Lua table key removes it, so
+            // `{a: null}` arrives with no key `a` at all — not a key holding nil.
+            if (IsNil(val) && StrictConversion(L)) {
+              throw std::runtime_error(
+                "strict conversion: null/undefined at key \"" + k
+                + "\" becomes a Lua nil, which removes the key rather than "
+                  "storing a value — the key would be absent, not nil. Omit it, "
+                  "or use false.");
+            }
             lua_pushlstring(L, k.c_str(), k.size());
             PushLuaValue(L, val, depth + 1);
             lua_settable(L, -3);
