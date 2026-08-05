@@ -47,9 +47,12 @@ const controlOnly = argv.includes('--control');
 // Canonical form of an outcome. A throw is an outcome, not an absence of one —
 // a door that refuses a value has told us something, and folding that into
 // "no result" is how a refusal disappears from a parity column.
-function outcome(fn) {
+// `fn` may be async: the async doors (call_async, resume_async) are entry points
+// like any other and belong in the same matrix, so awaiting here is what keeps
+// "every door" honest rather than "every synchronous door".
+async function outcome(fn) {
   try {
-    const v = fn();
+    const v = await fn();
     return { kind: 'value', canon: canon(v) };
   } catch (e) {
     // Only the *shape* of the refusal is compared across doors, not its
@@ -61,7 +64,7 @@ function outcome(fn) {
   }
 }
 
-function runCell(door, value) {
+async function runCell(door, value) {
   const lua = new lua_native.init({}, { libraries: 'all' });
   let input;
   try {
@@ -69,8 +72,8 @@ function runCell(door, value) {
   } catch (e) {
     return { status: 'HARNESS', note: `value factory threw: ${e.message}` };
   }
-  const before = outcome(() => input);
-  const after = outcome(() => door.roundTrip(lua, input));
+  const before = await outcome(() => input);
+  const after = await outcome(() => door.roundTrip(lua, input));
   return {
     door: door.id,
     value: value.id,
@@ -88,7 +91,7 @@ function runCell(door, value) {
 // report dirty. Here that means proving the comparator can see a difference the
 // round trip introduces, and proving each door is actually a round trip rather
 // than something that hands the input straight back without ever entering Lua.
-function runControls() {
+async function runControls() {
   const controls = [
     {
       name: 'the comparator sees a value change',
@@ -111,7 +114,7 @@ function runControls() {
     },
     {
       name: 'every door actually enters Lua (a sentinel Lua-side mutation is visible)',
-      run: () => {
+      run: async () => {
         // A door that never crossed into Lua would hand back the identical JS
         // object. Push a plain object and check the returned one is a *copy*,
         // not the same reference — which is what a real crossing produces.
@@ -120,7 +123,7 @@ function runControls() {
           const lua = new lua_native.init({}, { libraries: 'all' });
           const probe = { marker: 1 };
           try {
-            const back = d.roundTrip(lua, probe);
+            const back = await d.roundTrip(lua, probe);
             if (back !== probe) crossed++;
           } catch { crossed++; }
         }
@@ -136,7 +139,7 @@ function runControls() {
   let bad = 0;
   for (const c of controls) {
     let pass = false;
-    try { pass = c.run() === true; } catch (e) { console.log(`        ${e.message}`); }
+    try { pass = (await c.run()) === true; } catch (e) { console.log(`        ${e.message}`); }
     if (!pass) bad++;
     console.log(`  ${pass ? 'ok  ' : 'FAIL'}  ${c.name}`);
   }
@@ -146,7 +149,7 @@ function runControls() {
 
 // --- main ------------------------------------------------------------------
 
-const badControls = runControls();
+const badControls = await runControls();
 if (badControls > 0) {
   console.error(`${badControls} control(s) failed — the harness cannot report what it searches for.`);
   process.exit(1);
@@ -159,7 +162,10 @@ const doors = onlyDoor ? DOORS.filter((d) => d.id === onlyDoor) : DOORS;
 console.log(`CR-20 round-trip matrix: ${doors.length} doors x ${values.length} values = ${doors.length * values.length} cells\n`);
 
 const cells = [];
-for (const v of values) for (const d of doors) cells.push(runCell(d, v));
+// Sequential, not Promise.all: each cell builds its own context, and the async
+// doors are one-run-at-a-time per context anyway — but more importantly a
+// deterministic order is what makes a failing cell reproducible from the log.
+for (const v of values) for (const d of doors) cells.push(await runCell(d, v));
 
 // --- round-trip analysis ---------------------------------------------------
 

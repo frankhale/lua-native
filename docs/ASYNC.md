@@ -1,5 +1,15 @@
 # Async / Non-Blocking Execution
 
+> **Updated August 5, 2026.** This document describes the *worker-thread* async
+> model (`execute_script_async` / `execute_file_async`) and the main-thread
+> coroutine driver (`execute_async`). The driver now has two further doors —
+> **`call_async(nameOrFn, ...)`** and **`resume_async(coro, ...)`**, plus
+> `Symbol.asyncIterator` on coroutines — which share its machinery exactly: same
+> driver, same one-run-per-context rule, same `cancel()`. Everything said below
+> about `execute_async` holds for all three unless it names the method. The
+> difference between them, and why awaiting used to be reachable through only
+> one, is in `FEATURES.md` "Uniform Async Doors".
+
 > **Status:** Phase 1 completed (February 2026). `execute_script_async`,
 > `execute_file_async`, and `is_busy` are implemented and shipping. Phase 2
 > (ThreadSafeFunction callbacks) remains a future option if demand warrants it.
@@ -279,8 +289,9 @@ real-world patterns naturally separate these: gather data via JS callbacks
 > its wording plus a clause naming the worker handoff. Two of the three name the
 > method; the "already busy" one is the shared message every synchronous method
 > emits. If you need to kick off Lua work from inside a callback, use
-> `execute_async()` — coroutine-driven, main-thread, unrestricted. (Before
-> CR-15 this was accepted and segfaulted deterministically.)
+> `execute_async()` — coroutine-driven, main-thread, unrestricted — or its
+> siblings `call_async()` / `resume_async()`. (Before CR-15 this was accepted and
+> segfaulted deterministically.)
 
 ```javascript
 const lua = new lua_native.init({

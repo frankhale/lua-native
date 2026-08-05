@@ -243,6 +243,103 @@ export const FRAMES = [
     },
     trigger: (lua) => lua.get_global_ref('probe_t').get('anything'),
   },
+  // --- frames added by INTEROP-PARITY-PLAN (August 5, 2026) -----------------
+  //
+  // §15.6: a new Lua C frame that can call back into the host is a new row
+  // here. Each of these is a site from which a JS throw can reach Lua's C
+  // stack, and none existed before this work.
+  {
+    id: 'coroutine_close',
+    describe: '__close run by an explicit close(coroutine) (P3)',
+    install: (lua, act) => {
+      lua.execute_script('probe_t = {}');
+      lua.set_metatable('probe_t', { __close: act });
+    },
+    // Distinct from `close_metamethod`: there the handler runs from a Lua `do`
+    // block, here from lua_closethread driven by the binding. The frame the
+    // throw has to survive is a different one.
+    trigger: (lua) => {
+      const co = lua.create_coroutine(
+        'return function() local x <close> = probe_t coroutine.yield(1) end');
+      lua.resume(co);
+      return lua.close(co);
+    },
+  },
+  {
+    id: 'call_async_host',
+    describe: 'a host function called through call_async (P1a)',
+    install: (lua, act) => {
+      lua.set_global('probe_hostile', act);
+      lua.execute_script('function probe_fn() return probe_hostile() end');
+    },
+    trigger: (lua) => lua.call_async('probe_fn'),
+    isAsync: true,
+  },
+  {
+    id: 'resume_async_host',
+    describe: 'a host function called through resume_async (P1b)',
+    install: (lua, act) => lua.set_global('probe_hostile', act),
+    trigger: (lua) => {
+      const co = lua.create_coroutine('return function() return probe_hostile() end');
+      return lua.resume_async(co);
+    },
+    isAsync: true,
+  },
+  {
+    id: 'coroutine_async_iterator',
+    describe: 'a host function reached through the for-await protocol (P1b)',
+    install: (lua, act) => lua.set_global('probe_hostile', act),
+    trigger: async (lua) => {
+      const co = lua.create_coroutine(
+        'return function() coroutine.yield(probe_hostile()) end');
+      const seen = [];
+      for await (const v of co) seen.push(v);
+      return seen;
+    },
+    isAsync: true,
+  },
+  {
+    id: 'read_handler',
+    describe: 'the io.read handler (P4a)',
+    install: (lua, act) => lua.set_read_handler(act),
+    trigger: (lua) => lua.execute_script('return io.read()'),
+  },
+  {
+    id: 'file_reader',
+    describe: 'the dofile/loadfile reader (P4b)',
+    install: (lua, act) => lua.set_file_reader(act),
+    trigger: (lua) => lua.execute_script('return dofile("/probe.lua")'),
+  },
+  {
+    id: 'class_property_getter',
+    describe: 'a registered class property getter (P2b)',
+    install: (lua, act) => {
+      lua.register_class('ProbeG', {
+        construct: () => ({ tag: 'probe' }),
+        properties: { k: { get: act } },
+      });
+    },
+    trigger: (lua) => lua.execute_script('local c = ProbeG.new() return c.k'),
+  },
+  {
+    id: 'class_property_setter',
+    describe: 'a registered class property setter (P2b)',
+    install: (lua, act) => {
+      lua.register_class('ProbeS', {
+        construct: () => ({ tag: 'probe' }),
+        properties: { k: { get: () => 1, set: act } },
+      });
+    },
+    trigger: (lua) => lua.execute_script('local c = ProbeS.new() c.k = 1'),
+  },
+  {
+    id: 'class_static',
+    describe: 'a registered class static function (P2a)',
+    install: (lua, act) => {
+      lua.register_class('ProbeT', { construct: () => ({}), statics: { s: act } });
+    },
+    trigger: (lua) => lua.execute_script('return ProbeT.s()'),
+  },
   {
     id: 'pcall_frame',
     describe: 'the function handed to pcall()',

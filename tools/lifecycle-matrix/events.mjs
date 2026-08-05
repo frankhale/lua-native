@@ -103,6 +103,50 @@ export const EVENTS = [
     // classic way to produce aliasing that shows up arbitrarily far away.
     apply: (lua, handle, spec) => { spec.release(handle); spec.release(handle); },
   },
+  {
+    // P3. Closing is deliberately *not* a release: the handle stays valid and
+    // must keep answering correctly, reporting the coroutine as dead. The
+    // failure this row looks for is a closed thread that answers with something
+    // other than "dead" — or that crashes, since lua_closethread resets the
+    // thread's stack under a handle JS still holds.
+    id: 'close-then-use',
+    expect: 'works',
+    only: (spec) => typeof spec.close === 'function',
+    apply: (lua, handle, spec) => spec.close(handle, lua),
+    // "Report the value, not just survival" (tools/README.md): the resume after
+    // a close answers with a result object either way — a closed thread reports
+    // dead, but a *no-op* close would leave the fresh thread resumable and
+    // answering 'suspended', which is also outcome 'value'. Without pinning the
+    // answer's content, both classify CLEAN and the cell is vacuous with
+    // respect to close actually closing.
+    expectValue: /"status":"dead"/,
+  },
+  {
+    // Documented as idempotent. A second lua_closethread on an already-closed
+    // thread must not re-run finalizers or disturb the stack.
+    id: 'close-twice',
+    expect: 'works',
+    only: (spec) => typeof spec.close === 'function',
+    apply: (lua, handle, spec) => { spec.close(handle, lua); spec.close(handle, lua); },
+    expectValue: /"status":"dead"/,  // see close-then-use
+  },
+  {
+    // The ordering that has a free-then-touch shape: close runs Lua on the
+    // thread, release frees its registry slot. Doing both must leave a handle
+    // that refuses cleanly rather than one that reaches a recycled slot.
+    id: 'close-then-release',
+    expect: 'refuses',
+    only: (spec) => typeof spec.close === 'function' && typeof spec.release === 'function',
+    apply: (lua, handle, spec) => { spec.close(handle, lua); spec.release(handle); },
+  },
+  {
+    // The reverse order, which is the one the docs call a silent no-op: a
+    // released coroutine has no thread left to close.
+    id: 'release-then-close',
+    expect: 'refuses',
+    only: (spec) => typeof spec.close === 'function' && typeof spec.release === 'function',
+    apply: (lua, handle, spec) => { spec.release(handle); spec.close(handle, lua); },
+  },
 ];
 
 export async function forceGc() {

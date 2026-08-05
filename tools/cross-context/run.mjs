@@ -57,6 +57,33 @@ const HANDLE_CASES = [
   { id: 'userdata-lua', make: (l) => l.execute_script('return io.open("/dev/null","r")') },
 ];
 
+// **A coroutine iteration cursor is deliberately NOT listed above — either the
+// sync one or the async one added by P1b — and this note exists because adding
+// it is the obvious move and it produces a false finding.**
+//
+// It looks like a handle: `lifecycle-matrix` lists both cursors on its Axis A,
+// and §15.6 says a new handle kind belongs in both instruments. But the two
+// axes ask different questions. Lifecycle asks "does this object survive events
+// in its own context", which the cursor's shared_ptr-owned state makes a real
+// question. This file asks "can a *marker* minted by A be reinterpreted by B",
+// and a cursor has no marker to reinterpret: its `__coroIterOwner` External is a
+// GC root that is written and never read back (stated on the tag list in
+// lua-native.h), so nothing in the addon ever dereferences it from B.
+//
+// Passed into B it therefore converts as what it is — an ordinary JS object —
+// and arrives as a Lua table whose `next` is a host callback into A. Driven and
+// confirmed identical for the sync cursor, which has behaved this way since A4
+// shipped in July 2026, so this is not something P1b introduced. That is the
+// same answer `function-bridge` gets in part 2 and it is correct for the same
+// reason: a JS callable that closes over another context is ordinary, and
+// refusing it would mean refusing every closure.
+//
+// Listing it as a handle reports "a handle from A was accepted by B" — which is
+// exactly the false finding CR-22 F1 produced the first time, with
+// `function-bridge`.
+
+
+
 // --- part 2: data crosses intact -------------------------------------------
 //
 // Reuses the round-trip matrix's 50 values. The question here is different from

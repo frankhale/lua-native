@@ -75,7 +75,10 @@ try {
   // "refuses after reset" is trivially true of a handle that refused already.
   if (result.made) {
     try {
-      const v = spec.use(handle, lua);
+      // Awaited: a handle whose `use` is asynchronous (the async coroutine
+      // cursor) would otherwise be measured as "returned a Promise", which is
+      // true of a working handle and of a broken one alike.
+      const v = await spec.use(handle, lua);
       result.baselineWorked = v !== undefined && v !== null;
     } catch (e) {
       result.baselineWorked = false;
@@ -132,7 +135,7 @@ try {
     result.aliased = true;
   } else {
     try {
-      const v = spec.use(handle, lua);
+      const v = await spec.use(handle, lua);   // see the baseline probe above
       result.outcome = 'value';
       result.value = typeof v === 'object' && v !== null
         ? JSON.stringify(v).slice(0, 120) : String(v);

@@ -12,6 +12,8 @@ what to do, what is covered, or what to run, that is
   from source comments (M6).
 - `FEATURE-HISTORY.md` — the planned feature work, all implemented.
 - `BRIDGE-COMPARISON.md` — competitive survey; every gap closed.
+- `INTEROP-PARITY-PLAN.md` — the five interop-parity gaps (P1–P5), planned and
+  executed August 5, 2026; the first exercise of the new-surface trigger.
 
 The correctness programme closed on August 4, 2026 after CODE-REVIEW-22. Review
 is now triggered by **new surface, not by the calendar** — see

@@ -75,6 +75,67 @@ export const EXPECTED_NON_SURFACING = {
     + 'Symbol, so the kind\'s signature does not match it.',
   'class_constructor x return_bigint_out_of_range':
     'As above — the same "must return an object" error, which is the right one.',
+  // --- frames added by INTEROP-PARITY-PLAN (August 5, 2026) -----------------
+
+  // The three main-thread async frames share one reason: two of the eleven
+  // kinds re-enter Lua from inside the callback (`errmem_oom` allocates by
+  // running a script, `nested_then_throw` calls one), and re-entry during an
+  // async run is refused by the occupancy guard. The refusal is the correct
+  // outcome and it replaces the probe's own signature, so the cell reads as
+  // "the failure never surfaced" when what actually happened is that the
+  // failure was prevented. The other nine kinds surface normally at all three
+  // frames, which is what makes this a property of the two kinds rather than
+  // of the frames.
+  'call_async_host x errmem_oom':
+    'The kind re-enters Lua (execute_script) from inside the callback, which '
+    + 'is_busy_ refuses during an async run. The refusal is correct and is what '
+    + 'the cell observes instead of the OOM. The nine kinds that do not re-enter '
+    + 'surface normally at this frame.',
+  'call_async_host x nested_then_throw':
+    'As above: the kind re-enters Lua before throwing, and re-entry is refused '
+    + 'during an async run, so the inner throw never happens.',
+  'resume_async_host x errmem_oom':
+    'As call_async_host x errmem_oom — the same driver, the same guard.',
+  'resume_async_host x nested_then_throw':
+    'As call_async_host x nested_then_throw.',
+  'coroutine_async_iterator x errmem_oom':
+    'As call_async_host x errmem_oom; the async cursor steps through '
+    + 'resume_async and inherits its occupancy guard.',
+  'coroutine_async_iterator x nested_then_throw':
+    'As call_async_host x nested_then_throw.',
+
+  // The two handler frames whose contract is "return text": a *returned* value
+  // is not a failure at all, so there is nothing to surface.
+  'read_handler x return_bigint_out_of_range':
+    'Not a failure. The read handler is contracted to return text and its '
+    + 'return value is coerced with ToString, so a BigInt yields its digits — a '
+    + 'perfectly good line of input. Nothing converts it through the LuaValue '
+    + 'path, so the 2^53 range check never applies. Documented on '
+    + 'set_read_handler().',
+  'read_handler x return_deep_object':
+    'As above — coerced with ToString to "[object Object]", which is a valid '
+    + 'line. kMaxDepth never applies because no table conversion happens.',
+  'file_reader x return_bigint_out_of_range':
+    'The failure DOES surface, as the syntax error it should be: the reader is '
+    + 'contracted to return Lua *source*, the value is coerced to text, and the '
+    + 'text does not parse. The cell reads as non-surfacing only because the '
+    + "parser's message carries no probe signature.",
+  'file_reader x return_deep_object':
+    'As above — coerced to "[object Object]", which is not valid Lua, and the '
+    + 'load fails with a syntax error.',
+
+  // A setter has no return value.
+  'class_property_setter x return_symbol':
+    'Not applicable. A property setter\'s return value is discarded — there is '
+    + 'no conversion for a Symbol to be refused by.',
+  'class_property_setter x return_bigint_out_of_range':
+    'As above: the setter\'s return value is discarded, so an out-of-range '
+    + 'BigInt is never converted.',
+  'class_property_setter x return_deep_object':
+    'As above: discarded, so kMaxDepth is never reached. (The matching getter '
+    + 'cells DO surface, because a getter\'s return value is converted — which '
+    + 'is what makes this a fact about setters rather than about accessors.)',
+
 };
 
 // Longest-match lookup: a per-cell entry wins over a whole-row one.

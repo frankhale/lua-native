@@ -1524,10 +1524,13 @@ suspended where it stopped so a later loop resumes from there. Snapshotting was
 never an option — a coroutine has no copy operation — so the semantics are
 stated rather than hidden.
 
-**`for await` needs nothing extra.** JS wraps a sync iterable when
-`Symbol.asyncIterator` is absent, and the resume itself is synchronous, so a
-separate async iterator would only add a Promise per step and a second code path
-to keep correct.
+**~~`for await` needs nothing extra.~~** **Superseded August 5, 2026.** True as
+far as it went — JS does wrap a sync iterable when `Symbol.asyncIterator` is
+absent — but the fallback drives the *synchronous* cursor, which is exactly why
+a yield that needed a host Promise could not work. Coroutines now carry
+`Symbol.asyncIterator`, stepping through `resume_async`; see "Uniform Async
+Doors" below. The same conclusion carries the same supersession note in
+`LIMITATIONS.md`'s "Checked and *not* limitations" table.
 
 ### Lua → JS type converters (B3)
 
@@ -1702,6 +1705,235 @@ Notes:
 
 ---
 
+## Uniform Async Doors — `call_async` / `resume_async` (August 2026)
+
+### Overview
+
+Awaiting a host Promise used to be reachable through exactly one entry point.
+`LuaCallHostFunction` gates all Promise handling on `IsAwaitDriverMode()`, and
+only `execute_async` ever set it, so `call()`, a held `LuaFunction`, `pcall()`,
+`resume()`, `execute_script_in()` and `load_bytecode()` all answered a
+Promise-returning callback with *"call it inside execute_async() to await it"*.
+
+That was a **uniformity** gap rather than a capability gap, and it is the shape
+the correctness programme kept finding: something that works through one door and
+not its siblings looks complete on a feature list and is not. Two doors close it.
+
+### `call_async(nameOrFn, ...args)`
+
+The awaiting counterpart to `call()`. It is `execute_async` with the coroutine
+seeded from a function reference instead of a compiled chunk, so the driver, the
+M1 guard, `cancel()` and the one-run-per-context rule are the existing ones,
+unchanged. `CreateCoroutine(LuaFunctionRef)` already existed (shipped for A4), so
+the core needed no change at all.
+
+It closes two things:
+
+- **A capability hole.** A `LuaFunction` held only on the JS side — never stored
+  as a global — could not await at all, because the documented workaround
+  (re-source the call as script text for `execute_async`) needs a *name*.
+- **A cost.** Where the workaround did apply it compiled a fresh chunk per call,
+  which is strictly worse than the `get_global` route `call()` was added to
+  replace.
+
+### `resume_async(coro, ...args)`
+
+The awaiting counterpart to `resume()`, and the harder half: it drives a thread
+the binding does **not** own.
+
+Under `execute_async` the driven coroutine is created for the run and released by
+`FinishAsync`. Here it belongs to a coroutine object the caller still holds, so
+the binding keeps a *borrowed* pointer (`async_borrowed_`) with `async_co_`
+disengaged, roots the coroutine object for the run's duration, and releases
+nothing when the run ends. `cancel()` therefore leaves the caller's coroutine
+**suspended and resumable** at the point it reached — the same end state breaking
+out of a `for..of` loop already produced.
+
+Three consequences worth stating:
+
+- The M1 guard now admits awaits *from this coroutine*, because it is the driven
+  thread. A coroutine created inside it still cannot await, and the message says
+  so rather than naming `execute_async` alone.
+- A plain `coroutine.yield` means something different per door. For
+  `execute_async` and `call_async` nothing can resume it and it is an error; for
+  `resume_async` it is an ordinary suspension that resolves with the yielded
+  values. The core reports **which kind of yield happened**
+  (`AsyncStepResult::awaited`) rather than leaving the binding to infer it from
+  whether a promise is stashed — an inference that could go stale, and did:
+  the stash is written before the core decides whether the thread is the driven
+  one, so a *refused* nested await left a promise that the next plain yield was
+  misread as.
+- `resume_async` resolves with the same `{ status, values, error? }` object
+  `resume()` returns, **including for a Lua error**, which it reports in the
+  result rather than throwing. Diverging on error handling alone would be the
+  same defect this work exists to remove.
+
+`Symbol.asyncIterator` on a coroutine steps through `resume_async`. Before it,
+`for await` worked only through JS's sync-iterable fallback — which drove the
+*synchronous* cursor, and was precisely why a yield needing a Promise could not
+work. `LIMITATIONS.md` recorded that fallback as a "checked and not a
+limitation"; it was true, and it was the mechanism of the gap.
+
+### Design Decisions
+
+**One place arms the driver.** `BeginAsyncRun` is the single function every
+main-thread async door goes through. Three doors that each armed the driver
+themselves is how they would drift apart again.
+
+**Borrowed threads are never released.** `FinishAsync` releases `async_co_` only.
+Releasing a caller's coroutine on cancel would free a registry slot the caller
+still holds a handle to.
+
+**`AsyncRunSuperseded` asks whether a run is engaged, not whether `async_co_` is.**
+It tested `async_co_` directly, which is disengaged for the whole of a borrowed
+run — so every settle site reported the run as already superseded and none of
+them fired. The symptom was a promise that never settled and a context stuck
+busy.
+
+---
+
+## Coroutine Close — `close()` (August 2026)
+
+### Overview
+
+`close(coro)` runs a suspended coroutine's pending to-be-closed variables
+(`local x <close> = …`) and marks the thread dead, over `lua_closethread`.
+Mirrors Lua's own `coroutine.close`.
+
+Before it existed there was no way to run those handlers from JS at all:
+`release()` frees the registry slot without executing anything, and collecting
+the thread runs `__gc` but not `__close`.
+
+### Why it mattered more here than in most bridges
+
+Two shipped features conspire to make an abandoned suspended coroutine ordinary
+rather than exceptional:
+
+- `MetatableDefinition` **specifically advertises** `__close`, and calls it out
+  because "it is easy to assume Lua 5.4+ scoping features stop at the binding".
+- The A4 iterator contract deliberately leaves a coroutine suspended when the
+  loop `break`s.
+
+So the binding invited you to use `<close>` and provided a normal path that
+silently skipped it.
+
+### Design Decisions
+
+**`release()` still does not close.** Folding a close into it would make a "free
+this slot" call run arbitrary Lua — and from there JS — re-entrantly, and give it
+a way to throw. `release()` is called from teardown paths where neither is
+acceptable. The two stay orthogonal, exactly as `coroutine.close` and letting a
+thread be collected are orthogonal in Lua.
+
+**Idempotent.** A close is a statement about the end state, so closing an
+already-closed, finished or released coroutine succeeds and does nothing — which
+is what lets a caller close defensively.
+
+**A failing `__close` still leaves the thread dead**, and the status is updated
+before the error is raised: a failed close still closed everything it reached.
+
+---
+
+## Class Statics and Property Accessors (August 2026)
+
+### Overview
+
+`register_class` gained the two pieces that separated it from the sol2 /
+LuaBridge / kaguya bar its own design was measured against.
+
+**`statics`** — class-level members on the class *table* rather than on
+instances: `Player.count()`, `Player.VERSION`. Functions become host-function
+closures; other values are converted **once, at registration**, so a static is a
+class-level constant rather than a live view of the JS property. `new` is
+reserved and rejected.
+
+**`properties`** — named accessors, `{ get?, set? }` per name. This is what makes
+a computed property, a validated setter, and a read-only field on an otherwise
+writable instance expressible. Reading a set-only property and writing a get-only
+one are refused with a message naming the class, rather than silently answering
+`nil` or doing nothing.
+
+### Architecture
+
+Accessors are held in the binding (`class_accessors_`), not pushed into Lua.
+There is nothing to put in a Lua table but a host-function name, and routing
+through one would mean a Lua closure call plus a registry lookup per property
+access to reach the same JS function the map holds directly. The property
+handlers installed by `InstallRuntimeHandlers` consult them, so `UserdataEntry`
+carries its class name — accessors are per-class while `readable`/`writable` are
+per-instance.
+
+Precedence is **methods, then accessors, then `readable`/`writable`**. Methods
+win because `ClassIndex` resolves the method table before it ever reaches a
+property handler. Accessors beat the blanket flags, which is what lets a class
+with `readable: false` expose exactly the properties it declares.
+
+### Design Decisions
+
+**Accessors inherit; statics do not.** The rule is the one `extends` already
+states — it governs how Lua resolves names *on an instance*. A named accessor is
+instance-name resolution, the same question `methods` answers. `readable` /
+`writable` are set per instance by the constructor, and statics live on the class
+table, which has no metatable and therefore no lookup chain to extend.
+
+**`PropertyAccessDenied` was added to the core**, and the swallow in
+`UserdataIndex` / `ClassIndex` narrowed to it. Both used to catch *every* getter
+exception and answer `nil` when the object had methods — so a host getter that
+genuinely threw was reported as an absent field, and only on objects that
+happened to have methods. Named accessors made that unacceptable; the fix
+narrowed the swallow to exactly the case its own comment always claimed.
+
+---
+
+## Input Redirection and Virtual Files (August 2026)
+
+### Overview
+
+Two asymmetries left over from E1 and E2.
+
+**`set_read_handler`** routes `io.read` to a JS handler — the input counterpart
+to `set_print_handler`, which has redirected output since July 2026 while input
+still reached the process's real stdin. A prompting script under a print handler
+had its output captured and then blocked on a stdin nothing was writing to.
+
+The handler receives the format as Lua passes it (a string, or a **number** for a
+byte count), with the Lua 5.3 `*` prefix stripped so only one spelling is ever
+seen. `null` means end-of-input; an empty string is a valid empty line. The `"n"`
+format converts to a number or `nil`, matching real `io.read("n")`.
+
+**`set_file_reader`** resolves `dofile` and `loadfile` through a JS callback.
+`add_searcher` (E2) already covered `require`; this covers the other two ways Lua
+reaches a file. It matters most under `libraries: 'sandbox'`, where both globals
+are *cleared* precisely because they reach the real filesystem.
+
+### Design Decisions
+
+**The reader is exclusive, never a fallback.** With a reader installed the real
+filesystem is not consulted at all. "The reader, or the disk if the reader
+declines" would make the meaning of a path depend on the reader's answer — the
+data-dependent-behaviour defect `binaryStrings` also refused to introduce. A
+reader that wants disk access can read the disk itself.
+
+**Source only.** Chunks from the reader load in text-only mode, so a reader
+cannot hand back bytecode and route around `allowBytecode`.
+
+**The read wrapper falls through; the file overrides are removed.** Clearing the
+read handler needs no unwrap step because the installed `io.read` wrapper defers
+to the original whenever no handler is set. The file overrides are cleared to
+`nil` instead, because under `'sandbox'` that is what they were and there is no
+captured original to restore.
+
+**`io.read` only, and only with the `io` library.** There is no base-library
+input function to override the way `print` gave output a home, so a bare or
+`'sandbox'` state has nothing to redirect. Inventing a non-standard global to
+fill the gap would be worse than the gap.
+
+**Both handlers replay across `reset()`**, like the print handler — a sandbox
+context that reset would otherwise silently lose its virtual filesystem while
+still holding the JS callback.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -1740,3 +1972,9 @@ Notes:
 | Lua → JS type converters (`register_from_lua_converter()`) | Low | July 2026 |
 | Class inheritance (`register_class({ extends })`) | Moderate | July 2026 |
 | Live references to nested tables (`LuaTableHandle.get_ref()`) | Low | July 2026 |
+| Sealed sandbox preset (`libraries: 'sandbox'`) | Low | August 2026 |
+| Byte-faithful strings (`binaryStrings`) | Moderate | August 2026 |
+| Class statics and property accessors (`statics` / `properties`) | Moderate | August 2026 |
+| Awaiting through every door (`call_async`, `resume_async`, `Symbol.asyncIterator`) | High | August 2026 |
+| Coroutine close (`close()` — runs pending `<close>` variables) | Low | August 2026 |
+| Input redirection (`set_read_handler`) and virtual files (`set_file_reader`) | Moderate | August 2026 |

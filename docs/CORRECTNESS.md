@@ -343,6 +343,7 @@ is a trigger, and the trigger names the instrument to extend:
 |---|---|
 | A new public entry point that takes a JS value | `roundtrip-matrix` (a door) |
 | A new entry point that executes a script | `exec-parity` (a door) |
+| A new *asynchronous* entry point | both of the above — and check the door's own vacuity control proves it really awaits |
 | A new handle kind, or a new marker on a JS object | `lifecycle-matrix` (Axis A) **and** `cross-context` (handle cases) |
 | A new Lua C frame that can call back into the host | `exception-matrix` (Axis B) |
 | A new `ObjectWrap` subclass | nothing — `objectwrap-branding` will fail until it is branded |
@@ -354,12 +355,47 @@ is a trigger, and the trigger names the instrument to extend:
 The rows that say "nothing" are the ones worth noticing: for four classes the
 mechanism now fails closed without anyone deciding to look.
 
+**Exercised August 5, 2026, and it worked.** The `INTEROP-PARITY-PLAN` work added
+three entry points that take JS values, two that execute, a handle kind, nine Lua
+C frames and a `PropertyAccessDenied` type. Following this table found three
+defects that review had not:
+
+- `check-invariants` flagged `DetachRuntimeHandlers -> SetFileReader` as
+  `UNGUARDED_AND_PROPAGATES` — a `RunProtected` removal reachable from a teardown
+  path with no handler above it, i.e. the CR-6 F1 abort class, in code that had
+  just been written and read twice.
+- `exception-matrix`, on the new `read_handler` frame, showed a non-`Error` throw
+  losing its text — CR-18 F2 recurring at a new site, the first time it had been
+  caught by the instrument rather than by a person.
+- The `assertion-strength` invariant refused a bare `.toThrow()` in a new test,
+  which is the fail-closed row above doing exactly what it promises.
+
+(These three are what the *table* caught. The plan's banner records a partly
+different trio — the "three things found while building": the stale pending
+promise, the swallowed getter exception, and the same teardown abort, which is
+the one member the two lists share. Five distinct catches in all; neither list
+subsumes the other.)
+
+Two further points the table does *not* cover, recorded so the next pass has
+them:
+
+- **A new handle kind does not automatically belong in `cross-context`.** The
+  async coroutine cursor is a real Axis-A handle for `lifecycle-matrix` (its
+  state is shared_ptr-owned and can outlive the iterator) and is *not* a
+  cross-context case, because it carries no marker the addon ever reads back.
+  Listing it there reproduces CR-22 F1's false finding. The distinction is
+  "is there a marker to reinterpret", not "is it a handle".
+- **A new door needs its own vacuity control.** `exec-parity` requires each door
+  to prove the property that makes it *that* door; a door whose control only
+  showed it returns the right value would pass while being a thin synchronous
+  wrapper.
+
 ## 15.7 Regression mode
 
 ```bash
 npm run build-debug && npm test && npm run test-cpp   # after any change
 npm run check-invariants                              # after any source change
-npm run lifecycle-matrix && npm run cross-context     # after handle/marker changes
+npm run lifecycle-matrix && npm run cross-context     # after handle/marker or context-boundary changes
 npm run exec-parity                                   # after execution-path changes
 npm run oracle                                        # after core VM changes
 npm run roundtrip-matrix                              # after conversion changes

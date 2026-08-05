@@ -330,6 +330,33 @@ struct UserdataEntry {
   Napi::ObjectReference object;
   bool readable;
   bool writable;
+  // Empty for set_userdata instances; the class name for register_class ones.
+  // The property handlers use it to find named accessors (P2b) — which are
+  // per-class, while readable/writable are per-instance, so the entry has to
+  // carry the link back to its class.
+  std::string class_name;
+};
+
+// One named property accessor registered by `register_class` (P2b). Either half
+// may be absent: a get-only property is read-only and a set-only property is
+// write-only, and both refuse the other direction with a message naming the
+// class, rather than silently doing nothing.
+struct ClassAccessor {
+  Napi::FunctionReference getter;
+  Napi::FunctionReference setter;
+};
+
+// The accessor table for one class, plus its base-class link.
+//
+// Accessors **do** inherit, unlike `readable`/`writable` and unlike `statics`.
+// The rule the three follow is the one `extends` already states: it governs how
+// Lua resolves names *on an instance*. A named accessor is instance-name
+// resolution — the same question `methods` answers, and ClassIndex already
+// chains that — whereas readable/writable are set per instance by the
+// constructor and statics live on the class table, which has no lookup chain.
+struct ClassAccessorTable {
+  std::string parent;  // empty when the class has no base
+  std::unordered_map<std::string, ClassAccessor> props;
 };
 
 // A JS-side value that several LuaContexts mirror as a global — the backing
@@ -420,6 +447,17 @@ public:
     Napi::Value ExecuteScriptAsync(const Napi::CallbackInfo& info);
     Napi::Value ExecuteFileAsync(const Napi::CallbackInfo& info);
     Napi::Value ExecuteAsync(const Napi::CallbackInfo& info);
+    Napi::Value CallAsync(const Napi::CallbackInfo& info);
+    Napi::Value CloseCoroutine(const Napi::CallbackInfo& info);
+    Napi::Value ResumeAsync(const Napi::CallbackInfo& info);
+    Napi::Value ResumeCoroutineObjectAsync(const Napi::Object& coroObj,
+                                           const std::vector<Napi::Value>& args_js,
+                                           const Napi::Object& self);
+    // Shared `{ status, values, error? }` marshalling for resume/resume_async.
+    Napi::Value CoroutineResultToJs(const Napi::Object& coroObj,
+                                    lua_core::CoroutineStatus status,
+                                    const std::vector<lua_core::LuaPtr>& values,
+                                    const std::optional<std::string>& error);
     Napi::Value Cancel(const Napi::CallbackInfo& info);
     Napi::Value IsBusyMethod(const Napi::CallbackInfo& info);
     Napi::Value SetGlobal(const Napi::CallbackInfo& info);
@@ -446,6 +484,8 @@ public:
     Napi::Value Pcall(const Napi::CallbackInfo& info);
     Napi::Value SetPrintHandler(const Napi::CallbackInfo& info);
     Napi::Value AddSearcher(const Napi::CallbackInfo& info);
+    Napi::Value SetReadHandler(const Napi::CallbackInfo& info);
+    Napi::Value SetFileReader(const Napi::CallbackInfo& info);
     Napi::Value SetHook(const Napi::CallbackInfo& info);
     Napi::Value RemoveHook(const Napi::CallbackInfo& info);
     Napi::Value Release(const Napi::CallbackInfo& info);
@@ -746,9 +786,44 @@ private:
     std::shared_ptr<std::atomic<bool>> context_alive_ =
         std::make_shared<std::atomic<bool>>(true);
 
-    // In-flight coroutine-driven async execution state (execute_async).
-    // Only one runs at a time (guarded by is_busy_).
+    // In-flight coroutine-driven async execution state (execute_async,
+    // call_async, resume_async). Only one runs at a time (guarded by is_busy_).
+    //
+    // The driven thread comes in two flavours and the difference is ownership,
+    // not mechanism:
+    //
+    //  * **Binding-owned** (execute_async, call_async): the thread was created
+    //    for this run and nothing else refers to it. `async_co_` holds the ref
+    //    and FinishAsync releases it.
+    //  * **Caller-owned** (resume_async, P1b): the thread belongs to a
+    //    coroutine object the caller still holds and may resume again later.
+    //    `async_co_` stays disengaged, `async_borrowed_` points at the caller's
+    //    LuaThreadData, and FinishAsync releases *nothing* — abandoning the run
+    //    must leave the coroutine suspended and resumable, matching what an
+    //    early `break` out of `for..of` already leaves behind.
+    //
+    // `async_borrowed_` points into an object owned by an External finalizer, so
+    // the run roots that object in `async_coro_obj_` for its whole duration —
+    // otherwise a suspended await could outlive the coroutine object and resume
+    // through freed memory.
     std::optional<lua_core::LuaThreadRef> async_co_;
+    LuaThreadData* async_borrowed_ = nullptr;
+    Napi::ObjectReference async_coro_obj_;
+    // True when the run was started by resume_async. It changes exactly one
+    // decision — what a plain `coroutine.yield` means. For execute_async and
+    // call_async there is no resumer for it and it is an error; for resume_async
+    // it is an ordinary suspension that settles the promise with the yielded
+    // values, which is the whole point of the door.
+    bool async_coroutine_mode_ = false;
+    // The thread this run drives, whichever flavour it is. Valid only while a
+    // run is engaged (AsyncDriverEngaged()).
+    [[nodiscard]] const lua_core::LuaThreadRef& AsyncDrivenThread() const;
+    // True while a main-thread coroutine-driven run is in flight. Distinct from
+    // is_busy_, which is also true for the worker-thread doors.
+    [[nodiscard]] bool AsyncDriverEngaged() const {
+      return (async_co_.has_value() || async_borrowed_ != nullptr) &&
+             async_deferred_.has_value();
+    }
     std::optional<Napi::Promise::Deferred> async_deferred_;
     Napi::ObjectReference async_pending_promise_;
     // Roots the wrapping JS object for the lifetime of an execute_async run so
@@ -765,6 +840,13 @@ private:
     // can't drive a later run's coroutine.
     uint64_t async_generation_ = 0;
 
+    // Arms the await driver and takes the first step. Every main-thread async
+    // door goes through it so they cannot drift apart in what they arm — the
+    // divergence P1 was reported for. The caller must have set exactly one of
+    // `async_co_` (owned) or `async_borrowed_` + `async_coro_obj_` (borrowed)
+    // beforehand.
+    Napi::Value BeginAsyncRun(const Napi::Object& self,
+                              std::vector<lua_core::LuaPtr> args);
     void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error);
     Napi::Value OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen);
     void FinishAsync();
@@ -791,7 +873,12 @@ private:
     // then start a *new* run, re-engaging async_deferred_ with a different
     // promise. Testing the optional alone would pass and tear the new run down.
     [[nodiscard]] bool AsyncRunSuperseded(uint64_t gen) const {
-      return !async_co_ || !async_deferred_ || gen != async_generation_;
+      // Asks whether *a run is still engaged*, which is why it goes through
+      // AsyncDriverEngaged rather than testing async_co_: a resume_async run
+      // drives a borrowed thread and leaves async_co_ disengaged the whole time,
+      // so the direct test reported every such run as already superseded and no
+      // settle site ever fired.
+      return !AsyncDriverEngaged() || gen != async_generation_;
     }
     static Napi::Value OnAwaitResolveStatic(const Napi::CallbackInfo& info);
     static Napi::Value OnAwaitRejectStatic(const Napi::CallbackInfo& info);
@@ -862,6 +949,16 @@ private:
     Napi::FunctionReference print_handler_;
     void InstallPrintHandler(const Napi::Function& fn);
 
+    // Input redirection (P4a): JS handler for io.read(). The counterpart E1
+    // never had — output has been redirectable since July 2026 while input
+    // still reached the process's real stdin.
+    Napi::FunctionReference read_handler_;
+    void InstallReadHandler(const Napi::Function& fn);
+
+    // Virtual file access (P4b): JS reader backing dofile()/loadfile().
+    Napi::FunctionReference file_reader_;
+    void InstallFileReader(const Napi::Function& fn);
+
     // Debug hook (lua_sethook) state. The mask and interval are kept alongside
     // the JS callback so reset() can re-arm the hook on the replacement state,
     // the same way the print handler is replayed.
@@ -894,6 +991,26 @@ private:
     // silently returns the existing metatable for a repeated name, so a second
     // register_class(sameName) would half-merge definitions; reject it (L7).
     std::unordered_set<std::string> registered_classes_;
+
+    // Named property accessors per class (P2b), keyed by class name. Held here
+    // rather than pushed into Lua because the accessor has to *run JS* on every
+    // read/write — there is nothing to put in a Lua table but a host-function
+    // name, and routing through one would mean a Lua closure call plus a
+    // registry lookup per property access, to reach the same JS function this
+    // map holds directly. Consulted by the property handlers installed in
+    // InstallRuntimeHandlers.
+    //
+    // A class registration cannot be superseded (registered_classes_ forbids
+    // reusing a name), so entries here are permanent by design — the same
+    // reasoning that leaves a class's constructor and methods unreclaimable.
+    std::unordered_map<std::string, ClassAccessorTable> class_accessors_;
+
+    // Resolve `key` to an accessor, walking the base chain. Returns nullptr when
+    // no class in the chain declares it. Depth-capped for the same reason the
+    // core's ClassIndex walk is: the chain is acyclic by construction, so the
+    // cap only bounds a map someone corrupted.
+    [[nodiscard]] const ClassAccessor* FindClassAccessor(
+        const std::string& class_name, const std::string& key) const;
 
     // Stages a structured error table for a thrown JS value (object errors only)
     // and returns the display message.

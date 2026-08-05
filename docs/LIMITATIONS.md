@@ -163,6 +163,11 @@ policy (sizing, queueing, fairness, backpressure) into the addon, where it is
 hardest to tune. Tracked as A5 in
 [`reviews/BRIDGE-COMPARISON.md`](reviews/BRIDGE-COMPARISON.md).
 
+Note that *one* async operation per context is a separate and firmer rule:
+`execute_async`, `call_async`, `resume_async` and the worker doors all check
+`is_busy()` and refuse while another is in flight. That is not a pool question —
+a `LuaRuntime` is single-threaded by construction.
+
 ---
 
 ## 5. Documented conversion losses
@@ -182,13 +187,68 @@ document is a complete answer to "what should I not rely on". Full detail is on
 
 ---
 
+## 6. No generic JavaScript reflection from inside Lua
+
+fengari exposes a `js` library *inside* Lua — `js.global`, `js.new`, `js.of` —
+so a script can reach the JavaScript environment with no host wiring. Here,
+everything Lua can touch must be registered from JS first: a global, a userdata,
+a class, a module, a searcher.
+
+**A deliberate design decision, not a gap**, and it should stay that way: an
+allowlist is the entire basis of the sandboxing story. `libraries: 'sandbox'`
+would be meaningless with a `js.global` in scope, and so would `maxMemory`,
+`maxInstructions` and `allowBytecode`, since a script could reach the host's own
+facilities directly.
+
+Recorded because it is the largest single capability difference against fengari
+and someone will ask. Revocable by the owner; nothing should reopen it
+implicitly.
+
+**Workaround:** register what a script legitimately needs. `set_userdata` with
+`methods`, `register_class`, and `register_module` cover the object-model cases;
+a host callback covers the rest.
+
+---
+
+## 7. No raw Lua C API surface
+
+fengari exposes the entire `lua_*` / `lauxlib` C API to JavaScript. This is
+deliberately a high-level bridge — the two-layer split in `CLAUDE.md` exists so
+the C API stays on the C++ side, where the stack discipline, the `ExecutionScope`
+bracketing and the protected-call barriers can be enforced rather than hoped for.
+
+Everything the correctness programme mechanized (the occupancy model, the
+exception-escape matrix, the handle branding) assumes the binding is the only
+thing that touches the state. A raw stack API would put all of it back in the
+caller's hands.
+
+**Not a gap, and not planned.** Recorded for the same reason as §6.
+
+---
+
+## 8. `set_read_handler` needs the `io` library
+
+`set_print_handler` works everywhere because `print` lives in the base library.
+There is no base-library *input* function, so `io.read` is the only thing to
+redirect and a bare or `libraries: 'sandbox'` state has nothing to hook.
+`set_read_handler` is a no-op there, and does not throw.
+
+Inventing a non-standard global to fill the gap would be worse than the gap: a
+script written against it would not run on stock Lua.
+
+**Workaround under `'sandbox'`:** pass input in as a global or a host callback
+before the script runs, which is the same shape every other host capability takes
+in a sealed context.
+
+---
+
 ## Checked and *not* limitations
 
 Recorded so they are not re-investigated. Each was verified on August 4, 2026.
 
 | Assumption | Reality |
 |---|---|
-| `for await (… of coroutine)` needs `Symbol.asyncIterator` | **Works already.** JS falls back to `Symbol.iterator`, which coroutines have. |
+| ~~`for await (… of coroutine)` needs `Symbol.asyncIterator`~~ | **Superseded August 5, 2026.** It *did* work through JS's sync-iterable fallback — and that was the mechanism of a real gap, because the fallback drives the *synchronous* cursor, so a yield needing a host Promise could not work. Coroutines now carry `Symbol.asyncIterator`, which steps through `resume_async`. Kept here because "we checked, it's fine" was the wrong conclusion and the reasoning is worth not repeating. |
 | `__close` / to-be-closed variables are unsupported | **Supported.** Works in pure Lua and via `set_metatable`. It was merely undocumented; `MetatableDefinition` now lists it. |
 | Registered classes cannot overload operators | **They can** — metamethods including `__add`/`__tostring` apply to instances. |
 | Handles can be passed between contexts | Refused by design, with a clear error. See `CORRECTNESS.md` §15 and CODE-REVIEW-22. |

@@ -16,7 +16,7 @@
 // metamorphic, like the round-trip matrix's: no reference implementation is
 // needed, because the doors are their own references.
 //
-// **Three comparisons per case**, against the same door the differential
+// **Five comparisons per case**, against the same door the differential
 // oracle already trusts (execute_script, which agrees with stock Lua on this
 // corpus):
 //
@@ -34,6 +34,13 @@
 //              is the source text, matching what every direct load site uses,
 //              so an error-location difference between the doors is a real
 //              difference and not harness noise.
+//   call_async   — load(s) then call_async(fn) (P1a): the same chunk called
+//              through the main-thread coroutine driver from a held function
+//              ref. The chunk name is the source text, as above.
+//   resume_async — load(s), create_coroutine(fn), then resume_async(co)
+//              (P1b): the chunk runs as a caller-owned coroutine under the
+//              same driver. Its values array is unwrapped to the bare-value
+//              shape the other doors produce — see outcomeResumeAsync.
 //
 // The corpus is the differential oracle's (tools/diff-oracle/corpus.mjs),
 // reused deliberately: it is generated, it is already known to terminate in
@@ -135,6 +142,79 @@ async function outcomeAsync(source, door) {
   }
 }
 
+// The two doors added by INTEROP-PARITY-PLAN (August 5, 2026). Both take a
+// *function*, not a chunk, so the corpus case is compiled with `load` using the
+// source as its own chunkname — the same trick the bytecode door uses via
+// `load_bytecode(bytecode, source)` — and an error location stays comparable.
+//
+// A compile failure is reported as the error it is, so a syntactically invalid
+// case still produces a comparable row rather than a HARNESS hole.
+function compileToFunction(lua, source) {
+  lua.set_global('__parity_src', source);
+  const fn = lua.execute_script('return load(__parity_src, __parity_src)');
+  const msg = typeof fn === 'function' ? null
+    : lua.execute_script('local _, e = load(__parity_src, __parity_src) return e');
+  // The staging global must not survive into the case's run: only these two
+  // doors would have it set, so a future corpus case that enumerates _G would
+  // diverge here for a harness-caused reason rather than a real one.
+  lua.set_global('__parity_src', null);
+  if (typeof fn === 'function') return { fn };
+  return { error: String(msg) };
+}
+
+async function outcomeCallAsync(source) {
+  const lua = freshContext();
+  try {
+    const compiled = compileToFunction(lua, source);
+    if (compiled.error) {
+      return { kind: 'error', canon: `error:${normaliseMessage(compiled.error)}` };
+    }
+    return {
+      kind: 'ok',
+      canon: okCanon(await withTimeout(lua.call_async(compiled.fn))),
+    };
+  } catch (e) {
+    if (messageOf(e) === 'ASYNC_PARITY_TIMEOUT') {
+      return { kind: 'harness', canon: 'HARNESS:cell timed out' };
+    }
+    return { kind: 'error', canon: `error:${normaliseMessage(messageOf(e))}` };
+  }
+}
+
+async function outcomeResumeAsync(source) {
+  const lua = freshContext();
+  try {
+    const compiled = compileToFunction(lua, source);
+    if (compiled.error) {
+      return { kind: 'error', canon: `error:${normaliseMessage(compiled.error)}` };
+    }
+    const co = lua.create_coroutine(compiled.fn);
+    const r = await withTimeout(lua.resume_async(co));
+    if (r.error) {
+      return { kind: 'error', canon: `error:${normaliseMessage(String(r.error))}` };
+    }
+    // A chunk that returns hands its values back at status 'dead'; one that
+    // yields stops at 'suspended'. Both are the door's honest answer and both
+    // are compared as values — a yield that the other doors turn into an error
+    // is a real difference and belongs in a row.
+    //
+    // Unwrapped to the shape every other door produces: resume_async always
+    // answers with a values *array*, while execute_script hands back a bare
+    // value for one result. Comparing the raw array would have made all 1339
+    // cells differ for a reason that says nothing about the door.
+    const vs = r.values;
+    return {
+      kind: 'ok',
+      canon: okCanon(vs.length === 0 ? undefined : vs.length === 1 ? vs[0] : vs),
+    };
+  } catch (e) {
+    if (messageOf(e) === 'ASYNC_PARITY_TIMEOUT') {
+      return { kind: 'harness', canon: 'HARNESS:cell timed out' };
+    }
+    return { kind: 'error', canon: `error:${normaliseMessage(messageOf(e))}` };
+  }
+}
+
 // --- controls --------------------------------------------------------------
 //
 // The standing rule (tools/README.md): a search that reports clean must first
@@ -159,11 +239,39 @@ async function runControls() {
       },
     },
     {
-      name: 'all four doors actually run the case (sync/worker/driver/bytecode)',
+      name: 'all six doors actually run the case (sync/worker/driver/bytecode/call_async/resume_async)',
       run: async () => outcomeSync('return 6 * 7').canon === 'ok:num:42'
         && (await outcomeAsync('return 6 * 7', 'worker')).canon === 'ok:num:42'
         && (await outcomeAsync('return 6 * 7', 'driver')).canon === 'ok:num:42'
-        && outcomeBytecode('return 6 * 7').canon === 'ok:num:42',
+        && outcomeBytecode('return 6 * 7').canon === 'ok:num:42'
+        && (await outcomeCallAsync('return 6 * 7')).canon === 'ok:num:42'
+        && (await outcomeResumeAsync('return 6 * 7')).canon === 'ok:num:42',
+    },
+    {
+      // The vacuity hazard for the two new doors: both compile through `load`,
+      // so a bug that ran the *loader* rather than the loaded function would
+      // still return something plausible. Prove each reaches the real body.
+      name: 'the call_async door actually awaits (a Promise-returning host fn resolves in-script)',
+      run: async () => {
+        const lua = freshContext({ fetch42: async () => 42 });
+        const compiled = compileToFunction(lua, 'return fetch42() + 1');
+        if (compiled.error) return false;
+        return (await withTimeout(lua.call_async(compiled.fn))) === 43;
+      },
+    },
+    {
+      name: 'the resume_async door actually awaits (and is a coroutine, not a plain call)',
+      run: async () => {
+        const lua = freshContext({ fetch42: async () => 42 });
+        const compiled = compileToFunction(lua,
+          'local v = fetch42() coroutine.yield(v) return "after"');
+        if (compiled.error) return false;
+        const co = lua.create_coroutine(compiled.fn);
+        const first = await withTimeout(lua.resume_async(co));
+        // Suspended at the yield with the awaited value proves both halves:
+        // the await resolved, and this really is a coroutine.
+        return first.status === 'suspended' && first.values[0] === 42;
+      },
     },
     {
       name: 'the bytecode door actually goes through the dump (source rejected raw)',
@@ -240,7 +348,8 @@ async function main() {
   let cases = buildCorpus();
   if (onlyCategory) cases = cases.filter((c) => c.category === onlyCategory);
   if (onlyCase) cases = cases.filter((c) => c.id === onlyCase);
-  console.log(`${cases.length} cases x 3 doors (worker/driver/bytecode), vs execute_script\n`);
+  console.log(`${cases.length} cases x 5 doors `
+    + `(worker/driver/bytecode/call_async/resume_async), vs execute_script\n`);
 
   const rows = [];
   const usedLedger = new Set();
@@ -249,11 +358,13 @@ async function main() {
   let accepted = 0;
   let harness = 0;
 
+  const DOORS = ['worker', 'driver', 'bytecode', 'call_async', 'resume_async'];
   for (const c of cases) {
     const sync = outcomeSync(c.source);
-    for (const door of ['worker', 'driver', 'bytecode']) {
-      const got = door === 'bytecode'
-        ? outcomeBytecode(c.source)
+    for (const door of DOORS) {
+      const got = door === 'bytecode' ? outcomeBytecode(c.source)
+        : door === 'call_async' ? await outcomeCallAsync(c.source)
+        : door === 'resume_async' ? await outcomeResumeAsync(c.source)
         : await outcomeAsync(c.source, door);
       if (sync.kind === 'harness' || got.kind === 'harness') {
         harness += 1;
@@ -286,7 +397,7 @@ async function main() {
   const stale = rows.filter((r) => r.kind === 'STALE');
   const harnessRows = rows.filter((r) => r.kind === 'HARNESS');
 
-  console.log(`Cells: ${cases.length * 3}`);
+  console.log(`Cells: ${cases.length * DOORS.length}`);
   console.log(`  agree               ${agree}`);
   console.log(`  accepted divergence ${accepted}   (${ACCEPTED_DIVERGENCES.length} ledger entries)`);
   console.log(`  DISAGREE            ${disagreements.length}`);

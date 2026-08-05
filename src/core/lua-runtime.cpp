@@ -746,9 +746,12 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
             // top; raise it after the locals below are destroyed.
             raise = true;
           }
-        } catch (const std::exception& e) {
+        } catch (const PropertyAccessDenied& e) {
           // If this userdata has methods but isn't readable, return nil instead
-          // of erroring (methods work independently of readable).
+          // of erroring (methods work independently of readable). Narrowed from
+          // `catch (std::exception&)`: a getter that genuinely threw must reach
+          // the script rather than arriving as an indistinguishable nil. See
+          // PropertyAccessDenied.
           if (has_method_table) {
             lua_pushnil(L);
             have_result = true;
@@ -756,6 +759,9 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
             lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
             raise = true;
           }
+        } catch (const std::exception& e) {
+          lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
+          raise = true;
         }
         }
       }
@@ -1061,11 +1067,15 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
             // Same guard as LuaCallHostFunction: a promise-returning method
             // called from inside a user coroutine can't suspend correctly (M1).
             lua_pushfstring(L,
-              "cannot await a JS Promise inside a coroutine (method '%s'); "
-              "await only at the top level of execute_async",
+              "cannot await a JS Promise from a coroutine this run is not "
+              "driving (method '%s'); await at the top level of execute_async / "
+              "call_async, or drive the coroutine with resume_async",
               func_name ? func_name : "<unknown>");
             outcome = HostCallOutcome::Raise;
           } else {
+            // Record that *this* resume step suspended for a Promise, so the
+            // binding does not have to infer it (see AsyncStepResult::awaited).
+            runtime->await_yield_issued_ = true;
             outcome = HostCallOutcome::Yield;
           }
         } else {
@@ -1103,7 +1113,8 @@ void LuaRuntime::RegisterClass(
     const std::string& constructor_func_name,
     const std::unordered_map<std::string, std::string>& method_map,
     const std::vector<MetatableEntry>& metamethods,
-    const std::string& parent_class_name) const {
+    const std::string& parent_class_name,
+    const std::vector<MetatableEntry>& statics) const {
   // The whole build (metatable, method table, class global) runs in one
   // protected frame so an OOM under maxMemory, or a raising __newindex on a _G
   // metatable at the final lua_setglobal, throws instead of aborting (M3). Every
@@ -1209,10 +1220,24 @@ void LuaRuntime::RegisterClass(
   }
   lua_setfield(L_, LUA_REGISTRYINDEX, methods_key.c_str());
 
-  // 3. Create the class global table with a `new` constructor function.
+  // 3. Create the class global table with a `new` constructor function, plus
+  // any class-level statics (P2a). Statics go on this table, not the instance
+  // metatable, so they are reached as `ClassName.thing` and are invisible to
+  // `instance.thing` — which is the whole distinction they exist to draw.
   lua_newtable(L_);
+  const int class_idx = lua_gettop(L_);
   PushHostFunctionClosure(L_, constructor_func_name);  // see the metamethod loop
-  lua_setfield(L_, -2, "new");
+  lua_setfield(L_, class_idx, "new");
+  for (const auto& s : statics) {
+    if (s.is_function) {
+      PushHostFunctionClosure(L_, s.func_name);
+    } else if (PushLuaValueProtected(L_, s.value) != LUA_OK) {
+      // Already inside RunProtected: the failed push left the pcall's message
+      // on the stack, so re-raise it rather than inventing one.
+      lua_error(L_);
+    }
+    lua_setfield(L_, class_idx, s.key.c_str());
+  }
   lua_setglobal(L_, class_name.c_str());
   });
 }
@@ -1319,9 +1344,12 @@ int LuaRuntime::ClassIndex(lua_State* L) {
             // top; raise it after the locals below are destroyed.
             raise = true;
           }
-        } catch (const std::exception& e) {
+        } catch (const PropertyAccessDenied& e) {
           // Class with methods but not readable: return nil rather than erroring
           // (methods work independently of readable, matching userdata behavior).
+          // Narrowed from `catch (std::exception&)` for the reason given on
+          // PropertyAccessDenied — a named accessor that throws must reach the
+          // script, not arrive as nil.
           if (has_methods) {
             lua_pushnil(L);
             have_result = true;
@@ -1332,6 +1360,11 @@ int LuaRuntime::ClassIndex(lua_State* L) {
             lua_concat(L, 2);
             raise = true;
           }
+        } catch (const std::exception& e) {
+          luaL_where(L, 1);
+          lua_pushfstring(L, "Error reading property '%s': %s", key, e.what());
+          lua_concat(L, 2);
+          raise = true;
         }
         }
       }
@@ -1724,6 +1757,269 @@ int LuaRuntime::LuaIoWrite(lua_State* L) {
   return 0;
 }
 
+// --- Input redirection (P4a) ---
+
+void LuaRuntime::SetInputHandler(InputHandler handler) {
+  if (handler) {
+    // Install before committing the handler, for the reason SetOutputHandler
+    // gives (CR-8 F7): the protected _G/io writes can throw under maxMemory,
+    // and assigning first would leave a handler io.read was never rewired to.
+    InstallInputRedirection();
+    input_handler_ = std::make_shared<InputHandler>(std::move(handler));
+  } else {
+    // Reset rather than clear, so a dispatch in flight keeps its own owner
+    // alive (CR-9 F4). The installed wrapper stays and simply falls through to
+    // the original io.read from now on.
+    input_handler_.reset();
+  }
+}
+
+bool LuaRuntime::HasInputHandler() const {
+  const std::shared_ptr<InputHandler> handler = input_handler_;
+  // A worker thread owns the state during execute_script_async and the handler
+  // bridges to JS, so off-thread it must report "no handler" and let the
+  // original io.read run — the same rule DispatchOutput applies.
+  return handler && *handler && !async_mode_;
+}
+
+std::optional<std::string> LuaRuntime::DispatchInput(const LuaPtr& format) const {
+  // Copy the owner before calling: a handler that calls set_read_handler() from
+  // inside itself would otherwise destroy the std::function executing right now
+  // (CR-9 F4).
+  const std::shared_ptr<InputHandler> handler = input_handler_;
+  if (!handler || !*handler || async_mode_) return std::nullopt;
+  return (*handler)(format);
+}
+
+void LuaRuntime::InstallInputRedirection() const {
+  RunProtected([&]() {
+    lua_getglobal(L_, "io");
+    if (!lua_istable(L_, -1)) {
+      lua_pop(L_, 1);
+      return;  // no io library: nothing to redirect (documented on SetInputHandler)
+    }
+    lua_getfield(L_, -1, "read");
+    // Already wrapped: re-installing would nest a wrapper inside a wrapper and
+    // make "the original" one level deeper each time — the stacking hazard
+    // SetAllowBytecode guards against by the same test.
+    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaIoRead) {
+      lua_pop(L_, 2);
+      return;
+    }
+    lua_pushcclosure(L_, LuaIoRead, 1);  // upvalue 1 = the original io.read
+    lua_setfield(L_, -2, "read");
+    lua_pop(L_, 1);  // pop io
+  });
+}
+
+int LuaRuntime::LuaIoRead(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+
+  const int nargs = lua_gettop(L);
+
+  if (!runtime || !runtime->HasInputHandler()) {
+    // No handler (or a worker thread owns the state): defer to the original
+    // io.read, so removing a handler restores real stdin with no unwrap step.
+    lua_pushvalue(L, lua_upvalueindex(1));
+    if (!lua_isfunction(L, -1)) {
+      lua_pop(L, 1);
+      return luaL_error(L, "io.read is not available");
+    }
+    lua_insert(L, 1);
+    lua_call(L, nargs, LUA_MULTRET);
+    return lua_gettop(L);
+  }
+
+  // One value per requested format, matching io.read's own contract. No
+  // arguments means one line, which is Lua's default.
+  const int nformats = nargs > 0 ? nargs : 1;
+  int pushed = 0;
+  bool raise = false;
+  {
+    for (int i = 1; i <= nformats; ++i) {
+      LuaPtr fmt;
+      bool wants_number = false;
+      if (nargs == 0) {
+        fmt = std::make_shared<LuaValue>(LuaValue::from(std::string("l")));
+      } else if (lua_type(L, i) == LUA_TNUMBER) {
+        // A byte count. Passed through as a number so the handler can act on it
+        // rather than parse it back out of a string.
+        fmt = std::make_shared<LuaValue>(LuaValue::from(lua_tonumber(L, i)));
+      } else {
+        const char* f = lua_tostring(L, i);
+        std::string spec = f ? f : "l";
+        // Lua 5.3 and earlier wrote formats as "*l"; 5.4+ accepts both. Strip it
+        // so a handler only ever sees one spelling.
+        if (!spec.empty() && spec[0] == '*') spec.erase(0, 1);
+        wants_number = !spec.empty() && spec[0] == 'n';
+        fmt = std::make_shared<LuaValue>(LuaValue::from(spec));
+      }
+
+      std::optional<std::string> text;
+      try {
+        text = runtime->DispatchInput(fmt);
+      } catch (const std::exception& e) {
+        // Contained here rather than allowed to unwind through Lua's C frames.
+        // Staged and raised below, after every C++ local is destroyed.
+        lua_pushfstring(L, "io.read handler failed: %s", e.what());
+        raise = true;
+        break;
+      } catch (...) {
+        lua_pushliteral(L, "io.read handler failed");
+        raise = true;
+        break;
+      }
+
+      if (!text) {
+        // End of input. Lua stops at the first failing format, and so do we.
+        lua_pushnil(L);
+        ++pushed;
+        break;
+      }
+      if (wants_number) {
+        // "n" yields a number or nil (fail), exactly as the real io.read does.
+        if (lua_stringtonumber(L, text->c_str()) == 0) lua_pushnil(L);
+      } else {
+        lua_pushlstring(L, text->data(), text->size());
+      }
+      ++pushed;
+    }
+  }
+  if (raise) return lua_error(L);
+  return pushed;
+}
+
+// --- Virtual file access (P4b) ---
+
+void LuaRuntime::SetFileReader(FileReader reader) {
+  if (reader) {
+    InstallFileReader();  // see SetOutputHandler for the ordering (CR-8 F7)
+    file_reader_ = std::make_shared<FileReader>(std::move(reader));
+  } else {
+    // Remove the overrides *before* dropping the reader: between the two, a
+    // dofile would otherwise find our closure with no reader behind it. The
+    // reset itself is a reset rather than a clear so a dispatch in flight keeps
+    // its owner alive (CR-9 F4).
+    RemoveFileReaderOverrides();
+    file_reader_.reset();
+  }
+}
+
+void LuaRuntime::DropFileReader() { file_reader_.reset(); }
+
+std::optional<std::string> LuaRuntime::DispatchFileRead(const std::string& path) const {
+  const std::shared_ptr<FileReader> reader = file_reader_;  // see DispatchInput
+  if (!reader || !*reader || async_mode_) return std::nullopt;
+  return (*reader)(path);
+}
+
+void LuaRuntime::InstallFileReader() const {
+  // Protected: the closure pushes allocate, and a metatabled _G runs __newindex
+  // on each assignment (M3).
+  RunProtected([&]() {
+    lua_pushcfunction(L_, LuaLoadFile);
+    lua_setglobal(L_, "loadfile");
+    lua_pushcfunction(L_, LuaDoFile);
+    lua_setglobal(L_, "dofile");
+  });
+}
+
+void LuaRuntime::RemoveFileReaderOverrides() const {
+  RunProtected([&]() {
+    // Only clear what is still ours: a caller may have replaced either global
+    // in the meantime, and removing a reader is not a licence to undo that.
+    //
+    // Cleared to nil rather than restored: under 'sandbox' these were already
+    // nil before the reader arrived, and outside it the originals were never
+    // captured. nil is the state that is correct in both cases and honest in
+    // neither direction — see SetFileReader's doc comment.
+    lua_getglobal(L_, "loadfile");
+    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaLoadFile) {
+      lua_pushnil(L_);
+      lua_setglobal(L_, "loadfile");
+    }
+    lua_pop(L_, 1);
+    lua_getglobal(L_, "dofile");
+    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaDoFile) {
+      lua_pushnil(L_);
+      lua_setglobal(L_, "dofile");
+    }
+    lua_pop(L_, 1);
+  });
+}
+
+// Shared body for both overrides: resolve `path` through the reader and leave
+// the compiled chunk on the stack. Returns LUA_OK, or a status with the message
+// on the stack. Every C++ local is destroyed before it returns, so the caller
+// may longjmp freely.
+int LuaRuntime::LoadFromReader(lua_State* L, const LuaRuntime* runtime,
+                               const char* path) {
+  if (!runtime) {
+    lua_pushliteral(L, "no file reader is installed");
+    return LUA_ERRRUN;
+  }
+  if (!path) {
+    // The real loadfile/dofile read stdin when given no name. A virtual reader
+    // has no stdin to offer, and silently reading the process's would defeat the
+    // point, so require a name rather than invent one.
+    lua_pushliteral(L,
+      "a filename is required while a file reader is installed "
+      "(there is no virtual stdin to read from)");
+    return LUA_ERRRUN;
+  }
+  std::optional<std::string> source;
+  std::string chunkname;
+  try {
+    source = runtime->DispatchFileRead(path);
+    chunkname = "@" + std::string(path);
+  } catch (const std::exception& e) {
+    lua_pushfstring(L, "file reader failed for '%s': %s", path, e.what());
+    return LUA_ERRRUN;
+  } catch (...) {
+    lua_pushfstring(L, "file reader failed for '%s'", path);
+    return LUA_ERRRUN;
+  }
+  if (!source) {
+    lua_pushfstring(L, "cannot open %s", path);
+    return LUA_ERRFILE;
+  }
+  // "t": the reader serves source text. A reader handing back bytecode would
+  // otherwise route around the allowBytecode guard (E3) entirely.
+  return luaL_loadbufferx(L, source->data(), source->size(), chunkname.c_str(), "t");
+}
+
+int LuaRuntime::LuaLoadFile(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  const char* path = luaL_optstring(L, 1, nullptr);
+  if (LoadFromReader(L, runtime, path) != LUA_OK) {
+    // loadfile reports failure as nil + message rather than raising.
+    lua_pushnil(L);
+    lua_insert(L, -2);
+    return 2;
+  }
+  return 1;
+}
+
+int LuaRuntime::LuaDoFile(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRuntimeRegistryKey);
+  auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  const char* path = luaL_optstring(L, 1, nullptr);
+  // Everything the caller passed stays on the stack below the chunk, so the
+  // result count is measured against this base rather than against lua_gettop —
+  // otherwise dofile would hand the filename back as an extra return value.
+  const int base = lua_gettop(L);
+  if (LoadFromReader(L, runtime, path) != LUA_OK) {
+    return lua_error(L);  // dofile raises, as the real one does
+  }
+  lua_call(L, 0, LUA_MULTRET);
+  return lua_gettop(L) - base;
+}
+
 // --- Bytecode / untrusted-chunk guard (E3) ---
 
 void LuaRuntime::SetAllowBytecode(bool allow) {
@@ -1987,15 +2283,22 @@ int LuaRuntime::LuaCallHostFunction(lua_State* L) {
           // the resolved value).
           runtime->await_pending_ = false;
           if (L != runtime->await_driver_thread_) {
-            // Awaiting from inside a user-created coroutine: yielding here would
-            // suspend the wrong thread and deliver the settled value to the
-            // driver frame instead. Raise rather than silently misbehave (M1).
+            // Awaiting from a coroutine this run is not driving: yielding here
+            // would suspend the wrong thread and deliver the settled value to
+            // the driver frame instead. Raise rather than silently misbehave
+            // (M1). resume_async makes the *caller's* coroutine the driven
+            // thread, which is how a user coroutine gets to await at all; one
+            // nested inside it still lands here.
             lua_pushfstring(L,
-              "cannot await a JS Promise inside a coroutine (called '%s'); "
-              "await only at the top level of execute_async",
+              "cannot await a JS Promise from a coroutine this run is not "
+              "driving (called '%s'); await at the top level of execute_async / "
+              "call_async, or drive the coroutine with resume_async",
               func_name ? func_name : "<unknown>");
             outcome = HostCallOutcome::Raise;
           } else {
+            // Record that *this* resume step suspended for a Promise, so the
+            // binding does not have to infer it (see AsyncStepResult::awaited).
+            runtime->await_yield_issued_ = true;
             outcome = HostCallOutcome::Yield;
           }
         } else {
@@ -3463,6 +3766,36 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutine(const LuaFun
   return LuaThreadRef(threadRef, L_, thread);
 }
 
+std::optional<std::string> LuaRuntime::CloseCoroutine(const LuaThreadRef& threadRef) const {
+  if (!threadRef.thread) return std::string("Invalid coroutine thread");
+
+  // Idempotent by design (see the header): a thread that already finished
+  // normally has nothing left to close, and a caller closing defensively should
+  // not have to ask first. `lua_closethread` is safe on such a thread, but
+  // answering here keeps the no-op free of an ExecutionScope and a stack reset.
+  const int status = lua_status(threadRef.thread);
+  if (status == LUA_OK && lua_gettop(threadRef.thread) == 0) return std::nullopt;
+
+  // A __close handler is ordinary Lua and can reach a host callback, so this is
+  // an executing frame like a resume — same bracketing, same reason (CR-9 F1),
+  // and it starts a fresh instruction/wall-clock budget so a __close that loops
+  // is bounded by the same limits the rest of the API is.
+  int closeStatus;
+  {
+    ExecutionScope exec(this);
+    closeStatus = lua_closethread(threadRef.thread, L_);
+  }
+
+  if (closeStatus == LUA_OK) return std::nullopt;
+
+  // On failure the error object is on the coroutine's stack. Reuse the shared
+  // extraction so a table/object error gets the same __tostring treatment it
+  // would anywhere else, rather than a bare "(error object is a ...)".
+  std::string message = CaptureError(threadRef.thread);
+  lua_settop(threadRef.thread, 0);
+  return message;
+}
+
 CoroutineResult LuaRuntime::ResumeCoroutine(const LuaThreadRef& threadRef,
                                              const std::vector<LuaPtr>& args) const {
   CoroutineResult result;
@@ -3685,6 +4018,7 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
 
   last_error_value_.reset();
   await_is_error_ = arg_is_error;
+  await_yield_issued_ = false;
 
   // See CallFunction / ResumeCoroutine: staging the resume values allocates, so
   // it is bracketed too. This one had no binding-side guard at all either — the
@@ -3723,9 +4057,29 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
   }
 
   if (status == LUA_YIELD) {
-    // Suspended to await a promise; discard any yielded values (we yield none).
+    // Two different yields arrive here and the core cannot tell them apart:
+    // the host bridge's `lua_yieldk` for an awaited Promise (which yields no
+    // values), and a plain `coroutine.yield` from the script (which may yield
+    // several). Only the *binding* knows which — it holds the pending promise —
+    // so the values are collected rather than discarded and the caller decides.
+    //
+    // They used to be dropped, which was harmless while execute_async was the
+    // only driver and treated a plain yield as an error. resume_async (P1b)
+    // resolves a plain yield as a normal suspension, and needs the values.
+    try {
+      for (int i = 1; i <= nresults; ++i) {
+        result.values.push_back(ToLuaValueProtected(threadRef.thread, i));
+      }
+    } catch (const std::exception& e) {
+      result.values.clear();
+      lua_pop(threadRef.thread, nresults);
+      result.state = AsyncStepResult::State::Error;
+      result.error = e.what();
+      return result;
+    }
     if (nresults > 0) lua_pop(threadRef.thread, nresults);
     result.state = AsyncStepResult::State::Awaiting;
+    result.awaited = await_yield_issued_;
   } else if (status == LUA_OK) {
     try {
       for (int i = 1; i <= nresults; ++i) {

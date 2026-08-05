@@ -123,8 +123,12 @@ export interface LuaFunction {
  * loop (or `resume()`) picks up from there. An already-dead coroutine yields
  * nothing rather than raising "cannot resume dead coroutine".
  *
- * `for await (const v of coro)` also works, via JS's sync-iterable fallback —
- * the resume itself is synchronous.
+ * `for await (const v of coro)` binds to `Symbol.asyncIterator`, which steps
+ * through {@link LuaContext.resume_async} — so the coroutine may `await` a host
+ * Promise at any yield. (It used to work only through JS's sync-iterable
+ * fallback, which drove the *synchronous* cursor and was exactly why a yield
+ * needing a Promise could not.) The two cursors are independent and both
+ * advance the one Lua thread.
  *
  * @example
  * const co = lua.create_coroutine(`
@@ -134,7 +138,7 @@ export interface LuaFunction {
  * `);
  * for (const n of co) console.log(n);  // 1, 2, 3
  */
-export interface LuaCoroutine extends Iterable<LuaValue> {
+export interface LuaCoroutine extends Iterable<LuaValue>, AsyncIterable<LuaValue> {
   /** The current status of the coroutine */
   status: 'suspended' | 'running' | 'dead';
   /** Internal reference - do not modify */
@@ -144,6 +148,12 @@ export interface LuaCoroutine extends Iterable<LuaValue> {
    * the resume values, so a generator-style coroutine can be fed from JS.
    */
   [Symbol.iterator](): Iterator<LuaValue, LuaValue | undefined, LuaInput>;
+  /**
+   * Returns a fresh asynchronous cursor, stepping through
+   * {@link LuaContext.resume_async}. Use it (via `for await`) when the
+   * coroutine calls host functions that return Promises.
+   */
+  [Symbol.asyncIterator](): AsyncIterator<LuaValue, LuaValue | undefined, LuaInput>;
 }
 
 /**
@@ -307,10 +317,79 @@ export interface ClassDefinition {
    */
   metamethods?: Record<string, LuaCallback>;
 
-  /** Allow Lua to read instance properties via `instance.prop` (default: false) */
+  /**
+   * Named property accessors — the fine-grained counterpart to
+   * `readable`/`writable`, and the way to express a computed property, a
+   * validated setter, or a read-only field on an otherwise writable instance.
+   *
+   * Each entry may supply `get`, `set`, or both. Reading a set-only property
+   * and writing a get-only one are both refused with a message naming the class,
+   * rather than silently answering `nil` or doing nothing.
+   *
+   * **Precedence: methods, then accessors, then `readable`/`writable`.** An
+   * accessor is consulted before the blanket flags and wins over them, so a
+   * class with `readable: false` and one accessor exposes exactly that one
+   * property. A method of the same name still shadows the accessor.
+   *
+   * **Accessors are inherited** along the `extends` chain, unlike
+   * `readable`/`writable` and unlike {@link ClassDefinition.statics}. The rule
+   * is the one `extends` already states: it governs how Lua resolves names *on
+   * an instance*, which is exactly what an accessor does.
+   *
+   * @example
+   * lua.register_class('Player', {
+   *   construct: (name: string) => new Player(name),
+   *   properties: {
+   *     health: {
+   *       get: (self) => self._hp,
+   *       set: (self, v) => { if (v < 0) throw new Error('hp must be >= 0'); self._hp = v; },
+   *     },
+   *     name: { get: (self) => self._name },   // read-only from Lua
+   *   },
+   * });
+   * // Lua: p.health = 10   -> the setter runs
+   * //      p.name = "x"    -> error: property 'name' of class 'Player' is read-only
+   */
+  properties?: Record<string, {
+    get?: (self: any) => LuaValue | LuaValue[] | void;
+    set?: (self: any, value: LuaValue) => void;
+  }>;
+
+  /**
+   * Class-level members, placed on the class *table* rather than on instances —
+   * `ClassName.count`, `ClassName.from_json(...)`.
+   *
+   * Functions become callable from Lua as `ClassName.fn(...)` and receive the
+   * Lua call arguments with no `self`. Other values are converted **once, at
+   * registration**, and set directly: a static is a class-level constant, not a
+   * live view of the JavaScript property.
+   *
+   * `new` is reserved (it is the constructor) and is rejected.
+   *
+   * **Statics are not inherited.** `extends` describes how Lua resolves names on
+   * an *instance*; the class table has no metatable and therefore no lookup
+   * chain to extend. A derived class that wants a base's static states it again.
+   *
+   * @example
+   * lua.register_class('Player', {
+   *   construct: (name: string) => new Player(name),
+   *   statics: { count: () => Player.instances, VERSION: '1.2.0' },
+   * });
+   * // Lua: Player.count()   Player.VERSION
+   */
+  statics?: Record<string, LuaCallback | LuaInput>;
+
+  /**
+   * Allow Lua to read instance properties via `instance.prop` (default: false).
+   * Blanket access; see {@link ClassDefinition.properties} for per-name control,
+   * which is consulted first.
+   */
   readable?: boolean;
 
-  /** Allow Lua to write instance properties via `instance.prop = v` (default: false) */
+  /**
+   * Allow Lua to write instance properties via `instance.prop = v`
+   * (default: false). See {@link ClassDefinition.properties}.
+   */
   writable?: boolean;
 }
 
@@ -768,6 +847,79 @@ export interface LuaContext {
   resume(coroutine: LuaCoroutine, ...args: LuaInput[]): CoroutineResult;
 
   /**
+   * Resumes a coroutine **asynchronously**, so it may `await` a host Promise.
+   *
+   * The awaiting counterpart to {@link resume}, and a drop-in for it: the
+   * resolved value is the same `{ status, values, error? }` object, including
+   * for a Lua error, which is reported in the result rather than thrown.
+   *
+   * A coroutine driven by {@link resume} runs synchronously, so a JS callback
+   * that returns a Promise anywhere inside it hard-errors. Under `resume_async`
+   * the coroutine *is* the driven thread, so such a call suspends it until the
+   * Promise settles and then continues. A coroutine created *inside* it still
+   * cannot await and says so.
+   *
+   * Only one asynchronous operation runs per context at a time; a second call
+   * while one is in flight throws "Lua context is busy with an async operation".
+   *
+   * {@link cancel} abandons the run and rejects the Promise, and — because the
+   * coroutine is yours, not the binding's — leaves it **suspended and
+   * resumable** at the point it reached, exactly as breaking out of a
+   * `for await` loop does.
+   *
+   * @param coroutine The coroutine to resume
+   * @param args Arguments passed to the coroutine (received by `yield`, or as
+   *   the function's arguments on the first resume)
+   * @example
+   * const co = lua.create_coroutine(`
+   *   return function(id)
+   *     local user = fetchUser(id)   -- a JS callback returning a Promise
+   *     coroutine.yield(user.name)
+   *   end
+   * `);
+   * const step = await lua.resume_async(co, 7);
+   * // step.status === 'suspended', step.values === ['Ada']
+   */
+  resume_async(coroutine: LuaCoroutine, ...args: LuaInput[]): Promise<CoroutineResult>;
+
+  /**
+   * Closes a coroutine: runs its pending to-be-closed variables
+   * (`local x <close> = …`) and marks the thread dead. Mirrors Lua's own
+   * `coroutine.close`.
+   *
+   * **This is the only way to run those handlers from JavaScript.**
+   * {@link release} frees the coroutine's registry slot without executing
+   * anything, and garbage collection runs `__gc` but not `__close`. Because
+   * breaking out of a `for..of` (or `for await`) loop deliberately leaves the
+   * coroutine suspended, producing an unclosed thread is an ordinary outcome of
+   * the documented API rather than an edge case — so closing is worth doing
+   * whenever a coroutine you abandoned might hold a resource.
+   *
+   * Idempotent: closing an already-closed, finished, or released coroutine
+   * succeeds and does nothing. Throws if a `__close` handler raises — the
+   * thread is dead either way, since a failed close still closed everything it
+   * reached before failing.
+   *
+   * **{@link release} deliberately does not close.** Folding a close into it
+   * would make a "free this slot" call run arbitrary Lua — and from there
+   * JavaScript — re-entrantly, and give it a way to throw; `release` is called
+   * from teardown paths where neither is acceptable. The two are orthogonal, as
+   * `coroutine.close` and letting a thread be collected are in Lua.
+   *
+   * @param coroutine The coroutine to close
+   * @example
+   * const co = lua.create_coroutine(`
+   *   return function()
+   *     local f <close> = openResource()
+   *     for i = 1, 100 do coroutine.yield(i) end
+   *   end
+   * `);
+   * for (const n of co) { if (n === 3) break; }   // suspended, f still open
+   * lua.close(co);                                 // __close runs now
+   */
+  close(coroutine: LuaCoroutine): void;
+
+  /**
    * Executes a Lua script string asynchronously on a worker thread.
    * Returns a Promise that resolves with the result.
    * JS callbacks are not available during async execution.
@@ -831,7 +983,8 @@ export interface LuaContext {
    * may run per context at a time (`is_busy()` is true meanwhile).
    *
    * Calling a Promise-returning host function in synchronous `execute_script`
-   * throws — such functions must be awaited via `execute_async`.
+   * throws — such functions must be awaited through one of the three async
+   * doors: this one, {@link call_async}, or {@link resume_async}.
    *
    * @param script The Lua script to execute
    * @returns Promise resolving with the script's return value(s)
@@ -845,6 +998,41 @@ export interface LuaContext {
    * `);
    */
   execute_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
+
+  /**
+   * Calls a Lua function **asynchronously**, so it may `await` host Promises.
+   *
+   * The awaiting counterpart to {@link call}, and the way to await inside a
+   * function you hold rather than a script you write. Accepts either a global
+   * name (including a dotted path, like `get_global`) or a `LuaFunction` this
+   * context produced.
+   *
+   * Two things it does that `execute_async` cannot:
+   *
+   * - **A `LuaFunction` held only on the JavaScript side can await.** Routing
+   *   through `execute_async` needs a *name* to call, so a function that was
+   *   never stored as a global had no path to awaiting at all.
+   * - **No chunk is compiled per call.** `execute_async('return f(1)')` parses a
+   *   fresh chunk every time; this keeps the function a reference and calls it.
+   *
+   * Everything else matches `execute_async`: the same driver, the same
+   * one-run-per-context rule (`is_busy()`), the same {@link cancel} behaviour,
+   * and a rejection for any failure past argument validation.
+   *
+   * A callable table (`__call`) is refused, exactly as {@link call} refuses it.
+   *
+   * @param nameOrFn A global name, a dotted path, or a Lua function
+   * @param args Arguments to pass to the function
+   * @returns Promise resolving with the function's return value(s)
+   * @example
+   * lua.execute_script('function greet(id) return "hi " .. fetchName(id) end');
+   * await lua.call_async('greet', 7);
+   *
+   * const fn = lua.execute_script('return function(id) return fetchName(id) end');
+   * await lua.call_async(fn, 7);   // not reachable by name — the case this fixes
+   */
+  call_async<T extends LuaValue | LuaValue[] = LuaValue>(
+    nameOrFn: string | LuaFunction, ...args: LuaInput[]): Promise<T>;
 
   /**
    * Cancels an in-flight asynchronous run. No-op if nothing is running.
@@ -1208,6 +1396,92 @@ export interface LuaContext {
   set_print_handler(handler?: ((text: string) => void) | null): void;
 
   /**
+   * Routes Lua's `io.read` to a JavaScript handler — the input counterpart to
+   * {@link set_print_handler}.
+   *
+   * Without it, a script that prompts for input has its *output* captured by a
+   * print handler and then blocks on the process's real stdin, which in a
+   * server or an Electron embedding is wrong twice over.
+   *
+   * The handler receives the requested format exactly as Lua passes it: a
+   * string (`'l'` for a line — the default — `'L'`, `'a'` for the rest, `'n'`
+   * for a number) or a **number** when the script asked for a byte count. A
+   * leading `*` (the Lua 5.3 spelling) is stripped, so a handler only ever sees
+   * one form. `io.read(f1, f2)` calls the handler once per format.
+   *
+   * Return the text, or `null`/`undefined` for end-of-input, which reaches Lua
+   * as `nil` and stops the read there. (From untyped JS, a boolean return is
+   * also treated as end-of-input rather than coerced to `"true"`/`"false"`.)
+   * **An empty string is a valid empty line**, not end-of-input. For the `'n'` format the returned text is
+   * converted to a number, or `nil` if it does not parse — matching real
+   * `io.read('n')`.
+   *
+   * Pass `null` to restore the original `io.read`; no unwrap step is needed,
+   * since the installed wrapper simply falls through when no handler is set.
+   * The handler is re-installed automatically across {@link reset}.
+   *
+   * **Requires the `io` library.** There is no base-library input function to
+   * override the way `print` gave output a home, so a bare or
+   * `libraries: 'sandbox'` state has nothing to redirect and this is a no-op
+   * there. Inventing a non-standard global to fill the gap would be worse than
+   * the gap.
+   *
+   * Unlike the print handler, **a throwing read handler is not swallowed** — it
+   * surfaces as a Lua error (`io.read handler failed: …`), because a read that
+   * failed has no sensible value to continue with, whereas a print that failed
+   * does.
+   *
+   * @param handler Called with each requested format, or `null` to clear
+   * @example
+   * const lines = ['Ada', '42'];
+   * let i = 0;
+   * lua.set_read_handler(() => (i < lines.length ? lines[i++] : null));
+   * lua.execute_script('return io.read()');        // 'Ada'
+   * lua.execute_script('return io.read("n")');     // 42 (a number)
+   */
+  set_read_handler(
+    handler?: ((format: string | number) => string | null | undefined) | null): void;
+
+  /**
+   * Resolves `dofile` and `loadfile` through a JavaScript callback instead of
+   * the filesystem — a virtual filesystem for the two entry points
+   * {@link add_searcher} does not cover.
+   *
+   * It matters most under `libraries: 'sandbox'`, where both globals are
+   * *cleared* precisely because they reach the real filesystem. Installing a
+   * reader brings them back, backed only by what you choose to serve.
+   *
+   * **While a reader is installed, `dofile`/`loadfile` resolve through it
+   * exclusively; the real filesystem is never consulted.** Deliberately not a
+   * fallback chain — "the reader, or the disk if the reader declines" makes the
+   * meaning of a path depend on the reader's answer. A reader that wants disk
+   * access can read the disk itself.
+   *
+   * The reader returns Lua **source** for a path, or `null`/`undefined` for
+   * "no such file", which `loadfile` reports as `nil, message` and `dofile`
+   * raises — the shapes the real ones use. (From untyped JS, a boolean return
+   * is also treated as "no such file" rather than coerced to text.) An empty
+   * string is a valid empty file. Source is loaded in text-only mode, so a reader cannot hand back
+   * bytecode and route around {@link LuaInitOptions.allowBytecode}.
+   *
+   * Pass `null` to remove the reader; the overrides are cleared back to `nil`
+   * (which is what they were under `'sandbox'`, and what they must be rather
+   * than a filesystem `dofile` this never captured). The reader is re-installed
+   * automatically across {@link reset}.
+   *
+   * `require` is unaffected — use {@link add_searcher} for that.
+   *
+   * @param reader Called with the requested path, or `null` to clear
+   * @example
+   * const files: Record<string, string> = { '/lib/util.lua': 'return { add = function(a,b) return a+b end }' };
+   * const lua = new lua_native.init({}, { libraries: 'sandbox' });
+   * lua.set_file_reader((path) => files[path] ?? null);
+   * lua.execute_script('return dofile("/lib/util.lua").add(2, 3)');   // 5
+   */
+  set_file_reader(
+    reader?: ((path: string) => string | null | undefined) | null): void;
+
+  /**
    * Installs a debug hook (`lua_sethook`) that reports execution events to a
    * JavaScript callback — the building block for profilers, tracers, and
    * debugger integrations.
@@ -1313,6 +1587,12 @@ export interface LuaContext {
    * fn(21);          // 42
    * lua.release(fn); // registry slot freed
    * fn(21);          // throws: Lua function has been released
+   *
+   * @remarks
+   * **Releasing a coroutine does not run its to-be-closed variables.** This
+   * frees the registry slot and executes nothing; use {@link close} first if a
+   * suspended coroutine holds a `local x <close> = …` resource. The separation
+   * is deliberate — see {@link close}.
    */
   release(value: LuaFunction | LuaCoroutine | LuaTableRef | LuaTableHandle): void;
 

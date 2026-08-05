@@ -110,4 +110,76 @@ export const DOORS = [
       return lua.execute_script('local m = require("rtmod") return m.k');
     },
   },
+  // --- doors added by INTEROP-PARITY-PLAN (August 5, 2026) -------------------
+  //
+  // §15.6: a new public entry point that takes a JS value is a new door here.
+  // The async ones matter most: `call_async` and `resume_async` were added
+  // precisely because a capability existed at one door and not its siblings, so
+  // leaving them outside the parity search would repeat the mistake in the
+  // instrument that exists to catch it.
+  {
+    id: 'class-static-return',
+    describe: 'returned from a registered class static (P2a)',
+    roundTrip: (lua, v) => {
+      lua.register_class('RTS', { construct: () => ({}), statics: { get: () => v } });
+      return lua.execute_script('return RTS.get()');
+    },
+  },
+  {
+    id: 'class-property-get',
+    describe: 'returned from a registered class property accessor (P2b)',
+    roundTrip: (lua, v) => {
+      lua.register_class('RTP', {
+        construct: () => ({}),
+        properties: { k: { get: () => v } },
+      });
+      return lua.execute_script('local o = RTP.new() return o.k');
+    },
+  },
+  {
+    id: 'class-property-set',
+    describe: 'written through a class property setter and read back (P2b)',
+    roundTrip: (lua, v) => {
+      let held;
+      lua.register_class('RTW', {
+        construct: () => ({}),
+        properties: { k: { get: () => held, set: (_self, x) => { held = x; } } },
+      });
+      // Round trip is JS -> Lua (as the value set on the instance) -> JS. The
+      // Lua-side write is what carries it, so this door exercises the setter
+      // path rather than only the getter's.
+      lua.set_global('rtw_v', v);
+      return lua.execute_script('local o = RTW.new() o.k = rtw_v return o.k');
+    },
+  },
+  {
+    id: 'call_async-arg',
+    describe: 'passed as an argument to call_async, returned straight back (P1a)',
+    roundTrip: async (lua, v) => {
+      lua.execute_script('function rt_id(x) return x end');
+      return await lua.call_async('rt_id', v);
+    },
+  },
+  {
+    id: 'resume_async-arg',
+    describe: 'resume_async(co, v), yielded straight back (P1b)',
+    roundTrip: async (lua, v) => {
+      const co = lua.create_coroutine('return function(x) coroutine.yield(x) end');
+      const r = await lua.resume_async(co, v);
+      if (r.error) throw new Error(r.error);
+      return r.values.length === 1 ? r.values[0] : r.values;
+    },
+  },
+  {
+    id: 'file-reader-source',
+    describe: 'set as a global by a chunk served through the file reader (P4b)',
+    roundTrip: (lua, v) => {
+      // The reader serves *source*, so the value crosses as a global the served
+      // chunk reads — this door is about dofile being a real execution path for
+      // values, not about the source string itself.
+      lua.set_global('rt_in', v);
+      lua.set_file_reader((p) => (p === '/rt.lua' ? 'return rt_in' : null));
+      return lua.execute_script('return dofile("/rt.lua")');
+    },
+  },
 ];

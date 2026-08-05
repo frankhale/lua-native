@@ -57,6 +57,10 @@ export const HANDLES = [
     id: 'coroutine',
     make: (lua) => lua.create_coroutine('return function() coroutine.yield(1) return 2 end'),
     use: (h, lua) => lua.resume(h),
+    // P3: closing is a lifecycle event this handle can be held across, and the
+    // only handle kind that has one. Declared here so the close-* events know
+    // which kinds they apply to, the way `release` already does.
+    close: (h, lua) => lua.close(h),
   },
   {
     // The genuine Lua-created userdata handle, and the only userdata kind that
@@ -135,6 +139,18 @@ export const HANDLES = [
       return lua.execute_script('return Point.new(5)');
     },
     use: (h, lua) => { lua.set_global('back', h); return lua.execute_script('return type(back)'); },
+  },
+  {
+    // P1b: the async cursor. Same LuaContextBinding exposure as the sync one,
+    // plus a cursor state that is shared_ptr-owned so a pending step can outlive
+    // the iterator — a different ownership shape, and therefore its own row.
+    id: 'coroutine-async-iterator',
+    make: (lua) => {
+      const co = lua.create_coroutine(
+        'return function() coroutine.yield(1) coroutine.yield(2) end');
+      return co[Symbol.asyncIterator]();
+    },
+    use: (h) => h.next(),
   },
   {
     id: 'coroutine-iterator',

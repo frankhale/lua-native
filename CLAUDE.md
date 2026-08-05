@@ -34,20 +34,20 @@ npm run test-ts-tsan    # addon under TSan, via the async vitest suite
 npm run check-invariants
 node tools/invariants/run.mjs --update      # re-freeze after a reviewed change
 
-# Exception-escape matrix (27 Lua C frames x 11 throw kinds, 1 process/cell)
+# Exception-escape matrix (36 Lua C frames x 11 throw kinds, 1 process/cell)
 npm run exception-matrix
 
 # Differential oracle vs stock Lua 5.5 (2678 cases)
 # Needs the vcpkg port's interpreter:  vcpkg install lua[tools]
 npm run oracle
 
-# JS -> Lua -> JS round-trip and entry-point parity (12 doors x 50 values)
+# JS -> Lua -> JS round-trip and entry-point parity (18 doors x 50 values)
 npm run roundtrip-matrix
 
-# Execution-door parity: async + bytecode doors vs execute_script (1339 cases x 3 doors)
+# Execution-door parity: async + bytecode doors vs execute_script (1339 cases x 5 doors)
 npm run exec-parity
 
-# Handle lifecycle across reset/GC (11 handle kinds x 8 events, 1 process/cell)
+# Handle lifecycle across reset/GC (12 handle kinds x 12 events, 1 process/cell)
 npm run lifecycle-matrix
 
 # Two contexts exchanging values: handles refused, data intact, contexts independent
@@ -99,16 +99,17 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   oracle prints both Lua versions and warns if they differ. Checks whether an
   answer is *right* rather than whether nothing crashed, for the embedded VM and
   for values coming out of Lua. See `docs/DIFFERENTIAL-ORACLE.md`.
-- `npm run roundtrip-matrix` — the other direction: 12 entry points × 50 values,
-  checking that a JS value survives the crossing *into* Lua and that all twelve
+- `npm run roundtrip-matrix` — the other direction: 18 entry points × 50 values,
+  checking that a JS value survives the crossing *into* Lua and that all eighteen
   doors agree with each other. See `docs/reviews/CODE-REVIEW-20.md`.
 - `npm run exec-parity` — the oracle's 1339-case corpus through each alternate
   execution door (`execute_script_async`, `execute_async`,
-  `compile`→`load_bytecode`), compared against `execute_script` — values *and*
-  error messages. See `docs/reviews/CODE-REVIEW-21.md`.
-- `npm run lifecycle-matrix` — 10 handle kinds held across `reset`, double
-  reset, re-alias, GC, churn and release, one process per cell. A handle must
-  stay valid or refuse; answering with another state's data is the defect it
+  `compile`→`load_bytecode`, `call_async`, `resume_async`), compared against
+  `execute_script` — values *and* error messages. See
+  `docs/reviews/CODE-REVIEW-21.md`.
+- `npm run lifecycle-matrix` — 12 handle kinds held across `reset`, double
+  reset, re-alias, GC, churn, release and `close`, one process per cell. A handle
+  must stay valid or refuse; answering with another state's data is the defect it
   looks for. See `docs/reviews/CODE-REVIEW-22.md`.
 - `npm run cross-context` — the context ↔ context boundary: a handle from one
   context must be refused by another, a plain value must cross unchanged, and
@@ -117,7 +118,9 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
 
 **The review programme is closed** (August 4, 2026). All seven boundaries have a
 generated search, the enumeration is derived from a stated criterion, and review
-is now **triggered by new surface rather than by the calendar**. Before adding a
+is now **triggered by new surface rather than by the calendar**. That trigger was
+exercised for the first time on August 5, 2026 (`docs/reviews/INTEROP-PARITY-PLAN.md`)
+and it found three defects review had not — see `docs/CORRECTNESS.md` §15.6. Before adding a
 public entry point, a handle kind, a marker, an `ObjectWrap` subclass, a Lua C
 callback frame, or bumping Lua, read **`docs/CORRECTNESS.md` §15** —
 §15.6 maps each of those to the instrument to extend, and §15.7 is the
@@ -177,6 +180,10 @@ Lua objects that cross the C++ boundary (functions, coroutines, userdata, metata
 | Bytecode                        | `CompileScript`, `CompileFile`, `LoadBytecode`                                | `Compile`, `CompileFile`, `LoadBytecode`         |
 | Modules/require                 | `RegisterModuleTable`, `AddSearchPath`                                        | `RegisterModule`, `AddSearchPath`                |
 | Reference tables                | `GetTableField`, `SetTableField`, etc.                                        | Exposed via JS Proxy in `CoreToNapi`             |
+| Awaiting through every door     | `ResumeAsyncStep` (reports `awaited`), `CreateCoroutine`                      | `BeginAsyncRun`, `CallAsync`, `ResumeAsync`      |
+| Coroutine close                 | `CloseCoroutine` (`lua_closethread`)                                          | `CloseCoroutine`                                 |
+| Class statics / accessors       | `RegisterClass` (`statics`), `PropertyAccessDenied`                           | `RegisterClass`, `FindClassAccessor`             |
+| Input / virtual files           | `SetInputHandler`, `SetFileReader`, `LuaIoRead`, `LuaDoFile`                  | `SetReadHandler`, `SetFileReader`                |
 
 ## Documentation
 

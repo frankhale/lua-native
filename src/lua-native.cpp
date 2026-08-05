@@ -929,9 +929,12 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("set_metatable", &LuaContext::SetMetatable),
     InstanceMethod("create_coroutine", &LuaContext::CreateCoroutine),
     InstanceMethod("resume", &LuaContext::ResumeCoroutine),
+    InstanceMethod("close", &LuaContext::CloseCoroutine),
+    InstanceMethod("resume_async", &LuaContext::ResumeAsync),
     InstanceMethod("execute_script_async", &LuaContext::ExecuteScriptAsync),
     InstanceMethod("execute_file_async", &LuaContext::ExecuteFileAsync),
     InstanceMethod("execute_async", &LuaContext::ExecuteAsync),
+    InstanceMethod("call_async", &LuaContext::CallAsync),
     InstanceMethod("cancel", &LuaContext::Cancel),
     InstanceMethod("is_busy", &LuaContext::IsBusyMethod),
     InstanceMethod("add_search_path", &LuaContext::AddSearchPath),
@@ -950,6 +953,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("register_class", &LuaContext::RegisterClass),
     InstanceMethod("pcall", &LuaContext::Pcall),
     InstanceMethod("set_print_handler", &LuaContext::SetPrintHandler),
+    InstanceMethod("set_read_handler", &LuaContext::SetReadHandler),
+    InstanceMethod("set_file_reader", &LuaContext::SetFileReader),
     InstanceMethod("set_hook", &LuaContext::SetHook),
     InstanceMethod("remove_hook", &LuaContext::RemoveHook),
     InstanceMethod("add_searcher", &LuaContext::AddSearcher),
@@ -1205,6 +1210,21 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
   }
 }
 
+const ClassAccessor* LuaContext::FindClassAccessor(
+    const std::string& class_name, const std::string& key) const {
+  constexpr int kMaxClassDepth = 32;  // see the header
+  std::string current = class_name;
+  for (int depth = 0; depth < kMaxClassDepth && !current.empty(); ++depth) {
+    const auto it = class_accessors_.find(current);
+    if (it == class_accessors_.end()) return nullptr;
+    if (const auto p = it->second.props.find(key); p != it->second.props.end()) {
+      return &p->second;
+    }
+    current = it->second.parent;
+  }
+  return nullptr;
+}
+
 void LuaContext::InstallRuntimeHandlers() {
   // Set up userdata GC callback. The core has already dropped the Lua-side
   // method table by the time this runs; drop the JS half — the object reference
@@ -1238,8 +1258,41 @@ void LuaContext::InstallRuntimeHandlers() {
       if (it == js_userdata_.end()) {
         return std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::nil());
       }
+      // Named accessors (P2b) are consulted before the readable check, and win
+      // over it: declaring `properties: { health: { get } }` is how a class
+      // exposes exactly `health` while leaving the rest of the instance opaque.
+      // Methods still take precedence over both, because ClassIndex resolves the
+      // method table before it ever reaches a property handler.
+      if (!it->second.class_name.empty()) {
+        if (const ClassAccessor* acc = FindClassAccessor(it->second.class_name, key)) {
+          if (acc->getter.IsEmpty()) {
+            // Declared set-only. Refusing beats returning nil: nil is what an
+            // absent property already means, so silently conflating the two
+            // would hide the definition error this is reporting.
+            throw std::runtime_error(
+              "property '" + key + "' of class '" + it->second.class_name +
+              "' is write-only");
+          }
+          // Materialize both the instance and the accessor function before
+          // anything below can run user JS. `it` is invalidated by a rehash of
+          // js_userdata_, and `acc` by a re-entrant register_class rehashing
+          // class_accessors_ — both reachable from a JS getter (the CR-11 F5 /
+          // CR-13 class). Neither pointer is named again after this line.
+          const Napi::Object self = it->second.object.Value();
+          const Napi::Function getter = acc->getter.Value();
+          try {
+            Napi::Value val = getter.Call(self, {self});
+            return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+          } catch (const Napi::Error& e) {
+            throw Napi::Error::New(env, JsThrowMessage(e));
+          }
+        }
+      }
       if (!it->second.readable) {
-        throw std::runtime_error("userdata is not readable");
+        // PropertyAccessDenied, not runtime_error: this is the access-policy
+        // refusal the core is allowed to report as nil on an object with
+        // methods. A genuine failure below must not take that path.
+        throw lua_core::PropertyAccessDenied("userdata is not readable");
       }
       // Catch Napi::Error ahead of the core's generic `catch (std::exception&)`
       // so a non-Error throw keeps its text: `what()` is empty for one, and the
@@ -1257,8 +1310,36 @@ void LuaContext::InstallRuntimeHandlers() {
       Napi::HandleScope scope(env);
       auto it = js_userdata_.find(ref_id);
       if (it == js_userdata_.end()) return;
+      // See the getter: accessors are consulted first and win over `writable`,
+      // which is what makes a read-only field on an otherwise writable instance
+      // expressible.
+      if (!it->second.class_name.empty()) {
+        if (const ClassAccessor* acc = FindClassAccessor(it->second.class_name, key)) {
+          if (acc->setter.IsEmpty()) {
+            throw std::runtime_error(
+              "property '" + key + "' of class '" + it->second.class_name +
+              "' is read-only");
+          }
+          // Materialize the instance and the accessor BEFORE converting the
+          // value: CoreToNapi runs the Lua->JS converters, which are user JS and
+          // can rehash js_userdata_ (invalidating `it`) or, via a re-entrant
+          // register_class, class_accessors_ (invalidating `acc`). Written as
+          // named locals rather than relying on C++17's sequencing of a member
+          // call's postfix-expression before its arguments — the plain-property
+          // path below does depend on that rule, and says so precisely because
+          // it is too subtle to leave implicit twice.
+          const Napi::Object self = it->second.object.Value();
+          const Napi::Function setter = acc->setter.Value();
+          try {
+            setter.Call(self, {self, CoreToNapi(*value)});
+          } catch (const Napi::Error& e) {
+            throw Napi::Error::New(env, JsThrowMessage(e));
+          }
+          return;
+        }
+      }
       if (!it->second.writable) {
-        throw std::runtime_error("userdata is not writable");
+        throw lua_core::PropertyAccessDenied("userdata is not writable");
       }
       // Order-critical, and correct only because C++17 sequences a member
       // call's postfix-expression before its arguments: `it` is dereferenced
@@ -1284,6 +1365,14 @@ void LuaContext::DetachRuntimeHandlers() const {
   runtime->SetHostFunctionGCCallback(nullptr);
   runtime->SetPropertyHandlers(nullptr, nullptr);
   runtime->SetOutputHandler(nullptr);
+  runtime->SetInputHandler(nullptr);
+  // DropFileReader, not SetFileReader(nullptr): the latter removes the
+  // dofile/loadfile globals through RunProtected, which can throw, and this
+  // function is on the reset/teardown path where an escaping exception reaches
+  // N-API (CR-6 F1). The state is about to be replaced, so there is nothing to
+  // remove the globals from. Flagged here by the core-call-guarding invariant as
+  // UNGUARDED_AND_PROPAGATES.
+  runtime->DropFileReader();
   // lua_close fires __gc metamethods, which run Lua code — a line hook would
   // otherwise call into a context that is being torn down or repopulated.
   runtime->RemoveDebugHook();
@@ -1743,6 +1832,76 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     }
   }
 
+  // Statics (P2a) — validated up front, alongside the metamethods and for the
+  // same reason (L4): a rejected definition must not have stranded anything.
+  // Read once into a snapshot (N3); registration below never consults `def`
+  // again. Functions and plain values are separated here because they take
+  // different routes into the class table.
+  std::vector<std::pair<std::string, Napi::Function>> static_fn_snapshot;
+  std::vector<std::pair<std::string, Napi::Value>> static_val_snapshot;
+  {
+    const Napi::Value staticsVal = def.Get("statics");
+    if (staticsVal.IsObject() && !staticsVal.IsFunction()) {
+      auto statics = staticsVal.As<Napi::Object>();
+      Napi::Array keys = statics.GetPropertyNames();
+      for (uint32_t i = 0; i < keys.Length(); ++i) {
+        std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
+        if (key == "new") {
+          Napi::TypeError::New(env,
+            "register_class(): static 'new' is reserved — it is the constructor")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        Napi::Value val = statics.Get(key);
+        if (val.IsFunction()) {
+          static_fn_snapshot.emplace_back(std::move(key), val.As<Napi::Function>());
+        } else {
+          static_val_snapshot.emplace_back(std::move(key), val);
+        }
+      }
+    }
+  }
+
+  // Named property accessors (P2b). Same snapshot discipline. Held in
+  // class_accessors_ rather than pushed into Lua — see the member's comment.
+  ClassAccessorTable accessors;
+  accessors.parent = parent_class;
+  {
+    const Napi::Value propsVal = def.Get("properties");
+    if (propsVal.IsObject() && !propsVal.IsFunction()) {
+      auto props = propsVal.As<Napi::Object>();
+      Napi::Array keys = props.GetPropertyNames();
+      for (uint32_t i = 0; i < keys.Length(); ++i) {
+        std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
+        Napi::Value entryVal = props.Get(key);
+        if (!entryVal.IsObject() || entryVal.IsFunction()) {
+          Napi::TypeError::New(env,
+            "register_class(): property '" + key + "' must be an object with "
+            "'get' and/or 'set' functions")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        auto entry = entryVal.As<Napi::Object>();
+        const Napi::Value getVal = entry.Get("get");
+        const Napi::Value setVal = entry.Get("set");
+        const bool hasGet = getVal.IsFunction();
+        const bool hasSet = setVal.IsFunction();
+        if (!hasGet && !hasSet) {
+          // A property with neither half is inert, and inert-by-typo is exactly
+          // what a definition-time check is for.
+          Napi::TypeError::New(env,
+            "register_class(): property '" + key + "' declares neither 'get' nor 'set'")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        ClassAccessor acc;
+        if (hasGet) acc.getter = Napi::Persistent(getVal.As<Napi::Function>());
+        if (hasSet) acc.setter = Napi::Persistent(setVal.As<Napi::Function>());
+        accessors.props.emplace(std::move(key), std::move(acc));
+      }
+    }
+  }
+
   const Napi::Value readableVal = def.Get("readable");
   const Napi::Value writableVal = def.Get("writable");
   const bool readable = readableVal.IsBoolean() && readableVal.As<Napi::Boolean>().Value();
@@ -1793,6 +1952,41 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
     metamethods.push_back(std::move(entry));
   }
 
+  // Statics (P2a), from the snapshot. Functions become host-function closures
+  // on the class table; other values are converted once, here, and placed
+  // directly — a static is a class-level constant, not a live view of the JS
+  // property, and converting at registration is what makes that true.
+  std::vector<lua_core::MetatableEntry> statics;
+  statics.reserve(static_fn_snapshot.size() + static_val_snapshot.size());
+  for (const auto& [key, fn] : static_fn_snapshot) {
+    std::string func_name = "__class_static_" + std::to_string(class_id) + "_" + key;
+    deferred_fns.emplace_back(func_name, fn);
+    lua_core::MetatableEntry entry;
+    entry.key = key;
+    entry.is_function = true;
+    entry.func_name = std::move(func_name);
+    statics.push_back(std::move(entry));
+  }
+  for (const auto& [key, val] : static_val_snapshot) {
+    lua_core::MetatableEntry entry;
+    entry.key = key;
+    entry.is_function = false;
+    try {
+      entry.value = std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val));
+    } catch (const Napi::Error& e) {
+      // Conversion runs user JS (a converter, a Proxy trap) and can throw.
+      // Nothing is registered yet and the reservation guard releases the name.
+      e.ThrowAsJavaScriptException();
+      return env.Undefined();
+    } catch (const std::exception& e) {
+      Napi::Error::New(env,
+        "register_class(): static '" + key + "': " + e.what())
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    statics.push_back(std::move(entry));
+  }
+
   // RegisterClass builds inside RunProtected, which throws on OOM under
   // maxMemory or a raising __newindex on a _G metatable at the class-global
   // write. Surface that as a JS error: letting a std::runtime_error unwind
@@ -1800,7 +1994,8 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   try {
     // The class-global write fires __newindex on a metatabled _G (CR-9 F1);
     // the method-entry scope above already covers it.
-    runtime->RegisterClass(class_name, ctor_name, method_map, metamethods, parent_class);
+    runtime->RegisterClass(class_name, ctor_name, method_map, metamethods,
+                           parent_class, statics);
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     // The reservation guard releases the name; nothing was registered, so
@@ -1818,6 +2013,12 @@ Napi::Value LuaContext::RegisterClass(const Napi::CallbackInfo& info) {
   for (auto& [func_name, fn] : deferred_fns) {
     js_callbacks_[func_name] = Napi::Persistent(fn);
     runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+  }
+  // Accessors go in with the rest, after the core build succeeded — an entry
+  // here for a class the core rejected would answer property reads for a class
+  // that does not exist.
+  if (!accessors.props.empty() || !accessors.parent.empty()) {
+    class_accessors_.emplace(class_name, std::move(accessors));
   }
 
   reservation.Commit();
@@ -2748,7 +2949,8 @@ lua_core::LuaRuntime::Function LuaContext::CreateJsCallbackWrapper(const std::st
       if (result.IsPromise()) {
         if (!runtime->IsAwaitDriverMode()) {
           throw std::runtime_error(
-            "'" + name + "' returned a Promise; call it inside execute_async() to await it");
+            "'" + name + "' returned a Promise; call it inside execute_async(), "
+            "call_async(), or resume_async() to await it");
         }
         // Stash the promise and signal LuaCallHostFunction to suspend.
         async_pending_promise_ = Napi::Persistent(result.As<Napi::Object>());
@@ -2841,6 +3043,10 @@ lua_core::LuaRuntime::Function LuaContext::CreateConstructorWrapper(
     entry.object = Napi::Persistent(instObj);
     entry.readable = readable;
     entry.writable = writable;
+    // Carries the link the property handlers need to reach this class's named
+    // accessors (P2b); set_userdata instances leave it empty and keep the
+    // readable/writable-only behavior.
+    entry.class_name = class_name;
     js_userdata_[ref_id] = std::move(entry);
 
     // Return a class-bound userdata reference; PushLuaValue materializes it
@@ -3107,25 +3313,168 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
     return deferred.Promise();
   }
 
+  // Binding-owned thread: created for this run, released by FinishAsync.
+  async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
+  // Initial resume takes no arguments — a chunk has no parameters.
+  return BeginAsyncRun(info.This().As<Napi::Object>(), {});
+}
+
+// Arm the await driver on `thread` and take the first step. Shared by every
+// door that runs Lua on the main-thread coroutine driver, so the doors cannot
+// drift apart in what they arm — which is the failure P1 was reported for: a
+// capability that worked through execute_async and nowhere else.
+//
+// Takes ownership of `thread`: FinishAsync releases it. `self` is the JS wrapper
+// to root for the run's duration.
+const lua_core::LuaThreadRef& LuaContext::AsyncDrivenThread() const {
+  return async_co_ ? *async_co_ : async_borrowed_->threadRef;
+}
+
+Napi::Value LuaContext::BeginAsyncRun(const Napi::Object& self,
+                                      std::vector<lua_core::LuaPtr> args) {
   is_busy_ = true;
   ++async_generation_;  // invalidate any stale settlement from a prior run
   js_error_registry_.clear();
   runtime->ClearCancel();
   runtime->SetAwaitDriverMode(true);
-  async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
-  // Tell the core which thread is the driver so a promise awaited from inside a
-  // user coroutine is rejected rather than yielding the wrong state (M1).
-  runtime->SetAwaitDriverThread(async_co_->thread);
+  // Tell the core which thread is the driver so a promise awaited from a
+  // coroutine this run is *not* driving is rejected rather than yielding the
+  // wrong state (M1). Under resume_async the caller's own coroutine is the
+  // driven thread, which is exactly what lets it await.
+  runtime->SetAwaitDriverThread(AsyncDrivenThread().thread);
   async_deferred_.emplace(Napi::Promise::Deferred::New(env));
   // Root the wrapping JS object for the run's duration: while the coroutine is
   // suspended awaiting a promise, the settlement callbacks hold only a raw
   // pointer to this context, so the ObjectWrap must not be collectible.
-  async_self_ref_ = Napi::Persistent(info.This().As<Napi::Object>());
+  async_self_ref_ = Napi::Persistent(self);
 
   Napi::Promise promise = async_deferred_->Promise();
-  // Initial resume (no arguments) — runs until the script finishes or awaits.
-  DriveAsync({}, false);
+  DriveAsync(args, false);
   return promise;
+}
+
+// Defined further down, next to the coroutine API its other callers belong to.
+static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value);
+
+// call_async(nameOrFn, ...args) — P1a.
+//
+// The awaiting counterpart to call(). Before this existed, awaiting a host
+// Promise required routing the call through execute_async as *script text*,
+// which needs a name to call — so a LuaFunction held only on the JS side could
+// not await at all — and which compiles a fresh chunk per call, reintroducing
+// exactly the per-call cost call() was added to remove (F2).
+//
+// Mechanically this is execute_async with the coroutine seeded from a function
+// ref instead of a compiled chunk, so the driver, the M1 guard, cancel() and the
+// one-run-at-a-time rule are all the existing ones, unchanged.
+Napi::Value LuaContext::CallAsync(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 1 || (!info[0].IsString() && !info[0].IsFunction())) {
+    Napi::TypeError::New(env,
+      "call_async(nameOrFn, ...args) requires a global name or a Lua function")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Rejections rather than throws for everything past argument validation, so
+  // `await` and `.catch` see failures uniformly — the same choice execute_async
+  // makes for a chunk that fails to load.
+  const auto reject = [this](const std::string& msg) -> Napi::Value {
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Reject(Napi::Error::New(env, msg).Value());
+    return deferred.Promise();
+  };
+
+  // One scope over every step that can run user JS — the marker read (a Proxy
+  // trap), the global lookup (a metatabled _G's __index), the argument
+  // conversion (a registered type converter), and the coroutine creation — and
+  // closed before the drive below. Held across BeginAsyncRun it would leave
+  // call_depth_ raised for the whole suspended await, which is why execute_async
+  // scopes only its chunk load (CR-10 F1); opened any later, a Proxy trap on
+  // info[0] would run before the guard is armed (CR-13 F1).
+  std::optional<lua_core::LuaThreadRef> thread;
+  std::vector<lua_core::LuaPtr> args;
+  {
+  CallScope _cs(this);
+
+  std::optional<lua_core::LuaFunctionRef> funcRef;
+  if (info[0].IsFunction()) {
+    // Same identity checks create_coroutine and resume apply (M1): a ref from
+    // another context names a slot in an unrelated registry, and a released one
+    // names nothing.
+    auto* fnData = LuaFunctionDataFrom(info[0]);
+    if (!fnData) {
+      Napi::TypeError::New(env,
+        "call_async() accepts a global name or a Lua function; a plain "
+        "JavaScript function is not callable in Lua")
+        .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    if (fnData->runtime.get() != runtime.get()) {
+      return reject("Lua function belongs to a different Lua context");
+    }
+    if (fnData->funcRef.ref == LUA_NOREF) {
+      return reject("Lua function has been released");
+    }
+    // Copying shares the registry slot rather than minting a second owner, so
+    // the body outlives the JS wrapper for the run's duration.
+    funcRef = fnData->funcRef;
+  } else {
+    const std::string name = info[0].As<Napi::String>().Utf8Value();
+    lua_core::LuaPtr target;
+    try {
+      if (name.find('.') != std::string::npos) {
+        std::vector<std::string> path;
+        if (!SplitGlobalPath(name, path)) {
+          return reject("Invalid global path '" + name +
+            "': path segments must be non-empty (no leading, trailing, or doubled dots)");
+        }
+        target = runtime->GetGlobalPath(path);
+      } else {
+        target = runtime->GetGlobal(name);
+      }
+    } catch (const std::exception& e) {
+      return reject(e.what());
+    }
+    // Only a genuine Lua function. A callable table (__call) arrives as a
+    // LuaTableRef and would need a different core entry point — the same line
+    // call() draws, and drawn the same way so the two doors agree.
+    if (!target || !std::holds_alternative<lua_core::LuaFunctionRef>(target->value)) {
+      return reject("Lua global '" + name + "' is not a function");
+    }
+    funcRef = std::get<lua_core::LuaFunctionRef>(target->value);
+  }
+
+  // One collector spans every argument so a later argument's conversion failure
+  // sweeps the reclaimable callbacks minted by the earlier ones (CR-8 F1).
+  {
+    JsCallbackCollectorScope collector(this);
+    args.reserve(info.Length() > 0 ? info.Length() - 1 : 0);
+    try {
+      for (size_t i = 1; i < info.Length(); ++i) {
+        args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
+      }
+    } catch (const std::exception& e) {
+      return reject(e.what());
+    }
+  }
+
+  std::variant<lua_core::LuaThreadRef, std::string> co = std::string();
+  try {
+    co = runtime->CreateCoroutine(*funcRef);
+  } catch (const std::exception& e) {
+    return reject(e.what());
+  }
+  if (std::holds_alternative<std::string>(co)) {
+    return reject(std::get<std::string>(co));
+  }
+  thread.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
+  }  // CallScope closes here — nothing below runs user JS before the drive
+
+  // Binding-owned, like execute_async: the thread wraps the target function
+  // for this call alone and nothing else refers to it.
+  async_co_.emplace(std::move(*thread));
+  return BeginAsyncRun(info.This().As<Napi::Object>(), std::move(args));
 }
 
 // Data passed to the await-settlement callbacks: the context plus the generation
@@ -3165,7 +3514,7 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
   lua_core::AsyncStepResult step;
   {
     ResumeFlag resuming(async_resuming_);
-    step = runtime->ResumeAsyncStep(*async_co_, args, is_error);
+    step = runtime->ResumeAsyncStep(AsyncDrivenThread(), args, is_error);
   }
 
   // Honor a cancel() that arrived during the resume, now that the coroutine has
@@ -3179,14 +3528,58 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
   }
 
   if (step.state == lua_core::AsyncStepResult::State::Awaiting) {
-    if (async_pending_promise_.IsEmpty()) {
-      // The coroutine yielded without a pending host Promise — e.g. user code
-      // called coroutine.yield at the top level. That has no resumer here.
+    if (!step.awaited || async_pending_promise_.IsEmpty()) {
+      // A plain `coroutine.yield` rather than a suspension for a host Promise.
+      //
+      // `step.awaited` is the authority and `IsEmpty()` is only a belt-and-braces
+      // second condition: the stash is written by the host-call wrapper *before*
+      // the core checks whether this thread is the one being driven, so a
+      // refused nested await (M1) leaves a promise behind. Reading the stash
+      // alone therefore mistook the next plain yield for that await, attached to
+      // the stale promise, and resumed the coroutine with a value it never asked
+      // for. Drop any such residue here — nothing is going to consume it.
+      async_pending_promise_.Reset();
+
+      // What a plain yield *means* depends on the door.
+      if (async_coroutine_mode_) {
+        // resume_async: an ordinary suspension. Settle with the yielded values
+        // and detach, leaving the caller's thread suspended and resumable — the
+        // same shape resume() returns, so the two doors agree on everything but
+        // the ability to await.
+        //
+        // Marshalling runs user JS (converters, defineProperty), so the
+        // supersede re-check below is the same one the Finished branch makes
+        // and for the same reason (CR-16 F1).
+        const uint64_t yield_gen = async_generation_;
+        auto yield_deferred = *async_deferred_;
+        Napi::Value resolved;
+        bool ok = true;
+        std::string convErr;
+        try {
+          resolved = CoroutineResultToJs(async_coro_obj_.Value(),
+                                         lua_core::CoroutineStatus::Suspended,
+                                         step.values, std::nullopt);
+        } catch (const std::exception& e) {
+          ok = false;
+          convErr = e.what();
+        }
+        if (AsyncRunSuperseded(yield_gen)) return;
+        FinishAsync();
+        if (ok) {
+          yield_deferred.Resolve(resolved);
+        } else {
+          yield_deferred.Reject(Napi::Error::New(env,
+            std::string("failed to convert yielded values: ") + convErr).Value());
+        }
+        return;
+      }
+      // execute_async / call_async: nothing here can resume it.
       auto deferred = *async_deferred_;
       FinishAsync();
       deferred.Reject(Napi::Error::New(env,
-        "coroutine.yield is not supported at the top level of execute_async; "
-        "only awaiting a host Promise suspends execution").Value());
+        "coroutine.yield is not supported at the top level of execute_async or "
+        "call_async; only awaiting a host Promise suspends execution. Use "
+        "resume_async() to drive a coroutine that yields").Value());
       return;
     }
     // Attach continuation callbacks to the pending promise. The callbacks carry
@@ -3264,6 +3657,37 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
   // above already had the check and this one did not.
   const uint64_t settle_gen = async_generation_;
   auto deferred = *async_deferred_;
+
+  // resume_async answers with the same `{ status, values, error? }` object
+  // resume() does — including for a Lua error, which resume() reports in the
+  // result rather than throwing. Mirroring it exactly is what makes the async
+  // door a drop-in replacement; diverging on error handling alone would be the
+  // sibling-doors-disagree defect this work exists to remove.
+  if (async_coroutine_mode_) {
+    Napi::Value resolved;
+    bool ok = true;
+    std::string convErr;
+    const bool errored = step.state != lua_core::AsyncStepResult::State::Finished;
+    try {
+      resolved = CoroutineResultToJs(
+        async_coro_obj_.Value(), lua_core::CoroutineStatus::Dead,
+        errored ? std::vector<lua_core::LuaPtr>{} : step.values,
+        errored ? std::optional<std::string>(step.error) : std::nullopt);
+    } catch (const std::exception& e) {
+      ok = false;
+      convErr = e.what();
+    }
+    if (AsyncRunSuperseded(settle_gen)) return;
+    FinishAsync();
+    if (ok) {
+      deferred.Resolve(resolved);
+    } else {
+      deferred.Reject(Napi::Error::New(env,
+        std::string("failed to convert async result: ") + convErr).Value());
+    }
+    return;
+  }
+
   if (step.state == lua_core::AsyncStepResult::State::Finished) {
     Napi::Value resolved;
     bool ok = true;
@@ -3374,9 +3798,15 @@ void LuaContext::FinishAsync() {
   runtime->SetAwaitDriverThread(nullptr);
   runtime->ClearCancel();
   if (async_co_) {
-    async_co_->release();
+    async_co_->release();  // binding-owned: this run created it
     async_co_.reset();
   }
+  // Borrowed threads are never released here — the caller still holds the
+  // coroutine object and may resume it again. Dropping the root is all this
+  // run is entitled to do.
+  async_borrowed_ = nullptr;
+  async_coro_obj_.Reset();
+  async_coroutine_mode_ = false;
   async_deferred_.reset();
   async_pending_promise_.Reset();
   async_self_ref_.Reset();  // release the wrapper root taken in ExecuteAsync
@@ -3412,7 +3842,7 @@ Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
-  if (async_co_ && async_deferred_) {
+  if (AsyncDriverEngaged()) {
     if (async_resuming_) {
       // Called re-entrantly from a host callback while the coroutine is still
       // executing on the C stack. Tearing down now would free the running
@@ -3423,7 +3853,12 @@ Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
       return env.Undefined();
     }
     // Abandon the suspended coroutine and reject immediately. Any pending
-    // promise settlement becomes a no-op (async_co_ is cleared).
+    // promise settlement becomes a no-op (the driver is disengaged).
+    //
+    // For a resume_async run the thread is the *caller's*, so "abandon" means
+    // detach and leave it suspended exactly where it stopped — it stays
+    // resumable, the same end state an early `break` out of `for..of` produces.
+    // FinishAsync releases only a binding-owned thread.
     const auto deferred = *async_deferred_;
     FinishAsync();
     deferred.Reject(Napi::Error::New(env, "execution cancelled").Value());
@@ -3620,9 +4055,15 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // lua_State*. The kRetireState guard above means a run in flight can't reach
   // here, so this only covers a defensive residue.
   if (async_co_) {
-    async_co_->release();
+    async_co_->release();  // binding-owned: this run created it
     async_co_.reset();
   }
+  // Borrowed threads are never released here — the caller still holds the
+  // coroutine object and may resume it again. Dropping the root is all this
+  // run is entitled to do.
+  async_borrowed_ = nullptr;
+  async_coro_obj_.Reset();
+  async_coroutine_mode_ = false;
 
   // Invalidate every outstanding handle, then mint a fresh flag for the handles
   // this state will hand out.
@@ -3659,6 +4100,7 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   ud_method_fns_.clear();  // the userdata whose __gc would drain these are gone
   js_error_registry_.clear();
   registered_classes_.clear();
+  class_accessors_.clear();  // paired with registered_classes_ — same lifetime
 
   InstallRuntimeHandlers();
 
@@ -3698,6 +4140,29 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
     const Napi::Function handler = print_handler_.Value();
     try {
       InstallPrintHandler(handler);
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+
+  // The read handler and file reader replay for the same reason the print
+  // handler does: both are _G/io rewrites that the fresh state does not have.
+  // A sandbox context that reset() without this would silently lose its virtual
+  // filesystem while still holding the JS callback.
+  if (!read_handler_.IsEmpty()) {
+    const Napi::Function handler = read_handler_.Value();  // see the print handler
+    try {
+      InstallReadHandler(handler);
+    } catch (const std::exception& e) {
+      Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+  if (!file_reader_.IsEmpty()) {
+    const Napi::Function reader = file_reader_.Value();
+    try {
+      InstallFileReader(reader);
     } catch (const std::exception& e) {
       Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
       return env.Undefined();
@@ -3918,6 +4383,103 @@ Napi::Value LuaContext::SetPrintHandler(const Napi::CallbackInfo& info) {
       // null/undefined clears redirection (print/io.write go to stdout).
       print_handler_.Reset();
       runtime->SetOutputHandler(nullptr);
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  return env.Undefined();
+}
+
+void LuaContext::InstallReadHandler(const Napi::Function& fn) {
+  // Same ordering as InstallPrintHandler (CR-8 F7): the runtime install can
+  // throw, and read_handler_ must not be left pointing at a handler io.read was
+  // never rewired to reach. The lambda reads read_handler_ at call time.
+  runtime->SetInputHandler(
+    [this](const lua_core::LuaPtr& format) -> std::optional<std::string> {
+      if (read_handler_.IsEmpty()) return std::nullopt;
+      // Inside Lua's C call frame (io.read). Scope the per-call handles so a
+      // read loop does not accumulate them.
+      Napi::HandleScope scope(env);
+      Napi::Value result;
+      try {
+        result = read_handler_.Call({format ? CoreToNapi(*format) : env.Undefined()});
+      } catch (const Napi::Error& e) {
+        // Re-thrown with the message extracted here rather than left to the
+        // core's `e.what()`: for a non-Error throw (`throw "boom"`) what() is
+        // empty, and the core's "io.read handler failed: %s" would end at the
+        // colon. Exactly CR-18 F2, which the property handlers already fix this
+        // way — found again here by the exception matrix.
+        throw Napi::Error::New(env, JsThrowMessage(e));
+      }
+      // null / undefined / any boolean mean end-of-input, which reaches Lua as
+      // nil. A boolean is never meaningful input text, so it is not coerced to
+      // "true"/"false". Deliberately not "empty string means EOF": an empty
+      // line is a real line, and conflating them is the kind of data-dependent
+      // answer this codebase keeps out.
+      if (result.IsNull() || result.IsUndefined() || result.IsBoolean()) {
+        return std::nullopt;
+      }
+      return result.ToString().Utf8Value();
+    });
+  read_handler_ = Napi::Persistent(fn);
+}
+
+// set_read_handler(handler | null) — P4a.
+Napi::Value LuaContext::SetReadHandler(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  try {
+    // The io.read override is a protected write through a table a metatabled
+    // `io` could trap, and it allocates a closure (CR-9 F1, M3).
+    CallScope _cs(this);
+    if (info.Length() >= 1 && info[0].IsFunction()) {
+      InstallReadHandler(info[0].As<Napi::Function>());
+    } else {
+      read_handler_.Reset();
+      runtime->SetInputHandler(nullptr);
+    }
+  } catch (const std::exception& e) {
+    // A core throw must not unwind past N-API (the H1 class, CR-6 F1).
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  return env.Undefined();
+}
+
+void LuaContext::InstallFileReader(const Napi::Function& fn) {
+  runtime->SetFileReader(
+    [this](const std::string& path) -> std::optional<std::string> {
+      if (file_reader_.IsEmpty()) return std::nullopt;
+      Napi::HandleScope scope(env);
+      Napi::Value result;
+      try {
+        result = file_reader_.Call({Napi::String::New(env, path)});
+      } catch (const Napi::Error& e) {
+        throw Napi::Error::New(env, JsThrowMessage(e));  // see the read handler (CR-18 F2)
+      }
+      // null / undefined / any boolean mean "no such file" — a boolean is never
+      // Lua source, so it is not coerced to "true"/"false". An empty string is
+      // a valid empty module, so it is not folded into the same answer.
+      if (result.IsNull() || result.IsUndefined() || result.IsBoolean()) {
+        return std::nullopt;
+      }
+      return result.ToString().Utf8Value();
+    });
+  file_reader_ = Napi::Persistent(fn);
+}
+
+// set_file_reader(reader | null) — P4b.
+Napi::Value LuaContext::SetFileReader(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  try {
+    // Installing reassigns the dofile/loadfile globals, so a metatabled _G runs
+    // its __newindex here (CR-9 F1).
+    CallScope _cs(this);
+    if (info.Length() >= 1 && info[0].IsFunction()) {
+      InstallFileReader(info[0].As<Napi::Function>());
+    } else {
+      file_reader_.Reset();
+      runtime->SetFileReader(nullptr);
     }
   } catch (const std::exception& e) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -4689,6 +5251,10 @@ static Napi::Value SymbolIteratorKey(const Napi::Env env) {
   return env.Global().Get("Symbol").As<Napi::Object>().Get("iterator");
 }
 
+static Napi::Value SymbolAsyncIteratorKey(const Napi::Env env) {
+  return env.Global().Get("Symbol").As<Napi::Object>().Get("asyncIterator");
+}
+
 namespace {
   // One iteration cursor over a coroutine. Each `[Symbol.iterator]()` call mints
   // a fresh one, so two loops over the same coroutine are independent cursors
@@ -4699,11 +5265,36 @@ namespace {
     ContextLiveness liveness;
     Napi::ObjectReference coro;
     bool done = false;
+    // A weak handle to this same object, so a method holding only the raw
+    // `info.Data()` pointer can mint an additional GC root for it. The async
+    // cursor needs exactly that: its per-step mapper closure can outlive the
+    // `next` function that created it (`const p = it.next(); it = null; await p`),
+    // and would otherwise be the one holder of a freed state. Weak, not strong,
+    // because a strong self-reference is a cycle that never collects.
+    std::weak_ptr<LuaCoroIterState> self;
 
     [[nodiscard]] bool ContextLive() const {
       return context && liveness.HandlesLive();
     }
   };
+
+  // The state is shared_ptr-owned and each GC root is an External wrapping its
+  // own shared_ptr copy, so "rooted on the iterator, on every bound method, and
+  // on any pending async mapper" is expressed by ownership rather than by
+  // remembering to keep one designated holder alive.
+  using CoroIterOwner = std::shared_ptr<LuaCoroIterState>;
+
+  // Mints one such root. The unique_ptr owns the copy until the External's
+  // finalizer takes over, so a throw from External::New cannot leak it
+  // (CR-9 F4, the discipline the rest of this file follows).
+  Napi::Value NewCoroIterOwner(const Napi::Env env, const CoroIterOwner& sp) {
+    auto holder = std::make_unique<CoroIterOwner>(sp);
+    const auto ext = Napi::External<CoroIterOwner>::New(env, holder.get(),
+      [](Napi::Env, CoroIterOwner* h) { delete h; });
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    (void)holder.release();  // ownership transferred to the finalizer
+    return ext;
+  }
 }
 
 static Napi::Value CoroIterResult(const Napi::Env env, const Napi::Value& value,
@@ -4789,6 +5380,128 @@ static Napi::Value CoroIteratorNext(const Napi::CallbackInfo& info) {
   return CoroIterResult(env, value, dead);
 }
 
+// Maps one resume_async result object into the `{ value, done }` an async
+// iterator answers with. `info.Data()` is the cursor state; `info[0]` is the
+// `{ status, values, error? }` the promise resolved with. Deliberately the same
+// mapping CoroIteratorNext applies to the synchronous result — the two cursors
+// differ in *when* they get the step, not in what a step means.
+static Napi::Value CoroAsyncNextMap(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  auto* state = static_cast<LuaCoroIterState*>(info.Data());
+  const Napi::Value res = info.Length() > 0 ? info[0] : env.Undefined();
+  if (!state || !res.IsObject()) {
+    if (state) state->done = true;
+    return CoroIterResult(env, env.Undefined(), true);
+  }
+  const auto result = res.As<Napi::Object>();
+  if (result.Has("error")) {
+    state->done = true;
+    Napi::Error::New(env, result.Get("error").ToString().Utf8Value())
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const bool dead = result.Get("status").ToString().Utf8Value() == "dead";
+  if (dead) state->done = true;
+
+  const auto values = result.Get("values").As<Napi::Array>();
+  Napi::Value value = env.Undefined();
+  if (values.Length() == 1) {
+    value = values.Get(static_cast<uint32_t>(0));
+  } else if (values.Length() > 1) {
+    value = values;
+  }
+  return CoroIterResult(env, value, dead);
+}
+
+// The async cursor's `next()`. Same shape as CoroIteratorNext, driven through
+// resume_async so a host function that returns a Promise anywhere inside the
+// coroutine suspends it instead of hard-erroring.
+//
+// Before this existed, `for await (const v of coro)` worked — but only via JS's
+// sync-iterable fallback, which is exactly why a yield that needed a Promise
+// could not. With Symbol.asyncIterator present, `for await` binds to this
+// instead and the fallback no longer applies.
+static Napi::Value CoroAsyncIteratorNext(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  auto* state = static_cast<LuaCoroIterState*>(info.Data());
+
+  // Everything past the liveness check settles a promise rather than throwing,
+  // so `for await` sees failures through its normal channel.
+  const auto settled = [&env](const Napi::Value& v) -> Napi::Value {
+    auto d = Napi::Promise::Deferred::New(env);
+    d.Resolve(v);
+    return d.Promise();
+  };
+  const auto rejected = [&env](const std::string& msg) -> Napi::Value {
+    auto d = Napi::Promise::Deferred::New(env);
+    d.Reject(Napi::Error::New(env, msg).Value());
+    return d.Promise();
+  };
+
+  if (!state || !state->ContextLive()) {
+    return rejected(std::string("Lua coroutine is not usable: ") +
+                    (state ? state->liveness.DeadReason()
+                           : "its Lua context has been destroyed"));
+  }
+  if (state->done) return settled(CoroIterResult(env, env.Undefined(), true));
+
+  const Napi::Object coro = state->coro.Value();
+
+  // An already-dead coroutine ends the iteration rather than surfacing Lua's
+  // "cannot resume dead coroutine" — see CoroIteratorNext for the branding note.
+  if (const auto* threadData =
+        TaggedData<LuaThreadData>(coro.Get("_coroutine"), lua_tags::kThreadData);
+      threadData && threadData->threadRef.ref != LUA_NOREF &&
+      lua_core::LuaRuntime::GetCoroutineStatus(threadData->threadRef) ==
+        lua_core::CoroutineStatus::Dead) {
+    state->done = true;
+    return settled(CoroIterResult(env, env.Undefined(), true));
+  }
+
+  std::vector<Napi::Value> args;
+  args.reserve(info.Length());
+  for (size_t i = 0; i < info.Length(); ++i) args.push_back(info[i]);
+
+  // No CallScope around the drive: resume_async suspends and returns, so a scope
+  // held here would leave call_depth_ raised across the await — the reason
+  // execute_async scopes only its chunk load (CR-10 F1). The argument conversion
+  // inside ResumeCoroutineObjectAsync opens its own collector.
+  const Napi::Value promise =
+    state->context->ResumeCoroutineObjectAsync(coro, args, state->context->Value());
+  if (env.IsExceptionPending()) {
+    state->done = true;  // a broken cursor must not be resumable
+    return env.Undefined();
+  }
+  if (!promise.IsPromise()) {
+    state->done = true;
+    return rejected("resume_async did not return a Promise");
+  }
+
+  // `then` is user-influenceable (a patched Promise.prototype), so a failure
+  // here must not leave the cursor in a half-advanced state.
+  const auto promiseObj = promise.As<Napi::Object>();
+  Napi::Value thenVal = promiseObj.Get("then");
+  if (!thenVal.IsFunction()) {
+    state->done = true;
+    return rejected("the Promise from resume_async has no callable 'then'");
+  }
+  const Napi::Function mapper =
+    Napi::Function::New(env, CoroAsyncNextMap, "next", state);
+  // Root the cursor state on the mapper the same way the cursor's own methods
+  // root it. This one is not optional bookkeeping: the mapper runs when the
+  // promise settles, which can be after `next` and the iterator have both been
+  // dropped, leaving it the only holder (H3 / L6).
+  if (const CoroIterOwner keep = state->self.lock()) {
+    DefineHiddenProp(env, mapper, "__coroIterOwner", NewCoroIterOwner(env, keep),
+                     /*writable=*/false);
+  }
+  return thenVal.As<Napi::Function>().Call(promiseObj, {mapper});
+}
+
+static Napi::Value CoroAsyncIteratorSelf(const Napi::CallbackInfo& info) {
+  return info.This();
+}
+
 // Called when a for..of loop exits early (`break`, `return`, a throw). Ends
 // this cursor only — the underlying coroutine keeps its suspension point, so a
 // later loop resumes where this one stopped.
@@ -4821,35 +5534,80 @@ static Napi::Value CoroSymbolIterator(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  // Owned by the unique_ptr until the External's finalizer takes over, so a
-  // throw from the N-API allocations below cannot leak it (CR-9 F4, the same
-  // discipline as CreateTableHandle).
-  auto state_owner = std::make_unique<LuaCoroIterState>();
-  LuaCoroIterState* state = state_owner.get();
+  const CoroIterOwner sp = std::make_shared<LuaCoroIterState>();
+  sp->self = sp;
+  LuaCoroIterState* state = sp.get();
   state->context = binding->context;
   state->liveness = binding->liveness;
   state->coro = Napi::Persistent(info.This().As<Napi::Object>());
 
   const Napi::Object iterator = Napi::Object::New(env);
-  // The External's finalizer solely owns `state`. Rooted on the iterator AND on
-  // each bound method, so a method destructured off the iterator keeps the state
-  // alive — the same ownership discipline as the table handles (H3 / L6).
-  const auto owner = Napi::External<LuaCoroIterState>::New(env, state,
-    [](Napi::Env, const LuaCoroIterState* s) { delete s; });
-  // NOLINTNEXTLINE(bugprone-unused-return-value)
-  (void)state_owner.release();  // ownership transferred to the finalizer
-  DefineHiddenProp(env, iterator, "__coroIterOwner", owner, /*writable=*/false);
+  // Rooted on the iterator AND on each bound method, so a method destructured
+  // off the iterator keeps the state alive — the same ownership discipline as
+  // the table handles (H3 / L6). Each root is an independent shared_ptr copy.
+  DefineHiddenProp(env, iterator, "__coroIterOwner", NewCoroIterOwner(env, sp),
+                   /*writable=*/false);
 
   auto addMethod = [&](const char* name,
                        Napi::Value (*cb)(const Napi::CallbackInfo&)) {
     const Napi::Function fn = Napi::Function::New(env, cb, name, state);
-    DefineHiddenProp(env, fn, "__coroIterOwner", owner, /*writable=*/false);
+    DefineHiddenProp(env, fn, "__coroIterOwner", NewCoroIterOwner(env, sp),
+                     /*writable=*/false);
     (void)iterator.Set(name, fn);
   };
   addMethod("next", CoroIteratorNext);
   addMethod("return", CoroIteratorReturn);
   (void)iterator.Set(SymbolIteratorKey(env),
     Napi::Function::New(env, CoroIteratorSelf, "[Symbol.iterator]"));
+  return iterator;
+}
+
+// The coroutine object's `[Symbol.asyncIterator]` (P1b). Structurally identical
+// to CoroSymbolIterator; the cursor it mints steps through resume_async, so the
+// coroutine may await a host Promise at any yield.
+static Napi::Value CoroSymbolAsyncIterator(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  const auto* binding = static_cast<LuaContextBinding*>(info.Data());
+  if (!binding || !binding->ContextLive()) {
+    Napi::Error::New(env, std::string("Lua coroutine is not usable: ") +
+                          (binding ? binding->liveness.DeadReason()
+                                   : "its Lua context has been destroyed"))
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (!info.This().IsObject()) {
+    Napi::TypeError::New(env,
+      "coroutine[Symbol.asyncIterator]() must be called on a coroutine object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const CoroIterOwner sp = std::make_shared<LuaCoroIterState>();
+  sp->self = sp;
+  LuaCoroIterState* state = sp.get();
+  state->context = binding->context;
+  state->liveness = binding->liveness;
+  state->coro = Napi::Persistent(info.This().As<Napi::Object>());
+
+  const Napi::Object iterator = Napi::Object::New(env);
+  DefineHiddenProp(env, iterator, "__coroIterOwner", NewCoroIterOwner(env, sp),
+                   /*writable=*/false);
+
+  auto addMethod = [&](const char* name,
+                       Napi::Value (*cb)(const Napi::CallbackInfo&)) {
+    const Napi::Function fn = Napi::Function::New(env, cb, name, state);
+    DefineHiddenProp(env, fn, "__coroIterOwner", NewCoroIterOwner(env, sp),
+                     /*writable=*/false);
+    (void)iterator.Set(name, fn);
+  };
+  addMethod("next", CoroAsyncIteratorNext);
+  // `return` ends the cursor without touching the thread, exactly as the sync
+  // one does — an early `break` out of `for await` leaves the coroutine
+  // suspended and resumable. It answers synchronously; JS wraps a non-promise
+  // return from an async iterator's `return` for us.
+  addMethod("return", CoroIteratorReturn);
+  (void)iterator.Set(SymbolAsyncIteratorKey(env),
+    Napi::Function::New(env, CoroAsyncIteratorSelf, "[Symbol.asyncIterator]"));
   return iterator;
 }
 
@@ -4885,6 +5643,25 @@ Napi::Object LuaContext::CreateCoroutineObject(std::unique_ptr<LuaThreadData> da
   DefineHiddenProp(env, iterFn, "__coroBindingOwner", bindingExternal,
     /*writable=*/false);
   (void)coro.Set(SymbolIteratorKey(env), iterFn);
+
+  // Symbol.asyncIterator (P1b). `for await` previously bound to the *sync*
+  // iterator through JS's fallback, which is precisely why a yield needing a
+  // Promise could not work; with this present it binds here instead. A second
+  // binding object rather than a shared one: each is owned by its own External
+  // finalizer, and sharing would mean two finalizers over one allocation.
+  auto async_binding_owner =
+    std::make_unique<LuaContextBinding>(LuaContextBinding{this, Liveness()});
+  LuaContextBinding* async_binding = async_binding_owner.get();
+  const Napi::Function asyncIterFn = Napi::Function::New(
+    env, CoroSymbolAsyncIterator, "[Symbol.asyncIterator]", async_binding);
+  const auto asyncBindingExternal =
+    Napi::External<LuaContextBinding>::New(env, async_binding,
+      [](Napi::Env, const LuaContextBinding* b) { delete b; });
+  // NOLINTNEXTLINE(bugprone-unused-return-value)
+  (void)async_binding_owner.release();  // see the sync binding above
+  DefineHiddenProp(env, asyncIterFn, "__coroBindingOwner", asyncBindingExternal,
+    /*writable=*/false);
+  (void)coro.Set(SymbolAsyncIteratorKey(env), asyncIterFn);
   return coro;
 }
 
@@ -4986,6 +5763,171 @@ Napi::Value LuaContext::ResumeCoroutine(const Napi::CallbackInfo& info) {
   return ResumeCoroutineObject(info[0].As<Napi::Object>(), args);
 }
 
+// close(coro) — P3.
+//
+// Runs a suspended coroutine's pending to-be-closed variables (`local x <close>`)
+// and marks the thread dead, mirroring Lua's own `coroutine.close`. Before this
+// existed there was no way to run them from JS at all: `release()` frees the
+// registry slot without executing anything, and collecting the thread runs `__gc`
+// but not `__close`.
+//
+// It matters here more than in most bridges because two shipped features make an
+// abandoned suspended coroutine ordinary rather than exceptional — `__close` is
+// explicitly advertised as working through `set_metatable`, and `for..of` over a
+// coroutine deliberately leaves it suspended when the loop breaks.
+//
+// **`release()` deliberately still does not close.** Folding a close into it
+// would make a "free this slot" call run arbitrary Lua — and from there JS —
+// re-entrantly, and give it a way to throw; release() is called from teardown
+// paths where neither is acceptable. The two stay orthogonal, exactly as
+// `coroutine.close` and letting a thread be collected are orthogonal in Lua.
+Napi::Value LuaContext::CloseCoroutine(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  // A __close handler runs Lua, which can reach a host callback; the scope is
+  // what makes that re-entrancy visible to the occupancy checks (CR-9 F1).
+  CallScope scope(this);
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "close(coroutine) requires a coroutine object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const auto coroObj = info[0].As<Napi::Object>();
+
+  // Single branded read, and the same identity checks resume applies (CR-15 F6,
+  // M1): a thread from another context would be closed with this context's main
+  // state as `from`, which is two unrelated Lua states in one call.
+  auto* threadData =
+    TaggedData<LuaThreadData>(coroObj.Get("_coroutine"), lua_tags::kThreadData);
+  if (!threadData || !threadData->runtime) {
+    Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (threadData->runtime.get() != runtime.get()) {
+    Napi::Error::New(env, "coroutine belongs to a different Lua context")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  // Released, so there is no thread to close. Not an error: a released
+  // coroutine has no pending state a caller could still be responsible for.
+  if (threadData->threadRef.ref == LUA_NOREF) return env.Undefined();
+
+  std::optional<std::string> err;
+  try {
+    err = runtime->CloseCoroutine(threadData->threadRef);
+  } catch (const std::exception& e) {
+    // A __close handler can reach the host, so this inherits the whole
+    // exception surface a resume has; it must not unwind past N-API (H1).
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // The thread is dead either way — a failed __close still closed everything it
+  // reached — so the status is updated before the error is raised.
+  (void)coroObj.Set("status", Napi::String::New(env, "dead"));
+  if (err) {
+    ThrowLuaError(*err);
+    return env.Undefined();
+  }
+  return env.Undefined();
+}
+
+// resume_async(coro, ...args) — P1b.
+//
+// The awaiting counterpart to resume(). A coroutine resumed through resume() is
+// driven synchronously, so a host function that returns a Promise anywhere
+// inside it hard-errors: A1 (await) and A4 (coroutines) shipped without ever
+// intersecting, and `for await (… of coro)` appeared to work only because JS
+// falls back to the *synchronous* iterator.
+//
+// The mechanism is the execute_async driver pointed at a thread the binding does
+// not own. Two things follow, and both are deliberate:
+//
+//  * the M1 guard now admits awaits from this coroutine, because it *is* the
+//    driven thread — a coroutine nested inside it still cannot await, and says
+//    so;
+//  * abandoning the run (cancel(), or a failure) leaves the caller's coroutine
+//    suspended and resumable rather than releasing it.
+Napi::Value LuaContext::ResumeAsync(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env,
+      "resume_async(coroutine, ...args) requires a coroutine object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  std::vector<Napi::Value> args;
+  args.reserve(info.Length() > 0 ? info.Length() - 1 : 0);
+  for (size_t i = 1; i < info.Length(); ++i) args.push_back(info[i]);
+  return ResumeCoroutineObjectAsync(info[0].As<Napi::Object>(), args,
+                                    info.This().As<Napi::Object>());
+}
+
+Napi::Value LuaContext::ResumeCoroutineObjectAsync(
+    const Napi::Object& coroObj, const std::vector<Napi::Value>& args_js,
+    const Napi::Object& self) {
+  const auto reject = [this](const std::string& msg) -> Napi::Value {
+    auto deferred = Napi::Promise::Deferred::New(env);
+    deferred.Reject(Napi::Error::New(env, msg).Value());
+    return deferred.Promise();
+  };
+
+  // Scoped like CallAsync's, and for the same two reasons: the marker read and
+  // the argument conversion both run user JS and must be inside the guard
+  // (CR-13 F1), and the guard must be released before the drive so call_depth_
+  // is not held across a suspended await (CR-10 F1). The synchronous pair puts
+  // this scope in ResumeCoroutine and leaves ResumeCoroutineObject bare; the
+  // async pair cannot, because the scope has to end mid-function.
+  LuaThreadData* threadData = nullptr;
+  std::vector<lua_core::LuaPtr> args;
+  {
+  CallScope _cs(this);
+
+  // Identical validation to ResumeCoroutineObject, and identical for a reason:
+  // a branded single read (CR-15 F6), same-context identity (M1), and a
+  // released-ref check, because driving a foreign or released thread is the same
+  // UB whether the driver is synchronous or not. Reported as rejections rather
+  // than throws so `await`/`.catch` see everything past the argument check.
+  threadData =
+    TaggedData<LuaThreadData>(coroObj.Get("_coroutine"), lua_tags::kThreadData);
+  if (!threadData || !threadData->runtime) {
+    Napi::TypeError::New(env, "Invalid coroutine object").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (threadData->runtime.get() != runtime.get()) {
+    return reject("coroutine belongs to a different Lua context");
+  }
+  if (threadData->threadRef.ref == LUA_NOREF) {
+    return reject("coroutine has been released");
+  }
+
+  {
+    // One collector spans every argument so a later argument's conversion
+    // failure sweeps the callbacks minted by the earlier ones (CR-8 F1).
+    JsCallbackCollectorScope collector(this);
+    args.reserve(args_js.size());
+    try {
+      for (const auto& arg : args_js) {
+        args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(arg)));
+      }
+    } catch (const std::exception& e) {
+      return reject(e.what());
+    }
+  }
+  }  // CallScope closes here — nothing below runs user JS before the drive
+
+  // Borrowed, not owned: async_co_ stays disengaged so FinishAsync releases
+  // nothing, and the coroutine object is rooted for the run because
+  // async_borrowed_ points into data owned by that object's External finalizer.
+  async_borrowed_ = threadData;
+  async_coro_obj_ = Napi::Persistent(coroObj);
+  async_coroutine_mode_ = true;
+  // `self` is the context wrapper, not the coroutine: async_self_ref_ exists to
+  // keep the ObjectWrap alive across a suspended await (the settlement callbacks
+  // hold only a raw pointer to it). The coroutine object is rooted separately,
+  // above, because it owns the thread being driven.
+  return BeginAsyncRun(self, std::move(args));
+}
+
 Napi::Value LuaContext::ResumeCoroutineObject(const Napi::Object& coroObj,
                                               const std::vector<Napi::Value>& args_js) {
   // Single branded read (CR-15 F6). The old form did Has, then Get, then a
@@ -5036,11 +5978,21 @@ Napi::Value LuaContext::ResumeCoroutineObject(const Napi::Object& coroObj,
 
   // Resume the coroutine
   auto [status, values, error] = runtime->ResumeCoroutine(threadData->threadRef, args);
+  return CoroutineResultToJs(coroObj, status, values, error);
+}
 
-  // Build the result object
+// Marshals one coroutine step into the `{ status, values, error? }` object both
+// resume() and resume_async() answer with, and updates the coroutine object's
+// own `status`. Shared so the sync and async doors cannot drift apart in the
+// shape they return — the two differ in whether they can await, and in nothing
+// else.
+Napi::Value LuaContext::CoroutineResultToJs(
+    const Napi::Object& coroObj,
+    lua_core::CoroutineStatus status,
+    const std::vector<lua_core::LuaPtr>& values,
+    const std::optional<std::string>& error) {
   const Napi::Object resultObj = Napi::Object::New(env);
 
-  // Set status
   std::string statusStr;
   switch (status) {
     case lua_core::CoroutineStatus::Suspended:

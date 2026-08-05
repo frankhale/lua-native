@@ -33,6 +33,46 @@ export const ACCEPTED_DIVERGENCES = [
       + 'error("<no error object>"). CR-21 F1 fixed the cells that *were* the '
       + 'binding\'s (table, boolean, number); this one is not one of them.',
   },
+  // --- doors added by INTEROP-PARITY-PLAN (August 5, 2026) -------------------
+  //
+  // Both new doors run the chunk on a coroutine, exactly as the driver door
+  // does, so both inherit both of the divergences above unchanged. They are
+  // ledgered per door rather than by a shared pattern because a pattern would
+  // stop reporting STALE for one door if only the other converged — and a
+  // divergence that quietly stops applying to one door is precisely what the
+  // STALE check exists to surface.
+  {
+    id: 'coroutine/c7',            // return tostring(coroutine.isyieldable())
+    door: 'call_async',
+    reason:
+      'Same cause as the driver entry above: call_async runs the target on the '
+      + 'same main-thread coroutine driver execute_async uses, so '
+      + 'coroutine.isyieldable() is true inside it. Stated on call_async in '
+      + 'types.d.ts ("the same driver").',
+  },
+  {
+    id: 'coroutine/c7',
+    door: 'resume_async',
+    reason:
+      'resume_async resumes an actual coroutine, so coroutine.isyieldable() is '
+      + 'true by definition. Not an execution-model artefact here — it is the '
+      + "door's whole purpose.",
+  },
+  {
+    id: 'error/e13',               // error(nil)
+    door: 'call_async',
+    reason:
+      'Same liblua behaviour as the driver entry above: the chunk runs under '
+      + 'lua_resume, which replaces a nil error object with "<no error object>" '
+      + 'before returning. Upstream of any code here.',
+  },
+  {
+    id: 'error/e13',
+    door: 'resume_async',
+    reason:
+      'Same liblua behaviour as the driver entry above — lua_resume substitutes '
+      + '"<no error object>" for a nil error object. Upstream of any code here.',
+  },
 ];
 
 export function divergenceReason(id, door) {

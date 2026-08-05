@@ -115,6 +115,14 @@ function classify(r, event) {
       return { kind: 'UNEXPECTED-REFUSAL',
         detail: `handle should still be valid but ${p.outcome}: ${p.message}` };
     }
+    // "Report the value, not just survival" (tools/README.md). An event that
+    // states the answer it requires makes surviving with the *wrong* answer a
+    // finding: the close-* rows exist because a no-op close also survives its
+    // subsequent resume, just with 'suspended' where 'dead' must be.
+    if (event.expectValue && !event.expectValue.test(p.value ?? '')) {
+      return { kind: 'WRONG-ANSWER',
+        detail: `answer must match ${event.expectValue} but was: ${p.value}` };
+    }
     // Slope between the final two rounds (see cell.mjs). A settled plateau
     // reads 0; a genuine leak adds ~25 per round. Slack of 5 absorbs an
     // incidental ref without coming close to a real leak's magnitude.
@@ -142,7 +150,7 @@ function classify(r, event) {
 }
 
 const FINDING_KINDS = new Set(['CRASH', 'ALIASED', 'UNEXPECTED-REFUSAL',
-  'REGISTRY-GROWTH', 'STALE-ANSWERED', 'OPAQUE-REFUSAL']);
+  'REGISTRY-GROWTH', 'STALE-ANSWERED', 'OPAQUE-REFUSAL', 'WRONG-ANSWER']);
 
 // --- controls --------------------------------------------------------------
 //
@@ -192,6 +200,18 @@ async function runControls() {
         // value the handle already held, a genuine alias would read as clean.
         const r = await runCell('table-ref', 'none');
         return !r.crashed && String(r.parsed.value) === '1';
+      },
+    },
+    {
+      name: 'a close that did nothing is a WRONG-ANSWER, not survival',
+      run: async () => {
+        // A cell where close never ran: the coroutine answers 'suspended' to
+        // the resume, which is outcome 'value' — exactly what a silent no-op
+        // close would produce. classify() with the close event's stated answer
+        // must call that a finding, or the close-* cells are vacuous.
+        const r = await runCell('coroutine', 'none');
+        return !r.crashed && r.parsed.outcome === 'value'
+          && classify(r, EVENTS.find((e) => e.id === 'close-then-use')).kind === 'WRONG-ANSWER';
       },
     },
     {

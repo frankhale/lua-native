@@ -45,6 +45,7 @@
     "LuaContext::ExecuteScript": "SCOPE_NO_USER_JS",
     "LuaContext::ExecuteFile": "SCOPE_NO_USER_JS",
     "LuaContext::ExecuteAsync": "SCOPE_NO_USER_JS",
+    "LuaContext::CallAsync": "SCOPE_FIRST",
     "LuaContext::DriveAsync": "NO_SCOPE",
     "LuaContext::OnAwaitSettled": "NO_SCOPE",
     "LuaContext::Pcall": "NO_SCOPE",
@@ -54,6 +55,10 @@
     "LuaContext::InstallDebugHook": "NO_SCOPE",
     "LuaContext::SetHook": "SCOPE_FIRST",
     "LuaContext::SetPrintHandler": "SCOPE_NO_USER_JS",
+    "LuaContext::InstallReadHandler": "NO_SCOPE",
+    "LuaContext::SetReadHandler": "SCOPE_NO_USER_JS",
+    "LuaContext::InstallFileReader": "NO_SCOPE",
+    "LuaContext::SetFileReader": "SCOPE_NO_USER_JS",
     "LuaContext::AddSearcher": "SCOPE_NO_USER_JS",
     "LuaScriptAsyncWorker::OnOK": "SCOPE_NO_USER_JS",
     "LuaFileAsyncWorker::OnOK": "SCOPE_NO_USER_JS",
@@ -64,13 +69,20 @@
     "LuaContext::CoreToNapi": "NO_SCOPE",
     "LuaContext::CoreToNapiBuiltin": "NO_SCOPE",
     "SymbolIteratorKey": "NO_SCOPE",
+    "SymbolAsyncIteratorKey": "NO_SCOPE",
     "CoroIteratorNext": "SCOPE_LATE",
+    "CoroAsyncNextMap": "NO_SCOPE",
+    "CoroAsyncIteratorNext": "NO_SCOPE",
     "CoroSymbolIterator": "NO_SCOPE",
+    "CoroSymbolAsyncIterator": "NO_SCOPE",
     "LuaContext::CreateCoroutineObject": "NO_SCOPE",
     "LuaFunctionDataFrom": "NO_SCOPE",
     "LuaContext::CreateCoroutine": "SCOPE_LATE",
     "LuaContext::ResumeCoroutine": "SCOPE_NO_USER_JS",
-    "LuaContext::ResumeCoroutineObject": "NO_SCOPE"
+    "LuaContext::CloseCoroutine": "SCOPE_FIRST",
+    "LuaContext::ResumeCoroutineObjectAsync": "SCOPE_FIRST",
+    "LuaContext::ResumeCoroutineObject": "NO_SCOPE",
+    "LuaContext::CoroutineResultToJs": "NO_SCOPE"
   },
   "lua-next-sites": {
     "isSequentialArray": "NOT_EXPOSED",
@@ -86,7 +98,7 @@
     "reset()": "kRetireState"
   },
   "greppable-counts": {
-    "RejectIfBusy() call sites": 31,
+    "RejectIfBusy() call sites": 36,
     "LuaCallHostFunction closure pushes": 1,
     "napi_type_tag definitions": 6
   },
@@ -99,24 +111,25 @@
   },
   "assertion-strength": {
     "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
-    "toThrow assertions examined": 367,
-    "negative (.not) — exempt by design": 32,
+    "toThrow assertions examined": 403,
+    "negative (.not) — exempt by design": 36,
     "BARE positive assertions": 0
   },
   "exception-surface": {
-    "throw sites (binding)": 25,
+    "throw sites (binding)": 31,
     "throw sites (core)": 28,
-    "catch sites (binding)": 67,
-    "catch sites (core)": 38,
-    "RunProtected calls (core)": 32,
+    "catch sites (binding)": 84,
+    "catch sites (core)": 45,
+    "RunProtected calls (core)": 35,
     "lua_pcall calls (core)": 8
   },
   "scanner-coverage": {
-    "binding: functions found": 118,
+    "binding: functions found": 135,
     "binding: static LuaTableRefData* TableRefDataFrom(const Napi::Value& value);": "declaration",
+    "binding: static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value);": "declaration",
     "binding: NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)": "macro-invocation",
     "binding: unattributed": 0,
-    "core: functions found": 140,
+    "core: functions found": 154,
     "core: unattributed": 0
   },
   "core-call-guarding": {
@@ -159,12 +172,18 @@
     "LuaContext::GC -> GarbageCollectParam": "GUARDED",
     "LuaContext::GC -> GarbageCollect": "GUARDED",
     "LuaContext::ExecuteAsync -> CreateCoroutineFromScript": "GUARDED",
+    "LuaContext::CallAsync -> GetGlobalPath": "GUARDED",
+    "LuaContext::CallAsync -> GetGlobal": "GUARDED",
     "LuaContext::Reset -> SetAllowBytecode": "GUARDED",
     "LuaContext::Reset -> AddSearchPath": "GUARDED",
     "LuaContext::Reset -> AddJsSearcher": "GUARDED",
     "LuaContext::SetPrintHandler -> SetOutputHandler": "GUARDED",
+    "LuaContext::SetReadHandler -> SetInputHandler": "GUARDED",
+    "LuaContext::SetFileReader -> SetFileReader": "GUARDED",
     "LuaContext::AddSearcher -> AddJsSearcher": "GUARDED",
-    "LuaContext::DetachRuntimeHandlers -> SetOutputHandler": "JUSTIFIED_FALSE_POSITIVE",
-    "LuaContext::InstallPrintHandler -> SetOutputHandler": "CONTAINED_BY_CALLERS(3)"
+    "LuaContext::DetachRuntimeHandlers -> SetInputHandler+SetOutputHandler": "JUSTIFIED_FALSE_POSITIVE",
+    "LuaContext::InstallPrintHandler -> SetOutputHandler": "CONTAINED_BY_CALLERS(3)",
+    "LuaContext::InstallReadHandler -> SetInputHandler": "CONTAINED_BY_CALLERS(2)",
+    "LuaContext::InstallFileReader -> SetFileReader": "CONTAINED_BY_CALLERS(2)"
   }
 }

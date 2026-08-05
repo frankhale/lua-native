@@ -1,7 +1,7 @@
 # docs/
 
 Everything at **this level is current**. Everything in
-**[`reviews/`](reviews/) is frozen** — 26 files, none of them an instruction.
+**[`reviews/`](reviews/) is frozen** — 27 files, none of them an instruction.
 
 That split is carried by the directory itself rather than by this page, on
 purpose: a reader who never opens this file still cannot mistake
@@ -46,13 +46,24 @@ Current; changed when the feature changes.
 | [`CODE-REVIEW-HISTORY.md`](reviews/CODE-REVIEW-HISTORY.md) | The reasoning trail, in three parts: the trajectory commentary (CR-2→CR-17), the programme (CR-17→CR-22), and the sanitizer assessment. All three superseded **on their recommendations** — read for reasoning, never for what to do next. |
 | [`CODE-REVIEW-LEDGER.md`](reviews/CODE-REVIEW-LEDGER.md) | Disposition ledger for CR-1–14, last audited at CR-8. Kept because entries (notably M6) are cited from source comments as the record of a deliberate decision. |
 | [`FEATURE-HISTORY.md`](reviews/FEATURE-HISTORY.md) | The planned feature work, all implemented. Kept for rationale and as-built deltas. |
-| [`BRIDGE-COMPARISON.md`](reviews/BRIDGE-COMPARISON.md) | Competitive survey against wasmoon, fengari and others. Every gap closed. |
+| [`BRIDGE-COMPARISON.md`](reviews/BRIDGE-COMPARISON.md) | Competitive survey against wasmoon, fengari and others. Every gap closed. Carries one dated **correction** (§C1 described a `properties` key that did not ship until August 2026) — the one file here that did *not* only claim what was true on its date. |
+| [`INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) | The August 5, 2026 interop work: five gaps the survey's enumeration had no row for, because it was organised by capability and every capability answered yes. All implemented; the banner carries the three defects found while building that the plan itself did not predict. |
 
-**There is no roadmap document.** New work should start from a concrete need,
-not from either survey. The one open item across all of it is bridge-gap **A5
-(worker pool)**, and it is a *scope decision, not a pending task*: a
-`LuaRuntime` is single-threaded by construction, so parallelism means N contexts
-plus a scheduler, which userland can build over `execute_script_async` today.
+**There is no roadmap document.** New work must not start from either survey's
+priority matrix — both are records, and every item in both is either implemented
+or a stated scope decision. Bridge-gap **A5 (worker pool)** is the one item
+either survey still shows as open, and it is a *scope decision, not a pending
+task*: a `LuaRuntime` is single-threaded by construction, so parallelism means N
+contexts plus a scheduler, which userland can build over `execute_script_async`
+today.
+
+One plan document existed briefly and is worth knowing about, because it says
+what a *good* reason to write one looks like:
+[`reviews/INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) (August 5,
+2026, superseded the same day it was executed). It was not survey-derived —
+every item came from driving the shipped API and finding a door that behaved
+differently from its siblings, which is a different question from "what does the
+competition have". That is the bar for the next one.
 
 ---
 

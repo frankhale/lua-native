@@ -350,7 +350,14 @@ export function coreCallGuarding() {
   for (const [fn, callees] of localUnguarded) {
     const cs = callers.get(fn) ?? [];
     const key = `${fn} -> ${[...new Set(callees)].sort().join('+')}`;
-    delete rows[`${fn} -> ${callees[0]}`];
+    // Every per-callee row is folded into the aggregate, not just the first.
+    // Deleting only `callees[0]` left the second and later callees behind as
+    // stray rows once a function had more than one unguarded callee — which
+    // first happened in August 2026 when DetachRuntimeHandlers grew a second.
+    // The stray carries no verdict (the aggregate has it) and its only effect is
+    // to add noise to a list whose value is that everything in it means
+    // something.
+    for (const c of new Set(callees)) delete rows[`${fn} -> ${c}`];
     if (cs.length === 0) {
       // Nothing calls it: N-API does, so an escape here reaches the process.
       rows[key] = 'ESCAPES_AT_ROOT';
@@ -383,6 +390,18 @@ export const JUSTIFIED_ESCAPES = {
     + 'and so cannot throw. The analysis cannot see argument values. Verified by '
     + 'reading both branches at CR-19; the throwing branch is the `if (handler)` '
     + 'one only.',
+  'LuaContext::DetachRuntimeHandlers -> SetInputHandler+SetOutputHandler':
+    'Both are the same argument-insensitivity as the entry above: each is passed '
+    + '`nullptr`, and both null branches are a `shared_ptr::reset()` that touches '
+    + 'no Lua. Added August 5, 2026 with the input handler (P4a).\n\n'
+    + '**The third handler in this function is NOT here, and that is the point.** '
+    + 'The file reader (P4b) was written the same way and was genuinely unsafe: '
+    + '`SetFileReader(nullptr)` removes the dofile/loadfile globals through '
+    + 'RunProtected, which throws under an exhausted maxMemory. This check flagged '
+    + 'it as UNGUARDED_AND_PROPAGATES on its first run, and the fix was a separate '
+    + '`DropFileReader()` that drops the callback without touching Lua — not a '
+    + 'justification entry. Two of three were false positives and one was a defect; '
+    + 'the value of the check is that it did not let anyone assume which.',
 };
 
 // Kept as a named export for the review docs that cite it.

@@ -218,6 +218,25 @@ struct MetatableEntry {
   LuaPtr value;           // Used when is_function == false
 };
 
+/// Thrown by a host property handler to mean **"this object does not expose
+/// properties"** — as distinct from "the property handler ran and failed".
+///
+/// The distinction is load-bearing. `UserdataIndex` and `ClassIndex` swallow a
+/// refusal to `nil` when the object has methods, because methods are documented
+/// to work independently of `readable`. Before this type existed they swallowed
+/// *every* getter exception, so a host getter that genuinely threw was reported
+/// to Lua as `nil` — indistinguishable from an absent field, and only on objects
+/// that happened to have methods. Named property accessors made that
+/// unacceptable (a throwing accessor must reach the script), so the swallow was
+/// narrowed to exactly the case its comment always claimed.
+///
+/// Host handlers must therefore throw this type for an access-policy refusal and
+/// anything else for a real failure.
+class PropertyAccessDenied : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 enum class CoroutineStatus {
   Suspended,
   Running,
@@ -234,8 +253,20 @@ struct CoroutineResult {
 struct AsyncStepResult {
   enum class State { Finished, Awaiting, Error };
   State state = State::Error;  // fail-safe default: treated as an error unless set
-  std::vector<LuaPtr> values;  // return values when Finished
+  // Return values when Finished; the *yielded* values when Awaiting. Awaiting
+  // covers both an awaited host Promise (which yields nothing) and a plain
+  // `coroutine.yield`. See ResumeAsyncStep.
+  std::vector<LuaPtr> values;
   std::string error;           // message when Error
+  // Which kind of yield produced an Awaiting result: true when the host bridge
+  // yielded for a Promise, false for a plain `coroutine.yield`.
+  //
+  // The binding used to infer this from "is a pending promise stashed?", which
+  // is a side channel and could go stale: the stash happens in the binding
+  // before the core decides whether this thread is the one being driven, so a
+  // *refused* await (M1) left a promise behind that the next plain yield was
+  // then misread as. Reporting what actually happened removes the inference.
+  bool awaited = false;
 };
 
 // Names a registered host function so PushLuaValue can materialize it as a Lua
@@ -370,6 +401,26 @@ public:
   // (the resolved promise value, or the rejection message when arg_is_error).
   [[nodiscard]] AsyncStepResult ResumeAsyncStep(const LuaThreadRef& threadRef,
       const std::vector<LuaPtr>& args, bool arg_is_error);
+  /// Close a coroutine (P3): run its pending to-be-closed variables
+  /// (`local x <close> = …`) and mark the thread dead, over `lua_closethread`.
+  ///
+  /// Returns nullopt on success, or the error message if a `__close` handler
+  /// raised. A `__close` handler is ordinary Lua and can call back into the
+  /// host, so this is a Lua C frame like any other and is bracketed by an
+  /// ExecutionScope.
+  ///
+  /// The gap it fills: releasing a coroutine's registry slot frees the *slot*,
+  /// and collecting the thread runs `__gc` — but a suspended coroutine's
+  /// to-be-closed variables were never run at a point the caller could observe
+  /// or handle. Since `for..of` over a coroutine deliberately leaves it
+  /// suspended when the loop breaks, producing an unclosed thread is a normal
+  /// outcome of the documented API rather than an edge case.
+  ///
+  /// Closing an already-dead or already-closed coroutine is a no-op that
+  /// succeeds — a close is a statement about the end state, so making it
+  /// idempotent is what lets a caller close defensively.
+  [[nodiscard]] std::optional<std::string> CloseCoroutine(const LuaThreadRef& threadRef) const;
+
   void SetAwaitDriverMode(bool enabled);
   [[nodiscard]] bool IsAwaitDriverMode() const;
   // Records (or clears, with nullptr) the coroutine thread execute_async drives,
@@ -482,6 +533,65 @@ public:
   using OutputHandler = std::function<void(const std::string&)>;
   void SetOutputHandler(OutputHandler handler);
 
+  /// Input redirection (P4a): route `io.read` to a JS handler — the missing
+  /// counterpart to the output handler, which has redirected print/io.write
+  /// since E1 while input still went to the process's real stdin. In a server or
+  /// an Electron embedding that meant a prompting script had its output captured
+  /// and then blocked on a stdin nothing was writing to.
+  ///
+  /// The handler receives the requested format exactly as Lua passes it (a
+  /// string like `"l"`/`"a"`/`"n"`, or a number of bytes) and returns the text,
+  /// or nullopt for end-of-input, which reaches Lua as `nil`.
+  ///
+  /// **`io.read` only, and only when the `io` library is loaded.** There is no
+  /// base-library input function to override the way `print` gave output a home,
+  /// so a bare or `'sandbox'` state has nothing to redirect — inventing a
+  /// non-standard global to fill the gap would be worse than the gap.
+  ///
+  /// Installing the wrapper keeps the original `io.read` as an upvalue and falls
+  /// through to it whenever no handler is set, so removing the handler restores
+  /// real stdin without an unwrap step.
+  using InputHandler = std::function<std::optional<std::string>(const LuaPtr& format)>;
+  void SetInputHandler(InputHandler handler);
+  [[nodiscard]] bool HasInputHandler() const;
+
+  /// Virtual file access (P4b): resolve `dofile` and `loadfile` through a JS
+  /// callback instead of the filesystem.
+  ///
+  /// `add_searcher` (E2) already covers `require`; this covers the other two
+  /// ways Lua reaches a file. It matters most under `libraries: 'sandbox'`,
+  /// where both globals are cleared precisely because they reach the real
+  /// filesystem — with a reader installed they come back, backed only by what
+  /// the host chooses to serve.
+  ///
+  /// **When a reader is installed, `dofile`/`loadfile` resolve through it
+  /// exclusively; the filesystem is never consulted.** Deliberately not a
+  /// fallback chain: "the reader, or the disk if the reader declines" makes the
+  /// meaning of a path depend on the reader's answer, which is the
+  /// data-dependent-behavior defect this codebase keeps out. A reader that wants
+  /// disk access can read the disk itself.
+  ///
+  /// The reader returns Lua *source* for a path, or nullopt for "no such file",
+  /// which `loadfile` reports as `nil, msg` and `dofile` raises — the same shapes
+  /// the real ones use.
+  using FileReader = std::function<std::optional<std::string>(const std::string& path)>;
+  void SetFileReader(FileReader reader);
+
+  /// Drop the reader **without touching Lua** — no `dofile`/`loadfile` removal,
+  /// no protected write, and therefore nothing that can throw.
+  ///
+  /// Exists for teardown. `SetFileReader(nullptr)` removes the overrides through
+  /// RunProtected, which throws under an exhausted maxMemory or a raising
+  /// `__newindex` on `_G`; from a detach path that runs before `lua_close` (or
+  /// from a destructor) that exception has nowhere to go and reaches N-API,
+  /// which is the CR-6 F1 process-abort class. The invariants' core-call-guarding
+  /// check flagged exactly that when the file reader was first added.
+  ///
+  /// Safe to skip the removal there because the state those globals live on is
+  /// about to be destroyed or replaced: there is nothing left to remove them
+  /// from.
+  void DropFileReader();
+
   // Bytecode / untrusted-chunk guard (E3): when disabled, load_bytecode() is
   // rejected and Lua's load() is forced to text-only mode (binary chunks fail).
   void SetAllowBytecode(bool allow);
@@ -537,11 +647,19 @@ public:
   ///     `__add` keeps working on derived instances.
   ///   Property access (readable/writable) is per-instance and set by the
   ///   constructor, so it is not inherited — each class states its own.
+  /// statics: class-level entries placed on the class *table* rather than the
+  ///   instance metatable — `ClassName.count`, `ClassName.from_json(...)`.
+  ///   Functions (is_function) become host-function closures; other entries are
+  ///   set as plain values. They are deliberately **not** inherited: `extends`
+  ///   is documented as governing how Lua resolves names on an *instance*, and
+  ///   the class table has no metatable, so there is no lookup chain on it to
+  ///   extend. `new` is reserved and rejected by the binding.
   void RegisterClass(const std::string& class_name,
       const std::string& constructor_func_name,
       const std::unordered_map<std::string, std::string>& method_map,
       const std::vector<MetatableEntry>& metamethods,
-      const std::string& parent_class_name = "") const;
+      const std::string& parent_class_name = "",
+      const std::vector<MetatableEntry>& statics = {}) const;
 
   // HasClass was removed (CR-12 F5): it had no callers, and the one caller
   // proposed for it — register_class's duplicate check — is wrong. A
@@ -934,6 +1052,11 @@ private:
   // capture list fits libc++'s small-buffer optimization, which is an
   // implementation detail rather than a guarantee (CR-9 F4).
   std::shared_ptr<OutputHandler> output_handler_;  // null = stdout
+  // Held behind shared_ptr for the same reason output_handler_ is: a handler
+  // that clears itself mid-call must not destroy the std::function executing
+  // right now (CR-9 F4).
+  std::shared_ptr<InputHandler> input_handler_;    // null = real stdin
+  std::shared_ptr<FileReader> file_reader_;        // null = real filesystem
   bool allow_bytecode_ = true;          // false = reject binary chunks
 
   // Hands `text` to the output handler, if one is installed and this is not a
@@ -946,6 +1069,10 @@ private:
 
   // Coroutine-driven async (main-thread promise awaiting) state
   bool await_driver_mode_ = false;  // true while execute_async is driving
+  // Set at the exact site that issues an await-yield, cleared at the start of
+  // each ResumeAsyncStep. Reported as AsyncStepResult::awaited — see there for
+  // why the binding must not infer this instead.
+  bool await_yield_issued_ = false;
   bool await_pending_ = false;      // set by a host call that returned a promise
   bool await_is_error_ = false;     // next resume delivers a rejection to raise
   // The specific coroutine thread execute_async drives. A host call that returns
@@ -1143,6 +1270,19 @@ private:
   void InstallOutputRedirection() const;
   static int LuaPrint(lua_State* L);
   static int LuaIoWrite(lua_State* L);
+  // io.read wrapper (P4a). Upvalue 1 is the original io.read, used whenever no
+  // handler is installed.
+  static int LuaIoRead(lua_State* L);
+  void InstallInputRedirection() const;
+  [[nodiscard]] std::optional<std::string> DispatchInput(const LuaPtr& format) const;
+  // dofile / loadfile over the file reader (P4b).
+  static int LuaLoadFile(lua_State* L);
+  static int LuaDoFile(lua_State* L);
+  void InstallFileReader() const;
+  void RemoveFileReaderOverrides() const;
+  [[nodiscard]] std::optional<std::string> DispatchFileRead(const std::string& path) const;
+  // Shared body of both overrides; a member so it can reach DispatchFileRead.
+  static int LoadFromReader(lua_State* L, const LuaRuntime* runtime, const char* path);
   static int SafeLoad(lua_State* L);
   static int JsSearcher(lua_State* L);
 };

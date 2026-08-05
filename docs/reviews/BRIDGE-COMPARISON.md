@@ -286,6 +286,23 @@ Sub-capabilities, roughly in dependency order:
   properties })` producing a Lua table with a `.new`/`__call` that invokes the JS
   constructor and returns method-bound userdata. Builds directly on the existing
   userdata + method-table machinery.
+
+  > **Correction, August 5, 2026.** The `properties` key described here **did not
+  > ship with C1** and did not exist until August 2026. What shipped were the
+  > per-instance `readable` / `writable` booleans; there were no named accessors.
+  > This document was wrong on the day it was written, which is worth recording
+  > separately from the usual kind of staleness: `reviews/` is safe to keep
+  > because each file "only claims what was true on its date"
+  > ([`docs/README.md`](../README.md)), and that guarantee did not hold here.
+  >
+  > `properties: Record<string, { get?, set? }>` landed August 5, 2026 as P2b of
+  > `INTEROP-PARITY-PLAN`, alongside `statics` — the other half of the C++
+  > usertype bar this section sets and neither of which C1–C4 delivered. Neither
+  > gap was noticed by any of the audit passes this document records, because
+  > every one of them checked whether the *listed* items were implemented rather
+  > than whether the list was complete — the July 14 verification audit below
+  > even cites `properties` as confirmed evidence for C1–C3 (see the matching
+  > correction there).
 - **C2. Type-level metatable** — one shared metatable per class (methods,
   `__index`/`__newindex`, `__gc`), rather than per-instance wiring. More
   efficient and the standard pattern.
@@ -407,6 +424,11 @@ A full pass over `src/lua-native.cpp`, `src/core/lua-runtime.cpp`, and
 | C1–C3 class binding | `register_class` with constructor wrapper, shared metatable, methods, properties, metamethods |
 | D1–D3 error fidelity | Structured JS-error tables cross the boundary; `luaL_traceback` message handler on `lua_pcall` and coroutine resume; `pcall()` exposed to JS |
 | E1–E3 I/O | `set_print_handler`, `add_searcher`, `allowBytecode` option all present |
+
+> **Correction, August 5, 2026.** The C1–C3 row cites `properties` as confirmed
+> evidence. No `properties` key existed on July 14 (or until August 5, 2026);
+> what the audit actually confirmed were the `readable` / `writable` booleans.
+> See the correction at §C1 for what shipped and when.
 
 The audit also surfaced **three previously untracked findings**, folded into the
 matrix below:

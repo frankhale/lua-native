@@ -5698,7 +5698,7 @@ describe('lua-native Node adapter', () => {
         local ok, err = coroutine.resume(co)
         if not ok then error(err) end
         return err
-      `)).rejects.toThrow(/inside a coroutine/);
+      `)).rejects.toThrow(/coroutine this run is not driving/);
       // Context is not wedged.
       expect(lua.is_busy()).toBe(false);
       expect(lua.execute_script('return 1')).toBe(1);
@@ -10601,14 +10601,22 @@ describe('lua-native Node adapter', () => {
       expect(lua.execute_script('return math.floor(3.7) .. "/" .. ("x"):rep(2)')).toBe('3/xx');
     });
 
-    it('checked-not-a-limitation: for await works without Symbol.asyncIterator', async () => {
+    // Superseded by P1b (August 5, 2026). The old claim — "for await works
+    // through JS's sync-iterable fallback, so Symbol.asyncIterator is not
+    // needed" — was true and was also the reason a coroutine could not await a
+    // host Promise: the fallback drives the *synchronous* cursor. The pin now
+    // records the replacement fact.
+    it('for await binds to Symbol.asyncIterator, not the sync fallback', async () => {
       const lua: any = new lua_native.init({}, ALL_LIBS);
       const co = lua.create_coroutine(
         'return function() coroutine.yield(1) coroutine.yield(2) end');
-      expect(co[Symbol.asyncIterator]).toBeUndefined();
+      expect(typeof co[Symbol.asyncIterator]).toBe('function');
       const seen: any[] = [];
       for await (const v of co) seen.push(v);
-      expect(seen).toEqual([1, 2]);   // JS falls back to Symbol.iterator
+      expect(seen).toEqual([1, 2]);
+      // The sync iterator is still there, and still independent: each call mints
+      // its own cursor over the one thread.
+      expect(typeof co[Symbol.iterator]).toBe('function');
     });
 
     it('checked-not-a-limitation: __close works via set_metatable', () => {
@@ -10855,6 +10863,865 @@ describe('lua-native Node adapter', () => {
         expect(() => sync.execute_script('error("plain")')).toThrow(/plain/);
         const driver: any = new lua_native.init({}, ALL_LIBS);
         await expect(driver.execute_async('error("plain")')).rejects.toThrow(/plain/);
+      });
+    });
+  });
+
+
+  // ==========================================================================
+  // INTEROP-PARITY-PLAN (August 5, 2026) — P1a, P1b, P2, P3, P4
+  //
+  // Every item here closed a *uniformity* gap rather than a capability gap:
+  // something that worked through one door and not its siblings. The tests are
+  // written to pin the agreement between doors, not only the new door's own
+  // behaviour — a test that only exercised the new call would pass just as
+  // happily if the old one drifted.
+  // ==========================================================================
+  describe('INTEROP-PARITY-PLAN', () => {
+
+    describe('P2a: register_class statics', () => {
+      const withPlayer = (extra: any = {}) => {
+        let made = 0;
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Player', {
+          construct: (name: string) => { made++; return { name, hp: 100 }; },
+          statics: { count: () => made, VERSION: '1.2.0', LIMITS: { max: 99 } },
+          methods: { describe: (self: any) => `${self.name}` },
+          ...extra,
+        });
+        return lua;
+      };
+
+      it('exposes a static function on the class table', () => {
+        const lua = withPlayer();
+        expect(lua.execute_script('Player.new("a") Player.new("b") return Player.count()')).toBe(2);
+      });
+
+      it('exposes static values, converted once at registration', () => {
+        const lua = withPlayer();
+        expect(lua.execute_script('return Player.VERSION')).toBe('1.2.0');
+        expect(lua.execute_script('return Player.LIMITS.max')).toBe(99);
+      });
+
+      it('a static is a snapshot, not a live view of the JS property', () => {
+        const src = { n: 1 };
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('C', { construct: () => ({}), statics: { n: src.n } });
+        src.n = 2;
+        expect(lua.execute_script('return C.n')).toBe(1);
+      });
+
+      it('statics live on the class, not on instances', () => {
+        const lua = withPlayer();
+        expect(lua.execute_script('local p = Player.new("a") return tostring(p.VERSION)')).toBe('nil');
+      });
+
+      it("rejects a static named 'new'", () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.register_class('C', {
+          construct: () => ({}), statics: { new: () => 1 },
+        })).toThrow(/static 'new' is reserved/);
+      });
+
+      it('a rejected definition registers nothing — the name stays free', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.register_class('C', {
+          construct: () => ({}), statics: { new: () => 1 },
+        })).toThrow(/static 'new' is reserved/);
+        // The reservation must have rolled back (CR-8 F3), so a retry works.
+        expect(() => lua.register_class('C', { construct: () => ({ a: 1 }) })).not.toThrow();
+        expect(lua.execute_script('return type(C.new())')).toBe('userdata');
+      });
+
+      it('statics are NOT inherited through extends', () => {
+        const lua = withPlayer();
+        lua.register_class('Mage', { extends: 'Player', construct: () => ({ name: 'm', hp: 1 }) });
+        expect(lua.execute_script('return tostring(Mage.VERSION)')).toBe('nil');
+        // ...while methods still are, so this is a deliberate difference and
+        // not inheritance being broken.
+        expect(lua.execute_script('return Mage.new():describe()')).toBe('m');
+      });
+
+      it('survives reset only by re-registration — like every other class', () => {
+        const lua = withPlayer();
+        lua.reset();
+        expect(lua.execute_script('return tostring(Player)')).toBe('nil');
+      });
+    });
+
+    describe('P2b: register_class property accessors', () => {
+      const mk = () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('Player', {
+          construct: (name: string) => ({ _name: name, _hp: 100, _secret: null }),
+          properties: {
+            hp: {
+              get: (self: any) => self._hp,
+              set: (self: any, v: any) => {
+                if (v < 0) throw new Error('hp must be >= 0');
+                self._hp = v;
+              },
+            },
+            name: { get: (self: any) => self._name },
+            secret: { set: (self: any, v: any) => { self._secret = v; } },
+          },
+          methods: { describe: (self: any) => `${self._name}@${self._hp}` },
+        });
+        return lua;
+      };
+
+      it('a getter runs on read', () => {
+        expect(mk().execute_script('return Player.new("Link").hp')).toBe(100);
+      });
+
+      it('a setter runs on write', () => {
+        expect(mk().execute_script('local p = Player.new("Link") p.hp = 42 return p.hp')).toBe(42);
+      });
+
+      it('accessors win over readable/writable, which are not set here', () => {
+        // No `readable`/`writable` on the definition at all: the only reachable
+        // properties are the declared ones. That is the point of P2b.
+        const lua = mk();
+        expect(lua.execute_script('return tostring(Player.new("Link")._hp)')).toBe('nil');
+      });
+
+      it('a get-only property is read-only', () => {
+        expect(mk().execute_script(
+          'local p = Player.new("Link") local ok, e = pcall(function() p.name = "x" end) return tostring(e)'))
+          .toMatch(/property 'name' of class 'Player' is read-only/);
+      });
+
+      it('a set-only property is write-only', () => {
+        expect(mk().execute_script(
+          'local p = Player.new("Link") local ok, e = pcall(function() return p.secret end) return tostring(e)'))
+          .toMatch(/property 'secret' of class 'Player' is write-only/);
+      });
+
+      it('a throwing setter reaches the script', () => {
+        expect(mk().execute_script(
+          'local p = Player.new("Link") local ok, e = pcall(function() p.hp = -1 end) return tostring(e)'))
+          .toMatch(/hp must be >= 0/);
+      });
+
+      it('a throwing getter reaches the script, even on a class with methods', () => {
+        // The narrowing of ClassIndex's catch to PropertyAccessDenied. Before
+        // it, ANY getter exception on an object with methods became nil —
+        // indistinguishable from an absent field.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('C', {
+          construct: () => ({}),
+          properties: { boom: { get: () => { throw new Error('kaboom'); } } },
+          methods: { m: () => 1 },
+        });
+        expect(lua.execute_script(
+          'local c = C.new() local ok, e = pcall(function() return c.boom end) return tostring(e)'))
+          .toMatch(/kaboom/);
+      });
+
+      it('a not-readable userdata with methods still answers nil, not an error', () => {
+        // The other half of the same narrowing: the access-policy refusal keeps
+        // its documented nil behaviour.
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_userdata('u', { a: 1 }, { readable: false, methods: { m: () => 1 } });
+        expect(lua.execute_script('return tostring(u.a)')).toBe('nil');
+      });
+
+      it('a throwing getter on plain proxy userdata also reaches the script', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_userdata('u', { get boom(): any { throw new Error('ud kaboom'); } },
+          { readable: true, methods: { m: () => 1 } });
+        expect(lua.execute_script(
+          'local ok, e = pcall(function() return u.boom end) return tostring(e)'))
+          .toMatch(/ud kaboom/);
+      });
+
+      it('a method shadows an accessor of the same name', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.register_class('C', {
+          construct: () => ({}),
+          properties: { thing: { get: () => 'accessor' } },
+          methods: { thing: () => 'method' },
+        });
+        expect(lua.execute_script('return C.new():thing()')).toBe('method');
+      });
+
+      it('accessors ARE inherited through extends', () => {
+        const lua = mk();
+        lua.register_class('Mage', {
+          extends: 'Player',
+          construct: (n: string) => ({ _name: n, _hp: 50 }),
+          methods: { cast: () => 'zap' },
+        });
+        expect(lua.execute_script('return Mage.new("g").hp')).toBe(50);
+        expect(lua.execute_script('local m = Mage.new("g") m.hp = 7 return m.hp')).toBe(7);
+        expect(lua.execute_script('return Mage.new("g").name')).toBe('g');
+      });
+
+      it('a derived class may override an inherited accessor', () => {
+        const lua = mk();
+        lua.register_class('Ghost', {
+          extends: 'Player',
+          construct: (n: string) => ({ _name: n, _hp: 1 }),
+          properties: { hp: { get: () => 0 } },
+        });
+        expect(lua.execute_script('return Ghost.new("g").hp')).toBe(0);
+        expect(lua.execute_script('return Player.new("p").hp')).toBe(100);
+      });
+
+      it('rejects a malformed property definition', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => lua.register_class('A', { construct: () => ({}), properties: { x: 5 } }))
+          .toThrow(/must be an object with 'get' and\/or 'set'/);
+        expect(() => lua.register_class('B', { construct: () => ({}), properties: { x: {} } }))
+          .toThrow(/declares neither 'get' nor 'set'/);
+      });
+
+      it('accessors are dropped by reset, with the classes they belong to', () => {
+        const lua = mk();
+        lua.reset();
+        // Re-registering the same name must work, and must not see stale
+        // accessors from the previous generation.
+        lua.register_class('Player', { construct: () => ({ _hp: 5 }), readable: true });
+        expect(lua.execute_script('return Player.new()._hp')).toBe(5);
+      });
+    });
+
+    describe('P1a: call_async', () => {
+      const mk = () => {
+        const lua: any = new lua_native.init({
+          fetchName: async (id: number) => { await new Promise(r => setTimeout(r, 1)); return `user-${id}`; },
+          double: (x: number) => x * 2,
+        }, ALL_LIBS);
+        lua.execute_script(`
+          function greet(id, suffix) return fetchName(id) .. (suffix or ""), double(21) end
+          tbl = { nested = function(a) return fetchName(a) .. "!" end }
+          notafn = 5
+        `);
+        return lua;
+      };
+
+      it('awaits a host Promise inside a function called by name', async () => {
+        expect(await mk().call_async('greet', 7, '?')).toEqual(['user-7?', 42]);
+      });
+
+      it('accepts a dotted path, like call()', async () => {
+        expect(await mk().call_async('tbl.nested', 3)).toBe('user-3!');
+      });
+
+      it('awaits inside a LuaFunction held only on the JS side', async () => {
+        // The capability hole: this function is not reachable by name, so the
+        // execute_async workaround does not apply to it at all.
+        const lua = mk();
+        const fn = lua.execute_script('return function(id) return fetchName(id) .. "/held" end');
+        expect(await lua.call_async(fn, 9)).toBe('user-9/held');
+      });
+
+      it('the synchronous call() still refuses a Promise, pointing at the async doors', () => {
+        expect(() => mk().call('greet', 1)).toThrow(/returned a Promise/);
+        expect(() => mk().call('greet', 1)).toThrow(/call_async/);
+      });
+
+      it('rejects rather than throws for every failure past validation', async () => {
+        const lua = mk();
+        await expect(lua.call_async('nosuch')).rejects.toThrow(/is not a function/);
+        await expect(lua.call_async('notafn')).rejects.toThrow(/is not a function/);
+        await expect(lua.call_async('tbl..nested')).rejects.toThrow(/path segments must be non-empty/);
+      });
+
+      it('throws synchronously only for a bad argument type', () => {
+        expect(() => mk().call_async(5)).toThrow(/requires a global name or a Lua function/);
+        expect(() => mk().call_async(() => 1)).toThrow(/plain JavaScript function/);
+      });
+
+      it('a Lua error becomes a rejection', async () => {
+        const lua = mk();
+        lua.execute_script('function boom() error("kaboom") end');
+        await expect(lua.call_async('boom')).rejects.toThrow(/kaboom/);
+      });
+
+      it('a rejected host Promise propagates', async () => {
+        const lua: any = new lua_native.init(
+          { failing: async () => { throw new Error('nope'); } }, ALL_LIBS);
+        lua.execute_script('function f() return failing() end');
+        await expect(lua.call_async('f')).rejects.toThrow(/nope/);
+      });
+
+      it('is one-run-at-a-time, like execute_async', async () => {
+        const lua = mk();
+        const p = lua.call_async('greet', 1);
+        expect(() => lua.call_async('greet', 2)).toThrow(/busy with an async operation/);
+        await p;
+        expect(lua.is_busy()).toBe(false);
+      });
+
+      it('cancel() rejects it and leaves the context usable', async () => {
+        const lua: any = new lua_native.init({ never: () => new Promise(() => {}) }, ALL_LIBS);
+        lua.execute_script('function hangs() return never() end');
+        const p = lua.call_async('hangs');
+        lua.cancel();
+        await expect(p).rejects.toThrow(/execution cancelled/);
+        expect(lua.is_busy()).toBe(false);
+        expect(lua.execute_script('return 1')).toBe(1);
+      });
+
+      it('refuses a callable table, exactly as call() does', async () => {
+        const lua = mk();
+        lua.execute_script('callable = setmetatable({}, { __call = function() return 1 end })');
+        expect(() => lua.call('callable')).toThrow(/is not a function/);
+        await expect(lua.call_async('callable')).rejects.toThrow(/is not a function/);
+      });
+
+      it('refuses a function from another context', async () => {
+        const a = mk();
+        const b: any = new lua_native.init({}, ALL_LIBS);
+        const fn = a.execute_script('return function() return 1 end');
+        await expect(b.call_async(fn)).rejects.toThrow(/different Lua context/);
+      });
+
+      it('refuses a released function', async () => {
+        const lua = mk();
+        const fn = lua.execute_script('return function() return 1 end');
+        lua.release(fn);
+        await expect(lua.call_async(fn)).rejects.toThrow(/has been released/);
+      });
+
+      it('a bare coroutine.yield is still an error, and names resume_async', async () => {
+        const lua = mk();
+        lua.execute_script('function y() coroutine.yield(1) end');
+        await expect(lua.call_async('y')).rejects.toThrow(/resume_async/);
+        expect(lua.is_busy()).toBe(false);
+      });
+    });
+
+    describe('P1b: resume_async', () => {
+      const mk = () => {
+        const lua: any = new lua_native.init({
+          fetchUser: async (id: number) => { await new Promise(r => setTimeout(r, 1)); return `user-${id}`; },
+          bump: (x: number) => x + 1,
+        }, ALL_LIBS);
+        return lua;
+      };
+      const body = `
+        return function(start)
+          start = start or 1
+          for i = start, start + 2 do
+            coroutine.yield(fetchUser(i), bump(i))
+          end
+          return "finished"
+        end
+      `;
+
+      it('a user coroutine can await a host Promise', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine(body);
+        expect(await lua.resume_async(co, 10))
+          .toEqual({ status: 'suspended', values: ['user-10', 11] });
+        expect(await lua.resume_async(co))
+          .toEqual({ status: 'suspended', values: ['user-11', 12] });
+      });
+
+      it('the synchronous resume() still cannot — the gap this closes', () => {
+        const lua = mk();
+        const co = lua.create_coroutine(body);
+        expect(lua.resume(co, 1).error).toMatch(/returned a Promise/);
+      });
+
+      it('runs to completion and reports dead', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine(body);
+        for (let i = 0; i < 3; i++) await lua.resume_async(co, 1);
+        expect(await lua.resume_async(co)).toEqual({ status: 'dead', values: ['finished'] });
+      });
+
+      it('resolves with the same shape resume() returns, error included', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine('return function() error("inner boom") end');
+        const r = await lua.resume_async(co);
+        // Reported in the result, not thrown — matching resume() exactly.
+        expect(r.status).toBe('dead');
+        expect(r.error).toMatch(/inner boom/);
+      });
+
+      it('a rejected host Promise arrives as the result error', async () => {
+        const lua: any = new lua_native.init(
+          { failing: async () => { throw new Error('host nope'); } }, ALL_LIBS);
+        const co = lua.create_coroutine('return function() return failing() end');
+        expect((await lua.resume_async(co)).error).toMatch(/host nope/);
+      });
+
+      it('updates the coroutine object status, like resume()', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine(body);
+        await lua.resume_async(co, 1);
+        expect(co.status).toBe('suspended');
+      });
+
+      it('a coroutine nested inside it still cannot await, and says so', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine(`
+          return function()
+            local inner = coroutine.create(function() return fetchUser(1) end)
+            local ok, err = coroutine.resume(inner)
+            coroutine.yield(tostring(err))
+          end
+        `);
+        const r = await lua.resume_async(co);
+        expect(r.values[0]).toMatch(/coroutine this run is not driving/);
+      });
+
+      it('a refused nested await does not misbind the next plain yield', async () => {
+        // The stale-pending-promise defect. The stash is written before the
+        // core decides whether this thread is the driven one, so a refused
+        // await left a promise that the next yield was read as.
+        const lua = mk();
+        const co = lua.create_coroutine(`
+          return function()
+            local inner = coroutine.create(function() return fetchUser(99) end)
+            coroutine.resume(inner)
+            coroutine.yield("a plain yield")
+            coroutine.yield("and another")
+          end
+        `);
+        expect((await lua.resume_async(co)).values).toEqual(['a plain yield']);
+        expect((await lua.resume_async(co)).values).toEqual(['and another']);
+      });
+
+      it('cancel() leaves the caller\'s coroutine suspended and resumable', async () => {
+        // The distinguishing contract: the thread is the caller's, so
+        // abandoning the run may not release it.
+        const lua: any = new lua_native.init({ never: () => new Promise(() => {}) }, ALL_LIBS);
+        const co = lua.create_coroutine(
+          'return function() coroutine.yield(1) never() coroutine.yield(2) end');
+        expect((await lua.resume_async(co)).values).toEqual([1]);
+        const p = lua.resume_async(co);
+        lua.cancel();
+        await expect(p).rejects.toThrow(/execution cancelled/);
+        expect(lua.is_busy()).toBe(false);
+        expect(co.status).toBe('suspended');
+        // Still drivable afterwards — the whole point. It resumes at the
+        // abandoned await (which delivers nil, since nothing settled it) and
+        // runs on to the next yield.
+        expect(lua.resume(co)).toMatchObject({ status: 'suspended', values: [2] });
+      });
+
+      it('is one-run-at-a-time', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine(body);
+        const p = lua.resume_async(co, 1);
+        expect(() => lua.resume_async(co)).toThrow(/busy with an async operation/);
+        await p;
+      });
+
+      it('refuses a coroutine from another context', async () => {
+        const lua = mk();
+        const other: any = new lua_native.init({}, ALL_LIBS);
+        await expect(other.resume_async(lua.create_coroutine(body)))
+          .rejects.toThrow(/different Lua context/);
+      });
+
+      it('refuses a released coroutine', async () => {
+        const lua = mk();
+        const co = lua.create_coroutine(body);
+        lua.release(co);
+        await expect(lua.resume_async(co)).rejects.toThrow(/has been released/);
+      });
+
+      it('rejects a non-coroutine object', () => {
+        expect(() => mk().resume_async({})).toThrow(/Invalid coroutine object/);
+        expect(() => mk().resume_async()).toThrow(/requires a coroutine object/);
+      });
+    });
+
+    describe('P1b: Symbol.asyncIterator', () => {
+      const mk = () => new (lua_native as any).init({
+        fetchUser: async (id: number) => { await new Promise(r => setTimeout(r, 1)); return `user-${id}`; },
+      }, ALL_LIBS);
+      const body = `
+        return function()
+          for i = 1, 3 do coroutine.yield(fetchUser(i)) end
+          return "done"
+        end
+      `;
+
+      it('for await drives a coroutine that awaits', async () => {
+        const lua: any = mk();
+        const seen: any[] = [];
+        for await (const v of lua.create_coroutine(body)) seen.push(v);
+        expect(seen).toEqual(['user-1', 'user-2', 'user-3']);
+      });
+
+      it('the final return is discarded, as the generator contract requires', async () => {
+        const lua: any = mk();
+        const seen: any[] = [];
+        for await (const v of lua.create_coroutine(body)) seen.push(v);
+        expect(seen).not.toContain('done');
+      });
+
+      it('breaking out leaves the coroutine suspended and resumable', async () => {
+        const lua: any = mk();
+        const co = lua.create_coroutine(body);
+        const seen: any[] = [];
+        for await (const v of co) { seen.push(v); if (seen.length === 2) break; }
+        expect(seen).toEqual(['user-1', 'user-2']);
+        expect(co.status).toBe('suspended');
+        expect((await lua.resume_async(co)).values).toEqual(['user-3']);
+      });
+
+      it('each call mints an independent cursor over the one thread', async () => {
+        const lua: any = mk();
+        const co = lua.create_coroutine(body);
+        const a = co[Symbol.asyncIterator]();
+        const b = co[Symbol.asyncIterator]();
+        expect((await a.next()).value).toBe('user-1');
+        expect((await b.next()).value).toBe('user-2');   // same thread, next step
+      });
+
+      it('an already-dead coroutine ends the iteration rather than erroring', async () => {
+        const lua: any = mk();
+        const co = lua.create_coroutine(body);
+        for await (const _ of co) { /* drain */ }
+        const seen: any[] = [];
+        for await (const v of co) seen.push(v);
+        expect(seen).toEqual([]);
+      });
+
+      it('a Lua error inside the coroutine rejects the iteration', async () => {
+        const lua: any = mk();
+        const co = lua.create_coroutine('return function() error("iter boom") end');
+        await expect((async () => { for await (const _ of co) { /* */ } })())
+          .rejects.toThrow(/iter boom/);
+      });
+
+      it('a cursor whose method was destructured still works', async () => {
+        // The state is shared_ptr-owned and every root holds its own copy, so a
+        // detached `next` keeps it alive (H3 / L6).
+        const lua: any = mk();
+        const it = lua.create_coroutine(body)[Symbol.asyncIterator]();
+        const { next } = it;
+        expect((await next.call(it)).value).toBe('user-1');
+      });
+
+      it('a pending step survives dropping the iterator that made it', async () => {
+        // The mapper closure can outlive `next` and the iterator; it roots the
+        // cursor state itself for exactly this case.
+        const lua: any = mk();
+        let it: any = lua.create_coroutine(body)[Symbol.asyncIterator]();
+        const p = it.next();
+        it = null;
+        global.gc?.();
+        expect((await p).value).toBe('user-1');
+      });
+
+      it('the synchronous iterator is still present and still synchronous', () => {
+        const lua: any = mk();
+        const co = lua.create_coroutine(
+          'return function() coroutine.yield(1) coroutine.yield(2) end');
+        expect([...co]).toEqual([1, 2]);
+      });
+    });
+
+    describe('P3: close(coroutine)', () => {
+      const mk = (notes: string[]) => {
+        const lua: any = new lua_native.init(
+          { note: (s: string) => { notes.push(s); } }, ALL_LIBS);
+        return lua;
+      };
+      const body = `
+        return function()
+          local guard <close> = setmetatable({}, { __close = function() note("closed") end })
+          for i = 1, 5 do coroutine.yield(i) end
+        end
+      `;
+
+      it('runs a suspended coroutine\'s to-be-closed variables', () => {
+        const notes: string[] = [];
+        const lua = mk(notes);
+        const co = lua.create_coroutine(body);
+        lua.resume(co);
+        expect(notes).toEqual([]);
+        lua.close(co);
+        expect(notes).toEqual(['closed']);
+        expect(co.status).toBe('dead');
+      });
+
+      it('covers the case the iterator contract creates: break, then close', () => {
+        const notes: string[] = [];
+        const lua = mk(notes);
+        const co = lua.create_coroutine(body);
+        for (const v of co) { if (v === 2) break; }
+        expect(co.status).toBe('suspended');
+        expect(notes).toEqual([]);         // the resource is still held
+        lua.close(co);
+        expect(notes).toEqual(['closed']);
+      });
+
+      it('is idempotent', () => {
+        const notes: string[] = [];
+        const lua = mk(notes);
+        const co = lua.create_coroutine(body);
+        lua.resume(co);
+        lua.close(co);
+        lua.close(co);
+        expect(notes).toEqual(['closed']);
+      });
+
+      it('is a no-op on a coroutine that already ran to completion', () => {
+        const notes: string[] = [];
+        const lua = mk(notes);
+        const co = lua.create_coroutine(body);
+        for (const _ of co) { /* drain */ }
+        expect(notes).toEqual(['closed']);   // Lua closed it on normal exit
+        expect(() => lua.close(co)).not.toThrow();
+        expect(notes).toEqual(['closed']);
+      });
+
+      it('a resume after close reports dead', () => {
+        const lua = mk([]);
+        const co = lua.create_coroutine(body);
+        lua.resume(co);
+        lua.close(co);
+        expect(lua.resume(co).status).toBe('dead');
+      });
+
+      it('a throwing __close surfaces, and the thread is still dead', () => {
+        const lua: any = new lua_native.init(
+          { boom: () => { throw new Error('close failed'); } }, ALL_LIBS);
+        const co = lua.create_coroutine(`
+          return function()
+            local g <close> = setmetatable({}, { __close = function() boom() end })
+            coroutine.yield(1)
+          end
+        `);
+        lua.resume(co);
+        expect(() => lua.close(co)).toThrow(/close failed/);
+        expect(co.status).toBe('dead');
+      });
+
+      it('release() still does not close — the two stay orthogonal', () => {
+        const notes: string[] = [];
+        const lua = mk(notes);
+        const co = lua.create_coroutine(body);
+        lua.resume(co);
+        lua.release(co);
+        expect(notes).toEqual([]);
+        // And closing a released coroutine is a silent no-op: there is no
+        // pending state a caller could still be responsible for.
+        expect(() => lua.close(co)).not.toThrow();
+        expect(notes).toEqual([]);
+      });
+
+      it('refuses a coroutine from another context', () => {
+        const lua = mk([]);
+        const other: any = new lua_native.init({}, ALL_LIBS);
+        expect(() => other.close(lua.create_coroutine(body)))
+          .toThrow(/different Lua context/);
+      });
+
+      it('refuses a non-coroutine object, including a mislabelled marker', () => {
+        const lua = mk([]);
+        expect(() => lua.close({})).toThrow(/Invalid coroutine object/);
+        expect(() => lua.close()).toThrow(/requires a coroutine object/);
+        // A genuine External of the wrong kind must not be reinterpreted
+        // (CR-15 F6).
+        const handle = lua.create_table({ a: 1 });
+        expect(() => lua.close({ _coroutine: (handle as any)._tableRef }))
+          .toThrow(/Invalid coroutine object/);
+      });
+    });
+
+    describe('P4a: set_read_handler', () => {
+      const mk = (lines: string[]) => {
+        let i = 0;
+        const seen: any[] = [];
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_read_handler((fmt: any) => {
+          seen.push(fmt);
+          return i < lines.length ? lines[i++] : null;
+        });
+        return { lua, seen };
+      };
+
+      it('routes io.read() to the handler, defaulting to the line format', () => {
+        const { lua, seen } = mk(['Ada']);
+        expect(lua.execute_script('return io.read()')).toBe('Ada');
+        expect(seen).toEqual(['l']);
+      });
+
+      it('converts the "n" format to a number', () => {
+        const { lua } = mk(['42']);
+        expect(lua.execute_script('return io.read("n")')).toBe(42);
+      });
+
+      it('yields nil for an unparseable "n"', () => {
+        const { lua } = mk(['not a number']);
+        expect(lua.execute_script('return tostring(io.read("n"))')).toBe('nil');
+      });
+
+      it('strips the Lua 5.3 "*" prefix so a handler sees one spelling', () => {
+        const { lua, seen } = mk(['x']);
+        lua.execute_script('return io.read("*l")');
+        expect(seen).toEqual(['l']);
+      });
+
+      it('passes a byte count through as a number', () => {
+        const { lua, seen } = mk(['x']);
+        lua.execute_script('return io.read(5)');
+        expect(seen).toEqual([5]);
+      });
+
+      it('calls the handler once per requested format', () => {
+        const { lua, seen } = mk(['a', 'b']);
+        expect(lua.execute_script('return {io.read("l", "l")}')).toEqual(['a', 'b']);
+        expect(seen).toEqual(['l', 'l']);
+      });
+
+      it('null means end-of-input and arrives as nil', () => {
+        const { lua } = mk([]);
+        expect(lua.execute_script('return tostring(io.read())')).toBe('nil');
+      });
+
+      it('an empty string is a line, not end-of-input', () => {
+        const { lua } = mk(['']);
+        expect(lua.execute_script('return tostring(io.read())')).toBe('');
+      });
+
+      it('a throwing handler surfaces as a Lua error', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_read_handler(() => { throw new Error('read boom'); });
+        expect(lua.execute_script('local ok, e = pcall(io.read) return tostring(e)'))
+          .toMatch(/read boom/);
+      });
+
+      it('clearing restores the original io.read without an unwrap step', () => {
+        const { lua } = mk(['x']);
+        lua.set_read_handler(null);
+        expect(lua.execute_script('return type(io.read)')).toBe('function');
+      });
+
+      it('re-installing does not stack wrappers', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_read_handler(() => 'a');
+        lua.set_read_handler(() => 'b');
+        lua.set_read_handler(null);
+        // If the second install had nested inside the first, "the original"
+        // would now be the first wrapper rather than the real io.read.
+        expect(lua.execute_script('return type(io.read)')).toBe('function');
+      });
+
+      it('is re-installed across reset()', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_read_handler(() => 'after-reset');
+        lua.reset();
+        expect(lua.execute_script('return io.read()')).toBe('after-reset');
+      });
+
+      it('is a documented no-op without the io library', () => {
+        const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
+        expect(() => lua.set_read_handler(() => 'x')).not.toThrow();
+        expect(lua.execute_script('return tostring(io)')).toBe('nil');
+      });
+    });
+
+    describe('P4b: set_file_reader', () => {
+      const mk = (files: Record<string, string>, opts: any = { libraries: 'sandbox' }) => {
+        const lua: any = new lua_native.init({}, opts);
+        lua.set_file_reader((p: string) =>
+          Object.prototype.hasOwnProperty.call(files, p) ? files[p] : null);
+        return lua;
+      };
+
+      it('brings dofile/loadfile back under the sandbox preset', () => {
+        const bare: any = new lua_native.init({}, { libraries: 'sandbox' });
+        expect(bare.execute_script('return tostring(dofile)')).toBe('nil');
+        const lua = mk({ '/a.lua': 'return 2' });
+        expect(lua.execute_script('return dofile("/a.lua")')).toBe(2);
+      });
+
+      it('loadfile returns a callable chunk', () => {
+        const lua = mk({ '/a.lua': 'return 1 + 1' });
+        expect(lua.execute_script('return loadfile("/a.lua")()')).toBe(2);
+      });
+
+      it('dofile passes every return value through', () => {
+        const lua = mk({ '/m.lua': 'return 1, 2, 3' });
+        expect(lua.execute_script('return {dofile("/m.lua")}')).toEqual([1, 2, 3]);
+      });
+
+      it('a missing file is nil+message from loadfile and a raise from dofile', () => {
+        const lua = mk({});
+        expect(lua.execute_script(
+          'local f, e = loadfile("/nope") return tostring(f) .. "|" .. tostring(e)'))
+          .toMatch(/^nil\|cannot open \/nope/);
+        expect(lua.execute_script('local ok, e = pcall(dofile, "/nope") return tostring(e)'))
+          .toMatch(/cannot open \/nope/);
+      });
+
+      it('never touches the real filesystem', () => {
+        // The rule that makes the behaviour non-data-dependent: with a reader
+        // installed, the reader is the only source.
+        const real = path.join(__dirname, '..', 'fixtures');
+        const lua = mk({});
+        expect(lua.execute_script(
+          `local ok, e = pcall(dofile, ${JSON.stringify(path.join(real, 'simple.lua'))}) return tostring(e)`))
+          .toMatch(/cannot open/);
+      });
+
+      it('an empty string is a valid empty file, not a missing one', () => {
+        const lua = mk({ '/empty.lua': '' });
+        // An empty chunk is valid and returns nothing — distinct from the
+        // raise a missing file produces.
+        expect(lua.execute_script('return select("#", dofile("/empty.lua"))')).toBe(0);
+      });
+
+      it('rejects bytecode, so a reader cannot route around allowBytecode', () => {
+        const compiler: any = new lua_native.init({}, ALL_LIBS);
+        const bc = compiler.compile('return 7').toString('latin1');
+        const lua = mk({ '/bc.lua': bc });
+        expect(lua.execute_script(
+          'local f, e = loadfile("/bc.lua") return tostring(f) .. "|" .. tostring(e)'))
+          .toMatch(/^nil\|.*binary chunk/);
+      });
+
+      it('reports a syntax error the way loadfile does', () => {
+        const lua = mk({ '/bad.lua': 'this is not lua' });
+        expect(lua.execute_script(
+          'local f, e = loadfile("/bad.lua") return tostring(f) .. "|" .. tostring(e)'))
+          .toMatch(/^nil\|\/bad\.lua:1:/);
+      });
+
+      it('requires a filename — there is no virtual stdin', () => {
+        const lua = mk({});
+        expect(lua.execute_script('local ok, e = pcall(dofile) return tostring(e)'))
+          .toMatch(/a filename is required/);
+      });
+
+      it('a throwing reader surfaces', () => {
+        const lua: any = new lua_native.init({}, { libraries: 'sandbox' });
+        lua.set_file_reader(() => { throw new Error('reader boom'); });
+        expect(lua.execute_script('local ok, e = pcall(dofile, "/x") return tostring(e)'))
+          .toMatch(/reader boom/);
+      });
+
+      it('is re-installed across reset()', () => {
+        const lua = mk({ '/a.lua': 'return 2' });
+        lua.reset();
+        expect(lua.execute_script('return dofile("/a.lua")')).toBe(2);
+      });
+
+      it('clearing removes the overrides', () => {
+        const lua = mk({ '/a.lua': 'return 2' });
+        lua.set_file_reader(null);
+        expect(lua.execute_script('return tostring(dofile) .. "/" .. tostring(loadfile)'))
+          .toBe('nil/nil');
+      });
+
+      it('leaves require() alone — that is add_searcher\'s job', () => {
+        const lua: any = new lua_native.init({}, ALL_LIBS);
+        lua.set_file_reader(() => 'return 1');
+        lua.add_searcher((name: string) => (name === 'virt' ? 'return "from searcher"' : null));
+        // Parenthesised: require returns the module plus its loader data in
+        // Lua 5.4+, and only the first is the point here.
+        expect(lua.execute_script('return (require("virt"))')).toBe('from searcher');
       });
     });
   });
