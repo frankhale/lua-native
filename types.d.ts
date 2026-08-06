@@ -1445,6 +1445,14 @@ export interface LuaContext {
    * library, the wrapper stays and falls through to the original `io.read`, as
    * before.
    *
+   * **"A table created this way" means that exact table.** If a script has
+   * since replaced the global — `io = { read = io.read, mine = 1 }` — that is
+   * the caller's value and is left alone; only the table this method itself
+   * created is taken back. Conversely a script that merely reassigns `io.read`
+   * inside our table does not save it: the table is still ours and still goes.
+   * Fields a script added to the synthesized table are lost with it, which is
+   * the intended trade — the table existed only to hold the handler.
+   *
    * **Returns whether `io.read` is now wired to the handler.** The only `false`
    * case is a global `io` that exists and is not a table (`io = 42`): that value
    * is the caller's, so it is left alone rather than overwritten, and the handler
@@ -1456,6 +1464,17 @@ export interface LuaContext {
    * surfaces as a Lua error (`io.read handler failed: …`), because a read that
    * failed has no sensible value to continue with, whereas a print that failed
    * does.
+   *
+   * **The `format` argument is always a `string` or a `number`, in every mode.**
+   * It is protocol metadata the binding mints (`'l'`, `'n'`, `'a'`, or a byte
+   * count), not a value out of the script, so {@link LuaContextOptions.binaryStrings}
+   * does not turn it into bytes — `format === 'n'` compares correctly under
+   * either setting. (It did not until August 6, 2026; see CR-23 F2.)
+   *
+   * **The handler may return a `Uint8Array`/`Buffer` as well as a string**, and
+   * its exact bytes reach Lua unchanged. That is the useful answer in a
+   * `binaryStrings` context and the only way to feed Lua a byte sequence that is
+   * not valid UTF-8.
    *
    * @param handler Called with each requested format, or `null` to clear
    * @returns `true` if `io.read` now reaches the handler
@@ -1473,7 +1492,8 @@ export interface LuaContext {
    * lua.execute_script('return type(io.open)');    // nil — still sealed
    */
   set_read_handler(
-    handler?: ((format: string | number) => string | null | undefined) | null): boolean;
+    handler?: ((format: string | number) =>
+      string | Uint8Array | ArrayBuffer | null | undefined) | null): boolean;
 
   /**
    * Resolves `dofile` and `loadfile` through a JavaScript callback instead of
@@ -1985,7 +2005,7 @@ export interface LuaInitOptions {
   /**
    * Refuse a conversion that would silently lose data, instead of performing it.
    *
-   * The four losses in `docs/LIMITATIONS.md` §5 that happen **silently** become
+   * The losses in `docs/LIMITATIONS.md` §5 that happen **silently** become
    * errors naming what would have been lost and what to do instead:
    *
    * | Direction | Refused under `strictConversion` |
@@ -1994,12 +2014,22 @@ export interface LuaInitOptions {
    * | JS → Lua | `null`/`undefined` as an **object value** (a nil removes the key rather than storing one) |
    * | Lua → JS | a table key that is neither string nor number (dropped — JS cannot key an object by boolean, table or function) |
    * | Lua → JS | a string key and a number key with the same text (`"1"` and `1` collapse to one property, and *which* value survives depends on table order) |
+   * | Lua → JS | a table key whose **bytes** are not valid UTF-8, or contain a NUL — each bad byte becomes U+FFFD and a NUL truncates the name, so two distinct Lua keys can collapse into one JS property |
    *
    * Everything else is untouched. The two §5 entries that were already loud — a
    * circular reference and nesting past 100 levels — still throw their own
    * messages, and the BigInt widening past ±(2^53−1) is a *type* change rather
    * than a loss, so it is not affected. Values kept on the Lua side behind a
    * {@link LuaContext.get_global_ref} handle never convert and so never refuse.
+   *
+   * **The byte-key row is about keys only, and deliberately.** A lossy string
+   * *value* is the separate question {@link binaryStrings} answers, and it
+   * answers it by carrying the bytes rather than by refusing — a remedy is
+   * better than an error whenever one exists. A key has no such switch, because
+   * a JS property name is a string in every mode, so a refusal is the only
+   * honest answer available. With both options on there is **no silent loss
+   * left in either direction**, which is the strongest statement this API can
+   * make about conversion.
    *
    * **All-or-nothing per context, deliberately** — the same rule
    * {@link binaryStrings} states, for the same reason. A mode that refused only
@@ -2016,6 +2046,7 @@ export interface LuaInitOptions {
    * lua.set_global('rows', [1, null, 3]);         // throws: would truncate at index 1
    * lua.set_global('rows', [1, false, 3]);        // fine — false is a present value
    * lua.execute_script('return {["1"]="a",[1]="b"}');  // throws: keys collide
+   * lua.execute_script('return {["\xFF"]="a"}');       // throws: key bytes are not UTF-8
    */
   strictConversion?: boolean;
   allowBytecode?: boolean;

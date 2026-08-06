@@ -10555,6 +10555,67 @@ describe('lua-native Node adapter', () => {
         expect(() => strict().execute_script('return {["1"]="s",[1]="i"}'))
           .toThrow(/strict conversion.*both become the JavaScript property "1".*one value would be lost/s);
       });
+
+      // CR-23 F1: the third member of the same class, and the one that was
+      // missing from the §5 enumeration the option was built from. A Lua key is
+      // bytes and a JS property name is text, so two byte sequences do not
+      // survive — and both lose a whole *entry*, not a byte.
+      describe('a key whose bytes cannot become a JS property name', () => {
+        it('collapses two binary keys into one by default, refuses under strict', () => {
+          // Two distinct Lua keys; both decode to U+FFFD, so one entry vanishes.
+          const back = lossy().execute_script('return {["\\xFF"]="a", ["\\xFE"]="b"}');
+          expect(Object.keys(back)).toHaveLength(1);
+          expect(() => strict().execute_script('return {["\\xFF"]="a", ["\\xFE"]="b"}'))
+            .toThrow(/strict conversion.*not valid UTF-8.*U\+FFFD.*collapse into one/s);
+        });
+
+        it('refuses a single non-UTF-8 key too — a mangled key is already a loss', () => {
+          expect(Object.keys(lossy().execute_script('return {["k\\xFF"]="v"}'))).toEqual(['k�']);
+          expect(() => strict().execute_script('return {["k\\xFF"]="v"}'))
+            .toThrow(/strict conversion.*not valid UTF-8/s);
+        });
+
+        it('refuses an embedded NUL key, which truncates rather than replaces', () => {
+          // "a\0b" arrives as the property "a", colliding with a real "a".
+          expect(lossy().execute_script('return {["a\\0b"]="v1", ["a"]="v2"}'))
+            .toEqual({ a: 'v1' });
+          expect(() => strict().execute_script('return {["a\\0b"]="v1"}'))
+            .toThrow(/strict conversion.*embedded NUL is truncated/s);
+        });
+
+        // Measured, not assumed: each of these is replaced with U+FFFD on the
+        // way out, so each is a real loss and refusing it refuses nothing that
+        // would have survived.
+        it('counts overlong encodings and lone surrogates as losses', () => {
+          expect(() => strict().execute_script('return {["\\xC0\\xAF"]="v"}'))
+            .toThrow(/not valid UTF-8/);
+          expect(() => strict().execute_script('return {["\\xED\\xA0\\x80"]="v"}'))
+            .toThrow(/not valid UTF-8/);
+        });
+
+        // The other half of the property, and the more important one: a refusal
+        // that fired on keys which *do* survive would be a false alarm shipped
+        // as behaviour.
+        it('accepts every key that survives the crossing unchanged', () => {
+          const lua = strict();
+          expect(lua.execute_script(
+            'return {["café"]=1, ["日本"]=2, ["\\xF0\\x9F\\x98\\x80"]=3, ["plain"]=4, [7]=5}'))
+            .toEqual({ café: 1, 日本: 2, '😀': 3, plain: 4, 7: 5 });
+        });
+
+        it('points at the escape hatch that actually works', () => {
+          // handle.pairs() converts keys as *values*, so binaryStrings carries
+          // them byte-for-byte and nothing collides. This is what the refusal
+          // message tells the caller to do, so it has to be true.
+          const lua: any = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
+          lua.execute_script('t = {["\\xFF"]="a", ["\\xFE"]="b"}');
+          const h = lua.get_global_ref('t');
+          const keys = [...h.pairs()].map(([k]: any[]) => [...k]);
+          expect(keys).toHaveLength(2);
+          expect(keys).toEqual(expect.arrayContaining([[255], [254]]));
+          h.release();
+        });
+      });
     });
 
     describe('JS -> Lua: nil in a container', () => {
@@ -10640,6 +10701,45 @@ describe('lua-native Node adapter', () => {
       const lua = strict();
       lua.reset();
       expect(() => lua.execute_script('return {[true]=1}')).toThrow(/strict conversion/);
+    });
+
+    // CR-23 F5. ResumeAsyncStep is the shared floor under three doors, and its
+    // vocabulary is the resume machinery's. call_async's *first* step is the one
+    // place that is wrong: those values are the caller's arguments.
+    describe('names the operation the caller actually performed', () => {
+      it('call_async reports an argument, not a resume value', async () => {
+        const lua = strict();
+        lua.execute_script('function id(x) return x end');
+        await expect(lua.call_async('id', [1, null, 3]))
+          .rejects.toThrow(/^Error converting argument: strict conversion/);
+      });
+
+      it('resume_async still reports a resume value, because that is what it is', async () => {
+        const lua = strict();
+        const co = lua.create_coroutine('return function(x) return x end');
+        const res = await lua.resume_async(co, [1, null, 3]);
+        expect(res.error).toMatch(/^Error converting resume value: strict conversion/);
+      });
+
+      it('an awaited promise settling to a lossy value is still a resume value', async () => {
+        const lua = strict();
+        lua.set_global('slow', () => Promise.resolve([1, null, 3]));
+        await expect(lua.execute_async('return slow()'))
+          .rejects.toThrow(/Error converting resume value: strict conversion/);
+      });
+    });
+
+    // The statable property both options together deliver, and the reason the
+    // byte-key refusal is scoped to keys: values have a remedy, keys do not.
+    it('with binaryStrings there is no silent loss left in either direction', () => {
+      const lua: any = new lua_native.init({},
+        { libraries: 'all', strictConversion: true, binaryStrings: true });
+      // values: exact bytes, no refusal needed
+      expect([...lua.execute_script('return string.pack("i4", -2)')]).toEqual([254, 255, 255, 255]);
+      // keys: refused rather than mangled
+      expect(() => lua.execute_script('return {["\\xFF"]="a"}')).toThrow(/strict conversion/);
+      // and the structural losses stay refused
+      expect(() => lua.set_global('a', [1, null, 3])).toThrow(/strict conversion/);
     });
 
     it('is off by default and rejects a non-boolean rather than ignoring it', () => {
@@ -11826,6 +11926,44 @@ describe('lua-native Node adapter', () => {
           lua.set_read_handler(null);
           expect(lua.execute_script('return tostring(io)')).toBe('nil');
         });
+
+        // CR-23 F3. "Ours" is the identity of the table this class created, not
+        // whether our C function is still sitting in the `read` field. The old
+        // test got both of these backwards, and each direction is a separate
+        // defect: one destroys a value the caller owns, the other strands a
+        // table in a sealed context that can never be removed again.
+        describe('removal takes back the table it created, and only that table', () => {
+          it("leaves a caller's own replacement table alone", () => {
+            const lua = sealed();
+            lua.set_read_handler(() => 'x');
+            // The script keeps our wrapper but puts it in a table it built.
+            lua.execute_script('io = { read = io.read, mine = 1 }');
+            expect(lua.set_read_handler(null)).toBe(true);
+            expect(lua.execute_script('return type(io)')).toBe('table');
+            expect(lua.execute_script('return io.mine')).toBe(1);
+          });
+
+          it('still removes our table after a script overwrites io.read', () => {
+            const lua = sealed();
+            lua.set_read_handler(() => 'x');
+            lua.execute_script('io.read = function() return "mine" end');
+            expect(lua.set_read_handler(null)).toBe(true);
+            expect(lua.execute_script('return tostring(io)')).toBe('nil');
+          });
+
+          // The consequence of getting the previous case wrong: the tracking was
+          // cleared for a removal that never happened, so the table outlived
+          // every later attempt to take it back.
+          it('does not strand a table across install / overwrite / remove cycles', () => {
+            const lua = sealed();
+            for (let i = 0; i < 3; i++) {
+              expect(lua.set_read_handler(() => 'h')).toBe(true);
+              lua.execute_script('io.read = function() return "mine" end');
+              expect(lua.set_read_handler(null)).toBe(true);
+              expect(lua.execute_script('return tostring(io)')).toBe('nil');
+            }
+          });
+        });
       });
 
       // A real io library keeps the old semantics exactly: the wrapper stays
@@ -11855,6 +11993,57 @@ describe('lua-native Node adapter', () => {
         // reset() replays retained handlers; nothing should be replayed here.
         lua.reset();
         expect(lua.execute_script('return tostring(io)')).toBe('nil');
+      });
+
+      // CR-23 F2. The format token is metadata the binding mints, so it must not
+      // be affected by an option about what Lua *strings* become — the declared
+      // signature says `string | number` and every documented example compares
+      // it with ===. The file reader's path argument was always minted directly;
+      // these two channels now agree.
+      describe('the format token and the return value under binaryStrings', () => {
+        const bin = () => new lua_native.init({}, { libraries: 'all', binaryStrings: true }) as any;
+
+        it('passes the format as a string, not as bytes', () => {
+          const lua = bin();
+          const seen: any[] = [];
+          lua.set_read_handler((fmt: any) => { seen.push(fmt); return 'x'; });
+          lua.execute_script('io.read("n")');
+          lua.execute_script('io.read("a")');
+          lua.execute_script('io.read()');
+          expect(seen).toEqual(['n', 'a', 'l']);
+          expect(seen.every((s) => typeof s === 'string')).toBe(true);
+        });
+
+        it('passes a byte-count format as a number', () => {
+          const lua = bin();
+          let seen: any;
+          lua.set_read_handler((fmt: any) => { seen = fmt; return 'xxxxx'; });
+          lua.execute_script('io.read(5)');
+          expect(seen).toBe(5);
+        });
+
+        it('accepts a Uint8Array return as exact bytes', () => {
+          const lua = bin();
+          lua.set_read_handler(() => new Uint8Array([0xff, 0x41, 0x00]));
+          expect(lua.execute_script('local s = io.read() return {string.byte(s, 1, -1)}'))
+            .toEqual([255, 65, 0]);
+        });
+
+        it('accepts bytes in the default mode too — the inbound path always did', () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          lua.set_read_handler(() => new Uint8Array([0xfe, 0x42]));
+          expect(lua.execute_script('local s = io.read() return {string.byte(s, 1, -1)}'))
+            .toEqual([254, 66]);
+        });
+
+        it('leaves a string return and the default mode unchanged', () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          const seen: any[] = [];
+          lua.set_read_handler((fmt: any) => { seen.push(fmt); return fmt === 'n' ? '42' : 'text'; });
+          expect(lua.execute_script('return io.read()')).toBe('text');
+          expect(lua.execute_script('return io.read("n")')).toBe(42);
+          expect(seen).toEqual(['l', 'n']);
+        });
       });
     });
 

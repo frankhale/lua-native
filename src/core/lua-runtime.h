@@ -418,8 +418,18 @@ public:
       const std::string& script) const;
   // Resumes the async coroutine one step. `args` are the values to resume with
   // (the resolved promise value, or the rejection message when arg_is_error).
+  //
+  // `arg_role` names those values in the one error message that can mention
+  // them, and exists because this method is the shared floor under three doors
+  // that call their inputs different things (CR-23 F5). The *first* step of a
+  // `call_async` is resuming a coroutine with what the caller passed as call
+  // **arguments**, and reporting a conversion failure there as a bad "resume
+  // value" attributed it to an operation the caller never performed. Every
+  // later step really is a resume — the awaited promise's result — so the
+  // default is the right answer for all but the opening call.
   [[nodiscard]] AsyncStepResult ResumeAsyncStep(const LuaThreadRef& threadRef,
-      const std::vector<LuaPtr>& args, bool arg_is_error);
+      const std::vector<LuaPtr>& args, bool arg_is_error,
+      const char* arg_role = "resume value");
   /// Close a coroutine (P3): run its pending to-be-closed variables
   /// (`local x <close> = …`) and mark the thread dead, over `lua_closethread`.
   ///
@@ -1117,12 +1127,23 @@ private:
   // that clears itself mid-call must not destroy the std::function executing
   // right now (CR-9 F4).
   std::shared_ptr<InputHandler> input_handler_;    // null = real stdin
-  // True once InstallInputRedirection created the `io` table itself (a bare or
-  // 'sandbox' state). Gates the removal, so clearing the handler only ever takes
-  // back a table this class put there — the "only clear what is still ours" rule
-  // RemoveFileReaderOverrides states. A fresh LuaRuntime starts false, and
-  // reset() builds a fresh one, so it cannot survive a state it does not describe.
-  bool io_synthesized_ = false;
+  // A registry ref to the `io` table InstallInputRedirection created itself (a
+  // bare or 'sandbox' state), or LUA_NOREF when there was a real io library to
+  // wrap. Gates the removal, so clearing the handler only ever takes back a
+  // table this class put there — the "only clear what is still ours" rule
+  // RemoveFileReaderOverrides states.
+  //
+  // **A ref rather than a bool, because the question is identity** (CR-23 F3).
+  // The bool version had to re-derive "is this still ours" from the contents,
+  // and the only available test — is `io.read` still our C function — answers a
+  // different question: a caller can wrap our function in their own table, and a
+  // script can overwrite the field in ours. Holding the table itself makes the
+  // comparison exact and independent of anything the script does to it.
+  //
+  // A fresh LuaRuntime starts at LUA_NOREF and reset() builds a fresh one, so it
+  // cannot survive a state it does not describe; the ref dies with the registry
+  // it indexes.
+  int io_synthesized_ref_ = LUA_NOREF;
   std::shared_ptr<FileReader> file_reader_;        // null = real filesystem
   bool allow_bytecode_ = true;          // false = reject binary chunks
 

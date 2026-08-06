@@ -146,6 +146,65 @@ int ProtectedToString(lua_State* L) {  // [value] -> [string]
   luaL_tolstring(L, 1, nullptr);
   return 1;
 }
+
+// How a Lua table key fares on the way to being a JavaScript property name.
+//
+// A Lua key is a byte string; a JS property name is text. Two byte sequences
+// therefore do not survive the crossing, and **both lose a whole table entry
+// rather than mangling one byte** — which is what makes them a §5 structural
+// loss rather than the §2 representation one:
+//
+//   * an embedded NUL — the property is named from a NUL-terminated C string,
+//     so `"a\0b"` arrives as the property `"a"`, and a table holding both keys
+//     comes back with one entry;
+//   * anything that is not *strictly* valid UTF-8 — each bad byte decodes to
+//     U+FFFD, so `"\xFF"` and `"\xFE"` become the **same** property and one
+//     value is discarded. Which one survives depends on lua_next order, the
+//     same unpredictability the number/string collision has.
+//
+// "Strictly" is load-bearing and was settled by driving each case rather than
+// by reading the spec: overlong encodings (`C0 AF`) and WTF-8 lone surrogates
+// (`ED A0 80`) are *also* replaced with U+FFFD on the way out — the lone
+// surrogate becomes three of them — so they are losses too, even though the
+// surrogate case survives in the JS->Lua direction and is documented as
+// surviving there. Accepting them here would refuse nothing and lose data
+// anyway; refusing a sequence that actually round-trips would be worse still,
+// so the predicate is exactly the set measured to arrive unchanged.
+//
+// This asks a different question from `luaL_checkstring`-style validation: not
+// "is this text" but "does this survive the crossing byte-for-byte".
+enum class KeyCrossing { Exact, EmbeddedNul, NotUtf8 };
+
+KeyCrossing ClassifyKeyCrossing(const std::string& key) {
+  if (key.find('\0') != std::string::npos) return KeyCrossing::EmbeddedNul;
+  const auto* p = reinterpret_cast<const unsigned char*>(key.data());
+  const auto* const end = p + key.size();
+  while (p < end) {
+    if (*p < 0x80) {  // ASCII, the overwhelmingly common case, one branch
+      ++p;
+      continue;
+    }
+    int len = 0;
+    unsigned int cp = 0;
+    if ((*p & 0xE0) == 0xC0) { len = 2; cp = *p & 0x1FU; }
+    else if ((*p & 0xF0) == 0xE0) { len = 3; cp = *p & 0x0FU; }
+    else if ((*p & 0xF8) == 0xF0) { len = 4; cp = *p & 0x07U; }
+    else return KeyCrossing::NotUtf8;  // a continuation byte or 0xF8+ leads nothing
+    if (end - p < len) return KeyCrossing::NotUtf8;  // truncated at the end
+    for (int i = 1; i < len; ++i) {
+      if ((p[i] & 0xC0) != 0x80) return KeyCrossing::NotUtf8;
+      cp = (cp << 6U) | (p[i] & 0x3FU);
+    }
+    // Overlong: a code point encoded in more bytes than it needs. Rejected
+    // because the decoder does, and because it is the classic way to smuggle a
+    // byte past a check that compares encoded forms.
+    static constexpr unsigned int kMinForLen[] = {0, 0, 0x80, 0x800, 0x10000};
+    if (cp < kMinForLen[len] || cp > 0x10FFFF) return KeyCrossing::NotUtf8;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return KeyCrossing::NotUtf8;  // lone surrogate
+    p += len;
+  }
+  return KeyCrossing::Exact;
+}
 } // namespace
 
 int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
@@ -1804,7 +1863,7 @@ std::optional<std::string> LuaRuntime::DispatchInput(const LuaPtr& format) const
 
 bool LuaRuntime::InstallInputRedirection() {
   bool wired = true;
-  bool synthesized = false;
+  int synthesized_ref = LUA_NOREF;
   RunProtected([&]() {
     lua_getglobal(L_, "io");
     if (lua_isnil(L_, -1)) {
@@ -1823,8 +1882,16 @@ bool LuaRuntime::InstallInputRedirection() {
       lua_pushnil(L_);
       lua_pushcclosure(L_, LuaIoRead, 1);
       lua_setfield(L_, -2, "read");
+      // Remember the table *by identity*, not by what is in it (CR-23 F3). The
+      // removal below has to answer "is the thing installed now the thing I
+      // created", and no property of the contents answers that: a script can
+      // replace `io.read` in our table (so the wrapper is absent from a table
+      // that is still ours) or build its own table around our wrapper (so the
+      // wrapper is present in a table that is not). Both happen, and the
+      // function-identity test got both backwards.
+      lua_pushvalue(L_, -1);                             // copy to remember by
+      synthesized_ref = luaL_ref(L_, LUA_REGISTRYINDEX);  // pops the copy
       lua_setglobal(L_, "io");
-      synthesized = true;
       return;
     }
     if (!lua_istable(L_, -1)) {
@@ -1841,7 +1908,7 @@ bool LuaRuntime::InstallInputRedirection() {
     // make "the original" one level deeper each time — the stacking hazard
     // SetAllowBytecode guards against by the same test. This also covers
     // re-installing over a table synthesized by an earlier call, which must not
-    // clear io_synthesized_ below.
+    // disturb io_synthesized_ref_ below.
     if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaIoRead) {
       lua_pop(L_, 2);
       return;
@@ -1850,36 +1917,52 @@ bool LuaRuntime::InstallInputRedirection() {
     lua_setfield(L_, -2, "read");
     lua_pop(L_, 1);  // pop io
   });
-  // Only ever set, never cleared here: an install that found the wrapper already
-  // present says nothing about who created the table it lives in.
-  if (synthesized) io_synthesized_ = true;
+  // Adopted only on the path that actually created a table, and only after
+  // RunProtected returned — it throws rather than returning, so reaching here
+  // means the ref is real. An install that found the wrapper already present
+  // says nothing about who created the table it lives in, so it leaves the
+  // existing tracking alone.
+  if (synthesized_ref != LUA_NOREF) io_synthesized_ref_ = synthesized_ref;
   return wired;
 }
 
 void LuaRuntime::RemoveInputRedirection() {
-  if (!io_synthesized_) return;  // a real io library: the wrapper stays and falls through
+  // LUA_NOREF = we never created a table here, so there is a real io library and
+  // the wrapper stays and falls through to the original io.read.
+  if (io_synthesized_ref_ == LUA_NOREF) return;
   RunProtected([&]() {
     // Only take back what is still ours, the rule RemoveFileReaderOverrides
     // states: the caller may have replaced `io` in the meantime, and removing a
-    // handler is not a licence to undo that. A script that added fields to the
-    // synthesized table does lose them, which is correct — the table's whole
-    // reason to exist was the handler being removed here.
+    // handler is not a licence to undo that.
+    //
+    // "Ours" is settled by comparing the installed table with the one this
+    // class created — `lua_rawequal`, so a `__eq` metamethod cannot answer the
+    // question for us. Testing `io.read == LuaIoRead` instead was wrong in both
+    // directions (CR-23 F3): `io = { read = io.read, mine = 1 }` builds the
+    // caller's own table around our wrapper and used to be destroyed here, and
+    // a script that merely reassigned `io.read` made this decline to remove a
+    // table that *was* ours while clearing the flag that tracked it — stranding
+    // an `io` table in a sealed context that could never be removed again.
+    //
+    // A script that added fields to the synthesized table still loses them, and
+    // that is still correct — the table's whole reason to exist was the handler
+    // being removed here.
     lua_getglobal(L_, "io");
-    if (!lua_istable(L_, -1)) {
-      lua_pop(L_, 1);
-      return;
-    }
-    lua_getfield(L_, -1, "read");
-    const bool ours = lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == LuaIoRead;
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, io_synthesized_ref_);
+    const bool ours = lua_rawequal(L_, -1, -2);
     lua_pop(L_, 2);
     if (!ours) return;
     lua_pushnil(L_);
     lua_setglobal(L_, "io");
   });
-  // Cleared only after the removal succeeded. RunProtected throws rather than
-  // returning, so reaching this line means `io` is gone and a later install must
-  // synthesize afresh.
-  io_synthesized_ = false;
+  // Reached only if RunProtected returned rather than threw, so the decision
+  // above was actually made. The ref is dropped either way — whether the table
+  // was removed or had already been replaced by the caller, this runtime is done
+  // tracking it, and a later install finds `io` nil (or the caller's) and does
+  // the right thing from there. A throw leaves the ref in place, which is what
+  // keeps a failed removal from being remembered as a completed one.
+  luaL_unref(L_, LUA_REGISTRYINDEX, io_synthesized_ref_);
+  io_synthesized_ref_ = LUA_NOREF;
 }
 
 int LuaRuntime::LuaIoRead(lua_State* L) {
@@ -3240,6 +3323,39 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
           lua_pop(L, 1);
           continue;
         }
+        // A key whose *bytes* cannot become a JS property name (CR-23 F1). The
+        // check is here rather than at the binding's decode for the reason the
+        // two checks around it are here: this is the one place that knows the
+        // key is a key, and refusing before the map is built means nothing has
+        // been lost yet. It is reached only for string keys — a number key is
+        // rendered by lua_tostring above and is ASCII by construction — and it
+        // pays a scan per string key only under the mode, since StrictConversion
+        // is asked first.
+        //
+        // Deliberately *not* extended to string **values**. A lossy value is
+        // §2's representation question and it has a remedy — `binaryStrings`
+        // hands back the exact bytes — whereas a key has no such switch, because
+        // a JS property name is a string in every mode. So the two halves of the
+        // same byte problem get the two different answers their situations
+        // allow: values get a mode that carries them, keys get a refusal that
+        // names them. With both options on there is no silent loss left in
+        // either direction, which is the property §5 now states.
+        if (key_type == LUA_TSTRING && StrictConversion(L)) {
+          if (const KeyCrossing crossing = ClassifyKeyCrossing(key);
+              crossing != KeyCrossing::Exact) {
+            throw std::runtime_error(
+              std::string("strict conversion: a Lua table key containing ")
+              + (crossing == KeyCrossing::EmbeddedNul
+                   ? "an embedded NUL is truncated at that byte"
+                   : "bytes that are not valid UTF-8 has each of them replaced "
+                     "with U+FFFD")
+              + " when it becomes a JavaScript property name, so two distinct "
+                "keys can collapse into one and a value would be lost. Read the "
+                "table in place with get_global_ref() — handle.pairs() converts "
+                "keys as values, so with binaryStrings they arrive as exact "
+                "bytes.");
+          }
+        }
         // emplace does not overwrite, so on a collision it is the *later* entry
         // that is discarded — and which one that is depends on lua_next order.
         // The two keys are distinct in Lua and the same JS property name: the
@@ -4113,7 +4229,7 @@ int LuaRuntime::AsyncContinuation(lua_State* L, int status, lua_KContext ctx) {
 }
 
 AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
-    const std::vector<LuaPtr>& args, bool arg_is_error) {
+    const std::vector<LuaPtr>& args, bool arg_is_error, const char* arg_role) {
   AsyncStepResult result;
 
   if (!threadRef.thread) {
@@ -4161,7 +4277,9 @@ AsyncStepResult LuaRuntime::ResumeAsyncStep(const LuaThreadRef& threadRef,
       }
     } catch (const std::exception& e) {
       result.state = AsyncStepResult::State::Error;
-      std::string msg = "Error converting resume value: ";
+      std::string msg = "Error converting ";
+      msg += arg_role;  // "argument" on call_async's first step; see the header
+      msg += ": ";
       msg += e.what();
       result.error = msg;
       return result;

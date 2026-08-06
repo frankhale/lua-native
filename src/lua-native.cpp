@@ -3354,7 +3354,8 @@ const lua_core::LuaThreadRef& LuaContext::AsyncDrivenThread() const {
 }
 
 Napi::Value LuaContext::BeginAsyncRun(const Napi::Object& self,
-                                      std::vector<lua_core::LuaPtr> args) {
+                                      std::vector<lua_core::LuaPtr> args,
+                                      const char* arg_role) {
   is_busy_ = true;
   ++async_generation_;  // invalidate any stale settlement from a prior run
   js_error_registry_.clear();
@@ -3372,7 +3373,9 @@ Napi::Value LuaContext::BeginAsyncRun(const Napi::Object& self,
   async_self_ref_ = Napi::Persistent(self);
 
   Napi::Promise promise = async_deferred_->Promise();
-  DriveAsync(args, false);
+  // The opening step, so `arg_role` describes what the *caller* handed over —
+  // "argument" for call_async, resume values for the other two doors (CR-23 F5).
+  DriveAsync(args, false, arg_role);
   return promise;
 }
 
@@ -3497,7 +3500,9 @@ Napi::Value LuaContext::CallAsync(const Napi::CallbackInfo& info) {
   // Binding-owned, like execute_async: the thread wraps the target function
   // for this call alone and nothing else refers to it.
   async_co_.emplace(std::move(*thread));
-  return BeginAsyncRun(info.This().As<Napi::Object>(), std::move(args));
+  // These are the caller's call arguments, not resume values — the one door
+  // where the shared machinery's default vocabulary is wrong (CR-23 F5).
+  return BeginAsyncRun(info.This().As<Napi::Object>(), std::move(args), "argument");
 }
 
 // Data passed to the await-settlement callbacks: the context plus the generation
@@ -3524,7 +3529,8 @@ struct AwaitCookie {
 };
 }  // namespace
 
-void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error) {
+void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error,
+                            const char* arg_role) {
   // Mark the resume window so a cancel() arriving re-entrantly from a host
   // callback defers its teardown until after the coroutine leaves the C stack
   // (see Cancel()). Tearing down here would free the running coroutine. RAII so
@@ -3537,7 +3543,7 @@ void LuaContext::DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_e
   lua_core::AsyncStepResult step;
   {
     ResumeFlag resuming(async_resuming_);
-    step = runtime->ResumeAsyncStep(AsyncDrivenThread(), args, is_error);
+    step = runtime->ResumeAsyncStep(AsyncDrivenThread(), args, is_error, arg_role);
   }
 
   // Honor a cancel() that arrived during the resume, now that the coroutine has
@@ -4425,8 +4431,28 @@ bool LuaContext::InstallReadHandler(const Napi::Function& fn) {
       // read loop does not accumulate them.
       Napi::HandleScope scope(env);
       Napi::Value result;
+      // The format token is protocol metadata *this binding mints* — "l", "n",
+      // "a", or a byte count — not a value coming out of the script, so it is
+      // built directly instead of being run through the value converter
+      // (CR-23 F2). Under `binaryStrings` that converter answers every string
+      // with a Uint8Array, which turned the documented `format === 'l'`
+      // comparison into one that silently never matches and contradicted the
+      // declared `format: string | number` signature. `set_file_reader` already
+      // minted its path argument directly (`Napi::String::New`) for exactly this
+      // reason; the two channels carry the same kind of token and now behave the
+      // same way.
+      Napi::Value format_js = env.Undefined();
+      if (format) {
+        if (const auto* spec = std::get_if<std::string>(&format->value)) {
+          format_js = Napi::String::New(env, *spec);
+        } else if (const auto* count = std::get_if<double>(&format->value)) {
+          format_js = Napi::Number::New(env, *count);
+        } else if (const auto* n = std::get_if<int64_t>(&format->value)) {
+          format_js = Napi::Number::New(env, static_cast<double>(*n));
+        }
+      }
       try {
-        result = read_handler_.Call({format ? CoreToNapi(*format) : env.Undefined()});
+        result = read_handler_.Call({format_js});
       } catch (const Napi::Error& e) {
         // Re-thrown with the message extracted here rather than left to the
         // core's `e.what()`: for a non-Error throw (`throw "boom"`) what() is
@@ -4442,6 +4468,17 @@ bool LuaContext::InstallReadHandler(const Napi::Function& fn) {
       // answer this codebase keeps out.
       if (result.IsNull() || result.IsUndefined() || result.IsBoolean()) {
         return std::nullopt;
+      }
+      // Bytes are taken as bytes (CR-23 F2). `ToString()` on a Uint8Array is
+      // `Array.prototype.toString` — comma-joined decimals — so handing back the
+      // exact thing a `binaryStrings` context reads everywhere else fed Lua the
+      // six-character *text* "255,65". Accepted in every mode rather than only
+      // under the option: a handler that returns a byte view is being explicit,
+      // and the inbound conversion path (B1) has always turned
+      // Buffer/TypedArray/ArrayBuffer into a binary-safe Lua string. This makes
+      // the one input channel agree with it.
+      if (result.IsBuffer() || result.IsTypedArray() || result.IsArrayBuffer()) {
+        return BinaryBytesToString(result);
       }
       return result.ToString().Utf8Value();
     });

@@ -5,7 +5,12 @@ was true on its date, kept for reasoning and provenance. If you are looking for
 what to do, what is covered, or what to run, that is
 [`../CORRECTNESS.md`](../CORRECTNESS.md).
 
-- `CODE-REVIEW-1.md` … `CODE-REVIEW-22.md` — one per pass, in order.
+- `CODE-REVIEW-1.md` … `CODE-REVIEW-23.md` — one per pass, in order. CR-23
+  (August 6, 2026) is the second exercise of the new-surface trigger, over the
+  post-closure option surface (`sandbox`, `binaryStrings`, `strictConversion`,
+  the `set_read_handler` rewiring). All five findings resolved; it added the
+  **mode** axis to `roundtrip-matrix` and the mode row to `CORRECTNESS.md`
+  §15.6, which the trigger table had been missing.
 - `CODE-REVIEW-HISTORY.md` — the reasoning trail (three parts). Superseded on
   its recommendations.
 - `CODE-REVIEW-LEDGER.md` — disposition ledger, CR-1–14, audited at CR-8. Cited

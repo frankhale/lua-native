@@ -117,10 +117,23 @@ const lua = new lua_native.init({}, { libraries: 'all', binaryStrings: true });
 lua.execute_script('return string.pack("i4", -2)');   // → Uint8Array [254,255,255,255]
 ```
 
-Every Lua string comes back as a `Uint8Array` of its exact bytes. Values
-round-trip (a `Uint8Array` passed back in was already a Lua byte string), and
-**table keys are unaffected** — a JS property key is a string either way. Text
-is decoded by the caller: `new TextDecoder().decode(bytes)`.
+Every Lua string comes back as a `Uint8Array` of its exact bytes. Text is
+decoded by the caller: `new TextDecoder().decode(bytes)`.
+
+**Binary data round-trips exactly in this mode**, which is the one built-in
+conversion that stops being one-way: a `Uint8Array` goes in as a binary-safe Lua
+string and comes back as the same bytes. Verified at all eighteen doors by the
+`binary` mode of `npm run roundtrip-matrix`, where it is the single value that
+contradicts `LuaInput`'s blanket "the built-ins are one-way" and is ledgered as
+such.
+
+**Table keys are unaffected by the option — which is not the same as being
+safe.** A JS property name is a string in every mode, so a key is decoded as
+text whatever this is set to. A key whose bytes are not valid UTF-8 is therefore
+still mangled, and can still collapse two entries into one; that is §5's byte-key
+row, and the answer there is `strictConversion` (a refusal) plus `handle.pairs()`
+(which converts keys as *values*, so under this option they arrive as exact
+bytes). The two options together leave no silent loss in either direction.
 
 **All-or-nothing per context, deliberately.** Returning bytes *only* when the
 decode would have been lossy is the obvious-looking design and is the one to
@@ -190,11 +203,37 @@ document is a complete answer to "what should I not rely on". Full detail is on
 | JS → Lua | a circular reference is refused; nesting past 100 levels is refused | no — throws |
 | Lua → JS | a table key that is neither string nor number is dropped | **yes** |
 | Lua → JS | a string key and an integer key with the same text collide | **yes** |
+| Lua → JS | a table key whose **bytes** are not valid UTF-8, or contain a NUL, cannot become a JS property name | **yes** |
 | Lua → JS | an integer outside ±(2^53−1) arrives as a `BigInt`, so `typeof` is not stable | no — a type change, visible |
+
+**The byte-key row was added August 6, 2026 (CR-23 F1)**, and it is the nastiest
+of the five because it can lose an entire entry without either key looking
+unusual:
+
+```js
+lua.execute_script('return {["\xFF"]="a", ["\xFE"]="b"}')
+// → { "�": "a" }   — two distinct Lua keys, one JS property, one value gone
+
+lua.execute_script('return {["a\0b"]="v1", ["a"]="v2"}')
+// → { "a": "v1" }       — the NUL key truncates onto the plain one
+```
+
+A JS property name is *text*; a Lua key is *bytes*. Anything not strictly valid
+UTF-8 has each bad byte replaced with U+FFFD (including overlong encodings and
+lone surrogates — `"\xED\xA0\x80"` comes back as three replacement characters),
+and an embedded NUL truncates the name there. Either way two keys can land on
+one property, and which value survives depends on table order.
+
+**`binaryStrings` does not help here, and §2's "table keys are unaffected" is
+about the mode, not about safety** — a key is decoded as text in every mode,
+which is exactly why this row exists and why the answer for keys is a refusal
+rather than a switch. The remedy that does work is
+[`handle.pairs()`](TABLE-REFERENCE.md): it converts keys as *values*, so under
+`binaryStrings` both keys arrive as exact `Uint8Array`s and nothing collides.
 
 ### The fix: `strictConversion: true` (added August 5, 2026)
 
-The four **silent** rows can be refused instead of performed:
+The **silent** rows can be refused instead of performed:
 
 ```js
 const lua = new lua_native.init({}, { libraries: 'all', strictConversion: true });
@@ -208,6 +247,11 @@ lua.execute_script('return {["1"]="a",[1]="b"}');
 // throws: the Lua table keys 1 (number) and "1" (string) both become the
 //         JavaScript property "1", so one value would be lost. Read the table
 //         in place with get_global_ref() to keep both.
+
+lua.execute_script('return {["\xFF"]="a"}');
+// throws: a Lua table key containing bytes that are not valid UTF-8 has each of
+//         them replaced with U+FFFD when it becomes a JavaScript property name,
+//         so two distinct keys can collapse into one and a value would be lost.
 ```
 
 Each message names what would have been lost and what to do instead. The two
@@ -215,9 +259,18 @@ rows that already throw keep their own messages — strict mode does not relabel
 them — and the `BigInt` row is untouched, because a type change the caller can
 see is not the thing this option is for.
 
-**Refused uniformly at all eighteen entry points** a value can cross at, checked
-against `tools/roundtrip-matrix/doors.mjs`. A mode honoured by `set_global` but
-not by a Lua function argument would be worse than no mode at all.
+**Refused uniformly at all eighteen entry points** a value can cross at. A mode
+honoured by `set_global` but not by a Lua function argument would be worse than
+no mode at all — so this is *checked*, not asserted: `npm run roundtrip-matrix`
+runs its whole corpus through every door in `tools/roundtrip-matrix/doors.mjs`
+under this mode as well as the default, and a door that answered differently
+from its seventeen siblings would be a parity disagreement.
+
+**That check dates from August 6, 2026 (CR-23 F4).** The sentence above used to
+claim it while no such run existed — the suite hand-picked four of the eighteen
+doors, and the two it omitted were the two that push arguments on a worker
+thread. The property held when it was finally measured; the point is that it had
+been stated before it was.
 
 **All-or-nothing per context, deliberately** — the rule §2 states, for the reason
 §2 gives. A mode that refused only *some* lossy conversions would make behaviour

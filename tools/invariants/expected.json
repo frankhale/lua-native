@@ -111,13 +111,13 @@
   },
   "assertion-strength": {
     "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
-    "toThrow assertions examined": 419,
+    "toThrow assertions examined": 428,
     "negative (.not) — exempt by design": 37,
     "BARE positive assertions": 0
   },
   "exception-surface": {
     "throw sites (binding)": 31,
-    "throw sites (core)": 32,
+    "throw sites (core)": 33,
     "catch sites (binding)": 84,
     "catch sites (core)": 45,
     "RunProtected calls (core)": 36,
@@ -129,7 +129,7 @@
     "binding: static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value);": "declaration",
     "binding: NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)": "macro-invocation",
     "binding: unattributed": 0,
-    "core: functions found": 158,
+    "core: functions found": 159,
     "core: unattributed": 0
   },
   "core-call-guarding": {

@@ -845,9 +845,15 @@ private:
     // divergence P1 was reported for. The caller must have set exactly one of
     // `async_co_` (owned) or `async_borrowed_` + `async_coro_obj_` (borrowed)
     // beforehand.
+    // `arg_role` names `args` in a conversion-failure message and is forwarded
+    // to LuaRuntime::ResumeAsyncStep, whose header carries the reasoning: this
+    // is the opening step, so for call_async these are the caller's *arguments*
+    // rather than resume values (CR-23 F5).
     Napi::Value BeginAsyncRun(const Napi::Object& self,
-                              std::vector<lua_core::LuaPtr> args);
-    void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error);
+                              std::vector<lua_core::LuaPtr> args,
+                              const char* arg_role = "resume value");
+    void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error,
+                    const char* arg_role = "resume value");
     Napi::Value OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen);
     void FinishAsync();
 

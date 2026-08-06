@@ -247,7 +247,7 @@ Applying it to this codebase gives seven, and each has a generated search:
 
 | # | Boundary | The two rule-sets | Instrument |
 |---|---|---|---|
-| 1 | JS value → Lua | JS types / Lua types | `roundtrip-matrix` (12 doors × 50 values) |
+| 1 | JS value → Lua | JS types / Lua types | `roundtrip-matrix` (4 modes × 18 doors × 50 values) |
 | 2 | Lua value → JS | Lua types / JS types | `diff-oracle` mode B (1339 cases) |
 | 3 | Embedded VM → reference Lua | this VM's hooks / stock Lua | `diff-oracle` mode A (1339 cases) |
 | 4 | C++ exception → Lua C frame | C++ unwinding / Lua longjmp | `exception-matrix` (27 × 11, process/cell) |
@@ -345,6 +345,7 @@ is a trigger, and the trigger names the instrument to extend:
 | A new entry point that executes a script | `exec-parity` (a door) |
 | A new *asynchronous* entry point | both of the above — and check the door's own vacuity control proves it really awaits |
 | A new handle kind, or a new marker on a JS object | `lifecycle-matrix` (Axis A) **and** `cross-context` (handle cases) |
+| **A new option that changes conversion or VM rules** | **`roundtrip-matrix` (Axis C, a mode) — and `exec-parity` if it is execution-visible** |
 | A new Lua C frame that can call back into the host | `exception-matrix` (Axis B) |
 | A new `ObjectWrap` subclass | nothing — `objectwrap-branding` will fail until it is branded |
 | A new `napi_type_tag` | nothing — `greppable-counts` and `AllTagsDistinct` will fail |
@@ -389,6 +390,32 @@ them:
   to prove the property that makes it *that* door; a door whose control only
   showed it returns the right value would pass while being a thin synchronous
   wrapper.
+- **So does a new mode, and for the same reason.** `roundtrip-matrix`'s Axis C
+  requires each mode to demonstrate its option is actually in effect before its
+  cells are counted. A mode whose option were silently ignored would round-trip
+  everything, agree at every door, and report a clean column that searched
+  nothing — a whole axis of false confidence, which is worse than an absent one.
+
+**Exercised again August 6, 2026 (CR-23), and the table was found short.** The
+`sandbox` / `binaryStrings` / `strictConversion` work matched **no row above** —
+it added no entry point, door, handle kind, marker, frame, `ObjectWrap`, tag or
+policy — so the trigger correctly fired nothing while two defects sat in the
+region it did not name. The mode row was added as a result, and it is the fourth
+level at which this codebase has found a class boundary drawn one member short:
+in the product (CR-17), in a fix (CR-21), in an instrument (CR-22's drafts), in
+the boundary enumeration (CR-22 F2), and now in the trigger table itself.
+
+The lesson that generalizes, and the reason §15.1 states a *criterion* rather
+than only a list: **an enumeration has to record the rule that generated it, or
+it cannot be checked for completeness — only extended when something leaks
+past.** The boundary list has its criterion (§15.1). This table did not have
+one. It does now:
+
+> A trigger is anything that adds a **new way for a value or a call to cross a
+> boundary** — a new place (an entry point, a frame, a handle kind) *or a new
+> rule at an existing place* (an option, a preset, a version bump). The second
+> half is what the table was missing, and it is the half that is cheap to add
+> and easy to forget, because it ships as a flag rather than as a function.
 
 ## 15.7 Regression mode
 
@@ -398,7 +425,7 @@ npm run check-invariants                              # after any source change
 npm run lifecycle-matrix && npm run cross-context     # after handle/marker or context-boundary changes
 npm run exec-parity                                   # after execution-path changes
 npm run oracle                                        # after core VM changes
-npm run roundtrip-matrix                              # after conversion changes
+npm run roundtrip-matrix                              # after conversion changes, or a new option/mode
 npm run exception-matrix                              # after error-path changes
 npm run test-ts-asan                                  # before a release
 ```

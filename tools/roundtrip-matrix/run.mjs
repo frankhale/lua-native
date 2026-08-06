@@ -32,7 +32,8 @@ import lua_native from '../../index.js';
 import { canon } from '../diff-oracle/js-canonical.mjs';
 import { VALUES } from './values.mjs';
 import { DOORS } from './doors.mjs';
-import { EXPECTED, expectedNote } from './expected.mjs';
+import { MODES } from './modes.mjs';
+import { EXPECTED, expectedNote, assertsRoundTrip } from './expected.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (n) => {
@@ -41,6 +42,7 @@ const arg = (n) => {
 };
 const onlyValue = arg('value');
 const onlyDoor = arg('door');
+const onlyMode = arg('mode');
 const jsonOut = arg('json');
 const controlOnly = argv.includes('--control');
 
@@ -64,8 +66,8 @@ async function outcome(fn) {
   }
 }
 
-async function runCell(door, value) {
-  const lua = new lua_native.init({}, { libraries: 'all' });
+async function runCell(door, value, mode) {
+  const lua = new lua_native.init({}, { libraries: 'all', ...mode.options });
   let input;
   try {
     input = value.make();
@@ -75,6 +77,7 @@ async function runCell(door, value) {
   const before = await outcome(() => input);
   const after = await outcome(() => door.roundTrip(lua, input));
   return {
+    mode: mode.id,
     door: door.id,
     value: value.id,
     before: before.canon,
@@ -143,6 +146,29 @@ async function runControls() {
     if (!pass) bad++;
     console.log(`  ${pass ? 'ok  ' : 'FAIL'}  ${c.name}`);
   }
+
+  // Mode vacuity (CR-23 F4). A mode whose option were silently ignored would
+  // behave exactly like `default` — round-trip everything, agree at every door,
+  // and report a clean column that searched nothing. Each mode must first show
+  // its option is in effect. Same rule §15.6 states for a new *door*, one axis
+  // up, and the reason it is a control rather than a test is that a vacuous
+  // mode's cells must not be *counted*, not merely noted.
+  console.log('\nMode vacuity (a mode must prove its option is in effect):\n');
+  for (const m of MODES) {
+    if (!m.proves) {
+      console.log(`  ok    ${m.id.padEnd(14)} baseline — no option to prove`);
+      continue;
+    }
+    let pass = false;
+    try {
+      const lua = new lua_native.init({}, { libraries: 'all', ...m.options });
+      pass = (await m.proves.run(lua)) === true;
+    } catch (e) {
+      console.log(`        ${e.message}`);
+    }
+    if (!pass) bad++;
+    console.log(`  ${pass ? 'ok  ' : 'FAIL'}  ${m.id.padEnd(14)} ${m.proves.describe}`);
+  }
   console.log('');
   return bad;
 }
@@ -158,45 +184,69 @@ if (controlOnly) process.exit(0);
 
 const values = onlyValue ? VALUES.filter((v) => v.id === onlyValue) : VALUES;
 const doors = onlyDoor ? DOORS.filter((d) => d.id === onlyDoor) : DOORS;
+const modes = onlyMode ? MODES.filter((m) => m.id === onlyMode) : MODES;
 
-console.log(`CR-20 round-trip matrix: ${doors.length} doors x ${values.length} values = ${doors.length * values.length} cells\n`);
+console.log(`CR-20/23 round-trip matrix: ${modes.length} modes x ${doors.length} doors x `
+  + `${values.length} values = ${modes.length * doors.length * values.length} cells\n`);
 
 const cells = [];
 // Sequential, not Promise.all: each cell builds its own context, and the async
 // doors are one-run-at-a-time per context anyway — but more importantly a
 // deterministic order is what makes a failing cell reproducible from the log.
-for (const v of values) for (const d of doors) cells.push(await runCell(d, v));
+for (const m of modes) for (const v of values) for (const d of doors) cells.push(await runCell(d, v, m));
 
-// --- round-trip analysis ---------------------------------------------------
-
-const changed = cells.filter((c) => !c.identical);
-const undocumented = changed.filter((c) => !expectedNote(c.value, c.door));
-const documented = changed.filter((c) => expectedNote(c.value, c.door));
-const staleExpectations = cells.filter((c) => c.identical && expectedNote(c.value, c.door));
-
-console.log('Round trip (value in === value out):');
-console.log(`  identical            ${cells.length - changed.length}`);
-console.log(`  changed, documented  ${documented.length}   (${EXPECTED.length} ledger entries)`);
-console.log(`  changed, UNDOCUMENTED ${undocumented.length}`);
-if (staleExpectations.length) console.log(`  STALE ledger entry   ${staleExpectations.length}`);
-
-// --- parity analysis -------------------------------------------------------
+// --- round-trip and parity analysis, per mode ------------------------------
 //
-// For each value, group the doors by the answer they gave. More than one group
-// means the doors disagree.
-console.log('\nParity (every door gives the same answer for the same value):');
+// Reported per mode rather than pooled: a defect that appears only under one
+// option is the entire reason this axis exists, and a pooled total would let a
+// mode's whole column of divergences hide inside a bigger number.
+
+const undocumented = [];
+const staleExpectations = [];
 const disagreements = [];
-for (const v of values) {
-  const row = cells.filter((c) => c.value === v.id);
-  const groups = new Map();
-  for (const c of row) {
-    if (!groups.has(c.after)) groups.set(c.after, []);
-    groups.get(c.after).push(c.door);
+const brokenAssertions = [];
+
+for (const m of modes) {
+  const mine = cells.filter((c) => c.mode === m.id);
+  const changed = mine.filter((c) => !c.identical);
+  const undoc = changed.filter((c) => !expectedNote(c.value, c.door, c.mode));
+  const doc = changed.filter((c) => expectedNote(c.value, c.door, c.mode));
+  const stale = mine.filter((c) => c.identical && expectedNote(c.value, c.door, c.mode));
+  // The other direction: an entry that asserts a value round-trips in this mode
+  // and finds it does not.
+  const broken = mine.filter((c) => !c.identical && assertsRoundTrip(c.value, c.door, c.mode));
+
+  // Parity is asked *within* a mode. Across modes the doors are supposed to
+  // differ — that is what an option is — so comparing a strict cell with a
+  // default one would report the feature as a defect.
+  const modeDisagreements = [];
+  for (const v of values) {
+    const row = mine.filter((c) => c.value === v.id);
+    const groups = new Map();
+    for (const c of row) {
+      if (!groups.has(c.after)) groups.set(c.after, []);
+      groups.get(c.after).push(c.door);
+    }
+    if (groups.size > 1) modeDisagreements.push({ mode: m.id, value: v.id, groups: [...groups.entries()], row });
   }
-  if (groups.size > 1) disagreements.push({ value: v.id, groups: [...groups.entries()], row });
+
+  console.log(`--- mode: ${m.id} — ${m.describe}`);
+  console.log(`  round trip:  identical ${mine.length - changed.length}`
+    + `   documented ${doc.length}   UNDOCUMENTED ${undoc.length}`
+    + `${stale.length ? `   STALE ${stale.length}` : ''}`
+    + `${broken.length ? `   BROKEN ASSERTION ${broken.length}` : ''}`);
+  console.log(`  parity:      values where all ${doors.length} doors agree ${values.length - modeDisagreements.length}`
+    + `   DISAGREE ${modeDisagreements.length}\n`);
+
+  undocumented.push(...undoc);
+  staleExpectations.push(...stale);
+  disagreements.push(...modeDisagreements);
+  brokenAssertions.push(...broken);
 }
-console.log(`  values where all ${doors.length} doors agree   ${values.length - disagreements.length}`);
-console.log(`  values where doors DISAGREE          ${disagreements.length}`);
+
+console.log(`Totals across ${modes.length} mode(s): ${cells.length} cells, `
+  + `${EXPECTED.length} ledger entries, ${undocumented.length} undocumented, `
+  + `${disagreements.length} parity disagreements.`);
 
 // --- report ----------------------------------------------------------------
 
@@ -204,8 +254,9 @@ if (undocumented.length) {
   console.log('\n=== UNDOCUMENTED round-trip changes ===');
   const byValue = new Map();
   for (const c of undocumented) {
-    if (!byValue.has(c.value)) byValue.set(c.value, []);
-    byValue.get(c.value).push(c);
+    const k = `${c.mode} x ${c.value}`;
+    if (!byValue.has(k)) byValue.set(k, []);
+    byValue.get(k).push(c);
   }
   for (const [v, list] of byValue) {
     console.log(`  ${v}  (${list.length}/${doors.length} doors)`);
@@ -220,7 +271,7 @@ if (undocumented.length) {
 if (disagreements.length) {
   console.log('\n=== PARITY DISAGREEMENTS (doors that differ on the same value) ===');
   for (const d of disagreements) {
-    console.log(`\n  ${d.value}`);
+    console.log(`\n  ${d.mode} x ${d.value}`);
     for (const [answer, doorList] of d.groups) {
       const msg = d.row.find((c) => c.after === answer && c.message)?.message;
       console.log(`    ${String(doorList.length).padStart(2)} door(s): ${answer.slice(0, 110)}`);
@@ -231,8 +282,17 @@ if (disagreements.length) {
 }
 
 if (staleExpectations.length) {
-  console.log('\n=== STALE ledger entries (they round-trip now; delete the entry) ===');
-  for (const c of staleExpectations) console.log(`  ${c.value} x ${c.door}`);
+  console.log('\n=== STALE ledger entries (they round-trip now; delete or scope the entry) ===');
+  for (const c of staleExpectations) console.log(`  ${c.mode} x ${c.value} x ${c.door}`);
+}
+
+if (brokenAssertions.length) {
+  console.log('\n=== BROKEN round-trip assertions (a ledger entry says these survive) ===');
+  for (const c of brokenAssertions) {
+    console.log(`  ${c.mode} x ${c.value} x ${c.door}`);
+    console.log(`      in : ${c.before.slice(0, 120)}`);
+    console.log(`      out: ${c.after.slice(0, 120)}`);
+  }
 }
 
 if (jsonOut) {
@@ -241,6 +301,7 @@ if (jsonOut) {
   console.log(`\nfull results -> ${jsonOut}`);
 }
 
-const bad = undocumented.length + disagreements.length + staleExpectations.length;
+const bad = undocumented.length + disagreements.length + staleExpectations.length
+  + brokenAssertions.length;
 console.log(`\n${bad === 0 ? 'clean' : `${bad} item(s) to read`}.`);
 process.exit(bad > 0 ? 1 : 0);

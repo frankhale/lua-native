@@ -41,8 +41,10 @@ npm run exception-matrix
 # Needs the vcpkg port's interpreter:  vcpkg install lua[tools]
 npm run oracle
 
-# JS -> Lua -> JS round-trip and entry-point parity (18 doors x 50 values)
+# JS -> Lua -> JS round-trip and entry-point parity
+# (4 context modes x 18 doors x 50 values)
 npm run roundtrip-matrix
+node tools/roundtrip-matrix/run.mjs --mode=strict   # one mode
 
 # Execution-door parity: async + bytecode doors vs execute_script (1339 cases x 5 doors)
 npm run exec-parity
@@ -99,9 +101,13 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   oracle prints both Lua versions and warns if they differ. Checks whether an
   answer is *right* rather than whether nothing crashed, for the embedded VM and
   for values coming out of Lua. See `docs/DIFFERENTIAL-ORACLE.md`.
-- `npm run roundtrip-matrix` — the other direction: 18 entry points × 50 values,
-  checking that a JS value survives the crossing *into* Lua and that all eighteen
-  doors agree with each other. See `docs/reviews/CODE-REVIEW-20.md`.
+- `npm run roundtrip-matrix` — the other direction: 4 context modes × 18 entry
+  points × 50 values, checking that a JS value survives the crossing *into* Lua
+  and that all eighteen doors agree with each other — under `strictConversion`
+  and `binaryStrings` as well as the defaults. **A mode must prove its option is
+  in effect before its cells count**; a silently ignored option would otherwise
+  report a clean column that searched nothing. See
+  `docs/reviews/CODE-REVIEW-20.md` and `docs/reviews/CODE-REVIEW-23.md`.
 - `npm run exec-parity` — the oracle's 1339-case corpus through each alternate
   execution door (`execute_script_async`, `execute_async`,
   `compile`→`load_bytecode`, `call_async`, `resume_async`), compared against
