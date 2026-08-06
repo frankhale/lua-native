@@ -114,4 +114,48 @@ export const KINDS = [
     },
     act: (lua) => { lua.execute_script('probe_inner()'); },
   },
+
+  // --- the strictConversion kinds (W2, August 6, 2026) ----------------------
+  //
+  // **Why these are kinds and not a second matrix.** W2 asked for
+  // `exception-matrix` × `strictConversion`, and the obvious reading — re-run
+  // all 429 cells with the option on — would spend 8 of every 11 cells on kinds
+  // the option cannot affect. The option changes exactly one thing: whether a
+  // *conversion* refuses. Axis A already models "the addon's own conversion
+  // throws on the return path, with the Lua frame still on the stack"
+  // (`return_symbol`, `return_bigint_out_of_range`, `return_deep_object`), and a
+  // kind already carries `options`. So the mode enters where it belongs: as two
+  // more ways for the conversion to refuse, run against all 39 frames.
+  //
+  // **This is the class CR-23 verified by hand and could not leave behind.** Its
+  // "Verified and rejected" section drove a strict refusal out of one Lua C
+  // frame and confirmed it arrived as a catchable Lua error rather than an
+  // abort — the CR-6 F1 shape. That was one frame, once, in a scratch script.
+  // These are all thirty-nine, every run.
+  //
+  // **The vacuity question answers itself, as it does for the other kinds.** If
+  // `strictConversion` were ignored, the lossy value would convert silently, no
+  // error would surface, and every cell would report SWALLOWED — the loudest
+  // result this harness has. A disconnected knob cannot read as clean here.
+  {
+    id: 'return_lossy_array_strict',
+    signature: /strict conversion/i,
+    describe: 'return an array with a hole under strictConversion (refusal raised mid-frame)',
+    options: { strictConversion: true },
+    // [1, null, 3] would become a Lua sequence that ends at index 1. Under the
+    // option that is a refusal, raised by the addon inside whatever Lua C frame
+    // this cell installed the callback in.
+    act: () => [1, null, 3],
+  },
+  {
+    id: 'return_lossy_object_strict',
+    signature: /strict conversion/i,
+    describe: 'return an object with a null value under strictConversion',
+    options: { strictConversion: true },
+    // The other JS→Lua refusal: a nil object value removes the key rather than
+    // storing one. Included because the two take different branches of the
+    // converter (sequence vs map), and the whole reason this matrix exists is
+    // that a class fixed on one branch tends to be short on the other.
+    act: () => ({ a: null, b: 2 }),
+  },
 ];

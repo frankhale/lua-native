@@ -67,6 +67,26 @@ const arg = (n) => {
   return hit ? hit.slice(n.length + 3) : null;
 };
 const onlyCategory = arg('category');
+// Axis: the capability configuration every door runs in (W2). Parity is a
+// *relative* property — each door against `execute_script` in the same context
+// — so it is meaningful in any configuration, and the sealed one is the
+// interesting column: it is where a door that quietly consults a library the
+// others do not would show up.
+const CONFIGS = {
+  all: { libraries: 'all' },
+  sandbox: { libraries: 'sandbox' },
+};
+const configId = arg('config') ?? 'all';
+if (!CONFIGS[configId]) {
+  console.error(`unknown --config=${configId}; expected one of ${Object.keys(CONFIGS).join(', ')}`);
+  process.exit(2);
+}
+const CONFIG = CONFIGS[configId];
+// `sandbox` defaults allowBytecode to false, so the bytecode door is *defined*
+// to refuse there. Running 1339 identical refusals would measure the guard, not
+// parity — and `capability-matrix` already asserts the guard in one cell. The
+// door is dropped, and the drop is announced rather than silently applied.
+const GUARD_ON = configId === 'sandbox';
 const onlyCase = arg('case');
 const controlOnly = argv.includes('--control');
 const quiet = argv.includes('--quiet');
@@ -74,7 +94,7 @@ const quiet = argv.includes('--quiet');
 const TIMEOUT_MS = 20_000;
 
 function freshContext(globals = {}) {
-  return new lua_native.init(globals, { libraries: 'all' });
+  return new lua_native.init(globals, { ...CONFIG });
 }
 
 function messageOf(e) {
@@ -239,11 +259,16 @@ async function runControls() {
       },
     },
     {
-      name: 'all six doors actually run the case (sync/worker/driver/bytecode/call_async/resume_async)',
+      // Every door that this configuration actually runs must reach the case.
+      // The bytecode door is excluded under a guarded config — where it refuses
+      // by definition — and the control follows the door set rather than a
+      // hardcoded six, or it would report the deliberate exclusion as a broken
+      // instrument (which is exactly what it did on the first sandbox run).
+      name: `every active door runs the case (sync/worker/driver/${GUARD_ON ? '' : 'bytecode/'}call_async/resume_async)`,
       run: async () => outcomeSync('return 6 * 7').canon === 'ok:num:42'
         && (await outcomeAsync('return 6 * 7', 'worker')).canon === 'ok:num:42'
         && (await outcomeAsync('return 6 * 7', 'driver')).canon === 'ok:num:42'
-        && outcomeBytecode('return 6 * 7').canon === 'ok:num:42'
+        && (GUARD_ON || outcomeBytecode('return 6 * 7').canon === 'ok:num:42')
         && (await outcomeCallAsync('return 6 * 7')).canon === 'ok:num:42'
         && (await outcomeResumeAsync('return 6 * 7')).canon === 'ok:num:42',
     },
@@ -274,6 +299,9 @@ async function runControls() {
       },
     },
     {
+      // Skipped under a guarded config for the same reason the door is: it
+      // cannot demonstrate a property of a door that is not running.
+      skipWhenGuarded: true,
       name: 'the bytecode door actually goes through the dump (source rejected raw)',
       run: async () => {
         const lua = freshContext();
@@ -322,6 +350,12 @@ async function runControls() {
   console.log('Control (a comparator that reports clean must first report dirty):\n');
   let bad = 0;
   for (const c of controls) {
+    if (c.skipWhenGuarded && GUARD_ON) {
+      // Announced, not silently dropped: a control that vanishes without saying
+      // so is indistinguishable from one that was never written.
+      console.log(`  skip  ${c.name} (door not active under --config=${configId})`);
+      continue;
+    }
     let passed = false;
     try {
       passed = await c.run();
@@ -348,8 +382,9 @@ async function main() {
   let cases = buildCorpus();
   if (onlyCategory) cases = cases.filter((c) => c.category === onlyCategory);
   if (onlyCase) cases = cases.filter((c) => c.id === onlyCase);
-  console.log(`${cases.length} cases x 5 doors `
-    + `(worker/driver/bytecode/call_async/resume_async), vs execute_script\n`);
+  console.log(`${cases.length} cases x ${GUARD_ON ? 4 : 5} doors `
+    + `(worker/driver/${GUARD_ON ? '' : 'bytecode/'}call_async/resume_async), `
+    + `vs execute_script, under libraries: '${configId}'\n`);
 
   const rows = [];
   const usedLedger = new Set();
@@ -358,7 +393,13 @@ async function main() {
   let accepted = 0;
   let harness = 0;
 
-  const DOORS = ['worker', 'driver', 'bytecode', 'call_async', 'resume_async'];
+  const DOORS = ['worker', 'driver', 'bytecode', 'call_async', 'resume_async']
+    .filter((d) => !(GUARD_ON && d === 'bytecode'));
+  if (GUARD_ON) {
+    console.log('  dropped door: bytecode — allowBytecode defaults off under '
+      + "'sandbox', so this door refuses by definition; the guard itself is "
+      + 'capability-matrix\'s cell, not a parity question.\n');
+  }
   for (const c of cases) {
     const sync = outcomeSync(c.source);
     for (const door of DOORS) {

@@ -30,6 +30,8 @@
 // abort inside a shared runner ends the run instead of producing a data point.
 
 import { spawn } from 'node:child_process';
+
+import { childEnv } from '../sanitizer-env.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HANDLES } from './handles.mjs';
@@ -48,14 +50,19 @@ const onlyHandle = arg('handle');
 const onlyEvent = arg('event');
 const controlOnly = argv.includes('--control');
 
+// A sanitized run is several times slower per cell, so the ceiling is
+// overridable — a timeout that fires under ASan would report a clean cell as
+// a hang and hide whatever the sanitizer was about to say (W3.1).
+const CELL_TIMEOUT_MS = Number(process.env.LUA_NATIVE_CELL_TIMEOUT_MS ?? 30_000);
+
 function runCell(handleId, eventId, extra = []) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--expose-gc', CELL, handleId, eventId, ...extra], {
-      cwd: join(HERE, '../..'), stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: join(HERE, '../..'), stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(),
     });
     let out = '';
     let err = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
+    const timer = setTimeout(() => child.kill('SIGKILL'), CELL_TIMEOUT_MS);
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
     child.on('close', (code, signal) => {

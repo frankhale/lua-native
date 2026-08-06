@@ -17,6 +17,7 @@ correctness programme. Feature work is separate and has no roadmap document —
 > | Section | What it is | Status |
 > |---|---|---|
 > | **§15** | The exit record — coverage, triggers, how to run | **Live. Start here.** |
+> | **§15.9** | What a pass looks like now: no more numbered read-throughs | **Live.** Decided August 6, 2026. |
 > | **§14** | Platform/CI closed as out of scope | **Live and binding.** Do not re-raise. |
 > | §13 | What the final action items turned out to be | Record, with corrections worth keeping |
 >
@@ -255,6 +256,16 @@ Applying it to this codebase gives seven, and each has a generated search:
 | 6 | Handle → a later state of its context | live handle / retired state | `lifecycle-matrix` (11 × 8, process/cell) |
 | 7 | Context → context | two independent `lua_State`s | `cross-context` (handles, data, isolation) |
 
+**An eighth instrument, `capability-matrix`, is not an eighth boundary and is
+recorded here so nobody counts it as one.** It searches an *axis* that cuts
+across the seven: what a `libraries` / `allowBytecode` configuration grants. One
+of its three properties meets §15.1's criterion exactly — an entry point that
+returns normally while doing nothing observable (`LIMITATIONS.md` §8's
+accept-and-retain class) is a plausible answer rather than an error. The other
+two, the seal and the bytecode-door implication, are capability assertions that
+ride along because they share the fixture, and are labelled as such in the
+harness rather than filed under a criterion they do not meet.
+
 **The enumeration is complete against that criterion.** That is a stronger claim
 than "we found nothing" and a weaker one than "there are no defects" — it says
 the crossings have been identified by a rule rather than by recollection, and
@@ -264,6 +275,28 @@ each one has a search that has demonstrated it can report dirty.
 
 Recorded because an exit that lists only its strengths is the same failure the
 programme spent twenty-two passes correcting.
+
+> **The rule this table is generated from** (stated August 6, 2026, W4 — it had
+> none, which is the same defect §15.6 was found to have in CR-23):
+>
+> **An area belongs here when it fails a clause of §15.1's criterion, and the
+> row must name which clause.** That is the whole test. The criterion is *two
+> systems with different rules exchange a value such that a mismatch produces a
+> plausible answer rather than an error*; an area that satisfies all three
+> clauses is a boundary and needs an instrument, not an excuse.
+>
+> Applied to the rows below: resource limits and module resolution both fail
+> **clause three** — they abort or raise, loudly, so the suite catches them.
+> Re-entrancy fails **clause two** in its general form: it is not a value
+> crossing but a call arriving while another is in flight, which is why it was
+> closed structurally (one guard, one policy set) rather than by a matrix. Data
+> races fail nothing — they are a genuine gap, and the row says so rather than
+> justifying itself.
+>
+> **The distinction that keeps this honest:** a row saying "covered by the suite
+> instead" is a claim about *sufficiency* and needs the clause it fails; a row
+> saying "we have not searched this" is an admission and needs no clause. Mixing
+> the two is how an exclusion list becomes a place to put things.
 
 | Area | Covered by | Why not a matrix |
 |---|---|---|
@@ -346,7 +379,8 @@ is a trigger, and the trigger names the instrument to extend:
 | A new entry point that executes a script | `exec-parity` (a door) |
 | A new *asynchronous* entry point | both of the above — and check the door's own vacuity control proves it really awaits |
 | A new handle kind, or a new marker on a JS object | `lifecycle-matrix` (Axis A) **and** `cross-context` (handle cases) |
-| **A new option that changes conversion or VM rules** | **`roundtrip-matrix` (Axis C, a mode) — and `exec-parity` if it is execution-visible** |
+| **A new option that changes *conversion*** | **`roundtrip-matrix` (Axis C, a mode) — and `exec-parity` if it is execution-visible** |
+| **A new option, preset or library that changes *capability*** | **`capability-matrix` (Axis A, a config)** — the split is stated below |
 | A new Lua C frame that can call back into the host | `exception-matrix` (Axis B) |
 | A new `ObjectWrap` subclass | nothing — `objectwrap-branding` will fail until it is branded |
 | A new `napi_type_tag` | nothing — `greppable-counts` and `AllTagsDistinct` will fail |
@@ -356,6 +390,24 @@ is a trigger, and the trigger names the instrument to extend:
 
 The rows that say "nothing" are the ones worth noticing: for four classes the
 mechanism now fails closed without anyone deciding to look.
+
+**Since August 6, 2026 the table itself is checked (W4).** `surface-census`'s
+fifth census reads these rows *out of this document* and requires each to carry a
+disposition — `COMPUTED` (a census derives its universe), `FAILS-CLOSED` (no
+census needed, the mechanism turns the suite red on its own), or `MANUAL` with
+its reason. A row added here in prose without a ruling reports `UNDISPOSED` and
+the suite goes red; a disposition whose row is deleted reports `STALE`. Twelve
+rows, twelve dispositions: five computed, three fail closed, four manual.
+
+That closes the level CR-23 opened. The trigger table was the enumeration
+governing when anyone looks, and it had no way to notice a row that had never
+been ruled on — which is precisely how `binaryStrings` went two commits
+unsearched. **The four `MANUAL` rows are the honest residue**: "executes a
+script" and "is asynchronous" are properties of a method body rather than of a
+signature, a Lua version bump happens in vcpkg where nothing here can see it, and
+a threading mode would invalidate every instrument's assumptions rather than add
+a row. Those four are where a human still has to decide, and now they are the
+*only* four.
 
 **Since August 6, 2026 the rest of the table is computed too, and that is the
 point of the `surface-census` invariant** (`tools/invariants/surface-census.mjs`).
@@ -426,6 +478,19 @@ level at which this codebase has found a class boundary drawn one member short:
 in the product (CR-17), in a fix (CR-21), in an instrument (CR-22's drafts), in
 the boundary enumeration (CR-22 F2), and now in the trigger table itself.
 
+**And the mode row was itself half a row (August 6, 2026, W1).** CR-23 wrote it
+as "a new option that changes conversion **or VM rules**", which reads as one
+trigger and is two. An option that re-rules *conversion* is a `roundtrip-matrix`
+mode; an option that re-rules *capability* — which doors exist, which loaders
+run — cannot be, because no round-trip mode would ever set it. `surface-census`
+inherited the conflation and scored coverage as "a round-trip mode sets this
+key", so `libraries` and `allowBytecode` were not merely unclassified but
+**unclassifiable**: `LEDGERED` was the only verdict they could reach. Ruling on
+them found a guard five doors short of its own claim
+(`UNSEARCHED-REGIONS-PLAN.md` §2.1). The table now splits the row, the census
+ranges over a list of instrument axes rather than one instrument, and
+`capability-matrix` is the eighth harness.
+
 The lesson that generalizes, and the reason §15.1 states a *criterion* rather
 than only a list: **an enumeration has to record the rule that generated it, or
 it cannot be checked for completeness — only extended when something leaks
@@ -446,9 +511,13 @@ npm run check-invariants                              # after any source change
 npm run lifecycle-matrix && npm run cross-context     # after handle/marker or context-boundary changes
 npm run exec-parity                                   # after execution-path changes
 npm run oracle                                        # after core VM changes
-npm run roundtrip-matrix                              # after conversion changes, or a new option/mode
+npm run roundtrip-matrix                              # after conversion changes, or a new conversion option/mode
+npm run capability-matrix                             # after library/preset/seal or bytecode-guard changes
+node tools/exec-parity/run.mjs --config=sandbox       # door parity under a sealed state
+node tools/diff-oracle/run.mjs --mode=b --binary      # values out under binaryStrings, vs stock Lua
 npm run exception-matrix                              # after error-path changes
 npm run test-ts-asan                                  # before a release
+npm run test-harness-asan                             # before a release: the adversarial paths instrumented
 ```
 
 The suite and the invariants are the always-run pair; the harnesses are keyed to
@@ -476,6 +545,37 @@ matrix produced eight false findings before it produced a true one, every one of
 them the harness misreading its own probe, several with passing controls at the
 time. Both halves of the rule that came out of that are in `tools/README.md`,
 and they are the most likely thing in this programme to be needed again.
+
+## 15.9 What a pass looks like now (decided August 6, 2026)
+
+**There are no more numbered general read-throughs.** CODE-REVIEW-23 is the last
+one. The evidence is the yield law's other half, and by August 2026 it had
+enough data points to act on:
+
+| Pass shape | Yield |
+|---|---|
+| A named sweep against a **declared unsearched region** (`INTEROP-PARITY-PLAN`) | 5 catches, 3 of them defects review had not found |
+| A **new axis** on an existing instrument (CR-23's mode sweep; W1's option ruling) | 1 serious each |
+| Re-running the existing instruments | 0, every time |
+| A general read-through of code the instruments already cover | documentation nits |
+
+So a pass now has three obligations, and they replace the old format entirely:
+
+1. **Declare the unsearched region up front** — which boundary, which axis, and
+   why nothing currently searches it. "Read the diff again" is not a region.
+2. **Deliver an instrument and a ledger entry**, not a document. The write-up is
+   a by-product; the thing that survives is the check that runs next time.
+   Prose rots, and this programme has three reflective documents to prove it
+   (`docs/README.md`'s corollary).
+3. **Prove the instrument can report dirty before believing it clean**, and
+   drive every dirty result to a hand-run reproduction before believing *that*.
+   Twelve of this tree's findings have been the harness misreading itself; that
+   is more than any single defect class in the product.
+
+**The trigger is unchanged and is now checked**: new surface that §15.6 names, or
+`surface-census` reporting `UNCLASSIFIED` / `UNDISPOSED`. Never a date. A
+calendar-driven pass is how this programme spent twenty-two rounds re-deriving
+conclusions it had already reached.
 
 ---
 

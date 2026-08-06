@@ -84,6 +84,14 @@ function sortKeys(keys) {
   });
 }
 
+// `canon` is shared by three harnesses (`diff-oracle`, `exec-parity`,
+// `roundtrip-matrix`) and **must not learn about `binaryStrings` here.** The
+// first attempt at W2's oracle column added a Uint8Array branch to this
+// function; it made byte views canonicalise as text for every caller, which
+// turned 532 of `roundtrip-matrix`'s ledger entries stale — its binary mode is
+// written against the untouched representation. A shared canonicaliser is
+// shared semantics. The oracle decodes its own values before calling in; see
+// `decodeBinaryStrings` in run.mjs.
 export function canon(v, depth = 0, seen = new Set()) {
   if (v === null || v === undefined) return 'nil';
   if (typeof v === 'boolean') return v ? 'true' : 'false';

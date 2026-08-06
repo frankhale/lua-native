@@ -150,11 +150,36 @@ return canonical.run([${level}[${caseSource}]${level}])`;
   }
 }
 
+// Axis: the conversion mode mode B runs under (W2). `binaryStrings` re-rules
+// exactly the crossing mode B searches — Lua value out to JS — so it is a column
+// here, and the only instrument that can compare the byte form against a
+// *reference* rather than against itself.
+const BINARY = process.argv.slice(2).includes('--binary');
+
+// Under `binaryStrings` every Lua string arrives as its exact bytes. Decoded
+// here, on the oracle's side of the call, rather than inside the shared `canon`
+// — which three harnesses use and whose semantics are not this column's to
+// change (see js-canonical.mjs).
+//
+// UTF-8 with replacement, deliberately: that is what the *default* mode does, so
+// this column asks the right question — **do the bytes carry what stock Lua
+// printed** — rather than merely whether the byte form is self-consistent, which
+// is what roundtrip-matrix's binary mode already covers.
+const BINARY_DECODER = new TextDecoder('utf-8');
+function decodeBinaryStrings(v) {
+  if (v instanceof Uint8Array) return BINARY_DECODER.decode(v);
+  if (Array.isArray(v)) return v.map(decodeBinaryStrings);
+  if (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype) {
+    return Object.fromEntries(Object.entries(v).map(([k, val]) => [k, decodeBinaryStrings(val)]));
+  }
+  return v;
+}
+
 function runEmbeddedModeB(caseSource) {
-  const lua = new lua_native.init({}, { libraries: 'all' });
+  const lua = new lua_native.init({}, { libraries: 'all', ...(BINARY ? { binaryStrings: true } : {}) });
   try {
     const values = lua.execute_script(caseSource);
-    return { canon: canonOutcome({ kind: 'ok', values, multi: false }) };
+    return { canon: canonOutcome({ kind: 'ok', values: BINARY ? decodeBinaryStrings(values) : values, multi: false }) };
   } catch (e) {
     // The reference reports a failure as its display string; the binding
     // surfaces it as a JS throw whose message is that same display string. So
@@ -241,6 +266,25 @@ function runControls() {
     {
       name: 'the embedded side actually runs the case (mode B)',
       run: () => runEmbeddedModeB('return 6 * 7').canon === 'ok:[num:42]',
+    },
+    {
+      // The axis vacuity control (CR-23 F4's rule, `tools/README.md`): a
+      // `--binary` run whose option were silently ignored would behave exactly
+      // like the default column, agree with the reference on all 1339 cases,
+      // and report a clean sheet having searched nothing. Prove the knob is
+      // connected before believing the column — and prove the *decode* is
+      // reached too, since a canon that never saw a Uint8Array would be equally
+      // vacuous.
+      name: BINARY
+        ? 'binaryStrings is in effect, and the byte form decodes to the text form'
+        : 'binaryStrings is off in this run (the default column)',
+      run: () => {
+        const lua = new lua_native.init({}, { libraries: 'all', ...(BINARY ? { binaryStrings: true } : {}) });
+        const v = lua.execute_script('return "abc"');
+        return BINARY
+          ? v instanceof Uint8Array && canon(decodeBinaryStrings(v)) === canon('abc')
+          : typeof v === 'string';
+      },
     },
     {
       name: 'an error is a comparable outcome, not a missing row',

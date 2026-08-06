@@ -961,8 +961,12 @@ Three capabilities for controlling how a Lua context talks to the outside world:
   (bundles, DB, in-memory) instead of only from the filesystem
   (`add_search_path`) or a static preload (`register_module`).
 - **E3 — Bytecode guard:** the `allowBytecode: false` init option makes a context
-  refuse binary chunks — `load_bytecode()` throws and Lua's `load()` is forced
-  to text-only mode — for safely running untrusted scripts.
+  refuse binary chunks at **every** door — `load_bytecode()` throws;
+  `execute_file`/`compile_file` refuse a binary chunk; and Lua's `load`,
+  `loadfile`, `dofile` and both `require` search paths are forced to text-only
+  mode — for safely running untrusted scripts. (The file doors were added
+  August 6, 2026: this bullet used to name `load_bytecode` and `load` only, and
+  the five it omitted were open. See `docs/UNSEARCHED-REGIONS-PLAN.md` §2.1.)
 
 ### Architecture
 
@@ -978,7 +982,16 @@ Three capabilities for controlling how a Lua context talks to the outside world:
 - `SetAllowBytecode(false)` records the flag (checked at the top of
   `LoadBytecode`) and wraps the global `load` with `SafeLoad`, a closure over the
   original `load` that forces the `mode` argument to `"t"` — so binary chunks
-  fail regardless of the caller's arguments.
+  fail regardless of the caller's arguments. `InstallBytecodeFileGuards` does the
+  same for the file doors: `SafeLoadFile` forwards a forced `"t"`, `SafeDoFile`
+  rebuilds `dofile` on top of the original `loadfile` (`dofile` takes no mode
+  argument, so there is nothing to force), and `SafeLuaSearcher` replaces
+  `package.searchers[2]`, resolving through `package.searchpath` and loading with
+  `luaL_loadfilex(..., "t")`. `ExecuteFile` and `CompileFile` pass `"t"` directly.
+  The two globals are wrapped **only if they are not already text-only by
+  construction**: a file reader owns the same two names and removes its overrides
+  by identity, so wrapping `LuaDoFile` would leave a reader that could never be
+  uninstalled.
 - `AddJsSearcher` appends `JsSearcher` (carrying the host function name as an
   upvalue) to `package.searchers`. `JsSearcher` calls the host function with the
   module name; a returned string is compiled with `luaL_loadbufferx(..., "t")`

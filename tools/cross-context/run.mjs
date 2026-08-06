@@ -41,7 +41,24 @@ const arg = (n) => {
 const onlyCase = arg('case');
 const controlOnly = argv.includes('--control');
 const ALL = { libraries: 'all' };
-const ctx = () => new lua_native.init({}, ALL);
+const SANDBOX = { libraries: 'sandbox' };
+const ctx = (opts = ALL) => new lua_native.init({}, opts);
+
+// Axis: the capability pairing of the two contexts (W2).
+//
+// **The mixed pair is the one worth having, and it is a question no earlier
+// column asked.** Two contexts with the same libraries differ only by identity;
+// a *sealed* context beside an unsealed one differs by what it is allowed to do,
+// which raises two things the same-pair columns cannot: can a handle minted in a
+// permissive context be used to reach past a seal, and does a plain value still
+// cross a seal boundary intact. The first is the interesting direction — a
+// sealed context that accepted a foreign handle would have imported a capability
+// its preset exists to deny.
+const PAIRINGS = [
+  { id: 'all-all', a: ALL, b: ALL, describe: 'the original pairing: two permissive contexts' },
+  { id: 'all-sandbox', a: ALL, b: SANDBOX, describe: 'a permissive context handing values to a sealed one' },
+  { id: 'sandbox-all', a: SANDBOX, b: ALL, describe: 'a sealed context handing values to a permissive one' },
+];
 
 // --- part 1: handles are refused -------------------------------------------
 //
@@ -109,13 +126,23 @@ const NOT_HANDLE_CASES = [
     check: (b) => b.execute_script('return type(x)..":"..tostring(x.hidden)') === 'table:7' },
 ];
 
-function runHandleCases(findings) {
+function runHandleCases(findings, pairing = PAIRINGS[0]) {
   for (const c of HANDLE_CASES) {
-    const a = ctx();
-    const b = ctx();
+    const a = ctx(pairing.a);
+    const b = ctx(pairing.b);
     let h;
     try { h = c.make(a); } catch (e) {
-      findings.push({ id: `handle:${c.id}`, kind: 'VACUOUS', detail: `make threw: ${e.message}` });
+      // Under a sealed preset some handle kinds cannot be minted at all
+      // (`userdata-lua` is an io.open file). That is the seal working, not a
+      // vacuous cell — but it is announced, because a pairing that quietly
+      // stopped making handles would report a clean column having tested
+      // nothing.
+      if (pairing.a === SANDBOX) {
+        findings.push({ id: `handle:${c.id}@${pairing.id}`, kind: 'NOT-MINTABLE',
+          detail: `not available under the sealed preset: ${e.message}`, benign: true });
+        continue;
+      }
+      findings.push({ id: `handle:${c.id}@${pairing.id}`, kind: 'VACUOUS', detail: `make threw: ${e.message}` });
       continue;
     }
     if (h === undefined || h === null) {
@@ -124,18 +151,18 @@ function runHandleCases(findings) {
     }
     try {
       b.set_global('x', h);
-      findings.push({ id: `handle:${c.id}`, kind: 'HANDLE-ACCEPTED',
+      findings.push({ id: `handle:${c.id}@${pairing.id}`, kind: 'HANDLE-ACCEPTED',
         detail: `a handle from A was accepted by B as ${b.execute_script('return type(x)')}` });
     } catch (e) {
       if (!/belongs to a different Lua context/.test(String(e.message))) {
-        findings.push({ id: `handle:${c.id}`, kind: 'OPAQUE-REFUSAL',
+        findings.push({ id: `handle:${c.id}@${pairing.id}`, kind: 'OPAQUE-REFUSAL',
           detail: `refused, but not with the cross-context message: ${e.message}` });
       }
     }
     // And it must still work in its own context — a refusal that also broke the
     // legitimate path would pass the check above for the wrong reason.
     try { a.set_global('own', h); } catch (e) {
-      findings.push({ id: `handle:${c.id}`, kind: 'OWN-CONTEXT-BROKEN',
+      findings.push({ id: `handle:${c.id}@${pairing.id}`, kind: 'OWN-CONTEXT-BROKEN',
         detail: `the handle no longer works in its own context: ${e.message}` });
     }
   }
@@ -321,17 +348,31 @@ function main() {
   if (controlOnly) return;
 
   const findings = [];
-  if (!onlyCase || onlyCase.startsWith('handle')) runHandleCases(findings);
+  if (!onlyCase || onlyCase.startsWith('handle')) {
+    for (const p of PAIRINGS) runHandleCases(findings, p);
+  }
   if (!onlyCase || onlyCase.startsWith('data') || onlyCase.startsWith('route')) runDataCases(findings);
   if (!onlyCase || onlyCase.startsWith('isolation')) runIsolationCases(findings);
 
-  const cells = HANDLE_CASES.length + NOT_HANDLE_CASES.length + VALUES.length + 4;
+  const cells = HANDLE_CASES.length * PAIRINGS.length
+    + NOT_HANDLE_CASES.length + VALUES.length + 4;
   console.log(`~${cells} checks across three properties `
-    + `(handles refused, data intact, contexts independent)\n`);
-  console.log(`  FINDINGS  ${findings.length}`);
-  for (const f of findings) console.log(`\n${f.kind}  ${f.id}\n  ${f.detail}`);
-  console.log(findings.length ? '\ndirty.' : '\nclean.');
-  process.exit(findings.length ? 1 : 0);
+    + `(handles refused, data intact, contexts independent), `
+    + `handles over ${PAIRINGS.length} pairings\n`);
+
+  // A handle kind the sealed preset cannot mint is reported but is not a
+  // finding: it is the seal doing its job. Announced rather than filtered
+  // silently, per tools/README.md — a bounded search says what it dropped.
+  const benign = findings.filter((f) => f.benign);
+  const real = findings.filter((f) => !f.benign);
+  if (benign.length) {
+    console.log(`  not mintable under the sealed preset (expected, not findings): `
+      + `${benign.map((f) => f.id).join(', ')}\n`);
+  }
+  console.log(`  FINDINGS  ${real.length}`);
+  for (const f of real) console.log(`\n${f.kind}  ${f.id}\n  ${f.detail}`);
+  console.log(real.length ? '\ndirty.' : '\nclean.');
+  process.exit(real.length ? 1 : 0);
 }
 
 main();

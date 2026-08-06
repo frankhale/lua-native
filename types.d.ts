@@ -2049,6 +2049,44 @@ export interface LuaInitOptions {
    * lua.execute_script('return {["\xFF"]="a"}');       // throws: key bytes are not UTF-8
    */
   strictConversion?: boolean;
+
+  /**
+   * Whether this context will load **precompiled bytecode**. Defaults to `true`
+   * everywhere except `libraries: 'sandbox'`, which defaults it to `false`; an
+   * explicit value always wins.
+   *
+   * **Why it exists.** Lua does not verify undumped chunks, so malformed or
+   * hostile bytecode is a memory-safety problem in a way that untrusted *source*
+   * is not — source can only do what the loaded libraries allow. Setting this to
+   * `false` is what keeps a script that can produce bytecode (`string.dump`)
+   * from getting it back into the VM.
+   *
+   * **What `false` closes — all nine doors, since August 6, 2026:**
+   *
+   * | Door | Behaviour under `allowBytecode: false` |
+   * |---|---|
+   * | {@link LuaContext.load_bytecode} | throws |
+   * | {@link LuaContext.execute_file}, {@link LuaContext.compile_file} | refuse a binary chunk |
+   * | Lua `load` | forced to text mode |
+   * | Lua `loadfile`, `dofile` | forced to text mode |
+   * | `require`, via `package.path` or {@link LuaContext.add_search_path} | forced to text mode |
+   * | A {@link LuaContext.set_file_reader} handler, a {@link LuaContext.add_searcher} searcher | already text-only in every mode |
+   *
+   * The five file doors were **open until August 6, 2026** — `loadfile`,
+   * `dofile` and `require` are stock Lua C functions that load with mode
+   * `"bt"`, so a script under `libraries: 'all'` could reach the loader with
+   * `string.dump` → `io.write` → `dofile`, and under `'safe'` could load a
+   * planted binary file. If you relied on that, pass `allowBytecode: true`.
+   *
+   * Text loading is unaffected: `require`, `dofile` and `loadfile` keep working
+   * normally, including their error contracts (`loadfile` returns `nil, msg`;
+   * `dofile` raises), and a `dofile` the script replaced is left alone.
+   *
+   * @example
+   * const lua = new lua_native.init({}, { libraries: 'safe', allowBytecode: false });
+   * lua.execute_script('return load(string.dump(function() end))');  // → nil
+   * lua.execute_script('dofile("/tmp/precompiled.lua")');            // throws
+   */
   allowBytecode?: boolean;
 
   /**

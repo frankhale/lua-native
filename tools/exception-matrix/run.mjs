@@ -18,6 +18,8 @@
 // clean. `run.mjs` runs it automatically before the real matrix.
 
 import { spawn } from 'node:child_process';
+
+import { childEnv } from '../sanitizer-env.mjs';
 import { writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,7 +30,10 @@ import { expectedReason } from './expected.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CELL = join(HERE, 'cell.mjs');
 const CONCURRENCY = Math.max(2, Math.min(8, (await import('node:os')).cpus().length - 2));
-const TIMEOUT_MS = 30_000;
+// A sanitized run is several times slower per cell, so the ceiling is
+// overridable — a timeout that fires under ASan would report a clean cell as
+// a hang and hide whatever the sanitizer was about to say (W3.1).
+const TIMEOUT_MS = Number(process.env.LUA_NATIVE_CELL_TIMEOUT_MS ?? 30_000);
 
 const argv = process.argv.slice(2);
 const arg = (name) => {
@@ -46,6 +51,7 @@ function runCell(frameId, kindId, extraArgs = []) {
     const child = spawn(process.execPath, ['--expose-gc', CELL, frameId, kindId, ...extraArgs], {
       cwd: join(HERE, '../..'),
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: childEnv(),
     });
     let stdout = '';
     let stderr = '';

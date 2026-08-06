@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -5536,6 +5536,145 @@ describe('lua-native Node adapter', () => {
       it('still allows text chunks via load() when disabled', () => {
         const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
         expect(lua.execute_script('return load("return 7")()')).toBe(7);
+      });
+
+      // The chunk above touches no global, so it has no _ENV upvalue and cannot
+      // detect that SafeLoad was handing the loader an explicit nil `env`. Lua
+      // decides "was an env supplied" with lua_isnone, so an explicit nil counts
+      // as supplied — every chunk that *did* touch a global got _ENV = nil the
+      // moment this guard was on. Found August 6, 2026 while closing the file
+      // doors below; this is the assertion the original test could not make.
+      it('still allows text chunks that touch globals when disabled', () => {
+        const lua = new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+        lua.set_global('x', 5);
+        expect(lua.execute_script('return load("return x")()')).toBe(5);
+      });
+
+      // The guard was `load_bytecode` + `load` until August 6, 2026 — one class
+      // short. `loadfile`, `dofile` and `require` are stock Lua C functions that
+      // reach luaL_loadfilex with mode "bt", so each was an open door into the
+      // undumper. The two host-side file doors were open for the same reason.
+      //
+      // These matter more than an ordinary refusal pin: executing untrusted
+      // *source* is memory-safe and undumping untrusted *bytecode* is not, so a
+      // bypass converts a conceded capability into an unconceded one.
+      describe('the file doors (W1, August 6, 2026)', () => {
+        const REFUSED = /binary chunk|bytecode/i;
+        let dir: string;
+        let luac: string;
+
+        const gated = () =>
+          new lua_native.init({}, { libraries: 'all', allowBytecode: false });
+
+        beforeEach(() => {
+          dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-e3-'));
+          luac = path.join(dir, 'chunk.lua');   // .lua name, bytecode content
+          fs.writeFileSync(luac, Buffer.from(compiled()));
+        });
+
+        it('refuses loadfile of a binary chunk', () => {
+          expect(gated().execute_script(
+            `local f, e = loadfile(${JSON.stringify(luac)}); return f == nil and e or "LOADED"`
+          )).toMatch(REFUSED);
+        });
+
+        it('refuses dofile of a binary chunk', () => {
+          expect(() => gated().execute_script(`dofile(${JSON.stringify(luac)})`))
+            .toThrow(REFUSED);
+        });
+
+        it('refuses require of a binary chunk found on package.path', () => {
+          expect(() => gated().execute_script(
+            `package.path = ${JSON.stringify(path.join(dir, '?.lua'))}; require("chunk")`
+          )).toThrow(REFUSED);
+        });
+
+        it('refuses require of a binary chunk found via add_search_path', () => {
+          const lua = gated();
+          lua.add_search_path(path.join(dir, '?.lua'));
+          expect(() => lua.execute_script('require("chunk")')).toThrow(REFUSED);
+        });
+
+        it('refuses execute_file on a binary chunk', () => {
+          expect(() => gated().execute_file(luac)).toThrow(REFUSED);
+        });
+
+        it('refuses compile_file on a binary chunk', () => {
+          expect(() => gated().compile_file(luac)).toThrow(REFUSED);
+        });
+
+        // The sequence types.d.ts names as the reason the option exists,
+        // reaching the loader by a door the option did not cover.
+        it('refuses the in-VM string.dump -> io.write -> dofile route', () => {
+          const written = path.join(dir, 'self.lua');
+          expect(() => gated().execute_script(`
+            local h = io.open(${JSON.stringify(written)}, "wb")
+            h:write(string.dump(function() return "OWNED" end))
+            h:close()
+            dofile(${JSON.stringify(written)})
+          `)).toThrow(REFUSED);
+        });
+
+        it('leaves the text paths working', () => {
+          fs.writeFileSync(path.join(dir, 'textmod.lua'), 'return { hi = function() return "MOD" end }');
+          fs.writeFileSync(path.join(dir, 'plain.lua'), 'return "PLAIN"');
+          const lua = gated();
+          expect(lua.execute_script(
+            `package.path = ${JSON.stringify(path.join(dir, '?.lua'))}
+             local m = require("textmod")
+             return m.hi() .. "/" .. dofile(${JSON.stringify(path.join(dir, 'plain.lua'))})
+                    .. "/" .. loadfile(${JSON.stringify(path.join(dir, 'plain.lua'))})()`
+          )).toBe('MOD/PLAIN/PLAIN');
+        });
+
+        it('keeps dofile raising, and loadfile reporting nil + message', () => {
+          const lua = gated();
+          expect(lua.execute_script(
+            'local f, e = loadfile("/nope/missing.lua"); return f == nil and type(e) == "string"'
+          )).toBe(true);
+          expect(() => lua.execute_script('dofile("/nope/missing.lua")')).toThrow(/missing\.lua/);
+        });
+
+        it('does not take back a dofile the script replaced', () => {
+          expect(gated().execute_script(
+            'dofile = function() return "MINE" end; return dofile()'
+          )).toBe('MINE');
+        });
+
+        // The guard and the file reader both own `dofile`/`loadfile`. The reader
+        // removes its overrides by identity, so wrapping them would leave a
+        // reader that could never be uninstalled — CR-23 F3's failure one
+        // feature over. Both orders are pinned because only one of them was
+        // obviously safe.
+        it('composes with a file reader installed after it', () => {
+          const lua = gated();
+          lua.set_file_reader((p: string) => (p === 'v.lua' ? 'return "VIRT"' : null));
+          expect(lua.execute_script('return dofile("v.lua")')).toBe('VIRT');
+          lua.set_file_reader(null);
+          expect(lua.execute_script('return type(dofile)')).toBe('nil');
+        });
+
+        it('keeps the reader refusing bytecode when the two are composed', () => {
+          const lua = gated();
+          const bytes = Buffer.from(compiled()).toString('latin1');
+          lua.set_file_reader(() => bytes);
+          expect(() => lua.execute_script('dofile("x.lua")')).toThrow(REFUSED);
+        });
+
+        it('survives reset()', () => {
+          const lua = gated();
+          lua.reset();
+          expect(() => lua.execute_script(`dofile(${JSON.stringify(luac)})`)).toThrow(REFUSED);
+        });
+
+        // The change is opt-in: a context that never asked for the guard keeps
+        // every door it had.
+        it('changes nothing when allowBytecode is left alone', () => {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          expect(lua.execute_script(`return dofile(${JSON.stringify(luac)})`)).toBe(42);
+          expect(lua.execute_file(luac)).toBe(42);
+          expect(lua.compile_file(luac).length).toBeGreaterThan(0);
+        });
       });
     });
   });

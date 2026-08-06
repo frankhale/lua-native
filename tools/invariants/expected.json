@@ -111,7 +111,7 @@
   },
   "assertion-strength": {
     "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
-    "toThrow assertions examined": 428,
+    "toThrow assertions examined": 437,
     "negative (.not) — exempt by design": 37,
     "BARE positive assertions": 0
   },
@@ -129,7 +129,7 @@
     "binding: static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value);": "declaration",
     "binding: NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)": "macro-invocation",
     "binding: unattributed": 0,
-    "core: functions found": 159,
+    "core: functions found": 164,
     "core: unattributed": 0
   },
   "core-call-guarding": {
@@ -187,18 +187,19 @@
     "LuaContext::InstallFileReader -> SetFileReader": "CONTAINED_BY_CALLERS(2)"
   },
   "surface-census": {
-    "option: allowBytecode": "UNCLASSIFIED",
-    "option: binaryStrings": "COVERED: binary, strict+binary",
-    "option: libraries": "UNCLASSIFIED",
+    "option: allowBytecode": "COVERED: capability-matrix:all+nobytecode, capability-matrix:safe+nobytecode, capability-matrix:sandbox+bytecode",
+    "option: binaryStrings": "COVERED: roundtrip-matrix:binary, roundtrip-matrix:strict+binary",
+    "option: libraries": "COVERED: capability-matrix:all, capability-matrix:safe, capability-matrix:sandbox, capability-matrix:bare, capability-matrix:base-only, capability-matrix:all+nobytecode, capability-matrix:safe+nobytecode, capability-matrix:sandbox+bytecode",
     "option: maxInstructions": "LEDGERED",
     "option: maxMemory": "LEDGERED",
     "option: print": "LEDGERED",
     "option: shared": "LEDGERED",
-    "option: strictConversion": "COVERED: strict, strict+binary",
+    "option: strictConversion": "COVERED: roundtrip-matrix:strict, roundtrip-matrix:strict+binary",
     "option: timeout": "LEDGERED",
     "A. options declared": 9,
     "A. modes in roundtrip-matrix": 4,
-    "A. options UNCLASSIFIED": 2,
+    "A. configs in capability-matrix": 8,
+    "A. options UNCLASSIFIED": 0,
     "entry point: call": "COVERED: call-arg",
     "entry point: call_async": "COVERED: call_async-arg",
     "entry point: close": "LEDGERED",
@@ -247,9 +248,23 @@
     "frame: UserdataNewIndex": "COVERED: userdata_proxy_set",
     "D. host-callback aliases": 9,
     "D. host-callback members": "debug_hook_, file_reader_, host_fn_gc_callback_, host_functions_, input_handler_, output_handler_, property_getter_, property_setter_, userdata_gc_callback_",
-    "D. Lua C frames in core": 23,
+    "D. Lua C frames in core": 26,
     "D. host-callable frames": 13,
     "D. exception-matrix frames": 39,
-    "D. frames UNCLASSIFIED": 0
+    "D. frames UNCLASSIFIED": 0,
+    "trigger: A new public entry point that takes a JS value": "COMPUTED: census B",
+    "trigger: A new entry point that executes a script": "MANUAL: \"executes a script\" is a semantic property of a method body, not a signature; exec-parity's doors are declared by whoever adds one",
+    "trigger: A new asynchronous entry point": "MANUAL: same reason, plus the door must prove it really awaits",
+    "trigger: A new handle kind, or a new marker on a JS object": "COMPUTED: census C",
+    "trigger: A new option that changes conversion": "COMPUTED: census A (roundtrip-matrix modes)",
+    "trigger: A new option, preset or library that changes capabil": "COMPUTED: census A (capability-matrix configs)",
+    "trigger: A new Lua C frame that can call back into the host": "COMPUTED: census D",
+    "trigger: A new ObjectWrap subclass": "FAILS-CLOSED: objectwrap-branding",
+    "trigger: A new napi_type_tag": "FAILS-CLOSED: greppable-counts + AllTagsDistinct",
+    "trigger: A new occupancy policy": "FAILS-CLOSED: the generative assert in RejectIfOccupied",
+    "trigger: A Lua version bump": "MANUAL: the reference moves; nothing in this repository can detect that the vcpkg port changed underneath it",
+    "trigger: A new threading mode": "MANUAL: would invalidate §15.2's race row and every instrument's single-threaded assumption; not a row a scan can score",
+    "E. trigger rows in §15.6": 12,
+    "E. triggers UNDISPOSED": 0
   }
 }

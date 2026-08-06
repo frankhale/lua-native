@@ -55,6 +55,9 @@ npm run lifecycle-matrix
 # Two contexts exchanging values: handles refused, data intact, contexts independent
 npm run cross-context
 
+# What a libraries/allowBytecode configuration grants (8 configs x 28 doors)
+npm run capability-matrix
+
 # Clean build artifacts
 npm run clean
 ```
@@ -63,18 +66,23 @@ npm run clean
 
 **Important:** After C++ changes, you must `npm run build-debug` before running `npm test`. The debug build is required for testing — do not use prebuilt binaries.
 
-**Sanitizers (local, no CI required):** four harnesses cover the memory-safety /
+**Sanitizers (local, no CI required):** five harnesses cover the memory-safety /
 UB / data-race hazard classes the code reviews track. `test-cpp-asan` and
 `test-cpp-tsan` instrument the standalone C++ test binary; `test-ts-asan` and
 `test-ts-tsan` instrument the `.node` addon and run the full vitest suite under a
 preloaded sanitizer runtime (`run-sanitized-ts.js` handles the
 `DYLD_INSERT_LIBRARIES` preload and forces vitest's threads pool, since a forked
 worker would load the runtime too late). Each `test-*` script rebuilds the target,
-so run `build-debug` afterward to return to the normal binary. Highest-value one is
+so run `build-debug` afterward to return to the normal binary. `test-harness-asan` points the same instrumentation at the four `tools/`
+harnesses instead of the suite — the adversarial paths, which ran uninstrumented
+until August 6, 2026 — and `tools/gc-stress/run.mjs` is a fixture that hammers
+handle and finalizer lifetimes under forced GC for either to watch. **No
+sanitizer here sees a leak**: `detect_leaks=0` because LeakSanitizer does not
+exist on macOS. Highest-value one is
 `test-ts-asan` — the binding layer is where handle/finalizer use-after-frees live.
 `test-ts-tsan` is a best-effort probe only (TSan can't see libuv/V8/Lua
 synchronization, so a clean run is not a proof of race-freedom). Full details, the
-preload mechanics, and the July 2026 stress-test results are in
+preload mechanics, and the August 6, 2026 stress-test results are in
 `docs/SANITIZERS.md`. These sanitizers do **not** catch the exception-abort class
 (a `std::runtime_error` reaching `std::terminate`, e.g. CR-6 F1) — that is now
 the job of `npm run exception-matrix`, the generated search for that class
@@ -83,7 +91,7 @@ suite. The judgment behind the four harnesses — what each is worth, and why
 `test-ts-asan` is the one to run before shipping — is `docs/reviews/CODE-REVIEW-HISTORY.md`
 Part III (archive; superseded on its "no more tooling needed" conclusion).
 
-**Correctness harnesses (`tools/`).** Seven instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
+**Correctness harnesses (`tools/`).** Eight instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
 
 - `npm run check-invariants` — lists that used to live in comments (the
   `CallScope` classification, the `lua_next` traversal sites, the occupancy
@@ -94,7 +102,9 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   options, value-taking entry points, inbound markers and host-callable Lua C
   frames are derived from the source and scored against the harness that covers
   each. `UNCLASSIFIED` means nobody has ruled on that piece of surface — a
-  review item, not a defect. **Do not silence one by inventing a ledger entry;
+  review item, not a defect. Its fifth census reads §15.6's **trigger table out
+  of `CORRECTNESS.md`** and requires every row to be `COMPUTED`, `FAILS-CLOSED`
+  or `MANUAL`-with-a-reason, so a trigger added in prose cannot go unruled. **Do not silence one by inventing a ledger entry;
   either point an instrument at it or write down why it does not need one.** `tests/ts/invariants.spec.ts` runs the
   same checks, so drift is a red suite; re-freeze with `--update` so the change
   lands as a reviewable diff. **Do not "fix" a drifted invariant by editing the
@@ -127,6 +137,21 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   context must be refused by another, a plain value must cross unchanged, and
   neither context may observe the other. The boundary no earlier list contained
   (CR-22 F2). See `docs/reviews/CODE-REVIEW-22.md`.
+- `npm run capability-matrix` — what a `libraries` / `allowBytecode`
+  configuration actually grants: an entry point must **work or refuse loudly**,
+  never accept-and-retain (`LIMITATIONS.md` §8); each preset must load the
+  libraries it claims and no others; and a bytecode door must refuse iff the
+  guard is on. **Not an eighth boundary** — an axis across the seven; see
+  `docs/CORRECTNESS.md` §15.1. It exists because `libraries` and `allowBytecode`
+  were the two options no instrument could cover, and ruling on them found the
+  E3 guard five doors short of its own claim. See
+  `docs/UNSEARCHED-REGIONS-PLAN.md` §2.1.
+
+**Reviews are sweeps now, not read-throughs** (§15.9, August 6, 2026): a pass
+declares the unsearched region it is aimed at, delivers an instrument plus a
+ledger entry rather than a document, and proves the instrument can report dirty
+before believing it clean. There are no more numbered general passes —
+CODE-REVIEW-23 was the last.
 
 **The review programme is closed** (August 4, 2026). All seven boundaries have a
 generated search, the enumeration is derived from a stated criterion, and review
@@ -136,12 +161,15 @@ and it found three defects review had not — see `docs/CORRECTNESS.md` §15.6. 
 public entry point, a handle kind, a marker, an `ObjectWrap` subclass, a Lua C
 callback frame, or bumping Lua, read **`docs/CORRECTNESS.md` §15** —
 §15.6 maps each of those to the instrument to extend, and §15.7 is the
-regression-run matrix. (`docs/reviews/CODE-REVIEW-HISTORY.md` is the reasoning trail for
+regression-run matrix. A **capability** option (a preset, a library, the
+bytecode guard) is a `capability-matrix` config rather than a `roundtrip-matrix`
+mode — a distinction §15.6's table conflated until August 6, 2026, which is why
+two options sat uncoverable rather than merely uncovered. (`docs/reviews/CODE-REVIEW-HISTORY.md` is the reasoning trail for
 CR-17–22 — history, not instructions.) Four classes now fail closed on their own (a new tag, a
 new `ObjectWrap`, a new occupancy policy, a bare `.toThrow()`), so the check
 happens whether or not anyone remembers.
 
-All seven follow the same conventions, and `tools/README.md` states them with the
+All eight follow the same conventions, and `tools/README.md` states them with the
 reason each exists — chiefly: **an exhaustive search that reports clean must
 first demonstrate it can report dirty**, so each runs positive controls before
 its real work and refuses to proceed if they fail; each checks per-cell vacuity,

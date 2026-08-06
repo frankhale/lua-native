@@ -1375,6 +1375,16 @@ private:
   // Shared body of both overrides; a member so it can reach DispatchFileRead.
   static int LoadFromReader(lua_State* L, const LuaRuntime* runtime, const char* path);
   static int SafeLoad(lua_State* L);
+  // The file half of the E3 guard. `load` alone leaves four doors into the
+  // undumper open — `loadfile`, `dofile`, and `require` through either search
+  // path — because those are stock Lua C functions that pass mode NULL ("bt").
+  // Each wrapper forces "t" the way SafeLoad does; see InstallBytecodeFileGuards
+  // for why they are installed conditionally rather than unconditionally.
+  static int SafeLoadFile(lua_State* L);
+  static int SafeDoFile(lua_State* L);
+  static int SafeLuaSearcher(lua_State* L);
+  void InstallBytecodeFileGuards() const;
+  void RemoveBytecodeFileGuards() const;
   static int JsSearcher(lua_State* L);
 };
 

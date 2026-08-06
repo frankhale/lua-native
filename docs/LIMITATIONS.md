@@ -44,6 +44,18 @@ load(string.dump(f))                          -> function   (unless allowBytecod
 `loadfile` on a non-Lua file returns `nil`, so the target must parse as Lua. But
 any readable `.lua` file on the host can be executed.
 
+**What `allowBytecode: false` does and does not buy you here** (corrected
+August 6, 2026). The three file doors above reach the host's `.lua` files
+whatever this option says — that is what this section is about, and the option
+does not change it. What it *does* now guarantee is that whatever they reach is
+loaded as **source**: until August 6, 2026 `dofile`, `loadfile` and both
+`require` search paths loaded with mode `"bt"`, so a precompiled file was
+undumped — the memory-unsafe step the option exists to prevent — while
+`load(string.dump(f))` beside it was refused. All five file doors are now
+text-only under the option, so the distinction that matters holds: under
+`'safe'` an untrusted script can still *execute a readable `.lua` file*, and can
+no longer *undump a binary one*.
+
 ### The fix: `libraries: 'sandbox'` (added August 4, 2026)
 
 ```js
@@ -195,6 +207,27 @@ a `LuaRuntime` is single-threaded by construction.
 These are specified rather than surprising, and are listed here only so this
 document is a complete answer to "what should I not rely on". Full detail is on
 `LuaInput` (in) and `execute_script` (out) in `types.d.ts`.
+
+> **The rule this table is generated from** — stated August 6, 2026, because a
+> list without its generating rule cannot be checked for completeness, only
+> extended when something leaks past it:
+>
+> **A row belongs here when a value crosses between JS and Lua and arrives
+> *different*, for a reason that is a property of the two type systems rather
+> than of the caller's data.** Three clauses, each doing work. *Crosses* — an
+> internal representation choice that is never observable is not a row.
+> *Arrives different* — a refusal is not a loss, which is why the circular and
+> depth rows are marked "no" rather than omitted: they are here for contrast.
+> *A property of the type systems* — Lua keys are bytes and JS property names
+> are text; Lua tables have one namespace and JS objects another. Anything that
+> depends only on which values the caller happened to pass is a bug, not a row.
+>
+> **Why this is written down at all.** `strictConversion` was built from this
+> table, and the table was one row short — Lua keys are bytes, so the byte-key
+> row followed from the rule and nobody had derived it. The option shipped short
+> the same row (CR-23 F1). The generating rule is the thing that would have
+> caught it, and the three-way split above is what `roundtrip-matrix` and the
+> `strict` mode now range over.
 
 | Direction | Loss | Silent? |
 |---|---|---|

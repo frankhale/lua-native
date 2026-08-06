@@ -16,6 +16,26 @@
 //
 // Keys are `frameId` (the whole row) or `frameId x kindId` (one cell).
 
+// Shared reasons for the strictConversion kinds. Written as helpers so that a
+// frame borrowing one is visibly borrowing *that* reason, and a frame whose
+// reason changes has to stop borrowing it.
+const REJECTED_BEFORE_CONVERSION = (detail) =>
+  'strictConversion changes what the JS->Lua converter refuses. This frame never '
+  + 'reaches that converter with the returned value: ' + detail + '. The failure '
+  + 'the kind describes therefore cannot occur here, and the frame raising its own '
+  + 'type error instead is the correct behaviour.';
+
+const USED_VERBATIM =
+  "A from-Lua converter's return value is used verbatim (types.d.ts) and is never "
+  + 'converted back into Lua, so a JS->Lua conversion rule has nothing to apply to. '
+  + 'The same reason the return_bigint_out_of_range and return_deep_object entries '
+  + 'give for these frames.';
+
+const RETURN_DISCARDED =
+  'A setter\'s return value is discarded — nothing converts it in either '
+  + 'direction, so no conversion rule can fire on it. The exception path this '
+  + 'frame does cover is a setter that *throws*, which the throw_* kinds exercise.';
+
 export const EXPECTED_NON_SURFACING = {
   gc_finalizer:
     "Lua's own contract: an error in a __gc finalizer is reported as a warning "
@@ -188,6 +208,69 @@ export const EXPECTED_NON_SURFACING = {
   'file_reader_loadfile x return_deep_object':
     'As above — coerced to "[object Object]", which is not valid Lua.',
 
+
+  // --- the strictConversion kinds (W2, August 6, 2026) ----------------------
+  //
+  // Ten frames report both strict kinds as non-surfacing, and the reason is the
+  // same shape in every one: **the frame's return value never enters the JS->Lua
+  // conversion path**, so an option that changes how that conversion behaves has
+  // nothing to act on. Recorded per frame rather than as one wildcard, because
+  // the *why* differs and a shared excuse would hide a frame that stopped
+  // matching its own reason.
+  //
+  // This is the second time these kinds' first run reported the harness's model
+  // rather than the product's contract, which is the standing lesson of
+  // `tools/README.md`: an instrument's own assumptions are the likeliest source
+  // of a finding.
+
+  'require_searcher x return_lossy_array_strict': REJECTED_BEFORE_CONVERSION(
+    'a JS searcher must return a Lua source string or nil; the searcher type-checks '
+    + 'its result and raises "must return a Lua source string or nil" before any '
+    + 'value conversion happens'),
+  'require_searcher x return_lossy_object_strict': REJECTED_BEFORE_CONVERSION(
+    'as the array kind: the searcher refuses a non-string result outright'),
+
+  'read_handler x return_lossy_array_strict': REJECTED_BEFORE_CONVERSION(
+    'the io.read handler returns text (a string, a number, or since CR-23 a byte '
+    + 'view); an array is coerced or refused by that channel, never converted as a '
+    + 'Lua table'),
+  'read_handler x return_lossy_object_strict': REJECTED_BEFORE_CONVERSION(
+    'as the array kind, at the same channel'),
+
+  'file_reader x return_lossy_array_strict': REJECTED_BEFORE_CONVERSION(
+    'a file reader returns source text or null; its result is compiled, not '
+    + 'converted into a Lua value'),
+  'file_reader x return_lossy_object_strict': REJECTED_BEFORE_CONVERSION(
+    'as the array kind'),
+  'file_reader_loadfile x return_lossy_array_strict': REJECTED_BEFORE_CONVERSION(
+    'the loadfile door onto the same reader, and the same reason'),
+  'file_reader_loadfile x return_lossy_object_strict': REJECTED_BEFORE_CONVERSION(
+    'as the array kind'),
+
+  'from_lua_converter x return_lossy_array_strict': USED_VERBATIM,
+  'from_lua_converter x return_lossy_object_strict': USED_VERBATIM,
+  'from_lua_converter_async x return_lossy_array_strict': USED_VERBATIM,
+  'from_lua_converter_async x return_lossy_object_strict': USED_VERBATIM,
+
+  'class_constructor x return_lossy_array_strict':
+    'The constructor\'s result is the instance, held by Lua as userdata by '
+    + 'reference. Nothing converts it — the same reason the return_deep_object '
+    + 'entry above gives, and the two now agree because the option cannot reach a '
+    + 'value that is never converted.',
+  'class_constructor x return_lossy_object_strict':
+    'As the array kind: held by reference, never converted.',
+
+  'userdata_proxy_set x return_lossy_array_strict': RETURN_DISCARDED,
+  'userdata_proxy_set x return_lossy_object_strict': RETURN_DISCARDED,
+  'class_property_setter x return_lossy_array_strict': RETURN_DISCARDED,
+  'class_property_setter x return_lossy_object_strict': RETURN_DISCARDED,
+
+  'pcall_frame x return_lossy_array_strict':
+    'pcall() runs a JS function under protection and hands its result back to '
+    + '**JavaScript**, not into Lua. The crossing the option guards is not on this '
+    + 'path.',
+  'pcall_frame x return_lossy_object_strict':
+    'As the array kind: the result returns to JS.',
 };
 
 // Longest-match lookup: a per-cell entry wins over a whole-row one.

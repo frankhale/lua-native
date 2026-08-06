@@ -4,8 +4,22 @@
 // start — we arrange that by preloading the matching runtime dylib via
 // DYLD_INSERT_LIBRARIES (macOS) / LD_PRELOAD (Linux).
 //
-// Usage: node run-sanitized-ts.js <asan|tsan>
+// Usage: node run-sanitized-ts.js <asan|tsan> [script.mjs [args...]]
 // Build the matching addon first (npm run build-asan-addon / build-tsan-addon).
+//
+// With no script it runs the vitest suite, which is what it did for its first
+// year. **A script argument runs one of the `tools/` harnesses instead, and that
+// is the more valuable target** (W3.1): the suite exercises the happy paths,
+// while `lifecycle-matrix`, `exception-matrix` and `cross-context` are the
+// adversarial ones — released handles, double reset, re-alias, GC churn, throws
+// from C frames, two contexts trading handles — which is precisely where a
+// handle or finalizer use-after-free lives. Those ran uninstrumented until
+// August 6, 2026 because this file hardcoded the vitest binary.
+//
+// The preload reaches a harness's per-cell child processes because both matrices
+// spawn `process.execPath` without an explicit `env`, so the child inherits the
+// parent's — including DYLD_INSERT_LIBRARIES. That is *not* the same situation
+// as vitest's fork pool below, which builds its own worker environment.
 
 import { spawnSync } from "node:child_process";
 import os from "node:os";
@@ -14,9 +28,11 @@ import fs from "node:fs";
 
 const kind = process.argv[2];
 if (kind !== "asan" && kind !== "tsan") {
-  console.error("usage: node run-sanitized-ts.js <asan|tsan>");
+  console.error("usage: node run-sanitized-ts.js <asan|tsan> [script.mjs [args...]]");
   process.exit(2);
 }
+const target = process.argv[3] ?? null;
+const targetArgs = process.argv.slice(4);
 
 const platform = os.platform();
 if (platform === "win32") {
@@ -106,12 +122,36 @@ const env = {
   // threads pool, whose workers reject V8 flags in execArgv — --expose-gc is
   // provided process-wide on the node invocation below instead (CR-8 F2).
   LUA_NATIVE_SANITIZED: "1",
+  // dyld honours the preload at exec and then **strips it from the process's own
+  // environment**, so a target that spawns children cannot pass it on — every
+  // child would abort with "Interceptors are not working" (W3.1, found the hard
+  // way). These two survive, and `tools/sanitizer-env.mjs` re-injects the real
+  // variable for a spawned cell.
+  LUA_NATIVE_SANITIZER_PRELOAD: resolved,
+  LUA_NATIVE_SANITIZER_VAR: preloadVar,
   ...optionEnv,
 };
 
 console.log(`[${kind}] preloading ${resolved}`);
 console.log(`[${kind}] ${preloadVar} + ${Object.keys(optionEnv).join(", ")} set`);
 if (hasSupp) console.log(`[${kind}] using suppressions: ${suppressions}`);
+
+if (target) {
+  if (!fs.existsSync(target)) {
+    console.error(`no such script: ${target}`);
+    process.exit(2);
+  }
+  // A harness runs as an ordinary node process. Its own child processes inherit
+  // this environment, so a one-process-per-cell matrix is instrumented all the
+  // way down. Cells are slower under a sanitizer, so the per-cell timeouts read
+  // an override the harnesses respect.
+  console.log(`[${kind}] running ${target} ${targetArgs.join(" ")}`.trimEnd());
+  const run = spawnSync(process.execPath, ["--expose-gc", target, ...targetArgs], {
+    stdio: "inherit",
+    env: { ...env, LUA_NATIVE_CELL_TIMEOUT_MS: env.LUA_NATIVE_CELL_TIMEOUT_MS ?? "120000" },
+  });
+  process.exit(run.status ?? 1);
+}
 
 // Use the THREADS pool, single-threaded. A forked worker does not inherit
 // DYLD_INSERT_LIBRARIES (macOS drops it across the fork's exec), so the addon

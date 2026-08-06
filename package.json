@@ -29,6 +29,7 @@
     "test-cpp-tsan": "npm run build-cpp-tsan && node run-tests.js",
     "build-asan-addon": "node-gyp rebuild --debug -- -Dskip_test=1 -Daddon_asan=1",
     "test-ts-asan": "npm run build-asan-addon && node run-sanitized-ts.js asan",
+    "test-harness-asan": "npm run build-asan-addon && node run-sanitized-ts.js asan tools/cross-context/run.mjs && node run-sanitized-ts.js asan tools/capability-matrix/run.mjs && node run-sanitized-ts.js asan tools/lifecycle-matrix/run.mjs && node run-sanitized-ts.js asan tools/exception-matrix/run.mjs",
     "build-tsan-addon": "node-gyp rebuild --debug -- -Dskip_test=1 -Daddon_tsan=1",
     "test-ts-tsan": "npm run build-tsan-addon && node run-sanitized-ts.js tsan",
     "build-cmake-debug": "node cmake-build.js debug",
@@ -44,6 +45,7 @@
     "exec-parity": "node tools/exec-parity/run.mjs",
     "lifecycle-matrix": "node tools/lifecycle-matrix/run.mjs",
     "cross-context": "node tools/cross-context/run.mjs",
+    "capability-matrix": "node tools/capability-matrix/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib"
   },

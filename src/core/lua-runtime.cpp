@@ -2188,6 +2188,7 @@ void LuaRuntime::SetAllowBytecode(bool allow) {
         lua_pushcclosure(L_, SafeLoad, 1);  // upvalue 1 = original load
         lua_setglobal(L_, "load");
       }
+      InstallBytecodeFileGuards();
     } else {
       // Re-enable: unwrap by restoring the original load() saved as SafeLoad's
       // upvalue 1. Only touch load() if it is still our wrapper (a user may have
@@ -2198,6 +2199,7 @@ void LuaRuntime::SetAllowBytecode(bool allow) {
           lua_setglobal(L_, "load");      // restore it as the global load
         }
       }
+      RemoveBytecodeFileGuards();
     }
   });
 }
@@ -2208,9 +2210,189 @@ int LuaRuntime::SafeLoad(lua_State* L) {
   lua_pushvalue(L, 1);                                         // chunk
   if (nargs >= 2) lua_pushvalue(L, 2); else lua_pushnil(L);   // chunkname
   lua_pushliteral(L, "t");                                    // force text mode
-  if (nargs >= 4) lua_pushvalue(L, 4); else lua_pushnil(L);   // env
-  lua_call(L, 4, LUA_MULTRET);
+  // `env` is forwarded ONLY when the caller gave one. Lua decides "was an env
+  // supplied" with lua_isnone, so an explicit nil counts as *supplied* and
+  // load_aux then sets the chunk's _ENV to nil — which broke every loaded chunk
+  // that touched a global the moment this guard was on. It went unnoticed
+  // because the pinning test loaded `return 7`, a chunk with no _ENV upvalue at
+  // all. Found while closing the file doors below, August 6, 2026.
+  const int forwarded = (nargs >= 4) ? 4 : 3;
+  if (nargs >= 4) lua_pushvalue(L, 4);
+  lua_call(L, forwarded, LUA_MULTRET);
   return lua_gettop(L) - nargs;
+}
+
+// The file half of the guard.
+//
+// `SafeLoad` closes the in-memory door. It was the whole guard until August 6,
+// 2026, and the enumeration behind it ("load_bytecode() throws and load() is
+// forced to text-only", FEATURES.md E3) was one class short: `loadfile`,
+// `dofile` and `require` are stock Lua C functions that reach luaL_loadfilex
+// with mode NULL, i.e. "bt". Driven under `libraries: 'all', allowBytecode:
+// false`, a script reached the undumper with
+// `string.dump` -> `io.write` -> `dofile` — the exact sequence the option's own
+// documentation says it prevents.
+//
+// **Installed conditionally, and that is the load-bearing part.** A file reader
+// (P4b) replaces these same two globals with LuaLoadFile/LuaDoFile, which
+// already force "t", and removes them again by *identity*
+// (`lua_tocfunction == LuaDoFile`). Wrapping those would leave a reader that
+// could never be uninstalled — the CR-23 F3 failure, one feature over. So a
+// global that is already text-only by construction is left alone, which is
+// correct in both orders: install-guard-then-reader lets the reader overwrite a
+// wrapper that was only ever belt-and-braces, and reader-then-guard skips the
+// wrap and keeps the reader's identity check intact.
+void LuaRuntime::InstallBytecodeFileGuards() const {
+  // Caller holds RunProtected: every push here allocates and _G may carry a
+  // __newindex.
+  const auto alreadyTextOnly = [&](int idx) {
+    if (!lua_iscfunction(L_, idx)) return false;
+    const lua_CFunction f = lua_tocfunction(L_, idx);
+    return f == LuaLoadFile || f == LuaDoFile || f == SafeLoadFile || f == SafeDoFile;
+  };
+
+  lua_getglobal(L_, "loadfile");
+  if (lua_isfunction(L_, -1) && !alreadyTextOnly(-1)) {
+    lua_pushcclosure(L_, SafeLoadFile, 1);  // upvalue 1 = original loadfile
+    lua_setglobal(L_, "loadfile");
+  } else {
+    lua_pop(L_, 1);
+  }
+
+  // dofile takes no mode argument, so it cannot be forwarded the way loadfile
+  // is. The wrapper closes over the *original loadfile* instead and reproduces
+  // dofile's contract on top of it: raise on a load error, call with no
+  // arguments, return every result.
+  lua_getglobal(L_, "dofile");
+  if (lua_isfunction(L_, -1) && !alreadyTextOnly(-1)) {
+    lua_pop(L_, 1);  // the original dofile is not what the wrapper needs
+    lua_getglobal(L_, "loadfile");
+    if (lua_isfunction(L_, -1)) {
+      // Capture the *unwrapped* loadfile if we just wrapped it: SafeDoFile
+      // passes "t" itself, and going through SafeLoadFile would work but adds a
+      // frame that shows up in error messages.
+      if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == SafeLoadFile) {
+        if (!lua_getupvalue(L_, -1, 1)) lua_pushnil(L_);
+        lua_remove(L_, -2);
+      }
+      lua_pushcclosure(L_, SafeDoFile, 1);  // upvalue 1 = original loadfile
+      lua_setglobal(L_, "dofile");
+    } else {
+      lua_pop(L_, 1);
+    }
+  } else {
+    lua_pop(L_, 1);
+  }
+
+  // require's first file searcher. package.searchers[2] is searcher_Lua, which
+  // calls luaL_loadfilex with mode NULL; there is no argument to force, so it
+  // is replaced outright and restored on re-enable.
+  if (!HasPackageLibrary()) return;
+  PushProtectedGlobal("package");
+  lua_getfield(L_, -1, "searchers");
+  if (lua_istable(L_, -1)) {
+    lua_geti(L_, -1, 2);
+    if (lua_isfunction(L_, -1) && !(lua_iscfunction(L_, -1)
+        && lua_tocfunction(L_, -1) == SafeLuaSearcher)) {
+      lua_getfield(L_, -3, "searchpath");  // upvalue 2 = package.searchpath
+      lua_pushvalue(L_, -4);               // upvalue 3 = the package table
+      lua_pushcclosure(L_, SafeLuaSearcher, 3);  // upvalue 1 = original searcher
+      lua_seti(L_, -2, 2);
+    } else {
+      lua_pop(L_, 1);
+    }
+  }
+  lua_pop(L_, 2);  // searchers (or the non-table), package
+}
+
+void LuaRuntime::RemoveBytecodeFileGuards() const {
+  // Symmetric with SetAllowBytecode's load() unwrap, and for the same reason:
+  // only take back what is still ours. A script that replaced dofile keeps its
+  // replacement.
+  const auto unwrap = [&](const char* name, lua_CFunction ours) {
+    lua_getglobal(L_, name);
+    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == ours) {
+      if (lua_getupvalue(L_, -1, 1)) lua_setglobal(L_, name);
+    }
+    lua_pop(L_, 1);
+  };
+  unwrap("loadfile", SafeLoadFile);
+  // dofile's upvalue is the original *loadfile*, not the original dofile, so it
+  // cannot be restored from the closure. It is rebuilt the only way available:
+  // clear it, matching what RemoveFileReaderOverrides does with the same two
+  // globals and for the same reason — the original was never captured.
+  lua_getglobal(L_, "dofile");
+  if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == SafeDoFile) {
+    lua_pushnil(L_);
+    lua_setglobal(L_, "dofile");
+  }
+  lua_pop(L_, 1);
+
+  if (!HasPackageLibrary()) return;
+  PushProtectedGlobal("package");
+  lua_getfield(L_, -1, "searchers");
+  if (lua_istable(L_, -1)) {
+    lua_geti(L_, -1, 2);
+    if (lua_iscfunction(L_, -1) && lua_tocfunction(L_, -1) == SafeLuaSearcher) {
+      if (lua_getupvalue(L_, -1, 1)) lua_seti(L_, -3, 2);
+    }
+    lua_pop(L_, 1);
+  }
+  lua_pop(L_, 2);
+}
+
+// upvalue 1 = the original loadfile.
+int LuaRuntime::SafeLoadFile(lua_State* L) {
+  const int nargs = lua_gettop(L);
+  lua_pushvalue(L, lua_upvalueindex(1));
+  if (nargs >= 1) lua_pushvalue(L, 1); else lua_pushnil(L);   // filename
+  lua_pushliteral(L, "t");                                    // force text mode
+  // Same env rule as SafeLoad: forward only what was actually given.
+  const int forwarded = (nargs >= 3) ? 3 : 2;
+  if (nargs >= 3) lua_pushvalue(L, 3);
+  lua_call(L, forwarded, LUA_MULTRET);
+  return lua_gettop(L) - nargs;
+}
+
+// upvalue 1 = the original loadfile. Reproduces dofile: raise on a load error,
+// call the chunk with no arguments, return everything it returns.
+int LuaRuntime::SafeDoFile(lua_State* L) {
+  const int nargs = lua_gettop(L);
+  lua_pushvalue(L, lua_upvalueindex(1));
+  if (nargs >= 1) lua_pushvalue(L, 1); else lua_pushnil(L);
+  lua_pushliteral(L, "t");
+  lua_call(L, 2, 2);                    // -> chunk | nil, message
+  if (lua_isnil(L, -2)) {
+    lua_remove(L, -2);                  // drop the nil, leave the message
+    return lua_error(L);                // dofile raises, as the real one does
+  }
+  lua_pop(L, 1);                        // drop the (nil) message slot
+  lua_call(L, 0, LUA_MULTRET);
+  return lua_gettop(L) - nargs;
+}
+
+// upvalues: 1 = the original searcher (restored on re-enable), 2 =
+// package.searchpath, 3 = the package table (so package.path is read live —
+// a script may assign to it after this closure was built).
+int LuaRuntime::SafeLuaSearcher(lua_State* L) {
+  const char* name = luaL_checkstring(L, 1);
+  lua_pushvalue(L, lua_upvalueindex(2));       // searchpath
+  lua_pushvalue(L, 1);                         // module name
+  lua_getfield(L, lua_upvalueindex(3), "path");
+  lua_call(L, 2, 2);                           // -> filename | nil, message
+  if (!lua_isstring(L, -2)) {
+    // Not found: return the message so require moves to the next searcher.
+    lua_remove(L, -2);
+    return 1;
+  }
+  lua_pop(L, 1);                               // drop the (nil) message slot
+  const char* filename = lua_tostring(L, -1);
+  if (luaL_loadfilex(L, filename, "t") != LUA_OK) {
+    return luaL_error(L, "error loading module '%s' from file '%s':\n\t%s",
+                      name, filename, lua_tostring(L, -1));
+  }
+  lua_rotate(L, -2, 1);  // searchers return (loader, filename)
+  return 2;
 }
 
 // --- Dynamic require via a JS searcher (E2) ---
@@ -2535,7 +2717,11 @@ CompileResult LuaRuntime::CompileFile(const std::string& filepath,
   // finalizer that re-enters the host (CR-10 F1).
   ExecutionScope exec(this);
 
-  if (luaL_loadfile(L_, filepath.c_str()) != LUA_OK) {
+  // Text-only while the E3 guard is on: recompiling a file that is *already*
+  // bytecode undumps it first, which is the memory-unsafe step the guard exists
+  // to prevent. A host-side door is still a door — `load_bytecode` refuses here
+  // and this refused nothing.
+  if (luaL_loadfilex(L_, filepath.c_str(), allow_bytecode_ ? nullptr : "t") != LUA_OK) {
     std::string err = lua_tostring(L_, -1);
     return err;
   }
@@ -2990,7 +3176,9 @@ ScriptResult LuaRuntime::ExecuteFile(const std::string& filepath) const {
   int loadStatus;
   {
     ExecutionScope exec(this);
-    loadStatus = luaL_loadfile(L_, filepath.c_str());
+    // Text-only while the guard is on; see CompileFile for why a host-side door
+    // still counts.
+    loadStatus = luaL_loadfilex(L_, filepath.c_str(), allow_bytecode_ ? nullptr : "t");
   }
   if (loadStatus != LUA_OK) {
     std::string error = CaptureError(L_);

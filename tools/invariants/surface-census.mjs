@@ -61,6 +61,7 @@ import { fileURLToPath } from 'node:url';
 
 import { DOORS } from '../roundtrip-matrix/doors.mjs';
 import { MODES } from '../roundtrip-matrix/modes.mjs';
+import { CONFIGS } from '../capability-matrix/configs.mjs';
 import { HANDLES } from '../lifecycle-matrix/handles.mjs';
 import { FRAMES } from '../exception-matrix/frames.mjs';
 
@@ -343,6 +344,72 @@ export const ENTRY_POINT_LEDGER = {
 
 export const MARKER_LEDGER = {};
 
+// --- Census E: the trigger table's own rows --------------------------------
+//
+// **The kind-level check, and the one §1.1 of UNSEARCHED-REGIONS-PLAN predicted
+// would be needed next.** Censuses A–D each compute one *kind* of surface, and
+// the list of kinds — options, value-taking entry points, inbound markers,
+// host-callable frames — was itself a hand-written enumeration with no
+// generating rule. That is the exact shape of every defect this programme has
+// found at four levels already, and CR-23 found it one level up in §15.6.
+//
+// The rule the kind list is generated from is §15.6's own criterion:
+//
+//   > A trigger is anything that adds a new way for a value or a call to cross a
+//   > boundary — a new place (an entry point, a frame, a handle kind) *or a new
+//   > rule at an existing place* (an option, a preset, a version bump).
+//
+// So rather than assert the kinds by hand a second time, this census **reads the
+// trigger table out of `docs/CORRECTNESS.md` and requires every row to have a
+// disposition**. A row can be:
+//
+//   COMPUTED     — one of censuses A-D derives its universe
+//   FAILS-CLOSED — no census needed; the mechanism turns the suite red on its own
+//   MANUAL       — genuinely not mechanically decidable, with the reason
+//
+// A row with none of the three is UNDISPOSED and turns the suite red. **A new
+// row added to the table in prose therefore cannot be added without ruling on
+// it**, which is the property the table has never had — and a row deleted from
+// the doc while its disposition remains here reports STALE.
+export const TRIGGER_DISPOSITION = [
+  { match: /new public entry point that takes a JS value/i, verdict: 'COMPUTED: census B' },
+  { match: /new entry point that executes a script/i,
+    verdict: 'MANUAL: "executes a script" is a semantic property of a method body, '
+      + 'not a signature; exec-parity\'s doors are declared by whoever adds one' },
+  { match: /new \*?asynchronous\*? entry point/i,
+    verdict: 'MANUAL: same reason, plus the door must prove it really awaits' },
+  { match: /new handle kind, or a new marker/i, verdict: 'COMPUTED: census C' },
+  { match: /new option that changes \*?conversion\*?/i, verdict: 'COMPUTED: census A (roundtrip-matrix modes)' },
+  { match: /changes \*?capability\*?/i, verdict: 'COMPUTED: census A (capability-matrix configs)' },
+  { match: /new Lua C frame/i, verdict: 'COMPUTED: census D' },
+  { match: /new `?ObjectWrap`? subclass/i, verdict: 'FAILS-CLOSED: objectwrap-branding' },
+  { match: /new `?napi_type_tag`?/i, verdict: 'FAILS-CLOSED: greppable-counts + AllTagsDistinct' },
+  { match: /new occupancy policy/i, verdict: 'FAILS-CLOSED: the generative assert in RejectIfOccupied' },
+  { match: /Lua version bump/i,
+    verdict: 'MANUAL: the reference moves; nothing in this repository can detect '
+      + 'that the vcpkg port changed underneath it' },
+  { match: /new threading mode/i,
+    verdict: 'MANUAL: would invalidate §15.2\'s race row and every instrument\'s '
+      + 'single-threaded assumption; not a row a scan can score' },
+];
+
+// The §15.6 trigger table, read out of the document rather than restated.
+export function triggerTableRows(correctnessMd) {
+  const at = correctnessMd.indexOf('## 15.6');
+  if (at < 0) throw new Error('surface census: §15.6 not found in CORRECTNESS.md');
+  const section = correctnessMd.slice(at, correctnessMd.indexOf('\n## ', at + 10));
+  const rows = [];
+  for (const line of section.split('\n')) {
+    const m = /^\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*$/.exec(line);
+    if (!m) continue;
+    const trigger = m[1].trim();
+    if (/^-+$/.test(trigger) || /^Trigger$/i.test(trigger)) continue;
+    rows.push(trigger);
+  }
+  if (rows.length < 5) throw new Error(`surface census: §15.6 table parsed as ${rows.length} rows`);
+  return rows;
+}
+
 export const FRAME_LEDGER = {
   HostFnSentinelGC:
     'Reaches a host callback but not *user* JS, which is the distinction the '
@@ -465,20 +532,44 @@ export function surfaceCensus() {
   const header = read('src/core/lua-runtime.h');
   const out = {};
 
-  // --- A. Options -> round-trip modes --------------------------------------
+  // --- A. Options -> the axis of whichever instrument re-rules the boundary --
+  //
+  // **An option is covered by whichever instrument varies it, and until August
+  // 6, 2026 this census could only see one of them.** Coverage was the union of
+  // the option keys set by a `roundtrip-matrix` mode, which is right for the
+  // options that re-rule *conversion* and structurally wrong for the ones that
+  // re-rule *capability*: `libraries` and `allowBytecode` change which doors
+  // exist, not how a value converts, so no round-trip mode would ever set them
+  // and `LEDGERED` was the only verdict they could reach. They read as
+  // UNCLASSIFIED; they were in fact unclassifiable, which is a worse state and
+  // one the census had no way to distinguish.
+  //
+  // That is the same defect this file was written to end, one level up: an
+  // enumeration (here, "the instruments an option can be covered by") with a
+  // single member and no stated rule. The rule now is the one §15.1 already
+  // implies — **an option is covered iff some instrument's configuration axis
+  // varies it** — and the axis list below is what it ranges over. A third
+  // instrument with a config axis joins it by being added here.
+  const AXES = [
+    { instrument: 'roundtrip-matrix', entries: MODES },
+    { instrument: 'capability-matrix', entries: CONFIGS },
+  ];
   const options = optionKeys(interfaceBody(types, 'LuaInitOptions'));
   const modeCover = new Map();
-  for (const mode of MODES) {
-    for (const key of Object.keys(mode.options ?? {})) {
-      // Accumulate as an array. Joining on each pass and re-spreading the
-      // result spreads a *string*, one character per mode id.
-      modeCover.set(key, [...(modeCover.get(key) ?? []), mode.id]);
+  for (const axis of AXES) {
+    for (const entry of axis.entries) {
+      for (const key of Object.keys(entry.options ?? {})) {
+        // Accumulate as an array. Joining on each pass and re-spreading the
+        // result spreads a *string*, one character per mode id.
+        modeCover.set(key, [...(modeCover.get(key) ?? []), `${axis.instrument}:${entry.id}`]);
+      }
     }
   }
   for (const [k, v] of modeCover) modeCover.set(k, v.join(', '));
   const optionUnclassified = score(options, modeCover, OPTION_LEDGER, out, 'option: ');
   out['A. options declared'] = options.length;
   out['A. modes in roundtrip-matrix'] = MODES.length;
+  out['A. configs in capability-matrix'] = CONFIGS.length;
   out['A. options UNCLASSIFIED'] = optionUnclassified;
 
   // --- B. Value-taking entry points -> round-trip doors ---------------------
@@ -546,6 +637,32 @@ export function surfaceCensus() {
   out['D. host-callable frames'] = hostCallable.length;
   out['D. exception-matrix frames'] = FRAMES.length;
   out['D. frames UNCLASSIFIED'] = frameUnclassified;
+
+  // --- E. The trigger table's own rows --------------------------------------
+  const triggers = triggerTableRows(read('docs/CORRECTNESS.md'));
+  const usedDispositions = new Set();
+  let undisposed = 0;
+  for (const trigger of triggers) {
+    const hit = TRIGGER_DISPOSITION.find((d) => d.match.test(trigger));
+    // The row text is long prose; key on a short stable prefix so the frozen
+    // answer does not churn on an edit to the wording after the first clause.
+    const key = `trigger: ${trigger.replace(/[*`]/g, '').slice(0, 52)}`;
+    if (hit) {
+      usedDispositions.add(hit.match.source);
+      out[key] = hit.verdict;
+    } else {
+      out[key] = 'UNDISPOSED — add it to TRIGGER_DISPOSITION or give it a census';
+      undisposed += 1;
+    }
+  }
+  for (const d of TRIGGER_DISPOSITION) {
+    if (!usedDispositions.has(d.match.source)) {
+      out[`trigger disposition: ${d.match.source.slice(0, 40)}`] =
+        'STALE — no row in §15.6 matches this disposition';
+    }
+  }
+  out['E. trigger rows in §15.6'] = triggers.length;
+  out['E. triggers UNDISPOSED'] = undisposed;
 
   return out;
 }

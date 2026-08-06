@@ -16,6 +16,7 @@ purpose: a reader who never opens this file still cannot mistake
 | [`CORRECTNESS.md`](CORRECTNESS.md) | **The correctness posture.** What is covered and what is not, what reopens review (§15.6), the regression-run matrix (§15.7), and the binding platform scope (§14). The correctness programme is closed; this is its conclusion and operating manual. |
 | [`FEATURES.md`](FEATURES.md) | What the binding actually does today. The reference for behaviour. |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | What it deliberately does **not** do, and what it does less completely than you might assume — the sandbox's real reach, binary strings, and the documented conversion losses. Every claim driven, not inferred. |
+| [`UNSEARCHED-REGIONS-PLAN.md`](UNSEARCHED-REGIONS-PLAN.md) | The August 6, 2026 plan for the regions no instrument covers — the two `UNCLASSIFIED` options the census reports, mode as a shared axis, the memory gaps (the harnesses run uninstrumented; there is no leak check on macOS), and a **checkable** closing condition. Moves to `reviews/` when executed. |
 
 ## Tooling
 
@@ -64,6 +65,14 @@ what a *good* reason to write one looks like:
 every item came from driving the shipped API and finding a door that behaved
 differently from its siblings, which is a different question from "what does the
 competition have". That is the bar for the next one.
+
+[`UNSEARCHED-REGIONS-PLAN.md`](UNSEARCHED-REGIONS-PLAN.md) (August 6, 2026) is
+the second, and it is held to that bar: every item derives from a measurement in
+the repository — a frozen `UNCLASSIFIED` row in `tools/invariants/expected.json`,
+the dated sanitizer record, a standing ledger residual, or the programme's own
+yield law — rather than from a survey of what could exist. It is a plan, not a
+roadmap: it has a **stated closing condition** (§7) and moves to `reviews/` when
+executed.
 
 ---
 
