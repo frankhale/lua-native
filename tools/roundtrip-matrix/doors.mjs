@@ -15,25 +15,40 @@
 // crossing into Lua and back. Throwing is a legitimate outcome and is recorded
 // as one — a door that refuses a value its siblings accept is exactly the shape
 // being searched for.
+//
+// **`entryPoints` names the public methods the round-tripped value itself
+// crosses through**, and it is read by the surface census
+// (`tools/invariants/surface-census.mjs`), which computes the set of
+// value-taking entry points from `types.d.ts` and reports any that no door
+// drives. It is deliberately narrower than "methods this door calls": every
+// door calls `execute_script`, but the value does not cross through the script
+// string, and counting it would let one door claim coverage of everything.
+// `[]` is a real answer — several doors carry the value *out* of Lua (returned
+// from a class method, from a host callback) and enter it by no public method
+// at all.
 
 export const DOORS = [
   {
     id: 'set_global/get_global',
+    entryPoints: ['set_global'],
     describe: 'set_global(v) then get_global()',
     roundTrip: (lua, v) => { lua.set_global('rt', v); return lua.get_global('rt'); },
   },
   {
     id: 'set_global/script',
+    entryPoints: ['set_global'],
     describe: 'set_global(v) then `return rt` from a script',
     roundTrip: (lua, v) => { lua.set_global('rt', v); return lua.execute_script('return rt'); },
   },
   {
     id: 'create_table/get',
+    entryPoints: ['create_table'],
     describe: 'create_table({ k: v }) then handle.get("k")',
     roundTrip: (lua, v) => lua.create_table({ k: v }).get('k'),
   },
   {
     id: 'handle.set/get',
+    entryPoints: ['set'],
     describe: 'handle.set("k", v) then handle.get("k")',
     roundTrip: (lua, v) => {
       const h = lua.create_table({});
@@ -43,6 +58,7 @@ export const DOORS = [
   },
   {
     id: 'lua-fn-arg',
+    entryPoints: [],
     describe: 'passed as an argument to a Lua function that returns it',
     roundTrip: (lua, v) => {
       const f = lua.execute_script('return function(x) return x end');
@@ -51,6 +67,7 @@ export const DOORS = [
   },
   {
     id: 'host-callback-return',
+    entryPoints: [],
     describe: 'returned from a JS host callback, handed back by Lua',
     roundTrip: (lua, v) => {
       lua.set_global('give', () => v);
@@ -59,6 +76,7 @@ export const DOORS = [
   },
   {
     id: 'coroutine-resume-arg',
+    entryPoints: ['resume'],
     describe: 'resume(co, v), yielded straight back',
     roundTrip: (lua, v) => {
       const co = lua.create_coroutine('return function(x) coroutine.yield(x) end');
@@ -69,6 +87,7 @@ export const DOORS = [
   },
   {
     id: 'environment',
+    entryPoints: ['set'],
     describe: 'placed in an environment, read by a script run in it',
     roundTrip: (lua, v) => {
       const env = lua.create_environment();
@@ -78,6 +97,7 @@ export const DOORS = [
   },
   {
     id: 'pcall-arg',
+    entryPoints: ['pcall'],
     describe: 'pcall(luaFn, v)',
     roundTrip: (lua, v) => {
       const f = lua.execute_script('return function(x) return x end');
@@ -88,6 +108,7 @@ export const DOORS = [
   },
   {
     id: 'userdata-field',
+    entryPoints: ['set_userdata'],
     describe: 'a field of a proxy userdata, read from Lua',
     roundTrip: (lua, v) => {
       lua.set_userdata('ud', { k: v }, { readable: true });
@@ -96,6 +117,7 @@ export const DOORS = [
   },
   {
     id: 'class-method-return',
+    entryPoints: [],
     describe: 'returned from a registered class method',
     roundTrip: (lua, v) => {
       lua.register_class('RT', { construct: () => ({}), methods: { get: () => v } });
@@ -104,6 +126,7 @@ export const DOORS = [
   },
   {
     id: 'module-field',
+    entryPoints: ['register_module'],
     describe: 'a field of a registered module, read after require',
     roundTrip: (lua, v) => {
       lua.register_module('rtmod', { k: v });
@@ -119,6 +142,7 @@ export const DOORS = [
   // instrument that exists to catch it.
   {
     id: 'class-static-return',
+    entryPoints: [],
     describe: 'returned from a registered class static (P2a)',
     roundTrip: (lua, v) => {
       lua.register_class('RTS', { construct: () => ({}), statics: { get: () => v } });
@@ -127,6 +151,7 @@ export const DOORS = [
   },
   {
     id: 'class-property-get',
+    entryPoints: [],
     describe: 'returned from a registered class property accessor (P2b)',
     roundTrip: (lua, v) => {
       lua.register_class('RTP', {
@@ -138,6 +163,7 @@ export const DOORS = [
   },
   {
     id: 'class-property-set',
+    entryPoints: ['set_global'],
     describe: 'written through a class property setter and read back (P2b)',
     roundTrip: (lua, v) => {
       let held;
@@ -153,7 +179,23 @@ export const DOORS = [
     },
   },
   {
+    // Added August 6, 2026 by the surface census, which reported `call` as the
+    // one value-taking entry point no door drove. Its *asynchronous* twin got a
+    // door when INTEROP-PARITY added `call_async`; the synchronous original —
+    // older than the matrix — never had one, which is the same "the new sibling
+    // was covered, the old one was assumed" shape as the two frames added to
+    // the exception matrix in the same pass.
+    id: 'call-arg',
+    entryPoints: ['call'],
+    describe: 'passed as an argument to call(), returned straight back',
+    roundTrip: (lua, v) => {
+      lua.execute_script('function rt_id(x) return x end');
+      return lua.call('rt_id', v);
+    },
+  },
+  {
     id: 'call_async-arg',
+    entryPoints: ['call_async'],
     describe: 'passed as an argument to call_async, returned straight back (P1a)',
     roundTrip: async (lua, v) => {
       lua.execute_script('function rt_id(x) return x end');
@@ -162,6 +204,7 @@ export const DOORS = [
   },
   {
     id: 'resume_async-arg',
+    entryPoints: ['resume_async'],
     describe: 'resume_async(co, v), yielded straight back (P1b)',
     roundTrip: async (lua, v) => {
       const co = lua.create_coroutine('return function(x) coroutine.yield(x) end');
@@ -172,6 +215,7 @@ export const DOORS = [
   },
   {
     id: 'file-reader-source',
+    entryPoints: ['set_global'],
     describe: 'set as a global by a chunk served through the file reader (P4b)',
     roundTrip: (lua, v) => {
       // The reader serves *source*, so the value crosses as a global the served

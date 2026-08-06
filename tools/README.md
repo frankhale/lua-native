@@ -15,6 +15,8 @@ tools/
   cpp-scan.mjs            shared: a minimal C++ scanner (comments/strings,
                           top-level functions, try-block regions)
   invariants/             lists that used to live in comments, generated and frozen
+                          (incl. surface-census.mjs: is each harness below
+                           pointed at everything it should be?)
   exception-matrix/       can a C++ exception escape into the process?
   diff-oracle/            does lua-native agree with stock Lua?
   roundtrip-matrix/       does a JS value survive the crossing into Lua and back?
@@ -25,10 +27,10 @@ tools/
 
 | Harness | Run | What it searches | Docs |
 |---|---|---|---|
-| **invariants** | `npm run check-invariants` | Enumerations that decay: the `CallScope` classification, `lua_next` traversal sites, occupancy policies, greppable counts, the exception surface, whether every binding path to a throwing core call is guarded, and the scanner's own coverage | CODE-REVIEW-18 §4, CODE-REVIEW-19 F1/F2 |
-| **exception-matrix** | `npm run exception-matrix` | 36 Lua C frames × 11 throw kinds, one process per cell — a `std::runtime_error` reaching `std::terminate`, which the sanitizers are blind to | `docs/reviews/CODE-REVIEW-18.md` |
+| **invariants** | `npm run check-invariants` | Enumerations that decay: the `CallScope` classification, `lua_next` traversal sites, occupancy policies, greppable counts, the exception surface, whether every binding path to a throwing core call is guarded, the scanner's own coverage, and — the tenth, `surface-census` — whether every piece of new surface is covered by one of the harnesses below or deliberately ledgered | CODE-REVIEW-18 §4, CODE-REVIEW-19 F1/F2, `docs/CORRECTNESS.md` §15.3/§15.6 |
+| **exception-matrix** | `npm run exception-matrix` | 39 Lua C frames × 11 throw kinds, one process per cell — a `std::runtime_error` reaching `std::terminate`, which the sanitizers are blind to | `docs/reviews/CODE-REVIEW-18.md` |
 | **diff-oracle** | `npm run oracle` | 2678 cases against stock Lua 5.5: does the embedded VM behave like the reference (mode A), and do values coming *out* survive (mode B) | `docs/DIFFERENTIAL-ORACLE.md` |
-| **roundtrip-matrix** | `npm run roundtrip-matrix` | 4 context modes × 18 entry points × 50 values: does a value survive the crossing *in*, do all eighteen doors agree with each other, and does each answer hold under `strictConversion` / `binaryStrings` as well as the defaults | `docs/reviews/CODE-REVIEW-20.md`, `docs/reviews/CODE-REVIEW-23.md` |
+| **roundtrip-matrix** | `npm run roundtrip-matrix` | 4 context modes × 19 entry points × 50 values: does a value survive the crossing *in*, do all nineteen doors agree with each other, and does each answer hold under `strictConversion` / `binaryStrings` as well as the defaults | `docs/reviews/CODE-REVIEW-20.md`, `docs/reviews/CODE-REVIEW-23.md` |
 | **exec-parity** | `npm run exec-parity` | 1339 corpus cases × 5 doors: do `execute_script_async`, `execute_async`, `compile`→`load_bytecode`, `call_async` and `resume_async` agree with `execute_script` — values *and* error messages | `docs/reviews/CODE-REVIEW-21.md`, `docs/reviews/INTEROP-PARITY-PLAN.md` |
 | **cross-context** | `npm run cross-context` | Two contexts in one process: handles are refused, data crosses intact, contexts stay independent. The boundary CR-22 F2 found missing from every earlier list — where CR-20 F5 and CR-22 F1 both live | `docs/reviews/CODE-REVIEW-22.md` |
 | **lifecycle-matrix** | `npm run lifecycle-matrix` | 12 handle kinds × lifecycle events (reset, double reset, re-alias, GC, churn, release, double release, close, double close, close+release, release+close), one process per cell: a handle must stay valid or refuse — never answer with another state's data | `docs/reviews/CODE-REVIEW-22.md` |

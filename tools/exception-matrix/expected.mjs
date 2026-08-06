@@ -41,6 +41,16 @@ export const EXPECTED_NON_SURFACING = {
     + 'frame for print / io.write. Same trade-off, same fix — documented on '
     + 'set_print_handler() rather than only in a comment.',
 
+  io_write_handler:
+    'The same containment as print_handler, at the other C frame behind the '
+    + 'same handler. Added August 6, 2026 when the surface census reported '
+    + '`LuaIoWrite` as a host-callable frame with no row: `LuaPrint` and '
+    + '`LuaIoWrite` are separate C functions, print_handler triggered only the '
+    + 'first, and its describe line claimed both. All eleven kinds are contained '
+    + 'here exactly as they are through print(), which is the answer '
+    + 'set_print_handler()\'s documentation already promised for io.write — this '
+    + 'row is that promise now being checked rather than asserted.',
+
   'class_constructor x return_deep_object':
     'Not a failure. The over-deep object is a perfectly good JS object; the '
     + 'constructor returns it and Lua holds it by reference as userdata. Nothing '
@@ -135,6 +145,48 @@ export const EXPECTED_NON_SURFACING = {
     'As above: discarded, so kMaxDepth is never reached. (The matching getter '
     + 'cells DO surface, because a getter\'s return value is converted — which '
     + 'is what makes this a fact about setters rather than about accessors.)',
+
+  // The proxy-userdata setter, added August 6, 2026 by the surface census —
+  // `UserdataIndex` had a frame and `UserdataNewIndex` did not. Its three
+  // non-surfacing cells are the same three as the class property setter's, for
+  // the same reason, which is the evidence that the two accessor paths agree.
+  'userdata_proxy_set x return_symbol':
+    'Not applicable, as class_property_setter x return_symbol: a JS setter\'s '
+    + 'return value is discarded, so there is no conversion for a Symbol to be '
+    + 'refused by. The matching userdata_proxy_get cells DO surface.',
+  'userdata_proxy_set x return_bigint_out_of_range':
+    'As above: the setter\'s return value is discarded, so an out-of-range '
+    + 'BigInt is never converted.',
+  'userdata_proxy_set x return_deep_object':
+    'As above: discarded, so kMaxDepth is never reached.',
+
+  // loadfile, added August 6, 2026 by the surface census (`LuaLoadFile` was a
+  // host-callable frame with no row; `file_reader` triggered only dofile).
+  //
+  // **The whole row is by-convention, not by-accident, and it was driven rather
+  // than reasoned about.** `loadfile` returns `nil, message` where `dofile`
+  // raises — Lua's own contract for the pair — so every failure here arrives as
+  // a return value. Run side by side, the two frames produce the *identical*
+  // message text through the two conventions:
+  //
+  //   dofile   -> THREW    "file reader failed for '/p.lua': boom"
+  //   loadfile -> returned [null, "file reader failed for '/p.lua': boom"]
+  //
+  // Eight of the eleven kinds still read as surfacing because the probe's
+  // signature survives into the message. These three do not, for reasons that
+  // are already ledgered one frame over.
+  'file_reader_loadfile x throw_error_hostile_message':
+    'The failure DOES surface, in loadfile\'s `nil, message` form: the returned '
+    + 'message is the generic "threw a value that could not be converted to a '
+    + 'string". The cell reads as non-surfacing only because the hostile message '
+    + 'is by construction unrecoverable, so nothing of the probe\'s identity is '
+    + 'left to match on. Identical text to the dofile cell, which raises it.',
+  'file_reader_loadfile x return_bigint_out_of_range':
+    'As file_reader x return_bigint_out_of_range: the reader is contracted to '
+    + 'return Lua *source*, the BigInt is coerced to its digits, and the digits '
+    + 'do not parse. Surfaces as the syntax error it should be, via `nil, msg`.',
+  'file_reader_loadfile x return_deep_object':
+    'As above — coerced to "[object Object]", which is not valid Lua.',
 
 };
 

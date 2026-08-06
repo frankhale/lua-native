@@ -247,10 +247,10 @@ Applying it to this codebase gives seven, and each has a generated search:
 
 | # | Boundary | The two rule-sets | Instrument |
 |---|---|---|---|
-| 1 | JS value → Lua | JS types / Lua types | `roundtrip-matrix` (4 modes × 18 doors × 50 values) |
+| 1 | JS value → Lua | JS types / Lua types | `roundtrip-matrix` (4 modes × 19 doors × 50 values) |
 | 2 | Lua value → JS | Lua types / JS types | `diff-oracle` mode B (1339 cases) |
 | 3 | Embedded VM → reference Lua | this VM's hooks / stock Lua | `diff-oracle` mode A (1339 cases) |
-| 4 | C++ exception → Lua C frame | C++ unwinding / Lua longjmp | `exception-matrix` (27 × 11, process/cell) |
+| 4 | C++ exception → Lua C frame | C++ unwinding / Lua longjmp | `exception-matrix` (39 × 11, process/cell) |
 | 5 | One execution door → another | sync / worker / coroutine / bytecode | `exec-parity` (1339 × 3) |
 | 6 | Handle → a later state of its context | live handle / retired state | `lifecycle-matrix` (11 × 8, process/cell) |
 | 7 | Context → context | two independent `lua_State`s | `cross-context` (handles, data, isolation) |
@@ -302,7 +302,7 @@ codebase has the receipt: CR-11 F1 was a use-after-free reintroduced when a
 later modernization pass reverted a `NOLINT`ed loop whose reason was not
 attached to it. The comment now says "The NOLINT is load-bearing."
 
-Nine invariants, each computing a universe from the source and comparing it to a
+Ten invariants, each computing a universe from the source and comparing it to a
 frozen answer. The ones that close a defect *class* rather than track a count:
 
 | Invariant | Class closed | How a new member is caught |
@@ -313,6 +313,7 @@ frozen answer. The ones that close a defect *class* rather than track a count:
 | `exception-surface` | Drift in the throw/catch/barrier counts the CR-18 axes were derived from | Any change to the counts |
 | `callscope-classification`, `lua-next-sites`, `occupancy-policy-sites` | Hand-maintained enumerations that decayed in CR-13/14/15 | The frozen key set *is* the universe; a vanished member reports `(gone)` |
 | `scanner-coverage`, `greppable-counts` | The scanners' own blind spots (CR-19 F2) | Unattributed definitions and totals are frozen |
+| `surface-census` | **§15.6's trigger table decaying like every other hand-maintained enumeration (CR-23 F4)** | Options, value-taking entry points, inbound markers and host-callable Lua C frames are each computed from the source and scored against the instrument that covers them; anything neither covered nor ledgered is `UNCLASSIFIED` |
 
 Plus two compile-time and one runtime assertion in the source: `AllTagsDistinct`
 (`static_assert`), the occupancy-policy `assert`, and the `ContextLiveness`
@@ -355,6 +356,26 @@ is a trigger, and the trigger names the instrument to extend:
 
 The rows that say "nothing" are the ones worth noticing: for four classes the
 mechanism now fails closed without anyone deciding to look.
+
+**Since August 6, 2026 the rest of the table is computed too, and that is the
+point of the `surface-census` invariant** (`tools/invariants/surface-census.mjs`).
+The four triggers that are mechanically decidable — a new option, a new
+value-taking entry point, a new inbound marker, a new host-callable Lua C frame
+— have their universe derived from the source and scored against the instrument
+that claims them. Surface that is neither covered nor deliberately ledgered
+reports `UNCLASSIFIED` and turns the suite red. So the table above is now
+documentation of a check rather than the check itself, which is the state every
+other enumeration in this programme had to reach before it stopped decaying.
+
+Two things it deliberately does not do, both recorded because the temptation is
+obvious. It does **not** demand parity between `lifecycle-matrix` and
+`cross-context` — the note above about the coroutine cursor is exactly why, and
+a census that required every handle kind in both would regenerate CR-22 F1's
+false finding on every run. And `UNCLASSIFIED` is **not** a defect claim; it is
+the same contract `callscope-classification` offers, where a row that changes
+class is a review item and nothing more. What it ends is the third state:
+surface that is neither searched nor consciously excluded, which is what
+`binaryStrings` was for two commits and what §15.6 had no way to notice.
 
 **Exercised August 5, 2026, and it worked.** The `INTEROP-PARITY-PLAN` work added
 three entry points that take JS values, two that execute, a handle kind, nine Lua

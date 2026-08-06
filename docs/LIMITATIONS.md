@@ -122,7 +122,7 @@ decoded by the caller: `new TextDecoder().decode(bytes)`.
 
 **Binary data round-trips exactly in this mode**, which is the one built-in
 conversion that stops being one-way: a `Uint8Array` goes in as a binary-safe Lua
-string and comes back as the same bytes. Verified at all eighteen doors by the
+string and comes back as the same bytes. Verified at all nineteen doors by the
 `binary` mode of `npm run roundtrip-matrix`, where it is the single value that
 contradicts `LuaInput`'s blanket "the built-ins are one-way" and is ledgered as
 such.
@@ -259,15 +259,15 @@ rows that already throw keep their own messages — strict mode does not relabel
 them — and the `BigInt` row is untouched, because a type change the caller can
 see is not the thing this option is for.
 
-**Refused uniformly at all eighteen entry points** a value can cross at. A mode
+**Refused uniformly at all nineteen entry points** a value can cross at. A mode
 honoured by `set_global` but not by a Lua function argument would be worse than
 no mode at all — so this is *checked*, not asserted: `npm run roundtrip-matrix`
 runs its whole corpus through every door in `tools/roundtrip-matrix/doors.mjs`
 under this mode as well as the default, and a door that answered differently
-from its seventeen siblings would be a parity disagreement.
+from its eighteen siblings would be a parity disagreement.
 
 **That check dates from August 6, 2026 (CR-23 F4).** The sentence above used to
-claim it while no such run existed — the suite hand-picked four of the eighteen
+claim it while no such run existed — the suite hand-picked four of the then-eighteen
 doors, and the two it omitted were the two that push arguments on a worker
 thread. The property held when it was finally measured; the point is that it had
 been stated before it was.

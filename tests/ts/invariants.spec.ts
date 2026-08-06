@@ -20,6 +20,10 @@
 import { describe, it, expect } from 'vitest';
 import { topLevelFunctions, tryGuardMap } from '../../tools/cpp-scan.mjs';
 import { INVARIANTS, computeAll, readExpected, diffInvariant } from '../../tools/invariants/invariants.mjs';
+import {
+  score, mappedCoverage, valueBearingTypes, methodSignatures, inboundMarkers,
+  hostCallbackMembers, hostReachingCoreMethods,
+} from '../../tools/invariants/surface-census.mjs';
 
 // Wraps a body in a function definition the scanner will pick up, and returns
 // whether the marker call `boom()` is scored as inside a try block.
@@ -89,6 +93,115 @@ describe('invariant scanner: positive controls', () => {
       '}',
     ].join('\n');
     expect(topLevelFunctions(src).map((f) => f.name)).toEqual(['Defined', 'LuaContext::Method']);
+  });
+});
+
+// The surface census is the newest scanner here and, per `tools/README.md`, the
+// newest code is the least trustworthy part of any instrument — this one alone
+// produced three false findings while it was being written (an empty marker
+// universe scored as a clean sheet, a member-declaration pattern that dropped
+// `host_functions_` and so declared the main host bridge unable to reach the
+// host, and a coverage scan that read one of cross-context's two case arrays and
+// would have argued for reversing ledger entry M6).
+//
+// So each of its four censuses is driven against a synthetic input whose right
+// answer is known, in both directions: it must find the thing, and it must
+// report the thing missing.
+describe('surface census: positive controls', () => {
+  it('scores an option with no mode as UNCLASSIFIED, and one with a mode as COVERED', () => {
+    const out: Record<string, unknown> = {};
+    const n = score(['covered', 'orphan'], new Map([['covered', 'some-mode']]), {}, out, 'option: ');
+    expect(out['option: orphan']).toBe('UNCLASSIFIED');
+    expect(out['option: covered']).toBe('COVERED: some-mode');
+    expect(n).toBe(1);
+  });
+
+  it('reports a ledger entry for surface that no longer exists', () => {
+    const out: Record<string, unknown> = {};
+    score(['still-here'], new Map(), { 'still-here': 'reason', gone: 'reason' }, out, 'x: ');
+    expect(out['x: still-here']).toBe('LEDGERED');
+    expect(String(out['x: gone'])).toMatch(/STALE LEDGER ENTRY/);
+  });
+
+  it('reports a ledger entry that the instrument has since covered', () => {
+    const out: Record<string, unknown> = {};
+    score(['m'], new Map([['m', 'case-1']]), { m: 'stale excuse' }, out, 'x: ');
+    expect(String(out['x: m'])).toMatch(/LEDGERED_BUT_COVERED/);
+  });
+
+  it('reports a mapping that names a case the instrument does not have', () => {
+    const { cover, broken } = mappedCoverage({ a: ['real', 'imaginary'] }, ['real']);
+    expect(cover.get('a')).toBe('real');
+    expect(broken).toEqual(['a -> imaginary']);
+  });
+
+  it('closes the value-bearing type set transitively', () => {
+    const src = [
+      'export interface Direct { x: LuaInput; }',
+      'export interface Indirect { d: Direct; }',
+      'export interface Unrelated { flag: boolean; }',
+    ].join('\n');
+    const set = valueBearingTypes(src);
+    expect(set.has('Direct')).toBe(true);
+    // The hop that matters: `ClassDefinition` is reached this way, and a
+    // one-level scan is how an enumeration goes a member short.
+    expect(set.has('Indirect')).toBe(true);
+    expect(set.has('Unrelated')).toBe(false);
+  });
+
+  it('captures a method signature that spans several lines', () => {
+    const sigs = methodSignatures([
+      '  short(a: string): void;',
+      '  spread(',
+      '    a: LuaInput,',
+      '    b: (x: number) => void,',
+      '  ): void;',
+    ].join('\n'));
+    expect([...sigs.keys()]).toEqual(['short', 'spread']);
+    expect(sigs.get('spread')).toMatch(/LuaInput/);
+  });
+
+  it('counts a marker that is read back and ignores one that is only written', () => {
+    const src = 'DefineHiddenProp(env, o, "__writeOnly", x);\n'
+      + 'auto* d = TaggedData<X>(obj.Get("_readBack"), tag);\n'
+      + 'if (obj.Has("__alsoRead")) {}\n';
+    expect(inboundMarkers(src)).toEqual(['__alsoRead', '_readBack']);
+  });
+
+  it('finds a host-callback member whatever container it is declared in', () => {
+    const header = [
+      'using OutputHandler = std::function<void(int)>;',
+      'using Function = std::function<int(int)>;',
+      '  std::shared_ptr<OutputHandler> output_handler_;',
+      '  std::unordered_map<std::string, std::shared_ptr<Function>> host_functions_;',
+      '  int unrelated_;',
+    ].join('\n');
+    const { aliases, members } = hostCallbackMembers(header);
+    expect(aliases).toEqual(['OutputHandler', 'Function']);
+    // `host_functions_` is the one an anchored pattern dropped, which made the
+    // census declare LuaCallHostFunction unable to reach the host.
+    expect(members).toEqual(['host_functions_', 'output_handler_']);
+  });
+
+  it('follows a frame to a host callback through an accessor', () => {
+    const core = [
+      'bool LuaRuntime::HasInputHandler() const {',
+      '  return input_handler_ != nullptr;',
+      '}',
+      'int LuaRuntime::Indirect(lua_State* L) {',
+      '  if (runtime->HasInputHandler()) return 1;',
+      '  return 0;',
+      '}',
+      'int LuaRuntime::Unrelated(lua_State* L) {',
+      '  return 0;',
+      '}',
+    ].join('\n');
+    const reaching = hostReachingCoreMethods(core, ['input_handler_']);
+    expect(reaching.has('HasInputHandler')).toBe(true);
+    // The transitive hop. Without it the census saw 3 host-callable frames of
+    // 23 and missed the print, io, dofile and searcher bridges.
+    expect(reaching.has('Indirect')).toBe(true);
+    expect(reaching.has('Unrelated')).toBe(false);
   });
 });
 

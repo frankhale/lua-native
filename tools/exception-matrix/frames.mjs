@@ -127,9 +127,20 @@ export const FRAMES = [
   },
   {
     id: 'print_handler',
-    describe: 'the print / io.write handler',
+    describe: 'the print handler, reached through print()',
     install: (lua, act) => lua.set_print_handler(act),
     trigger: (lua) => lua.execute_script('print("probe")'),
+  },
+  {
+    // Added August 6, 2026 by the surface census: one output *handler*, two Lua
+    // C frames. `LuaPrint` and `LuaIoWrite` are separate C functions and only
+    // the first was triggered, while this frame's describe line claimed both —
+    // the "class fixed across the members someone could enumerate, short by one"
+    // shape, inside the instrument that exists to find it.
+    id: 'io_write_handler',
+    describe: 'the same output handler reached through io.write (a distinct C frame from print)',
+    install: (lua, act) => lua.set_print_handler(act),
+    trigger: (lua) => lua.execute_script('io.write("probe")'),
   },
   {
     id: 'require_searcher',
@@ -202,6 +213,23 @@ export const FRAMES = [
       lua.set_userdata('probe_ud', obj, { readable: true });
     },
     trigger: (lua) => lua.execute_script('return probe_ud.prop'),
+  },
+  {
+    // Added August 6, 2026 by the surface census. `UserdataIndex` had a frame
+    // and `UserdataNewIndex` did not — the write half of the same pair. It is
+    // not the read frame with the arrow reversed: the setter runs with a
+    // converted Lua value already staged on the C++ side, so a throw here
+    // unwinds over a live local the getter path does not have.
+    id: 'userdata_proxy_set',
+    describe: 'a proxy-userdata property write reaching a JS setter',
+    install: (lua, act) => {
+      const obj = {};
+      Object.defineProperty(obj, 'prop', {
+        get: () => 1, set: act, enumerable: true, configurable: true,
+      });
+      lua.set_userdata('probe_ud', obj, { readable: true, writable: true });
+    },
+    trigger: (lua) => lua.execute_script('probe_ud.prop = 1'),
   },
 
   // --- Binding call, no Lua running: converters and marshalling ----------
@@ -306,9 +334,21 @@ export const FRAMES = [
   },
   {
     id: 'file_reader',
-    describe: 'the dofile/loadfile reader (P4b)',
+    describe: 'the file reader reached through dofile (P4b)',
     install: (lua, act) => lua.set_file_reader(act),
     trigger: (lua) => lua.execute_script('return dofile("/probe.lua")'),
+  },
+  {
+    // Added August 6, 2026 by the surface census, for the same reason as
+    // io_write_handler: `LuaDoFile` and `LuaLoadFile` are two C frames behind
+    // one handler, and the describe line above used to claim both while
+    // triggering one. `loadfile` also differs in kind — it *returns* the chunk
+    // instead of running it, so the reader's throw has to unwind a frame that
+    // was going to hand a function back rather than a result.
+    id: 'file_reader_loadfile',
+    describe: 'the same file reader reached through loadfile (a distinct C frame from dofile)',
+    install: (lua, act) => lua.set_file_reader(act),
+    trigger: (lua) => lua.execute_script('return loadfile("/probe.lua")'),
   },
   {
     id: 'class_property_getter',

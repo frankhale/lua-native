@@ -28,6 +28,7 @@ import {
   readSource, topLevelFunctions, stripCommentsAndStrings, stripComments, tryGuardMap,
   unattributedDefinitions,
 } from '../cpp-scan.mjs';
+import { surfaceCensus } from './surface-census.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const BINDING = join(ROOT, 'src/lua-native.cpp');
@@ -634,6 +635,12 @@ export const INVARIANTS = [
     title: 'Binding calls that can let a C++ exception reach N-API',
     compute: coreCallGuarding,
     note: 'The CR-6 F1 class. ESCAPES_AT_ROOT or UNGUARDED_AND_PROPAGATES is a process-abort candidate and must be justified.',
+  },
+  {
+    id: 'surface-census',
+    title: 'Every piece of new surface is covered by an instrument or ledgered',
+    compute: surfaceCensus,
+    note: 'CORRECTNESS.md §15.6 computed. UNCLASSIFIED means nobody has ruled on that option / entry point / marker / frame — a review item, not automatically a defect. STALE LEDGER ENTRY and BROKEN LINK mean an excuse or a coverage claim that no longer refers to anything.',
   },
 ];
 

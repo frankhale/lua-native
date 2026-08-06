@@ -34,7 +34,7 @@ npm run test-ts-tsan    # addon under TSan, via the async vitest suite
 npm run check-invariants
 node tools/invariants/run.mjs --update      # re-freeze after a reviewed change
 
-# Exception-escape matrix (36 Lua C frames x 11 throw kinds, 1 process/cell)
+# Exception-escape matrix (39 Lua C frames x 11 throw kinds, 1 process/cell)
 npm run exception-matrix
 
 # Differential oracle vs stock Lua 5.5 (2678 cases)
@@ -42,7 +42,7 @@ npm run exception-matrix
 npm run oracle
 
 # JS -> Lua -> JS round-trip and entry-point parity
-# (4 context modes x 18 doors x 50 values)
+# (4 context modes x 19 doors x 50 values)
 npm run roundtrip-matrix
 node tools/roundtrip-matrix/run.mjs --mode=strict   # one mode
 
@@ -89,7 +89,13 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   `CallScope` classification, the `lua_next` traversal sites, the occupancy
   policy set, greppable counts, and every binding call to a `RunProtected`-backed
   core method scored guarded or not) are computed from the source and compared
-  against `tools/invariants/expected.json`. `tests/ts/invariants.spec.ts` runs the
+  against `tools/invariants/expected.json`. The tenth, **`surface-census`**, is
+  `CORRECTNESS.md` §15.6's trigger table computed rather than consulted: the
+  options, value-taking entry points, inbound markers and host-callable Lua C
+  frames are derived from the source and scored against the harness that covers
+  each. `UNCLASSIFIED` means nobody has ruled on that piece of surface — a
+  review item, not a defect. **Do not silence one by inventing a ledger entry;
+  either point an instrument at it or write down why it does not need one.** `tests/ts/invariants.spec.ts` runs the
   same checks, so drift is a red suite; re-freeze with `--update` so the change
   lands as a reviewable diff. **Do not "fix" a drifted invariant by editing the
   expected file without reading what moved** — the whole point is that the diff
@@ -101,9 +107,9 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   oracle prints both Lua versions and warns if they differ. Checks whether an
   answer is *right* rather than whether nothing crashed, for the embedded VM and
   for values coming out of Lua. See `docs/DIFFERENTIAL-ORACLE.md`.
-- `npm run roundtrip-matrix` — the other direction: 4 context modes × 18 entry
+- `npm run roundtrip-matrix` — the other direction: 4 context modes × 19 entry
   points × 50 values, checking that a JS value survives the crossing *into* Lua
-  and that all eighteen doors agree with each other — under `strictConversion`
+  and that all nineteen doors agree with each other — under `strictConversion`
   and `binaryStrings` as well as the defaults. **A mode must prove its option is
   in effect before its cells count**; a silently ignored option would otherwise
   report a clean column that searched nothing. See
