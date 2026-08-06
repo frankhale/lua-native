@@ -563,6 +563,62 @@ export interface LuaStateInfo {
    * the names it expanded to (`'all'` → all ten), and a bare state as `[]`.
    */
   libraries: LuaLibrary[];
+
+  /**
+   * How many JS values this context's own bookkeeping is holding alive, by
+   * container. Diagnostic only — nothing in the binding reads these back, and
+   * no behaviour depends on them.
+   *
+   * `memoryBytes` above measures the *Lua* heap. This measures the other side:
+   * the callbacks, userdata wrappers, converters and handlers the addon retains
+   * on the JS side so Lua can reach them. A context that grows without bound
+   * while `memoryBytes` stays flat is leaking here.
+   */
+  bindingRefs: BindingRefCounts;
+}
+
+/**
+ * Per-container counts of the JS values a context retains, from
+ * {@link LuaStateInfo.bindingRefs}.
+ *
+ * Each number counts **entries**, not `Napi::Reference`s — a class property
+ * with both a getter and a setter is one entry. `total` is the sum of the
+ * others, computed natively so the parts and the whole cannot disagree.
+ *
+ * These are diagnostics, not a contract: the set of containers reflects how the
+ * binding is currently built and may change with it. What is stable is the
+ * intent — a count that grows across repeated create/use/discard cycles is a
+ * leak, and that is what `tools/binding-balance` checks.
+ */
+export interface BindingRefCounts {
+  /** Host functions registered for Lua to call, by name. */
+  callbacks: number;
+  /** Live userdata instances, including `register_class` ones. */
+  userdata: number;
+  /** Userdata whose method closures are still registered. */
+  userdataMethods: number;
+  /** Thrown JS errors staged for round-trip; cleared at each outermost call. */
+  errorRegistry: number;
+  /** Classes registered via `register_class`. Permanent by design. */
+  classes: number;
+  /** Named class properties with an accessor. Permanent by design. */
+  classAccessors: number;
+  /** Converters registered with `register_type_converter`. */
+  typeConverters: number;
+  /** Converters registered with `register_from_lua_converter`. */
+  fromLuaConverters: number;
+  /** JS `require` searchers added with `add_searcher`. */
+  searchers: number;
+  /** Shared tables this context is subscribed to. */
+  sharedTables: number;
+  /** Redirection handlers in force: print, read, file reader, debug hook (0–4). */
+  handlers: number;
+  /** References held only while an async run is in flight (0–3 at rest: 0). */
+  asyncRefs: number;
+  /** Whether a `callbacks` object is registered (0 or 1). */
+  callbacksObject: number;
+  /** Sum of every count above. */
+  total: number;
 }
 
 /**

@@ -1,10 +1,35 @@
 # UNSEARCHED-REGIONS-PLAN
 
+> **SUPERSEDED — executed August 6, 2026. This is a record, not an instruction.**
+>
+> W1–W5 are all done; each carries its own execution record below, and those
+> records are the reason to read this file — three of them contradict the premise
+> that motivated the work (§4.2 W3.2 most sharply: *"two premises above were
+> wrong"*).
+>
+> **What survives as an instruction is §7's closing condition, and it now lives
+> in [`../CORRECTNESS.md`](../CORRECTNESS.md) §15.10** — together with its clause
+> tally (1–4 met, **clause 5 at 0 of 2**) and the ordered list of what to search
+> next. Read it there. The copy in §7 below is frozen at its August 6 state and
+> will not be updated as the count moves.
+>
+> The instruments this plan produced are current and documented where they
+> execute: `capability-matrix` (§2.1) in [`../../tools/README.md`](../../tools/README.md),
+> `test-harness-asan` and the re-dated stress record (§4.1, §4.3) in
+> [`../SANITIZERS.md`](../SANITIZERS.md), `tools/gc-stress` (§4.2) in
+> `tools/README.md`, and the `surface-census` trigger-table census (§5) in
+> `CORRECTNESS.md` §15.6.
+>
+> This document moved here under its own supersession rule, quoted directly
+> below — the rule worked, which is worth one line of evidence in a programme
+> whose recurring defect was the stale marker.
+
 **Date:** August 6, 2026
-**Status:** Current. **Not survey-derived** — every item below comes from a
-measurement in this repository (a frozen invariant answer, a dated sanitizer
-record, a ledger residual, or the programme's own yield law), which is the bar
-`docs/README.md` sets for writing a plan document at all.
+**Status:** Executed and superseded, same day. **Not survey-derived** — every
+item below came from a measurement in this repository (a frozen invariant
+answer, a dated sanitizer record, a ledger residual, or the programme's own
+yield law), which is the bar `docs/README.md` sets for writing a plan document
+at all.
 
 **Supersession rule, stated up front so this file cannot become the thing it is
 correcting:** when the work below is executed, this document moves to
@@ -560,6 +585,9 @@ numbered pass.
 ---
 
 ## 7. The closing condition, stated so it can be checked
+
+> **Frozen at its August 6, 2026 state.** The live copy — the one that gets
+> updated as clause 5 moves — is `CORRECTNESS.md` §15.10.
 
 Without this, the question "what should we do about correctness?" regenerates
 every few weeks — which is §14's lesson about the word *deferred*, applied to

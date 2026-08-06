@@ -966,7 +966,7 @@ Three capabilities for controlling how a Lua context talks to the outside world:
   `loadfile`, `dofile` and both `require` search paths are forced to text-only
   mode — for safely running untrusted scripts. (The file doors were added
   August 6, 2026: this bullet used to name `load_bytecode` and `load` only, and
-  the five it omitted were open. See `docs/UNSEARCHED-REGIONS-PLAN.md` §2.1.)
+  the five it omitted were open. See `docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1.)
 
 ### Architecture
 
@@ -1389,7 +1389,7 @@ The interesting part is not the hook itself but the fact that `lua_sethook` was 
 
 ### Overview
 
-`info()` returns a plain object describing the context: the Lua version it runs (`version`, `release`, `versionNumber`), the memory it currently holds (`memoryBytes`, `memoryKB`), the limits it was created with (`memoryLimit`, `maxInstructions`), and the standard libraries loaded into it (`libraries`). It is the "what is this context, and how close is it to its limits" snapshot that memory monitoring and bug reports need.
+`info()` returns a plain object describing the context: the Lua version it runs (`version`, `release`, `versionNumber`), the memory it currently holds (`memoryBytes`, `memoryKB`), the limits it was created with (`memoryLimit`, `maxInstructions`), the standard libraries loaded into it (`libraries`), and — since August 2026 — how many JS values the binding is holding on its behalf (`bindingRefs`). It is the "what is this context, and how close is it to its limits" snapshot that memory monitoring and bug reports need.
 
 ### Architecture
 
@@ -1408,6 +1408,16 @@ The interesting part is not the hook itself but the fact that `lua_sethook` was 
 **Reported fields go beyond the plan's two.** The plan's example showed `{ version, memoryKB }`, both of which duplicate existing API (`get_memory_usage()` and a build constant). The limits and library list are what make the memory number actionable — a `memoryBytes` with no `memoryLimit` beside it cannot answer "how close am I?" — and all four come from getters the runtime already exposes, so the cost is a few `Set` calls.
 
 **`libraries` reflects the resolved names, not the preset.** `RuntimeConfig` keeps the library list verbatim, and presets are expanded at construction, so `'safe'` reads back as the seven names it opened. That is what a diagnostic wants: the actual reachable surface, not the label someone passed.
+
+### `bindingRefs` — the other side of the memory number (August 2026)
+
+`memoryBytes` measures the **Lua** heap. `bindingRefs` measures the other side: the JS values the addon retains as `Napi::Reference`s so Lua can reach them — host callbacks, userdata wrappers, the type converters, `require` searchers, class property accessors, the redirection handlers, and the staged-error registry. Thirteen counts plus a `total`, each counting *entries* rather than references (a class property with a getter and a setter is one entry), with `total` summed natively for the same reason `memoryKB` is divided natively: the parts and the whole cannot disagree.
+
+The practical reading: **a context whose `bindingRefs.total` climbs while `memoryBytes` stays flat is leaking on the JS side**, which no other number here would show.
+
+**Why it ships rather than living behind a debug build.** It was added to make a search possible — `tools/binding-balance` had nothing to read, so roughly half the addon's retained memory was unmeasurable by any instrument, on a platform where LeakSanitizer does not exist. A debug-only counter would have left the *released* binary — the configuration users actually run — exactly as unmeasurable as before. `CORRECTNESS.md` §15.10 records the decision and the search's result.
+
+**The counters are diagnostics, not a contract.** The set of containers reflects how the binding is currently built and may change with it. What is stable is the intent, and it is enforced: `surface-census`'s census F derives every member that transitively retains a JS value and requires each to carry a declared lifetime policy, so a container added to the product without one turns the suite red.
 
 ---
 

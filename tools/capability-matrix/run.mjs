@@ -8,7 +8,7 @@
 // nobody had ruled on — `surface-census` reported both UNCLASSIFIED, and could
 // not have reported anything else, because it scored an option covered only if
 // a `roundtrip-matrix` mode set it and neither option changes conversion
-// (`docs/UNSEARCHED-REGIONS-PLAN.md` §2.1). Ruling on them turned up a guard
+// (`docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1). Ruling on them turned up a guard
 // whose member set was five doors short. This is the search that would have
 // found it.
 //

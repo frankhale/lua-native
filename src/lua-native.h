@@ -478,6 +478,11 @@ public:
     Napi::Value ExecuteScriptIn(const Napi::CallbackInfo& info);
     Napi::Value GetMemoryUsage(const Napi::CallbackInfo& info);
     Napi::Value Info(const Napi::CallbackInfo& info);
+    // Per-container counts of the JS values this context's bookkeeping holds
+    // alive, returned as `info().bindingRefs`. Diagnostic only; see the
+    // definition for why it ships rather than living behind a debug build, and
+    // `tools/binding-balance/policy.mjs` for what each count is allowed to do.
+    Napi::Object BindingRefCounts();
     Napi::Value RegisterTypeConverter(const Napi::CallbackInfo& info);
     Napi::Value RegisterFromLuaConverter(const Napi::CallbackInfo& info);
     Napi::Value RegisterClass(const Napi::CallbackInfo& info);
@@ -849,8 +854,15 @@ private:
     // to LuaRuntime::ResumeAsyncStep, whose header carries the reasoning: this
     // is the opening step, so for call_async these are the caller's *arguments*
     // rather than resume values (CR-23 F5).
+    // `args` is borrowed, not owned, and that is safe for a specific reason
+    // rather than by luck: DriveAsync forwards it to a single ResumeAsyncStep
+    // call that happens *before* any user JS or Lua runs, and never touches it
+    // afterwards. Nothing a re-entrant callback could reach owns the caller's
+    // vector either — it is a local in the calling door's frame. Taking it by
+    // value would move-construct at every call site (all three move or pass
+    // `{}`), which costs a vector move for a parameter this function only reads.
     Napi::Value BeginAsyncRun(const Napi::Object& self,
-                              std::vector<lua_core::LuaPtr> args,
+                              const std::vector<lua_core::LuaPtr>& args,
                               const char* arg_role = "resume value");
     void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error,
                     const char* arg_role = "resume value");

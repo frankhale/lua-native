@@ -256,8 +256,15 @@ Applying it to this codebase gives seven, and each has a generated search:
 | 6 | Handle → a later state of its context | live handle / retired state | `lifecycle-matrix` (11 × 8, process/cell) |
 | 7 | Context → context | two independent `lua_State`s | `cross-context` (handles, data, isolation) |
 
-**An eighth instrument, `capability-matrix`, is not an eighth boundary and is
-recorded here so nobody counts it as one.** It searches an *axis* that cuts
+**Two further instruments exist and neither is an eighth boundary**, recorded
+here so nobody counts them as one. `binding-balance` (August 6, 2026) is the
+second: it searches what the binding *retains* rather than what crosses it, which
+is not a value exchange between two rule-sets and so does not meet the criterion
+above. It is a resource-lifetime search, filed as such — see §15.10 — and its
+universe is derived by `surface-census`'s census F rather than from this list.
+The first:
+
+`capability-matrix` searches an *axis* that cuts
 across the seven: what a `libraries` / `allowBytecode` configuration grants. One
 of its three properties meets §15.1's criterion exactly — an entry point that
 returns normally while doing nothing observable (`LIMITATIONS.md` §8's
@@ -382,6 +389,7 @@ is a trigger, and the trigger names the instrument to extend:
 | **A new option that changes *conversion*** | **`roundtrip-matrix` (Axis C, a mode) — and `exec-parity` if it is execution-visible** |
 | **A new option, preset or library that changes *capability*** | **`capability-matrix` (Axis A, a config)** — the split is stated below |
 | A new Lua C frame that can call back into the host | `exception-matrix` (Axis B) |
+| **A new member that retains a JS value** | **`binding-balance` (a container, with a lifetime policy) — and a counter in `info().bindingRefs`** |
 | A new `ObjectWrap` subclass | nothing — `objectwrap-branding` will fail until it is branded |
 | A new `napi_type_tag` | nothing — `greppable-counts` and `AllTagsDistinct` will fail |
 | A new occupancy policy | nothing — the generative `assert` will fire |
@@ -487,7 +495,7 @@ inherited the conflation and scored coverage as "a round-trip mode sets this
 key", so `libraries` and `allowBytecode` were not merely unclassified but
 **unclassifiable**: `LEDGERED` was the only verdict they could reach. Ruling on
 them found a guard five doors short of its own claim
-(`UNSEARCHED-REGIONS-PLAN.md` §2.1). The table now splits the row, the census
+(`reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1). The table now splits the row, the census
 ranges over a list of instrument axes rather than one instrument, and
 `capability-matrix` is the eighth harness.
 
@@ -516,6 +524,8 @@ npm run capability-matrix                             # after library/preset/sea
 node tools/exec-parity/run.mjs --config=sandbox       # door parity under a sealed state
 node tools/diff-oracle/run.mjs --mode=b --binary      # values out under binaryStrings, vs stock Lua
 npm run exception-matrix                              # after error-path changes
+npm run binding-balance                               # after any change to what the binding retains
+node tools/gc-stress/run.mjs                          # after handle/finalizer changes: the aggregate registry balance
 npm run test-ts-asan                                  # before a release
 npm run test-harness-asan                             # before a release: the adversarial paths instrumented
 ```
@@ -534,11 +544,24 @@ inside a boundary that its instrument's axes do not reach is still possible —
 `exec-parity` covers four doors and there are more entry points than four,
 `lifecycle-matrix` covers eleven handle kinds under eight events.
 
-**The per-instrument yield law still holds, and it now has seven data points.**
-Every genuinely new instrument found something; every re-run of an existing one
-found nothing new. There is no reason to think an eighth instrument would find
-nothing — only that there is no longer an unsearched *boundary* to point it at.
-If a new one is ever built, expect it to find about one thing.
+**The per-instrument yield law held for eight instruments and broke on the
+ninth (August 6, 2026).** Every genuinely new instrument found something, and
+every re-run of an existing one found nothing new — until `binding-balance`,
+which searched a region no instrument had ever read and came back empty
+(§15.10). The amended law, with the failure included rather than explained away:
+
+> A new instrument finds about one thing **in the region it searches**. A region
+> that was unsearched because nobody could *read* it is not thereby a region
+> where something is wrong.
+
+The distinction is worth the words. The eight prior instruments were pointed at
+regions that were unsearched because nobody had *thought to look* — and code
+nobody has examined tends to contain something. The binding's bookkeeping was
+unsearched for a different reason: it had no accessor, so the question could not
+be asked at all. Those are different kinds of dark, and only the first predicts
+defects. The revised expectation for a tenth instrument therefore depends on
+which kind of region it is aimed at, and that is a question to answer before
+building it rather than after.
 
 **The instruments are the newest and least-tested code here.** The lifecycle
 matrix produced eight false findings before it produced a true one, every one of
@@ -576,6 +599,92 @@ So a pass now has three obligations, and they replace the old format entirely:
 `surface-census` reporting `UNCLASSIFIED` / `UNDISPOSED`. Never a date. A
 calendar-driven pass is how this programme spent twenty-two rounds re-deriving
 conclusions it had already reached.
+
+## 15.10 The closing condition, and where it stands (moved here August 6, 2026)
+
+`UNSEARCHED-REGIONS-PLAN.md` was written and executed on August 6, 2026 and now
+lives in [`reviews/`](reviews/UNSEARCHED-REGIONS-PLAN.md). Its five workstreams
+are done and its narrative is history. **What survives as an instruction is its
+§7 closing condition**, which is carried here because it is the answer to "what
+should we do about correctness?" in a form that can be checked rather than felt —
+and because leaving it in a plan document is how that question regenerates every
+few weeks (§14, on the word *deferred*).
+
+> **Review is producing nothing significant when all five hold:**
+>
+> 1. `surface-census` reports **0 `UNCLASSIFIED`**;
+> 2. every enumeration in `docs/` **cites the rule that generated it**;
+> 3. every instrument runs under **every mode that re-rules its boundary**, each
+>    mode carrying a vacuity control;
+> 4. **ASan covers the harnesses as well as the suite**, and a leak check exists
+>    that works on macOS;
+> 5. **two consecutive *new* searches, aimed at regions chosen by §15.1's
+>    criterion, return zero serious findings.**
+
+| # | Clause | State (August 6, 2026) |
+|---|---|---|
+| 1 | 0 `UNCLASSIFIED` | ✅ met — and 0 `UNDISPOSED` on §15.6's trigger table itself |
+| 2 | Every enumeration cites its generating rule | ✅ met |
+| 3 | Every instrument runs under every re-ruling mode | ✅ met, with one cell ruled against and the ruling recorded |
+| 4 | ASan over the harnesses; a macOS-viable leak check | ✅ met — `test-harness-asan`, plus three balance checks (two Lua-side, one binding-side) |
+| 5 | **Two consecutive new searches return zero serious findings** | ⏳ **1 of 2** — `binding-balance`, August 6, 2026 |
+
+**Clause 5 moved for the first time on August 6, 2026, and the way it moved
+matters more than the fact.** Clauses 1–4 are the work; clause 5 is the evidence,
+and it does not move by re-running instruments or by tightening the ones that
+exist — §15.9's table is the reason. A *new axis* on an existing instrument does
+not count either: W1 and CR-23 were both new axes and both found a serious
+defect, which is a reason to keep building them and not a clause-5 data point.
+
+### The first data point: `binding-balance` (August 6, 2026)
+
+The region was the one named below as candidate 1 and it is now searched. Both
+prior leak checks measure the **Lua registry**; the binding's own retained
+references — the callbacks, userdata wrappers, converters, searchers, accessors
+and handlers it holds so Lua can reach them — were measured by nothing, because
+nothing could read them. `info().bindingRefs` is the accessor that made the
+question askable; `tools/binding-balance` is the search; `surface-census`'s
+census F scores every retaining member against a declared lifetime policy, so a
+new one fails closed. **Zero findings in the product**, across 13 containers × 4
+series plus every counter watched in every context.
+
+**Three things about that zero, stated because a clean result is exactly when
+this record should be least comfortable:**
+
+- **It is the first new instrument here to find nothing**, which contradicts
+  §15.8's per-instrument yield law on its face. The law is amended rather than
+  abandoned below.
+- **The instrument found ten defects in itself first**, in two rounds, both the
+  documented class: it churned *fresh registrations* and called the resulting
+  growth a leak, when a named host function persisting until its name is reused
+  is what `LuaContext::SetGlobal` says it does, and a converter list with no
+  removal API grows because you called the API. `tools/binding-balance/policy.mjs`
+  records the misreading in full. Every one of those was caught by driving the
+  dirty result to a reproduction, which is the rule that has now paid twelve
+  times.
+- **The API decision was the actual blocker, not the search.** This region sat
+  uncovered because an instrument may not add public surface to make itself
+  possible, and `tools/README.md` had recorded that as a standing gap. Nothing
+  about it was hard once someone ruled on the accessor.
+
+**The next search, and what would make it count.** The remaining candidate is
+**the four `MANUAL` rows in §15.6**: two of them ("executes a script", "is
+asynchronous") look mechanizable from a method body rather than a signature,
+which would convert them to `COMPUTED`. That is hardening of the W4 kind and is
+unlikely to move clause 5 on its own — it tightens a census rather than searching
+a region. So clause 5's second point needs a region nobody has named yet, and
+the honest position is that **no such region is currently identified**. That is
+the most interesting state this record has been in: the list of known-unsearched
+regions is empty for the first time, which is either the closing condition
+arriving or the enumeration being one member short again. §15.8's first caveat
+says which of those to assume.
+
+**And two things deliberately not on the list**, carried over from the plan's §8:
+do not build a ninth instrument for its own sake — §15.8 predicts it would find
+about one thing, but there is no unsearched *boundary* left to aim it at, and the
+remaining yield is in modes and intersections. And do not re-run the existing
+eight expecting yield; that is the half of the yield law with eight
+confirmations. Run them as regression (§15.7), not as search.
 
 ---
 

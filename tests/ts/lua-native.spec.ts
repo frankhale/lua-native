@@ -3908,6 +3908,54 @@ describe('lua-native Node adapter', () => {
       expect(new lua_native.init().info().libraries).toEqual([]);
     });
 
+    // bindingRefs: the diagnostic that made `tools/binding-balance` possible.
+    // The harness is where the lifetime *policies* are asserted across many
+    // rounds; these four keep the accessor itself honest, because a counter
+    // wired to nothing would let the harness report a clean sheet forever.
+    it('reports zero retained bindings for a bare context', () => {
+      const refs = new lua_native.init().info().bindingRefs;
+      expect(refs.total).toBe(0);
+      expect(refs.callbacks).toBe(0);
+      expect(refs.userdata).toBe(0);
+    });
+
+    it('counts what the binding actually retains', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.set_global('cb', () => 1);
+      lua.set_userdata('ud', { v: 1 }, { methods: { get: () => 1 } });
+      lua.set_print_handler(() => {});
+      const refs = lua.info().bindingRefs;
+      expect(refs.callbacks).toBeGreaterThan(0);
+      expect(refs.userdata).toBe(1);
+      expect(refs.userdataMethods).toBe(1);
+      expect(refs.handlers).toBe(1);
+    });
+
+    it('keeps total equal to the sum of its parts', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.set_global('cb', () => 1);
+      lua.register_type_converter((v) => v instanceof Date, (v) => String(v));
+      const refs = lua.info().bindingRefs as unknown as Record<string, number>;
+      const sum = Object.entries(refs)
+        .filter(([k]) => k !== 'total')
+        .reduce((a, [, v]) => a + v, 0);
+      expect(sum).toBe(refs.total);
+    });
+
+    it('drops the bookkeeping a reset clears, and keeps what it replays', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.set_global('cb', () => 1);
+      lua.set_print_handler(() => {});
+      lua.register_type_converter((v) => v instanceof Date, (v) => String(v));
+      lua.reset();
+      const refs = lua.info().bindingRefs;
+      // Cleared: it described the retired state's contents.
+      expect(refs.callbacks).toBe(0);
+      // Replayed: context configuration outlives the state it was applied to.
+      expect(refs.handlers).toBe(1);
+      expect(refs.typeConverters).toBe(1);
+    });
+
     it('runs no Lua code and triggers no collection', () => {
       const lua = new lua_native.init({}, ALL_LIBS);
       // A stopped collector must stay stopped: info() is a pure read.

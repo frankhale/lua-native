@@ -7,7 +7,7 @@
 // value converts, so neither belongs in that axis — and because
 // `surface-census` scored an option covered only if a round-trip mode set it,
 // both were structurally unclassifiable rather than merely unclassified
-// (`docs/UNSEARCHED-REGIONS-PLAN.md` §2.1).
+// (`docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1).
 //
 // **Every config carries a vacuity control**, the same discipline
 // `roundtrip-matrix`'s modes carry and for the same reason: a preset that were

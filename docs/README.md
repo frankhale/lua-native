@@ -1,7 +1,13 @@
 # docs/
 
 Everything at **this level is current**. Everything in
-**[`reviews/`](reviews/) is frozen** — 27 files, none of them an instruction.
+**[`reviews/`](reviews/) is frozen** — every file a record of what was true on
+its date, none of them an instruction.
+
+(That sentence used to carry a file count. It was wrong by one the day this line
+was next read, which is rule 1 applied to a number instead of a filename: the
+directory's contents are its own census, and a hand-maintained tally of them is
+a stale marker waiting to happen.)
 
 That split is carried by the directory itself rather than by this page, on
 purpose: a reader who never opens this file still cannot mistake
@@ -13,10 +19,9 @@ purpose: a reader who never opens this file still cannot mistake
 
 | Document | What it is |
 |---|---|
-| [`CORRECTNESS.md`](CORRECTNESS.md) | **The correctness posture.** What is covered and what is not, what reopens review (§15.6), the regression-run matrix (§15.7), and the binding platform scope (§14). The correctness programme is closed; this is its conclusion and operating manual. |
+| [`CORRECTNESS.md`](CORRECTNESS.md) | **The correctness posture.** What is covered and what is not, what reopens review (§15.6), the regression-run matrix (§15.7), the closing condition and what to search next (§15.10), and the binding platform scope (§14). The correctness programme is closed; this is its conclusion and operating manual. |
 | [`FEATURES.md`](FEATURES.md) | What the binding actually does today. The reference for behaviour. |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | What it deliberately does **not** do, and what it does less completely than you might assume — the sandbox's real reach, binary strings, and the documented conversion losses. Every claim driven, not inferred. |
-| [`UNSEARCHED-REGIONS-PLAN.md`](UNSEARCHED-REGIONS-PLAN.md) | The August 6, 2026 plan for the regions no instrument covers — the two `UNCLASSIFIED` options the census reports, mode as a shared axis, the memory gaps (the harnesses run uninstrumented; there is no leak check on macOS), and a **checkable** closing condition. Moves to `reviews/` when executed. |
 
 ## Tooling
 
@@ -24,7 +29,7 @@ purpose: a reader who never opens this file still cannot mistake
 |---|---|
 | [`SANITIZERS.md`](SANITIZERS.md) | How to run the four sanitizer harnesses, and what each can and cannot see. |
 | [`DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md) | How the oracle works and what it does not cover. |
-| [`../tools/README.md`](../tools/README.md) | The seven correctness harnesses and the conventions every instrument follows. Read before extending one. |
+| [`../tools/README.md`](../tools/README.md) | The nine correctness harnesses and the conventions every instrument follows. Read before extending one. |
 
 ## Design references
 
@@ -49,6 +54,7 @@ Current; changed when the feature changes.
 | [`FEATURE-HISTORY.md`](reviews/FEATURE-HISTORY.md) | The planned feature work, all implemented. Kept for rationale and as-built deltas. |
 | [`BRIDGE-COMPARISON.md`](reviews/BRIDGE-COMPARISON.md) | Competitive survey against wasmoon, fengari and others. Every gap closed. Carries one dated **correction** (§C1 described a `properties` key that did not ship until August 2026) — the one file here that did *not* only claim what was true on its date. |
 | [`INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) | The August 5, 2026 interop work: five gaps the survey's enumeration had no row for, because it was organised by capability and every capability answered yes. All implemented; the banner carries the three defects found while building that the plan itself did not predict. |
+| [`UNSEARCHED-REGIONS-PLAN.md`](reviews/UNSEARCHED-REGIONS-PLAN.md) | The August 6, 2026 unsearched-region work (W1–W5), planned and executed the same day. Read for the execution records, three of which contradict the premise that motivated the work. Its closing condition survives in [`CORRECTNESS.md`](CORRECTNESS.md) §15.10. |
 
 **There is no roadmap document.** New work must not start from either survey's
 priority matrix — both are records, and every item in both is either implemented
@@ -58,21 +64,27 @@ task*: a `LuaRuntime` is single-threaded by construction, so parallelism means N
 contexts plus a scheduler, which userland can build over `execute_script_async`
 today.
 
-One plan document existed briefly and is worth knowing about, because it says
-what a *good* reason to write one looks like:
-[`reviews/INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) (August 5,
-2026, superseded the same day it was executed). It was not survey-derived —
-every item came from driving the shipped API and finding a door that behaved
-differently from its siblings, which is a different question from "what does the
-competition have". That is the bar for the next one.
+**Two plan documents have existed, and both are now in `reviews/`.** They are
+worth knowing about because between them they set the bar for writing a third.
 
-[`UNSEARCHED-REGIONS-PLAN.md`](UNSEARCHED-REGIONS-PLAN.md) (August 6, 2026) is
-the second, and it is held to that bar: every item derives from a measurement in
-the repository — a frozen `UNCLASSIFIED` row in `tools/invariants/expected.json`,
-the dated sanitizer record, a standing ledger residual, or the programme's own
-yield law — rather than from a survey of what could exist. It is a plan, not a
-roadmap: it has a **stated closing condition** (§7) and moves to `reviews/` when
-executed.
+[`reviews/INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) (August 5,
+2026, superseded the same day it was executed) was not survey-derived — every
+item came from driving the shipped API and finding a door that behaved
+differently from its siblings, which is a different question from "what does the
+competition have".
+
+[`reviews/UNSEARCHED-REGIONS-PLAN.md`](reviews/UNSEARCHED-REGIONS-PLAN.md)
+(August 6, 2026, likewise superseded the day it was executed) was held to that
+bar: every item derived from a measurement in the repository — a frozen
+`UNCLASSIFIED` row in `tools/invariants/expected.json`, the dated sanitizer
+record, a standing ledger residual, or the programme's own yield law — rather
+than from a survey of what could exist.
+
+So the bar for a third is: **each item traceable to something measured here, and
+a stated closing condition that can be checked rather than felt.** The second
+plan's closing condition outlived the plan and is now
+[`CORRECTNESS.md`](CORRECTNESS.md) §15.10 — which is also where to look before
+writing a third, since it already names what is worth searching next.
 
 ---
 

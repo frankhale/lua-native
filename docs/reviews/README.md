@@ -19,6 +19,10 @@ what to do, what is covered, or what to run, that is
 - `BRIDGE-COMPARISON.md` — competitive survey; every gap closed.
 - `INTEROP-PARITY-PLAN.md` — the five interop-parity gaps (P1–P5), planned and
   executed August 5, 2026; the first exercise of the new-surface trigger.
+- `UNSEARCHED-REGIONS-PLAN.md` — the five unsearched-region workstreams (W1–W5),
+  planned and executed August 6, 2026. Its §7 closing condition survives as an
+  instruction and lives in `../CORRECTNESS.md` §15.10; everything else here is
+  the record of how it was reached.
 
 The correctness programme closed on August 4, 2026 after CODE-REVIEW-22. Review
 is now triggered by **new surface, not by the calendar** — see

@@ -64,6 +64,7 @@ import { MODES } from '../roundtrip-matrix/modes.mjs';
 import { CONFIGS } from '../capability-matrix/configs.mjs';
 import { HANDLES } from '../lifecycle-matrix/handles.mjs';
 import { FRAMES } from '../exception-matrix/frames.mjs';
+import { CONTAINERS, NOT_COUNTED } from '../binding-balance/policy.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
@@ -201,6 +202,88 @@ export function hostCallbackMembers(header) {
 // the question is asked of a *path*, the same shape `coreCallGuarding` uses one
 // section up: a method reaches the host if it names a callback member, or calls
 // a method that does.
+// Members that retain a JS value beyond the call that supplied it — the
+// universe of census F.
+//
+// > A member qualifies iff its type mentions a `Napi::*Reference`, **or a
+// > struct that transitively does**.
+//
+// Stated as a rule rather than a list for the reason §15.6 gives: an
+// enumeration that cannot say where it came from cannot be checked for
+// completeness, only extended when something leaks past. The rule is
+// deliberately syntactic — it reads types, not intent — so a member whose type
+// says it retains but whose author believed otherwise still shows up.
+//
+// **The transitive clause was added after the direct-only version was written
+// and run**, which is worth recording because it is the same defect this file
+// exists to catch, made in this file. The first draft matched only types
+// literally containing `Napi::…Reference`, and so returned 21 members while
+// missing `js_userdata_` (a map of `UserdataEntry`, which holds one),
+// `class_accessors_` (a map of `ClassAccessorTable`, which holds a map of
+// `ClassAccessor`, which holds two) and `subscribers_` (a vector of
+// `Subscriber`, which holds one). A class boundary drawn one member short, at
+// the seventh level of this stack: the *rule* that generates the enumeration
+// that governs the census that scores the instrument.
+//
+// Two consequences of ranging over the whole header rather than `LuaContext`:
+//
+//   * `SharedTable` and `AddonData` hold references too. Dropping them silently
+//     would be the same defect again, so they are scored and then ledgered,
+//     with reasons, in `binding-balance/policy.mjs`'s NOT_COUNTED.
+//   * The *fields* of a retaining struct (`UserdataEntry::object`,
+//     `ClassAccessor::getter`) qualify alongside the containers holding them.
+//     They are counted through their container rather than separately — a
+//     ruling, and one that has to be written down, which is the point.
+//
+// What the rule **cannot** see, stated rather than left to be discovered: a
+// container holding *names* of references held elsewhere. `ud_method_fns_`
+// (strings naming `js_callbacks_` entries) and `registered_classes_` are exactly
+// that, and no type-directed scan can decide it. They are covered by
+// `binding-balance` anyway, and the census reports such rows as coverage beyond
+// its own universe rather than pretending it derived them.
+export function retainingMembers(header) {
+  const DIRECT = /Napi::\w*Reference/;
+  // Struct bodies, so the transitive step has something to walk. Indented
+  // declarations included: `SharedTable::Subscriber` is nested and private, and
+  // it is the member that most needs to be seen — a vector of it is the one
+  // retaining container in this header that belongs to neither LuaContext nor
+  // the harness's subject.
+  const structs = new Map();
+  for (const m of header.matchAll(/^[ \t]*(?:struct|class)\s+(\w+)[^;{]*\{/gm)) {
+    structs.set(m[1], functionBodyAt(header, m.index));
+  }
+
+  // A struct retains if a field's type is a reference, or names a struct that
+  // retains. Iterated to a fixpoint, the same shape `hostReachingCoreMethods`
+  // uses one section down — for the same reason: one hop is never enough.
+  const retaining = new Set(
+    [...structs].filter(([, body]) => DIRECT.test(body)).map(([name]) => name),
+  );
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, body] of structs) {
+      if (retaining.has(name)) continue;
+      for (const other of retaining) {
+        if (new RegExp(`\\b${other}\\b`).test(body)) { retaining.add(name); changed = true; break; }
+      }
+    }
+  }
+
+  const members = new Set();
+  for (const m of header.matchAll(/^\s+((?:const\s+)?[\w:<>,\s*&]+?)\s+(\w+_?);/gm)) {
+    const type = m[1];
+    // A raw pointer or reference to a retaining type does not itself retain —
+    // it observes. Without this the RAII scope structs' `LuaContext* ctx`
+    // back-pointers qualify, and four of them would sit in the universe wanting
+    // a lifetime policy they can only answer "not mine".
+    if (/[*&]\s*$/.test(type)) continue;
+    if (DIRECT.test(type) || [...retaining].some((s) => new RegExp(`\\b${s}\\b`).test(type))) {
+      members.add(m[2]);
+    }
+  }
+  return [...members].sort();
+}
+
 export function hostReachingCoreMethods(core, members) {
   const fns = [...core.matchAll(/^[\w:<>&* ]+?\b(?:LuaRuntime::)?(\w+)\([^;{]*\)(?: const)?\s*\{/gm)]
     .map((m) => ({ name: m[1], body: functionBodyAt(core, m.index) }));
@@ -382,6 +465,7 @@ export const TRIGGER_DISPOSITION = [
   { match: /new option that changes \*?conversion\*?/i, verdict: 'COMPUTED: census A (roundtrip-matrix modes)' },
   { match: /changes \*?capability\*?/i, verdict: 'COMPUTED: census A (capability-matrix configs)' },
   { match: /new Lua C frame/i, verdict: 'COMPUTED: census D' },
+  { match: /new member that retains a JS value/i, verdict: 'COMPUTED: census F' },
   { match: /new `?ObjectWrap`? subclass/i, verdict: 'FAILS-CLOSED: objectwrap-branding' },
   { match: /new `?napi_type_tag`?/i, verdict: 'FAILS-CLOSED: greppable-counts + AllTagsDistinct' },
   { match: /new occupancy policy/i, verdict: 'FAILS-CLOSED: the generative assert in RejectIfOccupied' },
@@ -663,6 +747,40 @@ export function surfaceCensus() {
   }
   out['E. trigger rows in §15.6'] = triggers.length;
   out['E. triggers UNDISPOSED'] = undisposed;
+
+  // --- F. Retaining members -> binding-balance containers -------------------
+  //
+  // The universe nothing scored until August 6, 2026, because nothing could
+  // read it: the binding's own bookkeeping had no diagnostic accessor, so the
+  // question "does this container return to baseline" had no way to be asked at
+  // all (`CORRECTNESS.md` §15.10). `info().bindingRefs` is that accessor and
+  // `tools/binding-balance` is the search; this scores whether the search's
+  // ruling covers every member the rule finds.
+  //
+  // A container declared in `policy.mjs` but absent from the computed universe
+  // is reported as coverage *beyond* it rather than as staleness — see
+  // `retainingMembers` on the two name-holding containers a type-directed scan
+  // cannot derive. Reporting them as STALE would push whoever saw it to delete
+  // real coverage to satisfy a rule that admits it cannot see them.
+  const retaining = retainingMembers(read('src/lua-native.h'));
+  const containerCover = new Map();
+  for (const c of CONTAINERS) {
+    for (const mem of c.members) {
+      containerCover.set(mem, [...(containerCover.get(mem) ?? []), c.field]);
+    }
+  }
+  for (const [k, v] of containerCover) containerCover.set(k, v.join(', '));
+  const beyond = [...containerCover.keys()].filter((m) => !retaining.includes(m));
+  const inUniverse = new Map([...containerCover].filter(([m]) => retaining.includes(m)));
+  const retainUnclassified = score(retaining, inUniverse, NOT_COUNTED, out, 'retains: ');
+  for (const m of beyond.sort()) {
+    out[`retains: ${m}`] = `COVERED BEYOND THE COMPUTED UNIVERSE: ${containerCover.get(m)} `
+      + '— holds names of references held elsewhere, which no type-directed scan derives';
+  }
+  out['F. retaining members'] = retaining.length;
+  out['F. binding-balance containers'] = CONTAINERS.length;
+  out['F. members covered beyond the universe'] = beyond.length;
+  out['F. retaining members UNCLASSIFIED'] = retainUnclassified;
 
   return out;
 }

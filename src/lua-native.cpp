@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <functional>
@@ -2679,7 +2680,90 @@ Napi::Value LuaContext::Info(const Napi::CallbackInfo& /*info*/) {
   }
   (void)result.Set("libraries", libs);
 
+  (void)result.Set("bindingRefs", BindingRefCounts());
+
   return result;
+}
+
+// How many JS values this context's own bookkeeping is holding alive, by
+// container. Diagnostic only: nothing in the binding reads these back, and no
+// behaviour depends on them.
+//
+// **Why this is public API rather than a debug-build hook.** Both existing leak
+// checks — `lifecycle-matrix`'s gc-churn high-water mark and `tools/gc-stress`'s
+// aggregate balance — measure the *Lua registry*. The binding side had no
+// accessor at all, so the containers below were the one part of this addon's
+// memory that no instrument could see, on a platform where LeakSanitizer does
+// not exist (`docs/SANITIZERS.md`). A debug-only counter would have left the
+// shipped binary unmeasurable, which is the configuration a user actually runs.
+// `CORRECTNESS.md` §15.10 records the decision.
+//
+// Each field is the count of *entries*, not of `Napi::Reference`s: an entry may
+// hold more than one (a class accessor holds a getter and a setter). Counting
+// entries is what the lifetime policies in `tools/binding-balance/policy.mjs`
+// are stated in terms of, and a reference count would make a get-only property
+// and a get/set property read differently for no reason a caller could act on.
+//
+// `total` is summed here rather than by the caller for the same reason
+// `memoryKB` is divided here: one source of truth means the parts and the whole
+// can never disagree.
+Napi::Object LuaContext::BindingRefCounts() {
+  // Accessors are stored per class, each class holding a map of named
+  // properties; the interesting number is the properties, since that is what a
+  // register_class call adds and what a leak would accumulate.
+  size_t accessor_props = 0;
+  for (const auto& [class_name, table] : class_accessors_) {
+    accessor_props += table.props.size();
+  }
+
+  // The four redirection handlers share one counter: they have identical
+  // lifetimes (set once, replayed across reset, dropped only at close), so
+  // splitting them would be four columns that always move together.
+  const size_t handlers =
+    static_cast<size_t>(!print_handler_.IsEmpty()) +
+    static_cast<size_t>(!read_handler_.IsEmpty()) +
+    static_cast<size_t>(!file_reader_.IsEmpty()) +
+    static_cast<size_t>(!debug_hook_.IsEmpty());
+
+  // The async trio is transient by construction — held only between the start
+  // of an async run and its settlement — which makes it the one group where a
+  // non-zero reading at rest is itself the finding.
+  const size_t async_refs =
+    static_cast<size_t>(!async_coro_obj_.IsEmpty()) +
+    static_cast<size_t>(!async_pending_promise_.IsEmpty()) +
+    static_cast<size_t>(!async_self_ref_.IsEmpty());
+
+  const size_t counts[] = {
+    js_callbacks_.size(),
+    js_userdata_.size(),
+    ud_method_fns_.size(),
+    js_error_registry_.size(),
+    registered_classes_.size(),
+    accessor_props,
+    type_converters_.size(),
+    from_lua_converters_.size(),
+    searchers_.size(),
+    shared_tables_.size(),
+    handlers,
+    async_refs,
+    static_cast<size_t>(!callbacks_ref_.IsEmpty()),
+  };
+  static constexpr const char* kNames[] = {
+    "callbacks", "userdata", "userdataMethods", "errorRegistry", "classes",
+    "classAccessors", "typeConverters", "fromLuaConverters", "searchers",
+    "sharedTables", "handlers", "asyncRefs", "callbacksObject",
+  };
+  static_assert(std::size(counts) == std::size(kNames),
+                "every bindingRefs count needs a name");
+
+  Napi::Object refs = Napi::Object::New(env);
+  size_t total = 0;
+  for (size_t i = 0; i < std::size(counts); ++i) {
+    (void)refs.Set(kNames[i], Napi::Number::New(env, static_cast<double>(counts[i])));
+    total += counts[i];
+  }
+  (void)refs.Set("total", Napi::Number::New(env, static_cast<double>(total)));
+  return refs;
 }
 
 // Garbage-collector control: a thin pass-through to lua_gc, using Lua's own
@@ -3354,7 +3438,7 @@ const lua_core::LuaThreadRef& LuaContext::AsyncDrivenThread() const {
 }
 
 Napi::Value LuaContext::BeginAsyncRun(const Napi::Object& self,
-                                      std::vector<lua_core::LuaPtr> args,
+                                      const std::vector<lua_core::LuaPtr>& args,
                                       const char* arg_role) {
   is_busy_ = true;
   ++async_generation_;  // invalidate any stale settlement from a prior run
@@ -3502,7 +3586,7 @@ Napi::Value LuaContext::CallAsync(const Napi::CallbackInfo& info) {
   async_co_.emplace(std::move(*thread));
   // These are the caller's call arguments, not resume values — the one door
   // where the shared machinery's default vocabulary is wrong (CR-23 F5).
-  return BeginAsyncRun(info.This().As<Napi::Object>(), std::move(args), "argument");
+  return BeginAsyncRun(info.This().As<Napi::Object>(), args, "argument");
 }
 
 // Data passed to the await-settlement callbacks: the context plus the generation
@@ -5366,7 +5450,7 @@ namespace {
   Napi::Value NewCoroIterOwner(const Napi::Env env, const CoroIterOwner& sp) {
     auto holder = std::make_unique<CoroIterOwner>(sp);
     const auto ext = Napi::External<CoroIterOwner>::New(env, holder.get(),
-      [](Napi::Env, CoroIterOwner* h) { delete h; });
+      [](Napi::Env, const CoroIterOwner* h) { delete h; });
     // NOLINTNEXTLINE(bugprone-unused-return-value)
     (void)holder.release();  // ownership transferred to the finalizer
     return ext;
@@ -6001,7 +6085,7 @@ Napi::Value LuaContext::ResumeCoroutineObjectAsync(
   // keep the ObjectWrap alive across a suspended await (the settlement callbacks
   // hold only a raw pointer to it). The coroutine object is rooted separately,
   // above, because it owns the thread being driven.
-  return BeginAsyncRun(self, std::move(args));
+  return BeginAsyncRun(self, args);
 }
 
 Napi::Value LuaContext::ResumeCoroutineObject(const Napi::Object& coroObj,

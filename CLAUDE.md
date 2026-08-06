@@ -58,6 +58,11 @@ npm run cross-context
 # What a libraries/allowBytecode configuration grants (8 configs x 28 doors)
 npm run capability-matrix
 
+# Does the binding's own bookkeeping return to baseline?
+# (13 retaining containers x 4 series; needs --expose-gc, which the script passes)
+npm run binding-balance
+node tools/binding-balance/run.mjs --control          # just the controls
+
 # Clean build artifacts
 npm run clean
 ```
@@ -91,7 +96,7 @@ suite. The judgment behind the four harnesses — what each is worth, and why
 `test-ts-asan` is the one to run before shipping — is `docs/reviews/CODE-REVIEW-HISTORY.md`
 Part III (archive; superseded on its "no more tooling needed" conclusion).
 
-**Correctness harnesses (`tools/`).** Eight instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
+**Correctness harnesses (`tools/`).** Nine instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
 
 - `npm run check-invariants` — lists that used to live in comments (the
   `CallScope` classification, the `lua_next` traversal sites, the occupancy
@@ -104,7 +109,10 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   each. `UNCLASSIFIED` means nobody has ruled on that piece of surface — a
   review item, not a defect. Its fifth census reads §15.6's **trigger table out
   of `CORRECTNESS.md`** and requires every row to be `COMPUTED`, `FAILS-CLOSED`
-  or `MANUAL`-with-a-reason, so a trigger added in prose cannot go unruled. **Do not silence one by inventing a ledger entry;
+  or `MANUAL`-with-a-reason, so a trigger added in prose cannot go unruled. Its
+  sixth derives every member that **retains a JS value** — transitively, so a
+  container of a struct holding a `Napi::Reference` counts — and requires each to
+  carry a `binding-balance` lifetime policy or a written exclusion. **Do not silence one by inventing a ledger entry;
   either point an instrument at it or write down why it does not need one.** `tests/ts/invariants.spec.ts` runs the
   same checks, so drift is a red suite; re-freeze with `--update` so the change
   lands as a reviewable diff. **Do not "fix" a drifted invariant by editing the
@@ -145,7 +153,18 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   `docs/CORRECTNESS.md` §15.1. It exists because `libraries` and `allowBytecode`
   were the two options no instrument could cover, and ruling on them found the
   E3 guard five doors short of its own claim. See
-  `docs/UNSEARCHED-REGIONS-PLAN.md` §2.1.
+  `docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1.
+- `npm run binding-balance` — the **binding's own** bookkeeping: do the
+  `Napi::Reference`s the addon retains (callbacks, userdata wrappers, converters,
+  searchers, class accessors, handlers) obey their declared lifetime policy, or
+  strand an entry per cycle. The other side of the two existing leak checks,
+  which measure the Lua registry only. Reads `info().bindingRefs`, the diagnostic
+  accessor added for it; `surface-census`'s census F requires every retaining
+  member to carry a policy, so a new one fails closed. **Not a boundary** — a
+  resource-lifetime search; see `docs/CORRECTNESS.md` §15.1 and §15.10. Its four
+  series exist because the first draft had one and reported seven leaks that were
+  all its own: churning *fresh* registrations measures the API's contract, not a
+  defect. Read `tools/binding-balance/policy.mjs` before extending it.
 
 **Reviews are sweeps now, not read-throughs** (§15.9, August 6, 2026): a pass
 declares the unsearched region it is aimed at, delivers an instrument plus a
@@ -169,7 +188,7 @@ CR-17–22 — history, not instructions.) Four classes now fail closed on their
 new `ObjectWrap`, a new occupancy policy, a bare `.toThrow()`), so the check
 happens whether or not anyone remembers.
 
-All eight follow the same conventions, and `tools/README.md` states them with the
+All nine follow the same conventions, and `tools/README.md` states them with the
 reason each exists — chiefly: **an exhaustive search that reports clean must
 first demonstrate it can report dirty**, so each runs positive controls before
 its real work and refuses to proceed if they fail; each checks per-cell vacuity,

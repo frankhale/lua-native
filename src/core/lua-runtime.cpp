@@ -3549,11 +3549,17 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
         // The two keys are distinct in Lua and the same JS property name: the
         // integer 1 and the string "1" both arrive as "1" (LIMITATIONS §5).
         if (!map.emplace(key, ToLuaValue(L, -1, depth + 1)).second && StrictConversion(L)) {
-          throw std::runtime_error(
-            "strict conversion: the Lua table keys " + key + " (number) and \""
-            + key + "\" (string) both become the JavaScript property \"" + key
-            + "\", so one value would be lost. Read the table in place with "
-              "get_global_ref() to keep both.");
+          // Built by append rather than a `+` chain: `key` appears three times,
+          // so the chain allocates five temporaries to say one sentence.
+          // Nothing here is hot — it is the throw path of a collision — but it
+          // is the one message in this file that concatenates the same string
+          // more than twice, which is why clang-tidy singles it out.
+          std::string message = "strict conversion: the Lua table keys ";
+          message.append(key).append(" (number) and \"");
+          message.append(key).append("\" (string) both become the JavaScript property \"");
+          message.append(key).append("\", so one value would be lost. Read the table "
+                                     "in place with get_global_ref() to keep both.");
+          throw std::runtime_error(message);
         }
         lua_pop(L, 1);
       }

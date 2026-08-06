@@ -24,6 +24,7 @@ tools/
   lifecycle-matrix/       what happens to a handle held across reset / GC?
   cross-context/          what happens when two contexts exchange values?
   capability-matrix/      what does a `libraries` / `allowBytecode` config grant?
+  binding-balance/        does the addon's own bookkeeping return to baseline?
   gc-stress/              not a search: makes the addon do dangerous things
                           so a sanitizer has something to watch
 ```
@@ -36,8 +37,9 @@ tools/
 | **roundtrip-matrix** | `npm run roundtrip-matrix` | 4 context modes × 19 entry points × 50 values: does a value survive the crossing *in*, do all nineteen doors agree with each other, and does each answer hold under `strictConversion` / `binaryStrings` as well as the defaults | `docs/reviews/CODE-REVIEW-20.md`, `docs/reviews/CODE-REVIEW-23.md` |
 | **exec-parity** | `npm run exec-parity` | 1339 corpus cases × 5 doors (`--config=sandbox` re-runs the four that remain under a sealed state): do `execute_script_async`, `execute_async`, `compile`→`load_bytecode`, `call_async` and `resume_async` agree with `execute_script` — values *and* error messages | `docs/reviews/CODE-REVIEW-21.md`, `docs/reviews/INTEROP-PARITY-PLAN.md` |
 | **cross-context** | `npm run cross-context` | Two contexts in one process, over three pairings including a sealed one beside an unsealed one: handles are refused, data crosses intact, contexts stay independent. The boundary CR-22 F2 found missing from every earlier list — where CR-20 F5 and CR-22 F1 both live | `docs/reviews/CODE-REVIEW-22.md` |
-| **capability-matrix** | `npm run capability-matrix` | 8 configurations × (8 host entry points, 10 bytecode doors, 10 libraries): does a door **work or refuse loudly** — never accept-and-retain; is the seal what the preset claims; and does a bytecode door refuse iff the guard is on | `docs/UNSEARCHED-REGIONS-PLAN.md` §2.1 |
+| **capability-matrix** | `npm run capability-matrix` | 8 configurations × (8 host entry points, 10 bytecode doors, 10 libraries): does a door **work or refuse loudly** — never accept-and-retain; is the seal what the preset claims; and does a bytecode door refuse iff the guard is on | `docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1 |
 | **lifecycle-matrix** | `npm run lifecycle-matrix` | 12 handle kinds × lifecycle events (reset, double reset, re-alias, GC, churn, release, double release, close, double close, close+release, release+close), one process per cell: a handle must stay valid or refuse — never answer with another state's data | `docs/reviews/CODE-REVIEW-22.md` |
+| **binding-balance** | `npm run binding-balance` | 13 bookkeeping containers × 4 series (repeat the same registration; a fixed population across pure resets; reset-and-re-register; reclaim the GC-reclaimable form), plus every counter watched in every context: does the **binding's own** retained-reference bookkeeping obey its declared lifetime policy, or strand an entry per cycle | `docs/CORRECTNESS.md` §15.10 |
 
 ## Conventions every harness follows
 
@@ -126,14 +128,22 @@ rounds, and the Lua registry high-water mark must stop growing. It runs a
 control first (retain the handles instead of dropping them; the check must call
 that a leak), because a leak detector that can only report clean is not one.
 
-Two things it does **not** cover, stated so the gap is visible: the binding's own
-bookkeeping (`js_userdata_`, `js_callbacks_`, the `Napi::Reference` set) has no
-diagnostic accessor, and adding a public one to make a test easier is a change to
-the shipped API rather than an instrument's business; and `lifecycle-matrix`'s
-`gc-churn` already measures the same registry mark **per handle kind in its own
-process**, which this does not replace — it runs every kind together for far more
-rounds, which is the shape a slow per-cycle strand shows in and a per-kind cell
-does not.
+One thing it does **not** cover, stated so the gap stays visible:
+`lifecycle-matrix`'s `gc-churn` already measures the same registry mark **per
+handle kind in its own process**, which this does not replace — it runs every
+kind together for far more rounds, which is the shape a slow per-cycle strand
+shows in and a per-kind cell does not.
+
+**It measures the Lua side only, and `binding-balance` is now the other half.**
+This paragraph used to name a second gap — the binding's own bookkeeping had no
+diagnostic accessor, and adding a public one to make a test easier was a change
+to the shipped API rather than an instrument's business. That was correct, and it
+stood for exactly as long as it took someone to make the API decision rather than
+route around it: `info().bindingRefs` ships, `binding-balance` searches it, and
+`surface-census`'s census F now scores every retaining member against a declared
+lifetime policy. The gap is recorded here rather than deleted because "an
+instrument cannot decide this, a person must" is a real category and this is what
+its resolution looks like.
 
 ## Re-freezing the invariants
 
@@ -154,5 +164,5 @@ The differential oracle needs stock Lua from the same vcpkg port that supplies
 vcpkg install lua[tools]
 ```
 
-Nothing else here needs anything the addon build does not already need. All eight
+Nothing else here needs anything the addon build does not already need. All nine
 expect a current `npm run build-debug`.
