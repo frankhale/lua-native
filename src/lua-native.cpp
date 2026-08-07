@@ -5747,7 +5747,7 @@ lua_core::LuaValue LuaContext::MapToTableRef(const Napi::Object& map, const int 
   }
   const Napi::Value arrayFrom =
     env.Global().Get("Array").As<Napi::Object>().Get("from");
-  const Napi::Array entries =
+  const auto entries =
     arrayFrom.As<Napi::Function>().Call({map}).As<Napi::Array>();
 
   int ref;

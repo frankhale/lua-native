@@ -583,7 +583,7 @@ public:
   // `mutable` (CaptureError is const and records into it), so a `const` version
   // compiles — 805d6a9 made it one, and a mutating operation that reads as a
   // query is exactly the shape CR-11 warned about. Reverted at CR-15 F6.
-  LuaPtr TakeLastErrorValue() { return std::move(last_error_value_); }
+  LuaPtr TakeLastErrorValue() const { return std::move(last_error_value_); }
 
   // Module / require support
   void AddSearchPath(const std::string& path) const;

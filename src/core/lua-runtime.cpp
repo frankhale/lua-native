@@ -2484,8 +2484,8 @@ void LuaRuntime::SetFilesystemAccess(const bool allow) {
       lua_getfield(L_, pkg, "searchers");
       if (lua_istable(L_, -1)) {
         const int searchers = lua_gettop(L_);
-        const char* names[] = {nullptr, nullptr, "Lua file", "C library", "all-in-one"};
         for (int i = 2; i <= 4; ++i) {
+          const char* names[] = {nullptr, nullptr, "Lua file", "C library", "all-in-one"};
           lua_geti(L_, searchers, i);
           const bool present = lua_isfunction(L_, -1);
           lua_pop(L_, 1);

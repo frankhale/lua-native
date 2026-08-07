@@ -16,7 +16,7 @@ public:
     std::string script,
     LuaContext* context,
     Napi::ObjectReference contextRef,
-    Napi::Promise::Deferred deferred,
+    const Napi::Promise::Deferred &deferred,
     // Copied across the thread boundary with the source, for the same reason
     // the source is: the worker thread must not touch a JS string.
     std::string chunkName = "")
