@@ -256,12 +256,21 @@ Applying it to this codebase gives seven, and each has a generated search:
 | 6 | Handle → a later state of its context | live handle / retired state | `lifecycle-matrix` (11 × 8, process/cell) |
 | 7 | Context → context | two independent `lua_State`s | `cross-context` (handles, data, isolation) |
 
-**Two further instruments exist and neither is an eighth boundary**, recorded
-here so nobody counts them as one. `binding-balance` (August 6, 2026) is the
-second: it searches what the binding *retains* rather than what crosses it, which
-is not a value exchange between two rule-sets and so does not meet the criterion
-above. It is a resource-lifetime search, filed as such — see §15.10 — and its
-universe is derived by `surface-census`'s census F rather than from this list.
+**Three further instruments exist and none is an eighth boundary**, recorded
+here so nobody counts them as one.
+
+`crossing-cost` (August 6, 2026) is the third and the clearest case: it measures
+what a crossing **costs**. A cost defect returns the *correct* answer, slowly, so
+there is no mismatch at all — the criterion above does not merely fail on one
+clause, it does not apply. Filed as a cost search. It is also the region §15.2
+had no row for, because nobody had considered it either way; see §15.10.
+
+`binding-balance` (August 6, 2026) is the second: it searches what the binding
+*retains* rather than what crosses it, which is not a value exchange between two
+rule-sets and so does not meet the criterion above. It is a resource-lifetime
+search, filed as such — see §15.10 — and its universe is derived by
+`surface-census`'s census F rather than from this list.
+
 The first:
 
 `capability-matrix` searches an *axis* that cuts
@@ -392,6 +401,7 @@ is a trigger, and the trigger names the instrument to extend:
 | **A new member that retains a JS value** | **`binding-balance` (a container, with a lifetime policy) — and a counter in `info().bindingRefs`** |
 | A new `ObjectWrap` subclass | nothing — `objectwrap-branding` will fail until it is branded |
 | A new `napi_type_tag` | nothing — `greppable-counts` and `AllTagsDistinct` will fail |
+| **A new performance claim in shipped docs** | **nothing — `perf-claims` reports `UNCLAIMED` and the suite goes red until a `crossing-cost` Axis A cell measures it or a ledger entry gives a reason. A claim measured and found false may never be ledgered: it gets fixed, restated or deleted** |
 | A new occupancy policy | nothing — the generative `assert` will fire |
 | A Lua version bump | `diff-oracle` (both modes) — the reference moves |
 | A new threading mode | everything, plus a reconsideration of §15.2's race row |
@@ -404,8 +414,24 @@ fifth census reads these rows *out of this document* and requires each to carry 
 disposition — `COMPUTED` (a census derives its universe), `FAILS-CLOSED` (no
 census needed, the mechanism turns the suite red on its own), or `MANUAL` with
 its reason. A row added here in prose without a ruling reports `UNDISPOSED` and
-the suite goes red; a disposition whose row is deleted reports `STALE`. Twelve
-rows, twelve dispositions: five computed, three fail closed, four manual.
+the suite goes red; a disposition whose row is deleted reports `STALE`. **The
+row count and the per-class breakdown are computed and frozen by that census**
+(`E. trigger rows in §15.6`, `E. dispositions COMPUTED` / `FAILS-CLOSED` /
+`MANUAL`) and are deliberately not restated here: this paragraph used to carry
+the tally by hand, and on August 6, 2026 it read "twelve rows, twelve
+dispositions" while the census was reporting thirteen. A hand-maintained count
+is a stale marker waiting to happen — `docs/README.md` rule 1, applied to a
+number instead of a filename, which is the same lesson that directory's own
+census note records.
+
+The row added August 6, 2026 — a new performance claim — is a `FAILS-CLOSED`
+one, and it is the first trigger in this table that fires on **documentation**
+rather than on code. That is deliberate: C1–C9 were nine cost claims that reached
+shipped docs, four of them telling the reader to route on a number, and none of
+them touched an entry point, a door, a handle kind, a marker, a frame, an
+`ObjectWrap`, a tag, a policy or an option. They matched no row here, exactly as
+`binaryStrings` matched none in CR-23 — surface that ships and that nothing was
+watching.
 
 That closes the level CR-23 opened. The trigger table was the enumeration
 governing when anyone looks, and it had no way to notice a row that had never
@@ -525,6 +551,7 @@ node tools/exec-parity/run.mjs --config=sandbox       # door parity under a seal
 node tools/diff-oracle/run.mjs --mode=b --binary      # values out under binaryStrings, vs stock Lua
 npm run exception-matrix                              # after error-path changes
 npm run binding-balance                               # after any change to what the binding retains
+npm run crossing-cost                                 # after conversion/door changes, or any new performance claim
 node tools/gc-stress/run.mjs                          # after handle/finalizer changes: the aggregate registry balance
 npm run test-ts-asan                                  # before a release
 npm run test-harness-asan                             # before a release: the adversarial paths instrumented
@@ -533,6 +560,14 @@ npm run test-harness-asan                             # before a release: the ad
 The suite and the invariants are the always-run pair; the harnesses are keyed to
 what changed. `test-ts-asan` is the highest-value sanitizer and the one to run
 before shipping.
+
+**`crossing-cost` is deliberately split across that line.** Its `perf-claims`
+census is cheap and fail-closed, so it rides `check-invariants` and is therefore
+already in the always-run pair — a performance claim cannot enter shipped docs
+unmeasured whether or not anyone remembers this file. The *measurement* half is
+slow and variance-prone and stays on demand. A noisy check wired into every run
+is a check people learn to ignore, and this programme has no shortage of evidence
+about what happens to a signal nobody reads.
 
 ## 15.8 What this record does not claim
 
@@ -678,6 +713,37 @@ the most interesting state this record has been in: the list of known-unsearched
 regions is empty for the first time, which is either the closing condition
 arriving or the enumeration being one member short again. §15.8's first caveat
 says which of those to assume.
+
+### The second search: `crossing-cost` (August 6, 2026)
+
+The region §15.10 said was not identified turned out to be **cost**. §15.2 — the
+list of areas deliberately not covered, where every row must name the criterion
+clause it fails — had no row for it. It was not excluded, not ledgered, not ruled
+on; nobody had considered it either way, which is a different and worse state
+than "uncovered". Meanwhile nine performance claims had reached shipped
+documentation with nothing behind them, four of them telling the reader to route
+on a number.
+
+**It does not count as clause 5's second data point, and the reason is worth
+keeping.** Clause 5 asks for searches "aimed at regions chosen by §15.1's
+criterion" returning zero *serious* findings, and §15.5 defines serious in
+correctness terms. A cost search returns evidence about cost. It also did not
+return zero: `types.d.ts` carried an absolute figure that was wrong by 5–20x
+(`tools/crossing-cost/FINDINGS.md` F2), which is a documentation defect rather
+than a correctness one, but not nothing. Counting it either way would be
+laundering. **Clause 5 therefore stands at 1 of 2**, unchanged.
+
+What did move is clause 1's spirit rather than its letter: there is now a
+fail-closed census over a kind of surface that had none, and the trigger table
+gained its first row that fires on documentation rather than code (§15.6).
+
+The honest summary of the search itself: **nine claims measured, none falsified,
+no shape defect anywhere** — every size-scalable crossing and every scaling knob
+measured the complexity class it declared. Against that, **six of the defects
+found were in the harness**, two of which looked exactly like product findings
+first. That ratio is the yield law's amendment holding: a genuinely new
+instrument mostly finds itself, and the rule that saves it is driving every dirty
+result to a hand-run reproduction before believing it.
 
 **And two things deliberately not on the list**, carried over from the plan's §8:
 do not build a ninth instrument for its own sake — §15.8 predicts it would find

@@ -47,6 +47,7 @@
     "cross-context": "node tools/cross-context/run.mjs",
     "capability-matrix": "node tools/capability-matrix/run.mjs",
     "binding-balance": "node --expose-gc tools/binding-balance/run.mjs",
+    "crossing-cost": "node tools/crossing-cost/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib"
   },

@@ -63,6 +63,12 @@ npm run capability-matrix
 npm run binding-balance
 node tools/binding-balance/run.mjs --control          # just the controls
 
+# What does it cost, and are the docs right about that?
+# (9 documented claims, 19 doors, 5 value kinds, 5 scaling knobs)
+npm run crossing-cost
+node tools/crossing-cost/run.mjs --control            # just the controls
+node tools/crossing-cost/run.mjs --claims             # just the documented claims
+
 # Clean build artifacts
 npm run clean
 ```
@@ -96,7 +102,7 @@ suite. The judgment behind the four harnesses — what each is worth, and why
 `test-ts-asan` is the one to run before shipping — is `docs/reviews/CODE-REVIEW-HISTORY.md`
 Part III (archive; superseded on its "no more tooling needed" conclusion).
 
-**Correctness harnesses (`tools/`).** Nine instruments the test suites do not replace; `tools/README.md` is the index. Each is a directory named for what it does, with `run.mjs` as its entry point:
+**Correctness harnesses (`tools/`).** Ten instruments the test suites do not replace; `tools/README.md` is the index. Nine ask whether an answer is *right*; the tenth, `crossing-cost`, asks what it *cost* — a cost defect returns the correct value slowly, so it is invisible to the other nine and to every sanitizer. Each is a directory named for what it does, with `run.mjs` as its entry point:
 
 - `npm run check-invariants` — lists that used to live in comments (the
   `CallScope` classification, the `lua_next` traversal sites, the occupancy
@@ -112,7 +118,12 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   or `MANUAL`-with-a-reason, so a trigger added in prose cannot go unruled. Its
   sixth derives every member that **retains a JS value** — transitively, so a
   container of a struct holding a `Napi::Reference` counts — and requires each to
-  carry a `binding-balance` lifetime policy or a written exclusion. **Do not silence one by inventing a ledger entry;
+  carry a `binding-balance` lifetime policy or a written exclusion. The
+  eleventh, **`perf-claims`**, greps shipped documentation (`README.md`,
+  `docs/*.md` and `types.d.ts`, which ships) for claim-shaped vocabulary and
+  requires every hit to be measured by a `crossing-cost` cell or ledgered with a
+  reason — scoped to sections describing shipped behaviour, since a census that
+  flags estimates for code that was never built trains its reader to ignore it. **Do not silence one by inventing a ledger entry;
   either point an instrument at it or write down why it does not need one.** `tests/ts/invariants.spec.ts` runs the
   same checks, so drift is a red suite; re-freeze with `--update` so the change
   lands as a reviewable diff. **Do not "fix" a drifted invariant by editing the
@@ -184,11 +195,14 @@ regression-run matrix. A **capability** option (a preset, a library, the
 bytecode guard) is a `capability-matrix` config rather than a `roundtrip-matrix`
 mode — a distinction §15.6's table conflated until August 6, 2026, which is why
 two options sat uncoverable rather than merely uncovered. (`docs/reviews/CODE-REVIEW-HISTORY.md` is the reasoning trail for
-CR-17–22 — history, not instructions.) Four classes now fail closed on their own (a new tag, a
-new `ObjectWrap`, a new occupancy policy, a bare `.toThrow()`), so the check
-happens whether or not anyone remembers.
+CR-17–22 — history, not instructions.) **A new performance claim in shipped docs is a trigger too**
+(added August 6, 2026, and the first row in that table that fires on documentation rather than
+on code) — `perf-claims` reports `UNCLAIMED` until a `crossing-cost` cell measures it or a ledger
+entry gives a reason. Five classes now fail closed on their own (a new tag, a
+new `ObjectWrap`, a new occupancy policy, a bare `.toThrow()`, an unmeasured performance claim),
+so the check happens whether or not anyone remembers.
 
-All nine follow the same conventions, and `tools/README.md` states them with the
+All ten follow the same conventions, and `tools/README.md` states them with the
 reason each exists — chiefly: **an exhaustive search that reports clean must
 first demonstrate it can report dirty**, so each runs positive controls before
 its real work and refuses to proceed if they fail; each checks per-cell vacuity,

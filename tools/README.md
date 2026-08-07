@@ -1,8 +1,14 @@
 # tools/
 
-Correctness harnesses. None of these is part of the build or the published
-package — they are instruments the review programme uses to search for defect
-classes the test suites do not cover.
+Correctness harnesses, and — since August 6, 2026 — one cost harness. None of
+these is part of the build or the published package: they are instruments the
+review programme uses to search for defect classes the test suites do not cover.
+
+`crossing-cost` is the odd one and is labelled as such throughout. Every other
+instrument here asks whether an answer is **right**; it asks what the answer
+**cost**, which is a different kind of question with a different kind of
+evidence. A cost defect returns the correct value, slowly, so it is invisible to
+all nine of the others and to every sanitizer.
 
 Each harness is a directory named for **what it does**, with `run.mjs` as its
 entry point and an `npm` script as the usual way in. (They were originally named
@@ -25,6 +31,7 @@ tools/
   cross-context/          what happens when two contexts exchange values?
   capability-matrix/      what does a `libraries` / `allowBytecode` config grant?
   binding-balance/        does the addon's own bookkeeping return to baseline?
+  crossing-cost/          what does it cost, and are the docs right about that?
   gc-stress/              not a search: makes the addon do dangerous things
                           so a sanitizer has something to watch
 ```
@@ -39,6 +46,7 @@ tools/
 | **cross-context** | `npm run cross-context` | Two contexts in one process, over three pairings including a sealed one beside an unsealed one: handles are refused, data crosses intact, contexts stay independent. The boundary CR-22 F2 found missing from every earlier list — where CR-20 F5 and CR-22 F1 both live | `docs/reviews/CODE-REVIEW-22.md` |
 | **capability-matrix** | `npm run capability-matrix` | 8 configurations × (8 host entry points, 10 bytecode doors, 10 libraries): does a door **work or refuse loudly** — never accept-and-retain; is the seal what the preset claims; and does a bytecode door refuse iff the guard is on | `docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1 |
 | **lifecycle-matrix** | `npm run lifecycle-matrix` | 12 handle kinds × lifecycle events (reset, double reset, re-alias, GC, churn, release, double release, close, double close, close+release, release+close), one process per cell: a handle must stay valid or refuse — never answer with another state's data | `docs/reviews/CODE-REVIEW-22.md` |
+| **crossing-cost** | `npm run crossing-cost` | 9 documented performance claims, 19 doors, 5 value kinds and 5 scaling knobs: does the binding cost what the docs say, and is any crossing accidentally the wrong complexity class. The **only harness here that measures time**, and the only one whose `expected.json` share holds no measurement — every verdict is a ratio or a shape taken in one process, because a frozen nanosecond baseline on a laptop reports dirt that is its own. Its `perf-claims` census rides `check-invariants`, so a new claim in shipped docs fails closed | `docs/reviews/PERFORMANCE-PLAN.md`, `tools/crossing-cost/FINDINGS.md` |
 | **binding-balance** | `npm run binding-balance` | 13 bookkeeping containers × 4 series (repeat the same registration; a fixed population across pure resets; reset-and-re-register; reclaim the GC-reclaimable form), plus every counter watched in every context: does the **binding's own** retained-reference bookkeeping obey its declared lifetime policy, or strand an entry per cycle | `docs/CORRECTNESS.md` §15.10 |
 
 ## Conventions every harness follows
@@ -85,6 +93,15 @@ that reported clean while measuring nothing.
   fire was real. Drive every reported finding to a hand-run reproduction before
   believing it, and keep the reproduction — it is what the review writes up
   (CR-22).
+- **A time measurement is a ratio, never a stored number.** The tenth harness
+  had to be built around this and it is the reason it exists at all: a cost
+  harness that freezes nanoseconds and fails on a 5% delta reports dirt on every
+  busy machine, and the dirt is the instrument's. `crossing-cost` compares two
+  measurements taken minutes apart in one process, so machine speed and thermal
+  state cancel — the same move `diff-oracle` makes when it asserts agreement with
+  stock Lua rather than asserting a value. Four of the six defects found building
+  it were measurement artefacts that a stored baseline would have shipped as
+  product findings (`crossing-cost/FINDINGS.md` H2–H4, H6).
 - **A shared helper is shared semantics.** `js-canonical.mjs`'s `canon` is used
   by `diff-oracle`, `exec-parity` and `roundtrip-matrix`. Teaching it about
   `binaryStrings` for the oracle's new column made byte views canonicalise as
@@ -164,5 +181,5 @@ The differential oracle needs stock Lua from the same vcpkg port that supplies
 vcpkg install lua[tools]
 ```
 
-Nothing else here needs anything the addon build does not already need. All nine
+Nothing else here needs anything the addon build does not already need. All ten
 expect a current `npm run build-debug`.

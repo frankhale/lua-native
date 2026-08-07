@@ -29,7 +29,7 @@ purpose: a reader who never opens this file still cannot mistake
 |---|---|
 | [`SANITIZERS.md`](SANITIZERS.md) | How to run the four sanitizer harnesses, and what each can and cannot see. |
 | [`DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md) | How the oracle works and what it does not cover. |
-| [`../tools/README.md`](../tools/README.md) | The nine correctness harnesses and the conventions every instrument follows. Read before extending one. |
+| [`../tools/README.md`](../tools/README.md) | The nine correctness harnesses, the one cost harness, and the conventions every instrument follows. Read before extending one. |
 
 ## Design references
 
@@ -55,6 +55,7 @@ Current; changed when the feature changes.
 | [`BRIDGE-COMPARISON.md`](reviews/BRIDGE-COMPARISON.md) | Competitive survey against wasmoon, fengari and others. Every gap closed. Carries one dated **correction** (§C1 described a `properties` key that did not ship until August 2026) — the one file here that did *not* only claim what was true on its date. |
 | [`INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) | The August 5, 2026 interop work: five gaps the survey's enumeration had no row for, because it was organised by capability and every capability answered yes. All implemented; the banner carries the three defects found while building that the plan itself did not predict. |
 | [`UNSEARCHED-REGIONS-PLAN.md`](reviews/UNSEARCHED-REGIONS-PLAN.md) | The August 6, 2026 unsearched-region work (W1–W5), planned and executed the same day. Read for the execution records, three of which contradict the premise that motivated the work. Its closing condition survives in [`CORRECTNESS.md`](CORRECTNESS.md) §15.10. |
+| [`PERFORMANCE-PLAN.md`](reviews/PERFORMANCE-PLAN.md) | The August 6, 2026 cost search, planned and executed the same day. Read for the four things it got wrong — two of them defects in the plan rather than in the harness or the product, including a control that would have failed against a correct classifier. The instrument is `tools/crossing-cost`. |
 
 **There is no roadmap document.** New work must not start from either survey's
 priority matrix — both are records, and every item in both is either implemented
@@ -64,8 +65,9 @@ task*: a `LuaRuntime` is single-threaded by construction, so parallelism means N
 contexts plus a scheduler, which userland can build over `execute_script_async`
 today.
 
-**Two plan documents have existed, and both are now in `reviews/`.** They are
-worth knowing about because between them they set the bar for writing a third.
+**Three plan documents have existed, and all three are now in `reviews/`.** They
+are worth knowing about because between them they set the bar for writing a
+fourth.
 
 [`reviews/INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) (August 5,
 2026, superseded the same day it was executed) was not survey-derived — every
@@ -80,11 +82,22 @@ bar: every item derived from a measurement in the repository — a frozen
 record, a standing ledger residual, or the programme's own yield law — rather
 than from a survey of what could exist.
 
-So the bar for a third is: **each item traceable to something measured here, and
-a stated closing condition that can be checked rather than felt.** The second
-plan's closing condition outlived the plan and is now
-[`CORRECTNESS.md`](CORRECTNESS.md) §15.10 — which is also where to look before
-writing a third, since it already names what is worth searching next.
+[`reviews/PERFORMANCE-PLAN.md`](reviews/PERFORMANCE-PLAN.md) (August 6, 2026,
+superseded the same day) was held to the same bar and met it — every item traced
+to a grep that returned nothing or a claim printed in shipped docs with no number
+behind it. It also demonstrated the bar's limit: **a plan can be rigorously
+derived and still be wrong in its details.** Two of its four errors were in the
+plan's own controls and propositions rather than in the work, and neither was
+catchable by reading — only by building the thing and watching it fail. That is
+an argument for executing a plan the day it is written, which all three now have
+been.
+
+So the bar for a fourth is: **each item traceable to something measured here, and
+a stated closing condition that can be checked rather than felt** — plus the
+corollary the third plan supplied: **do not trust a plan's controls until they
+have run.** The second plan's closing condition outlived the plan and is now
+[`CORRECTNESS.md`](CORRECTNESS.md) §15.10, which is also where to look before
+writing a fourth.
 
 ---
 

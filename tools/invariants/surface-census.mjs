@@ -468,6 +468,8 @@ export const TRIGGER_DISPOSITION = [
   { match: /new member that retains a JS value/i, verdict: 'COMPUTED: census F' },
   { match: /new `?ObjectWrap`? subclass/i, verdict: 'FAILS-CLOSED: objectwrap-branding' },
   { match: /new `?napi_type_tag`?/i, verdict: 'FAILS-CLOSED: greppable-counts + AllTagsDistinct' },
+  { match: /new performance claim in shipped docs/i,
+    verdict: 'FAILS-CLOSED: perf-claims reports UNCLAIMED and the suite goes red' },
   { match: /new occupancy policy/i, verdict: 'FAILS-CLOSED: the generative assert in RejectIfOccupied' },
   { match: /Lua version bump/i,
     verdict: 'MANUAL: the reference moves; nothing in this repository can detect '
@@ -747,6 +749,20 @@ export function surfaceCensus() {
   }
   out['E. trigger rows in §15.6'] = triggers.length;
   out['E. triggers UNDISPOSED'] = undisposed;
+  // The per-class breakdown is computed rather than counted by hand, because
+  // §15.6's prose carried one and it was wrong: it read "Twelve rows, twelve
+  // dispositions: five computed, three fail closed, four manual" while this
+  // census was already reporting thirteen. That is `docs/README.md` rule 1
+  // applied to a tally instead of a filename — the same defect the directory
+  // listing note calls out — and the fix is the same one this file exists to
+  // apply everywhere else: compute it, freeze it, and let the prose point here
+  // instead of restating it.
+  for (const cls of ['COMPUTED', 'FAILS-CLOSED', 'MANUAL']) {
+    out[`E. dispositions ${cls}`] = triggers.filter((t) => {
+      const hit = TRIGGER_DISPOSITION.find((d) => d.match.test(t));
+      return hit?.verdict.startsWith(cls);
+    }).length;
+  }
 
   // --- F. Retaining members -> binding-balance containers -------------------
   //

@@ -2000,8 +2000,12 @@ export interface LuaInitOptions {
    * Enforcement is hook-driven, with two consequences: the deadline is checked
    * between VM instructions (so a single long-running C call — a huge
    * `string.rep`, or a host callback that blocks — is not interrupted), and
-   * granularity is the hook's sampling interval, so expect overshoot on the
-   * order of a few hundred microseconds rather than exactness.
+   * granularity is the hook's sampling interval rather than exactness. That
+   * interval is every 1000 VM instructions, so the overshoot to expect is
+   * however long 1000 instructions take on your hardware for the code being
+   * run — tens of microseconds for a tight numeric loop on a 2026 laptop,
+   * proportionally more where individual instructions are expensive. It does
+   * not grow with the length of the timeout.
    *
    * The clock is monotonic, so a system time change cannot shorten or extend a
    * running script.

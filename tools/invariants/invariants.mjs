@@ -29,6 +29,7 @@ import {
   unattributedDefinitions,
 } from '../cpp-scan.mjs';
 import { surfaceCensus } from './surface-census.mjs';
+import { perfClaims } from './perf-claims.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const BINDING = join(ROOT, 'src/lua-native.cpp');
@@ -641,6 +642,12 @@ export const INVARIANTS = [
     title: 'Every piece of new surface is covered by an instrument or ledgered',
     compute: surfaceCensus,
     note: 'CORRECTNESS.md §15.6 computed. UNCLASSIFIED means nobody has ruled on that option / entry point / marker / frame — a review item, not automatically a defect. STALE LEDGER ENTRY and BROKEN LINK mean an excuse or a coverage claim that no longer refers to anything.',
+  },
+  {
+    id: 'perf-claims',
+    title: 'Every performance claim in shipped docs is measured by a cell or ledgered',
+    compute: perfClaims,
+    note: 'UNCLAIMED must stay 0 — a cost claim nobody has measured is how C1–C9 reached the shipped README and types.d.ts. Add a `tools/crossing-cost` Axis A cell, or a CLAIM_LEDGER entry with a reason; a false claim may never be ledgered, it gets fixed or deleted. If "claim-shaped lines examined" drops sharply, suspect the scanner before believing the zero.',
   },
 ];
 
