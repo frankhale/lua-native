@@ -1060,6 +1060,15 @@ lua.set_hook((event, line) => {
 - **`line` is expensive.** It crosses into JavaScript for every source line
   executed, which slows a script by orders of magnitude. Use `count` with a
   coarse interval for anything long-running.
+- **A coarser `count` stops paying off.** Hook overhead is
+  `fixed + per-fire × fires`, and the fixed part — the cost of the VM taking its
+  hook-dispatch path at all — is there whether the callback fires hundreds of
+  times or not once. Once the interval is coarse enough that the hook fires only
+  a handful of times across your script, what is left is that fixed part, and
+  widening it further buys nothing measurable: the remaining choice is between
+  *a hook* and *no hook*, not between intervals. On a tight numeric loop
+  (measured August 7, 2026) the fixed part was already most of the overhead at
+  `count: 1000`.
 - **A throwing callback is swallowed.** The hook is a diagnostic channel, not a
   control one — an exception can't be allowed to unwind through Lua's C frames,
   so it's contained and execution continues. To stop a running script, use

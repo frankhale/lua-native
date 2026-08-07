@@ -1,14 +1,24 @@
 // Axis A — the performance claims shipped documentation makes, each restated as
 // a falsifiable proposition and measured.
 //
-// **Seven cells, not the plan's four.** `PERFORMANCE-PLAN` §1 enumerated C1–C4
-// by grepping the README. The `perf-claims` census, on its first run over the
-// wider surface the same section defines (README + `docs/*.md` + `types.d.ts`,
-// which ships), found three more claims that are equally shipped, equally
-// unmeasured, and — like C2 — state a threshold the reader is expected to act
-// on. That is the plan's own enumeration coming up short at the fifth level, and
-// it is the census earning its place on the first run rather than later.
-// See `FINDINGS.md` E1.
+// **More cells than the plan's four, and the provenance is the interesting
+// part** (a count is deliberately not restated here — `runClaims` below is the
+// census of this list, and a tally in a comment is the stale marker
+// `docs/README.md` rule 1 warns about, which this very paragraph used to be):
+//
+//   - **C1–C4** — `PERFORMANCE-PLAN` §1, arrived at by grepping the README.
+//   - **C5–C9** — the `perf-claims` census, on its first run over the wider
+//     surface the same section defines (README + `docs/*.md` + `types.d.ts`,
+//     which ships). Equally shipped, equally unmeasured, and — like C2 — four of
+//     them state a threshold the reader is expected to act on. That is the
+//     plan's own enumeration coming up short at the fifth level, and the census
+//     earning its place on its first run rather than later. See `FINDINGS.md` E1.
+//   - **C10** — the census firing *forwards* for the first time (August 7,
+//     2026): F1 measured something the docs did not say, the sentence was added,
+//     and it could not ship without this cell because a claim-shaped line no cell
+//     measures turns the suite red.
+//
+// See `FINDINGS.md` E1 and F1.
 //
 // Every cell here is a **ratio or a shape**, never an elapsed time compared
 // against a stored one (§4). C6 arrived as the exception — an absolute
@@ -152,7 +162,7 @@ async function a2ConverterScan(noise) {
 // C3 / A3-sampling-bound
 //   "`count` is the option to reach for when tracing whole programs — it
 //    samples instead of reporting everything, so the overhead stays bounded"
-//   README.md:1028-1030
+//   README.md:1029-1030
 //
 // **Read the claim, not a restatement of it** (H5). This cell first tested
 // whether overhead scales as 1/count, failed at 1.24x against an expected 10x,
@@ -162,10 +172,14 @@ async function a2ConverterScan(noise) {
 // had invented a different one. Driving the failure to a reproduction is what
 // surfaced that — the rule that has now paid thirteen times.
 //
-// The decomposition is *reported* rather than asserted, because it is the
-// decision-relevant part and the docs do not mention it: hook overhead is
-// `fixed + per-fire x fires`, and the fixed part is the cost of having any hook
-// installed at all. See `FINDINGS.md` F1.
+// The decomposition — hook overhead is `fixed + per-fire x fires`, and the fixed
+// part is the cost of having any hook installed at all — is *reported* here
+// rather than asserted, because this cell's proposition is the count-vs-line
+// comparison and a cell that carries two propositions cannot say which one a
+// FAIL belongs to. It was reported-only for one day (F1: the decomposition was
+// decision-relevant and the docs did not mention it). **The README now does
+// mention it**, which makes it a shipped claim rather than an observation, so
+// `A10-hook-fixed-floor` asserts it. See `FINDINGS.md` F1.
 // ---------------------------------------------------------------------------
 async function a3SamplingBound(noise) {
   const SCRIPT = 'local s=0 for i=1,20000 do s=s+i%7 end return s';
@@ -195,7 +209,7 @@ async function a3SamplingBound(noise) {
   return {
     id: 'A3-sampling-bound',
     claim: 'C3',
-    site: 'README.md:1028-1030',
+    site: 'README.md:1029-1030',
     proposition: 'count-mode overhead is bounded well below line mode, which is what "reporting everything" means',
     detail: `no hook ${fmtNs(base)} | line:true +${fmtNs(overheadLine)} | count=1000 +${fmtNs(overheadCount)}`
       + ` | ${(overheadLine / overheadCount).toFixed(0)}x cheaper`
@@ -206,6 +220,86 @@ async function a3SamplingBound(noise) {
     reason: verdict === 'PASS' ? undefined
       : verdict === 'VACUOUS' ? 'count mode added no measurable overhead; nothing to bound'
         : `count mode is only ${(overheadLine / overheadCount).toFixed(1)}x cheaper than line mode`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// C10 / A10-hook-fixed-floor
+//   "Hook overhead is `fixed + per-fire x fires` ... widening it further buys
+//    nothing measurable ... the fixed part was already most of the overhead at
+//    `count: 1000`"
+//   README.md:1063-1071
+//
+// The claim F1 recommended and the README now makes, restated as two
+// propositions and measured as two ratios:
+//
+//   1. the fixed component is **most** of count-mode overhead at `count: 1000`
+//      — a share, not a figure;
+//   2. an interval coarse enough to fire a handful of times has **converged**
+//      onto that floor, so widening it further changes nothing measurable.
+//
+// **Its vacuity check is the fine interval**, and it is the whole reason this
+// cell can be believed. A hook that was never installed, a `count` option
+// silently ignored, or a script too short to reach the interval would each
+// produce a flat line across every interval — which reads as proposition 2
+// holding perfectly while measuring nothing at all. This is `tools/README.md`'s
+// knob rule (*whenever a new axis is a knob rather than a value, ask what it
+// would look like if the knob were disconnected*), and here the disconnected
+// knob and the confirmed claim have the *same* shape, so the witness is not
+// optional. `count: 100` must therefore cost measurably more than the
+// never-fires floor before either proposition is scored.
+// ---------------------------------------------------------------------------
+async function a10HookFixedFloor(noise) {
+  // The same workload A3 uses: ~20k iterations, so `count: 100` fires hundreds
+  // of times, `count: 10_000` a handful, and `count: 10_000_000` never.
+  const SCRIPT = 'local s=0 for i=1,20000 do s=s+i%7 end return s';
+  const measure = async (opts) => {
+    const lua = ctx();
+    if (opts) lua.set_hook(() => {}, opts);
+    const fn = () => lua.execute_script(SCRIPT);
+    const reps = await calibrateReps(fn);
+    return (await timePerCall(fn, { reps })).ns;
+  };
+  const base = await measure(null);
+  const fine = (await measure({ count: 100 })) - base;
+  const practical = (await measure({ count: 1000 })) - base;
+  const coarse = (await measure({ count: 10_000 })) - base;
+  const floor = (await measure({ count: 10_000_000 })) - base;
+
+  // Band for "no measurable difference". The noise floor is measured on a bare
+  // JS probe and is narrower than a run that enters Lua, so it is a lower bound
+  // on this comparison rather than the right band on its own.
+  const band = 1 + Math.max(noise, 0.15);
+  const share = practical > 0 ? floor / practical : NaN;
+  const convergence = floor > 0 ? coarse / floor : NaN;
+
+  // The knob must be connected before either proposition means anything.
+  const witnessMoved = fine > floor * band && floor > 0;
+  const verdict = !witnessMoved ? 'VACUOUS'
+    : share > 0.5 && convergence <= band ? 'PASS' : 'FAIL';
+
+  return {
+    id: 'A10-hook-fixed-floor',
+    claim: 'C10',
+    site: 'README.md:1063-1071',
+    proposition: 'hook overhead is fixed + per-fire x fires: the fixed part is most of it at count=1000,'
+      + ' and a coarser interval has already converged onto that floor',
+    detail: `no hook ${fmtNs(base)} | +count=100 ${fmtNs(fine)} | +count=1000 ${fmtNs(practical)}`
+      + ` | +count=10000 ${fmtNs(coarse)} | +never-fires ${fmtNs(floor)}`
+      + ` || fixed share at count=1000 ${(share * 100).toFixed(0)}%`
+      + ` | coarse/floor ${convergence.toFixed(2)}x`,
+    fixedShare: share,
+    ratio: convergence,
+    verdict,
+    reason: verdict === 'PASS' ? undefined
+      : !witnessMoved
+        ? `count=100 cost ${fmtNs(fine)} against a ${fmtNs(floor)} floor — the per-fire component is not`
+          + ' measurable here, so a flat line across intervals is not evidence of convergence'
+        : share <= 0.5
+          ? `the fixed component is only ${(share * 100).toFixed(0)}% of count=1000 overhead —`
+            + ' the README says it is most of it'
+          : `count=10000 costs ${convergence.toFixed(2)}x the never-fires floor — widening the interval`
+            + ' is still buying something, so "buys nothing measurable" is stated too early',
   };
 }
 
@@ -488,5 +582,6 @@ export async function runClaims(noise) {
     await a7ParseOverhead(noise),
     await a8JsToLuaScan(noise),
     await a9ProxyRead(noise),
+    await a10HookFixedFloor(noise),
   ];
 }

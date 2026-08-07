@@ -128,6 +128,16 @@ export const CLAIM_CELLS = {
     cell: 'A9-proxy-read',
     phrases: [/Matching against a Proxy is not free/i],
   },
+  // C10 is the first claim to arrive through this census rather than be found by
+  // it: `crossing-cost` F1 measured a decomposition the docs did not state, the
+  // sentence was added, and the cell that asserts it was written in the same
+  // change. That is the trigger working in the direction it was built for
+  // (`CORRECTNESS.md` §15.6's documentation row) — the sentence could not have
+  // shipped alone, because this census would have reported it UNCLAIMED.
+  C10: {
+    cell: 'A10-hook-fixed-floor',
+    phrases: [/Hook overhead is/i, /the fixed part was already most of the overhead/i],
+  },
 };
 
 // Hits that are real matches but not claims about this binding's cost. Every

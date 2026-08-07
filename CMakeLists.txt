@@ -23,12 +23,16 @@ endif()
 if(WIN32)
     set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "Vcpkg target triplet")
 elseif(APPLE)
-    # Check for Apple Silicon vs Intel
-    if(_LUA_NATIVE_DETECTED_ARCH MATCHES "arm64|aarch64")
-        set(VCPKG_TARGET_TRIPLET "arm64-osx" CACHE STRING "Vcpkg target triplet")
-    else()
-        set(VCPKG_TARGET_TRIPLET "x64-osx" CACHE STRING "Vcpkg target triplet")
+    # Apple Silicon only. Refusing here rather than falling through is
+    # deliberate: with no triplet set, vcpkg picks its own host default and the
+    # build would quietly succeed as a target nothing else in the project claims
+    # to support (`docs/CORRECTNESS.md` §14).
+    if(NOT _LUA_NATIVE_DETECTED_ARCH MATCHES "arm64|aarch64")
+        message(FATAL_ERROR
+            "Unsupported macOS architecture '${_LUA_NATIVE_DETECTED_ARCH}'. "
+            "This project targets Apple Silicon (arm64) only.")
     endif()
+    set(VCPKG_TARGET_TRIPLET "arm64-osx" CACHE STRING "Vcpkg target triplet")
 else()
     message(WARNING "Unsupported platform - using default x64 triplet")
     set(VCPKG_TARGET_TRIPLET "x64-unknown" CACHE STRING "Vcpkg target triplet")
@@ -137,8 +141,7 @@ collect_node_gyp_dirs(NODE_INCLUDE_CANDIDATES "/include/node")
 list(APPEND NODE_INCLUDE_CANDIDATES
         "/usr/include/node"
         "/usr/local/include/node"
-        "/opt/homebrew/include/node"  # macOS Homebrew ARM
-        "/usr/local/opt/node/include/node"  # macOS Homebrew Intel
+        "/opt/homebrew/include/node"  # macOS Homebrew
         "C:/Program Files/nodejs/include/node"
         "C:/Program Files (x86)/nodejs/include/node"
 )

@@ -64,7 +64,7 @@ npm run binding-balance
 node tools/binding-balance/run.mjs --control          # just the controls
 
 # What does it cost, and are the docs right about that?
-# (9 documented claims, 19 doors, 5 value kinds, 5 scaling knobs)
+# (10 documented claims, 19 doors, 5 value kinds, 5 scaling knobs)
 npm run crossing-cost
 node tools/crossing-cost/run.mjs --control            # just the controls
 node tools/crossing-cost/run.mjs --claims             # just the documented claims
@@ -268,7 +268,8 @@ Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, 
 
 - C++17 standard, compiled via node-gyp (`binding.gyp`)
 - N-API version 8, with `NODE_ADDON_API_CPP_EXCEPTIONS` enabled
-- Platform targets declared in `binding.gyp`: macOS (arm64, x64), Windows (x64).
+- Supported platform targets: **macOS arm64 and Windows x64** (`binding.gyp`
+  conditions on `OS` and declares no arch list).
   **In practice this is a macOS project and there is no CI, and both are settled
   decisions — not gaps.** Do not raise the untested targets, the absence of CI,
   pre-push hooks, or `CODE-REVIEW-LEDGER` M5 as findings, risks, action items,

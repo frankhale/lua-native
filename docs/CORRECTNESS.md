@@ -170,9 +170,11 @@ document, in `CODE-REVIEW-18`, and in any earlier pass, on these two subjects.**
 
 ### What is closed
 
-- The untested targets declared in `binding.gyp` (mac x64, win x64). Not a
-  correctness gap. **Do not propose narrowing `binding.gyp` either** — the
-  proposal itself is part of what was closed.
+- The untested target (win x64). Not a correctness gap. **Do not
+  propose narrowing `binding.gyp` either** — the proposal itself is part of what
+  was closed. (`binding.gyp` conditions on `OS=='win'` / `OS=='mac'` and declares
+  no arch list, so "narrowing" it was always a documentation change rather than a
+  build one.)
 - CI, in every form: hosted runners, pre-push hooks, "runs without anyone
   remembering to run it" automation.
 - `CODE-REVIEW-LEDGER` M5 (`MACOSX_DEPLOYMENT_TARGET`). Not a blocker.
@@ -744,6 +746,20 @@ found were in the harness**, two of which looked exactly like product findings
 first. That ratio is the yield law's amendment holding: a genuinely new
 instrument mostly finds itself, and the rule that saves it is driving every dirty
 result to a hand-run reproduction before believing it.
+
+**Its one open recommendation was closed the next day, and the trigger ran
+forwards (August 7, 2026).** F1 — hook overhead is a fixed floor plus a per-fire
+cost, which no shipped sentence mentioned — was the search's only outstanding
+item. The sentence is now in `README.md`, stated as a mechanism and a share
+rather than as the absolute figures it came from (F2's rule), and
+`A10-hook-fixed-floor` asserts both halves of it. **The sentence could not have
+shipped on its own**: `perf-claims` would have reported it `UNCLAIMED` and turned
+the suite red, which is the §15.6 documentation row doing the job it was added
+for — every earlier claim, C1–C9, was found by that census in prose that had
+already shipped. The record is `tools/crossing-cost/FINDINGS.md` F1, including
+the injection table showing the cell reporting `VACUOUS` and `FAIL` on demand,
+and the reason its vacuity witness is load-bearing rather than decorative: a
+disconnected `count` knob passes both propositions.
 
 **And two things deliberately not on the list**, carried over from the plan's §8:
 do not build a ninth instrument for its own sake — §15.8 predicts it would find

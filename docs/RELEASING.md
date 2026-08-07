@@ -2,7 +2,9 @@
 
 Checklist for publishing `lua-native` to npm. Written up in response to
 CODE-REVIEW-5 finding F8 (the committed tree ships prebuilds for one of the
-three supported platforms) and the still-deferred CODE-REVIEW-3 M5.
+supported platforms) and the still-deferred CODE-REVIEW-3 M5.
+
+**Supported targets: `darwin-arm64` and `win32-x64`.**
 
 ## Before publishing
 
@@ -14,16 +16,15 @@ three supported platforms) and the still-deferred CODE-REVIEW-3 M5.
    that un-defers it.
 
 2. **Build a prebuild for every supported platform.** `prebuilds/` currently
-   contains `darwin-arm64` only. Without the others, `npm install lua-native`
-   on `darwin-x64` or `win32-x64` falls through `node-gyp-build` to
-   `node-gyp rebuild`, which requires the *consumer* to have `VCPKG_ROOT` set
-   and Lua installed via vcpkg — an install failure for anyone without a
-   development setup.
+   contains `darwin-arm64` only. Without `win32-x64`, `npm install lua-native`
+   on Windows falls through `node-gyp-build` to `node-gyp rebuild`, which
+   requires the *consumer* to have `VCPKG_ROOT` set and Lua installed via
+   vcpkg — an install failure for anyone without a development setup.
 
-   On each target machine (or via CI runners):
+   On each target machine:
 
    ```bash
-   npm ci
+   npm install
    npm run prebuildify   # prebuildify --napi --strip
    ```
 
@@ -31,9 +32,12 @@ three supported platforms) and the still-deferred CODE-REVIEW-3 M5.
 
    ```
    prebuilds/darwin-arm64/node.napi.node
-   prebuilds/darwin-x64/node.napi.node
    prebuilds/win32-x64/node.napi.node
    ```
+
+   A macOS x64 consumer is not a supported target and falls through to the same
+   source build. That is the documented consequence of the scope decision, not a
+   packaging defect to fix here.
 
 3. **Reconcile the legacy prebuild name.** The committed
    `prebuilds/darwin-arm64/lua-native.node` predates `prebuildify` and does not

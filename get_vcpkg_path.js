@@ -10,12 +10,15 @@ if (platform === "win32") {
   // Windows - always use x64 for now (CMake uses x64-windows-static)
   triplet = "x64-windows-static";
 } else if (platform === "darwin") {
-  // macOS - check for Apple Silicon vs Intel
-  if (arch === "arm64" || arch === "aarch64") {
-    triplet = "arm64-osx";
-  } else {
-    triplet = "x64-osx";
+  // Apple Silicon only, and it throws rather than falling back for the reason
+  // CMakeLists.txt states: a fallback triplet builds a target nothing here
+  // claims to support, and does it silently.
+  if (arch !== "arm64" && arch !== "aarch64") {
+    throw new Error(
+      `Unsupported macOS architecture: ${arch}. This project targets Apple Silicon (arm64) only.`
+    );
   }
+  triplet = "arm64-osx";
 } else {
   // Unsupported platform - use default
   console.warn(`Unsupported platform: ${platform} - using default x64 triplet`);

@@ -69,8 +69,8 @@ End users will not have vcpkg, node-gyp, or a C++ toolchain, so the
 - Because Lua is statically linked (`LUA_STATIC` in `binding.gyp`), there is
   **no external Lua `.dylib` / `.dll` to bundle** — the prebuilt `.node` is
   self-contained. This is a real advantage over a dynamically-linked Lua.
-- Build a prebuild per target arch (`darwin-arm64`, `darwin-x64`,
-  `win32-x64`) so packaged apps on each platform find a match.
+- Build a prebuild per target arch (`darwin-arm64`, `win32-x64`) so packaged
+  apps on each platform find a match.
 
 ## 4. Check the macOS deployment target
 

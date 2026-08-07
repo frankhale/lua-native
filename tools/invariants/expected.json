@@ -307,6 +307,8 @@
     "README.md: Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_b...": "COVERED by A4-bytecode-start (C4)",
     "README.md: number and string crossing out of Lua stays on the fast path.": "COVERED by A1-fast-path (C1)",
     "README.md: instead of reporting everything, so the overhead stays bounded:": "COVERED by A3-sampling-bound (C3)",
+    "README.md: A coarser `count` stops paying off.** Hook overhead is": "COVERED by A10-hook-fixed-floor (C10)",
+    "README.md: (measured August 7, 2026) the fixed part was already most of the overhead at": "COVERED by A10-hook-fixed-floor (C10)",
     "README.md: Compile Lua source to bytecode and load it later for faster startup. Bytecode": "COVERED by A4-bytecode-start (C4)",
     "README.md: Performance:** every registered `match` runs for every object-valued result": "COVERED by A2-converter-scan (C2)",
     "README.md: crossing Lua→JS, in registration order, until one matches. Keep `match` cheap.": "COVERED by A2-converter-scan (C2)",
@@ -320,11 +322,12 @@
     "docs/ASYNC.md: synchronous path is faster.": "COVERED by A5-async-threshold (C5)",
     "docs/ASYNC.md: | Overhead for short scripts | Low | Document that sync is faster for < 1ms scripts; ...": "COVERED by A5-async-threshold (C5)",
     "docs/BYTECODE.md: Compile Lua source code to bytecode with `compile()` and load precompiled bytecode wi...": "COVERED by A4-bytecode-start (C4)",
+    "docs/CORRECTNESS.md: forwards (August 7, 2026).** F1 — hook overhead is a fixed floor plus a per-fire": "COVERED by A10-hook-fixed-floor (C10)",
     "docs/TABLE-REFERENCE.md: 1. **Parsing overhead.** Every `execute_script` call compiles Lua source. For": "COVERED by A7-parse-overhead (C7)",
     "files scanned": 16,
-    "claim-shaped lines examined": 53,
+    "claim-shaped lines examined": 56,
     "skipped: under a hypothetical heading": 10,
-    "COVERED by a cell": 17,
+    "COVERED by a cell": 20,
     "LEDGERED with a reason": 26,
     "UNCLAIMED": 0
   }

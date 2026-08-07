@@ -294,8 +294,9 @@ written specifically to avoid it.
 
 ## F1 — hook overhead is dominated by a fixed cost the docs do not mention
 
-**Status:** an omission, not a false claim. C3 is confirmed. Recommended: one
-sentence in the README.
+**Status:** fixed in `README.md` (August 7, 2026), and now measured by
+`A10-hook-fixed-floor`. An omission, not a false claim — C3 was confirmed
+throughout.
 
 `set_hook` with a `count` interval costs `fixed + per-fire x fires`, and on this
 machine the fixed component is **~68µs against 88µs total** at `count=1000` — 76%
@@ -318,6 +319,41 @@ coarser interval keeps buying cheaper, and past roughly `count=10000` on a scrip
 this size it buys nothing measurable — the choice is between *a hook* and *no
 hook*, not between intervals. The documented claim ("overhead stays bounded") is
 true and, if anything, understated.
+
+### Resolution — August 7, 2026
+
+The sentence is in `README.md`'s *What to Know Before Using It*, stated as the
+decomposition and a **share** rather than as the table above: no absolute figure
+survives the machine it was measured on (F2), so what ships is
+`fixed + per-fire × fires`, "already most of the overhead at `count: 1000`", and
+the mechanism that makes a coarser interval stop paying. `A10-hook-fixed-floor`
+asserts both halves — share > 50% at `count=1000`, and `count=10000` within the
+noise band of the never-fires floor — and `perf-claims` C10 scores the two
+sentences `COVERED`.
+
+**The order is the point, and it is the §15.6 documentation trigger working
+forwards for the first time.** Every earlier claim, C1–C9, was found by the
+census in prose that had already shipped. This one could not ship alone: the
+sentence and the cell that defends it landed in the same change, because
+`check-invariants` goes red on a claim-shaped line no cell measures.
+
+**The dirty demonstration, and the reason the witness column exists.** Driven on
+purpose against a modified copy of the cell:
+
+| Injection | Verdict |
+|---|---|
+| as shipped | PASS — share 79%, coarse/floor 1.10x |
+| witness interval also never fires (a disconnected knob) | **VACUOUS** |
+| the claim restated at `count=10`, where per-fire dominates | **FAIL** — share 3% |
+| `coarse` set to `count=100`, still firing hundreds of times | **FAIL** — 4.10x the floor |
+
+Row 2 is the one worth keeping. With the knob disconnected the cell still
+measured share 77% and convergence 0.95x — **both propositions passing, on four
+columns that were all the same measurement.** A disconnected knob and a confirmed
+convergence claim have the identical shape here, which is `tools/README.md`'s
+knob rule arriving in its sharpest form: the vacuity witness is not a
+belt-and-braces check on this cell, it is the only thing separating the result
+from its own negation.
 
 ## F2 — a shipped absolute figure was wrong by 5–20x, and has been restated
 
@@ -348,7 +384,7 @@ can defend one.**
 
 ## What was confirmed
 
-Nine documented claims, all measured, none falsified. Worth stating plainly
+Ten documented claims, all measured, none falsified. Worth stating plainly
 because the interesting ones are the two that are *dramatically* true:
 
 | Claim | Measured |
@@ -362,6 +398,7 @@ because the interesting ones are the two that are *dramatically* true:
 | C7 `execute_script` recompiles every call | 2.3x a retained handle |
 | C8 JS→Lua converter scan is linear | exponent 0.38 |
 | C9 a Proxy read is not free | **212x** a plain object read |
+| C10 hook overhead is a fixed floor plus per-fire (added August 7, 2026) | 75% fixed at `count=1000`; `count=10000` within 1.04x of the floor |
 
 And no shape defect anywhere: every size-scalable crossing and every scaling knob
 measured the class it declared, with no accidental quadratic in the tree.
