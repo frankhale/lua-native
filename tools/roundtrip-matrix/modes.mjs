@@ -83,4 +83,26 @@ export const MODES = [
       },
     },
   },
+  // T1, August 7, 2026. A conversion option, so a mode here rather than a
+  // capability-matrix config — the split W1 had to draw.
+  {
+    id: 'map',
+    options: { tableAs: 'map' },
+    describe: "tableAs: 'map': every Lua table crosses as a Map with its real keys "
+      + '(LIMITATIONS §5, three of the four Lua→JS key losses)',
+    proves: {
+      // The knob rule, and this mode needs it more than most: a disconnected
+      // `tableAs` would hand back plain objects that round-trip everything the
+      // default mode round-trips, agree at every door, and report a clean
+      // column having searched nothing (CR-23 F4). So the control asserts the
+      // *representation*, and asserts the thing only this mode can do:
+      // a number key and a string key with the same text staying distinct.
+      describe: 'a table arrives as a Map, and 1 and "1" survive as separate keys',
+      run: (lua) => {
+        const t = lua.execute_script('return {[1]="int", ["1"]="str"}');
+        if (!(t instanceof Map)) return false;
+        return t.size === 2 && t.get(1) === 'int' && t.get('1') === 'str';
+      },
+    },
+  },
 ];

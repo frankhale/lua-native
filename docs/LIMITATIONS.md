@@ -40,9 +40,50 @@ package.path = "/tmp/?.lua"; require("x")     -> executed
 load(string.dump(f))                          -> function   (unless allowBytecode: false)
 ```
 
-**Bounded honestly:** a script cannot read arbitrary file *contents* as data —
-`loadfile` on a non-Lua file returns `nil`, so the target must parse as Lua. But
-any readable `.lua` file on the host can be executed.
+**Bounded honestly — and the bound was wrong, corrected August 7, 2026.** What
+this paragraph used to say: *a script cannot read arbitrary file contents as
+data, `loadfile` on a non-Lua file returns `nil`, so the target must parse as
+Lua; but any readable `.lua` file on the host can be executed.* Both halves of
+that are true and the conclusion is still too generous, because the list of
+doors above is four short. `package` also carries **`loadlib`**, and
+`package.searchers[3]`/`[4]` reach the same loader through `require`:
+
+```
+package.loadlib("/usr/lib/libSystem.B.dylib", "*")   -> true   (under 'safe')
+```
+
+That links a **native library** into the process — not a `.lua` file, so the
+"must parse as Lua" limit does not apply to it at all. `package.searchpath`
+additionally probes the filesystem for existence, which the old text did not
+mention either. The doors
+were found by deriving them from the source rather than from this list (T2), and
+the list is now: `dofile`, `loadfile`, `searchers[2]`, `searchers[3]`,
+`searchers[4]`, `loadlib`, `searchpath` — plus `io`'s and `os`'s file functions
+where those libraries are loaded.
+
+None of this changes what `'safe'` *claims*: it says it is not a sandbox, and it
+is not. What changed is that the worst case is now stated accurately.
+
+### The other fix: `filesystem: 'deny'` (added August 7, 2026)
+
+`'sandbox'` seals by *removing* `package`, so `require` goes with it. The
+option below seals by closing the doors instead, so the host can still serve
+modules:
+
+```js
+const lua = new lua_native.init({}, { libraries: 'safe', filesystem: 'deny' });
+lua.register_module('config', { env: 'prod' });
+lua.execute_script('return require("config").env');   // 'prod'
+lua.execute_script('dofile("/etc/passwd")');          // throws
+```
+
+Every door in the list above refuses, each in the idiom its real counterpart
+uses for failure (`nil, msg` or a raise), and `add_search_path` refuses rather
+than accepting a path `require` can never consult. It governs what *Lua* can
+reach: `execute_file`, `compile_file` and a `set_file_reader` handler still
+work, because the host asking for a file by name is the caller's own decision.
+It is **not** a general sandbox — `os.execute` and `io.popen` are process doors,
+not filesystem doors, and are untouched.
 
 **What `allowBytecode: false` does and does not buy you here** (corrected
 August 6, 2026). The three file doors above reach the host's `.lua` files
@@ -233,6 +274,7 @@ document is a complete answer to "what should I not rely on". Full detail is on
 |---|---|---|
 | JS → Lua | `null`/`undefined` in an **array** truncates the Lua sequence at that index | **yes** |
 | JS → Lua | `null` as an object value removes the key | **yes** |
+| JS → Lua | a **`Map`**'s keys are stringified, so `1` and `"1"` collide and `true` becomes `"true"` | **yes** |
 | JS → Lua | a circular reference is refused; nesting past 100 levels is refused | no — throws |
 | Lua → JS | a table key that is neither string nor number is dropped | **yes** |
 | Lua → JS | a string key and an integer key with the same text collide | **yes** |
@@ -263,6 +305,56 @@ which is exactly why this row exists and why the answer for keys is a refusal
 rather than a switch. The remedy that does work is
 [`handle.pairs()`](TABLE-REFERENCE.md): it converts keys as *values*, so under
 `binaryStrings` both keys arrive as exact `Uint8Array`s and nothing collides.
+
+**The Map row was added August 7, 2026 (T1)**, and it is the second time this
+table has been found a row short by the rule that generates it — CR-23 F1 was
+the first. It was missed for a specific reason worth recording: `Map` was
+believed to *be* the answer to the Lua→JS key losses, so nobody asked what
+happened to a Map's own keys on the way **in**. Driven:
+
+```js
+lua.set_global('m', new Map([[1, 'int'], ['1', 'str'], [true, 'bool']]));
+// Lua sees two entries, both string-keyed: "1" (one value lost) and "true"
+```
+
+It follows from the rule exactly as the byte-key row did: a Lua key is bytes, a
+`Map` key is any JS value, and the two type systems disagree about what a key
+is. `tableAs: 'map'` fixes this direction too.
+
+### The fix: `tableAs: 'map'` (added August 7, 2026)
+
+Where `strictConversion` **refuses** the Lua→JS key losses, this one **represents**
+them — a `Map` holds what a JS object cannot:
+
+```js
+const lua = new lua_native.init({}, { libraries: 'all', tableAs: 'map' });
+lua.execute_script('return {[1]="int", ["1"]="str", [true]="bool"}');
+// → Map { 1 => 'int', '1' => 'str', true => 'bool' }   — nothing lost, nothing refused
+```
+
+Three of the four Lua→JS rows above stop being losses, and the Map row on the
+JS→Lua side stops too: in this mode a `Map` crosses into Lua with its key types
+intact, so the option is symmetric.
+
+**Every table becomes a Map, including sequences** — `{"a","b"}` arrives as
+`Map { 1 => "a", 2 => "b" }`. Making the shape depend on whether the table
+happened to be a sequence is the data-dependent return type §2 refuses.
+
+**Where the option had to live, which is the interesting part.** It was designed
+as a rendering switch in the binding: build a Map instead of an object. That is
+impossible — `LuaTable` is a `std::unordered_map<std::string, LuaPtr>`, so the
+number key `1` and the string key `"1"` have **already merged** before the
+binding sees the table. Rendering a Map from that would have produced a
+faithful-looking container full of data that was already lossy. So the mode
+instead makes the core keep a plain table **by reference** — the branch
+metatabled tables always used — and the binding materializes the Map by walking
+the real table. The lesson generalizes: *a fidelity option has to be applied
+where the fidelity is lost, and that is not always where the value is rendered.*
+
+**Composes with `strictConversion`**: nothing is left for it to refuse on those
+rows, so the pair is the first configuration with no silent loss **and** no
+refusal in either direction. A metatabled table is unaffected — still a live
+Proxy in both modes.
 
 ### The fix: `strictConversion: true` (added August 5, 2026)
 
@@ -317,6 +409,21 @@ whole job is catching mistakes would be the exact failure it is meant to prevent
 > The escape hatch that needs no option is still there and is still the better
 > answer when it fits: a handle from `get_global_ref` reads the real table in
 > place, so boolean keys and colliding keys survive because nothing is converted.
+>
+> **That sentence was half false until August 7, 2026, and the half that failed
+> is worth recording.** Colliding keys did survive. Boolean keys did not:
+> `handle.pairs()` skipped every key that was not a string or number, and
+> `get`/`set`/`has` took no boolean, so a `t[true]` entry could be neither
+> enumerated nor read — this row's own silent-loss class, reappearing in the API
+> this document nominates as the way out of it. The skip was deliberate and its
+> comment gave the reason: *"only string and number keys survive the crossing"*,
+> which is true of a table converted to a JS **object**, where a key becomes a
+> property name. `pairs()` emits `[key, value]` tuples and converts the key as a
+> *value*, so the constraint was inherited from a path this one is not on. Both
+> halves are now fixed together — `pairs()` emits boolean keys and the accessors
+> take them — because emitting a key nothing could address would have been the
+> worse limitation. Table, function and userdata keys are still skipped, and
+> `pairs()` now says so.
 
 ---
 
@@ -406,6 +513,54 @@ left alone rather than overwritten. A refused handler is not retained.
 > constraint, drew a correct conclusion about one bad solution, and then let that
 > stand as a conclusion about *all* solutions — while a working precedent for the
 > right one sat in the neighbouring capability, documented three sections up.
+
+---
+
+## 9. Lua 5.5 only, which is narrower than it sounds
+
+**This document had no entry for the single most likely reason an existing Lua
+codebase will not run here** until August 7, 2026 (R2). It is not a defect and
+nothing is going to be fixed; it is a fact about reach that an embedder should
+learn before porting rather than during.
+
+`lua-native` links **Lua 5.5** (`info().version` → `Lua 5.5`, release
+`Lua 5.5.0`, `versionNumber` 505), and that is the only version there is — the
+build resolves one `liblua.a` from vcpkg. There is no 5.4 build, no 5.1 build,
+and no LuaJIT. Comparable bridges sit a version or two back: wasmoon ships 5.4,
+fengari 5.3/5.4.
+
+**Why that matters more than a version number usually does.** Most published
+Lua code — and most of LuaRocks — targets 5.1 through 5.4, and 5.1-era code is
+still common because LuaJIT is pinned there. Driven under `libraries: 'all'`:
+
+| Removed before 5.5 | Here |
+|---|---|
+| `setfenv`, `getfenv` (5.1) | `nil` — use [`create_environment`](FEATURES.md) / `execute_script_in` |
+| `unpack` (5.1) | `nil` — `table.unpack` |
+| `loadstring` (5.1) | `nil` — `load` |
+| `module` (5.1) | `nil` — return a table, or `register_module` from JS |
+| `math.pow`, `math.mod`, `table.getn` (5.1) | `nil` — `^`, `%`, `#` |
+| `bit32` (5.2), `math.atan2` (5.2) | `nil` — native bitwise operators |
+
+A script written for 5.1 therefore fails at the first call, loudly, which is the
+good case. **The quiet case is the integer/float split** introduced in 5.3:
+`3` and `3.0` are distinct (`tostring` gives `3` and `3.0`), `7 // 2` is `3`,
+and `math.type` exists to tell them apart. Code written before 5.3 that assumed
+one number type can produce subtly different output rather than an error — and
+that difference reaches JavaScript, where §5's BigInt row is its other end.
+
+What 5.5 does have, and 5.1 does not: integer division, bitwise operators,
+`goto`, `<const>` and `<close>` (with `__close` honoured), `coroutine.close`,
+`table.move`, `warn`. String→number coercion still works (`"10" + 5` → `15`).
+
+**Not planned, and the reason is scope rather than difficulty.** Supporting a
+second Lua would mean a second `liblua.a`, a matrix over both for every
+instrument that asserts VM behaviour (`diff-oracle` compares against *the* stock
+interpreter from the same vcpkg port), and a version axis on the exception and
+capability matrices. A Lua version bump is already a `diff-oracle` trigger
+(`CORRECTNESS.md` §15.6); a version *choice* would be a standing axis. If you
+need 5.4 or LuaJIT, this is the wrong bridge — better learned from this page
+than part-way through a port.
 
 ---
 

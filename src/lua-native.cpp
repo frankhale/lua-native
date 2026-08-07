@@ -384,6 +384,14 @@ static bool NapiToTableKey(const Napi::Value& value, lua_core::TableKey& out) {
     out = value.As<Napi::String>().Utf8Value();
     return true;
   }
+  // Booleans are real Lua keys and `handle.pairs()` emits them (August 7, 2026).
+  // Accepting them here is what makes that emission addressable: a key the
+  // caller can see and cannot read back would be a worse limitation than the
+  // silent drop it replaced.
+  if (value.IsBoolean()) {
+    out = value.As<Napi::Boolean>().Value();
+    return true;
+  }
   return false;
 }
 
@@ -402,7 +410,7 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
 
   lua_core::TableKey key;
   if (!NapiToTableKey(info[0], key)) {
-    Napi::TypeError::New(env, "get() key must be a string or number").ThrowAsJavaScriptException();
+    Napi::TypeError::New(env, "get() key must be a string, number, or boolean").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -440,7 +448,7 @@ static Napi::Value TableHandleGetRef(const Napi::CallbackInfo& info) {
 
   lua_core::TableKey key;
   if (!NapiToTableKey(info[0], key)) {
-    Napi::TypeError::New(env, "get_ref() key must be a string or number").ThrowAsJavaScriptException();
+    Napi::TypeError::New(env, "get_ref() key must be a string, number, or boolean").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -477,7 +485,7 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
 
   lua_core::TableKey key;
   if (!NapiToTableKey(info[0], key)) {
-    Napi::TypeError::New(env, "set() key must be a string or number").ThrowAsJavaScriptException();
+    Napi::TypeError::New(env, "set() key must be a string, number, or boolean").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -509,7 +517,7 @@ static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
 
   lua_core::TableKey key;
   if (!NapiToTableKey(info[0], key)) {
-    Napi::TypeError::New(env, "has() key must be a string or number").ThrowAsJavaScriptException();
+    Napi::TypeError::New(env, "has() key must be a string, number, or boolean").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -583,6 +591,208 @@ static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
     Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
     return env.Undefined();
   }
+}
+
+// Defined with the coroutine iterator further down, which was the first user.
+static Napi::Value SymbolIteratorKey(Napi::Env env);
+
+// The key snapshot behind `keys()` and `[Symbol.iterator]()`. Converting keys
+// runs no from-Lua converter (a key is a string, number or boolean by the time
+// it gets here) but CoreToNapi is still the one place that knows about
+// `binaryStrings`, so it goes through the same door as everything else.
+static Napi::Value TableHandleKeys(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  try {
+    LuaContext::CallScope scope(data->context);  // as TableHandlePairs, CR-13 F1
+    auto keys = data->runtime->TableKeys(data->tableRef.ref);
+    Napi::Array result = Napi::Array::New(env, keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      (void)result.Set(static_cast<uint32_t>(i), data->context->CoreToNapi(*keys[i]));
+    }
+    return result;
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+}
+
+namespace {
+  // One iteration cursor over a table handle. Mirrors LuaCoroIterState below:
+  // each `[Symbol.iterator]()` mints a fresh one, so two loops over the same
+  // handle are independent.
+  //
+  // **Why the keys are eager and only the values are lazy.** A cursor that kept
+  // `lua_next` open across a return into JavaScript would be undefined the
+  // moment the caller touched the table mid-loop — the same hazard CR-15 F2
+  // drove through a `__gc` finalizer (a 200-entry table yielding 2682 entries),
+  // except that arbitrary JS between two `next()` calls is a far wider window
+  // than a finalizer. So `TableKeys` snapshots the key set up front and each
+  // `next()` does an independent raw read. What that buys is the expensive
+  // half: values are converted one at a time instead of all at once, and a
+  // value conversion is what mints handles and runs registered converters.
+  //
+  // The handle object is held strongly (an ObjectReference), matching the
+  // coroutine iterator: nothing on the handle points back here, so no cycle.
+  struct LuaTableIterState {
+    LuaTableRefData* data = nullptr;
+    ContextLiveness liveness;
+    Napi::ObjectReference handle;
+    std::vector<lua_core::LuaPtr> keys;
+    size_t index = 0;
+    // Same predicate the handle itself uses: true while this handle's Lua
+    // state is still the context's current one.
+    [[nodiscard]] bool ContextLive() const { return liveness.HandlesLive(); }
+  };
+
+  // Same ownership discipline as the coroutine cursor below: the state is
+  // shared_ptr-owned and every GC root is an External wrapping its own copy, so
+  // "rooted on the iterator and on each bound method" is expressed by ownership
+  // rather than by keeping one designated holder alive (H3 / L6).
+  using TableIterOwner = std::shared_ptr<LuaTableIterState>;
+
+  // The unique_ptr owns the copy until the External's finalizer takes over, so
+  // a throw from External::New cannot leak it (CR-9 F4).
+  Napi::Value NewTableIterOwner(const Napi::Env env, const TableIterOwner& sp) {
+    auto holder = std::make_unique<TableIterOwner>(sp);
+    const auto ext = Napi::External<TableIterOwner>::New(env, holder.get(),
+      [](Napi::Env, const TableIterOwner* h) { delete h; });
+    // NOLINTNEXTLINE(bugprone-unused-return-value)
+    (void)holder.release();  // ownership transferred to the finalizer
+    return ext;
+  }
+}
+
+// Converts a snapshotted key back to the addressing type the raw read needs.
+// Total by construction: TableKeys only emits these three.
+static bool KeyToTableKey(const lua_core::LuaValue& v, lua_core::TableKey& out) {
+  if (std::holds_alternative<std::string>(v.value)) {
+    out = std::get<std::string>(v.value);
+  } else if (std::holds_alternative<int64_t>(v.value)) {
+    out = std::get<int64_t>(v.value);
+  } else if (std::holds_alternative<double>(v.value)) {
+    out = std::get<double>(v.value);
+  } else if (std::holds_alternative<bool>(v.value)) {
+    out = std::get<bool>(v.value);
+  } else {
+    return false;
+  }
+  return true;
+}
+
+static Napi::Value TableIteratorNext(const Napi::CallbackInfo& info) {
+  const Napi::Env env = info.Env();
+  auto* state = static_cast<LuaTableIterState*>(info.Data());
+  if (!state) {
+    Napi::Error::New(env, "table iterator is not usable").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const auto finished = [&]() {
+    Napi::Object out = Napi::Object::New(env);
+    (void)out.Set("value", env.Undefined());
+    (void)out.Set("done", Napi::Boolean::New(env, true));
+    return out;
+  };
+
+  if (!state->ContextLive()) {
+    Napi::Error::New(env, std::string("table handle is not usable: ") +
+                          state->liveness.DeadReason())
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  // Released mid-loop. Ending the iteration is the honest answer: the entries
+  // this cursor was walking are no longer reachable, and inventing values for
+  // them would be answering with another state's data.
+  if (!state->data || state->data->tableRef.ref == LUA_NOREF) {
+    state->keys.clear();
+    return finished();
+  }
+
+  try {
+    LuaContext::CallScope scope(state->data->context);
+    while (state->index < state->keys.size()) {
+      const lua_core::LuaPtr key = state->keys[state->index++];
+      lua_core::TableKey addr;
+      if (!key || !KeyToTableKey(*key, addr)) continue;
+
+      // Raw, so the cursor reports what `pairs()` reports rather than what an
+      // `__index` metamethod would answer.
+      auto value = state->data->runtime->RawGetTableFieldKeyed(
+        state->data->tableRef.ref, addr);
+      // Deleted between the snapshot and now: skip it, as a traversal that
+      // reached the key later would have.
+      if (!value || std::holds_alternative<std::monostate>(value->value)) continue;
+
+      Napi::Array entry = Napi::Array::New(env, 2);
+      (void)entry.Set(static_cast<uint32_t>(0), state->data->context->CoreToNapi(*key));
+      (void)entry.Set(static_cast<uint32_t>(1), state->data->context->CoreToNapi(*value));
+
+      Napi::Object out = Napi::Object::New(env);
+      (void)out.Set("value", entry);
+      (void)out.Set("done", Napi::Boolean::New(env, false));
+      return out;
+    }
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  state->keys.clear();
+  return finished();
+}
+
+static Napi::Value TableIteratorSelf(const Napi::CallbackInfo& info) {
+  return info.This();
+}
+
+static Napi::Value TableHandleSymbolIterator(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  if (RejectIfWorkerBusy(env, data)) return env.Undefined();
+  if (!data || data->tableRef.ref == LUA_NOREF) {
+    Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const TableIterOwner sp = std::make_shared<LuaTableIterState>();
+  LuaTableIterState* state = sp.get();
+  state->data = data;
+  state->liveness = data->liveness;  // the handle already carries it
+  if (info.This().IsObject()) state->handle = Napi::Persistent(info.This().As<Napi::Object>());
+
+  // The snapshot happens here, at `[Symbol.iterator]()`, not at the first
+  // `next()`: it is the traversal, and it must complete before any JS the loop
+  // body runs can touch the table.
+  try {
+    LuaContext::CallScope scope(data->context);
+    state->keys = data->runtime->TableKeys(data->tableRef.ref);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const Napi::Object iterator = Napi::Object::New(env);
+  DefineHiddenProp(env, iterator, "__tableIterOwner", NewTableIterOwner(env, sp),
+                   /*writable=*/false);
+
+  auto addMethod = [&](const char* name,
+                       Napi::Value (*cb)(const Napi::CallbackInfo&)) {
+    const Napi::Function fn = Napi::Function::New(env, cb, name, state);
+    DefineHiddenProp(env, fn, "__tableIterOwner", NewTableIterOwner(env, sp),
+                     /*writable=*/false);
+    (void)iterator.Set(name, fn);
+  };
+  addMethod("next", TableIteratorNext);
+  (void)iterator.Set(SymbolIteratorKey(env),
+    Napi::Function::New(env, TableIteratorSelf, "[Symbol.iterator]"));
+  return iterator;
 }
 
 static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
@@ -958,6 +1168,8 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("set_file_reader", &LuaContext::SetFileReader),
     InstanceMethod("set_hook", &LuaContext::SetHook),
     InstanceMethod("remove_hook", &LuaContext::RemoveHook),
+    InstanceMethod("get_stack", &LuaContext::GetStack),
+    InstanceMethod("get_locals", &LuaContext::GetLocals),
     InstanceMethod("add_searcher", &LuaContext::AddSearcher),
     InstanceMethod("release", &LuaContext::Release),
     InstanceMethod("reset", &LuaContext::Reset),
@@ -1161,9 +1373,57 @@ LuaContext::LuaContext(const Napi::CallbackInfo& info)
         allow_bytecode_ = false;
         runtime->SetAllowBytecode(false);  // E3
       }
+      // T2. Applied after the libraries are open, because it closes doors that
+      // only exist once they are — and a non-string value is rejected rather
+      // than ignored, for the reason `strictConversion` states: an option whose
+      // job is to remove a capability must never fail quietly.
+      if (options.Has("filesystem")) {
+        const Napi::Value fs = options.Get("filesystem");
+        if (!fs.IsUndefined() && !fs.IsNull()) {
+          if (!fs.IsString()) {
+            Napi::TypeError::New(env, "filesystem must be 'allow' or 'deny'")
+              .ThrowAsJavaScriptException();
+            return;
+          }
+          const std::string mode = fs.As<Napi::String>().Utf8Value();
+          if (mode == "deny") {
+            filesystem_denied_ = true;
+            runtime->SetFilesystemAccess(false);
+          } else if (mode != "allow") {
+            Napi::TypeError::New(env,
+              "filesystem must be 'allow' or 'deny', got '" + mode + "'")
+              .ThrowAsJavaScriptException();
+            return;
+          }
+        }
+      }
       if (options.Has("binaryStrings") && options.Get("binaryStrings").IsBoolean() &&
           options.Get("binaryStrings").As<Napi::Boolean>().Value()) {
         binary_strings_ = true;
+      }
+      // T1. Rejected rather than ignored when misspelled, like `filesystem`
+      // above: an option that silently stayed off would hand back objects that
+      // look right and have already lost keys — the exact failure it exists to
+      // remove.
+      if (options.Has("tableAs")) {
+        const Napi::Value mode = options.Get("tableAs");
+        if (!mode.IsUndefined() && !mode.IsNull()) {
+          if (!mode.IsString()) {
+            Napi::TypeError::New(env, "tableAs must be 'object' or 'map'")
+              .ThrowAsJavaScriptException();
+            return;
+          }
+          const std::string want = mode.As<Napi::String>().Utf8Value();
+          if (want == "map") {
+            table_as_map_ = true;
+            runtime->SetPreserveTableKeys(true);
+          } else if (want != "object") {
+            Napi::TypeError::New(env,
+              "tableAs must be 'object' or 'map', got '" + want + "'")
+              .ThrowAsJavaScriptException();
+            return;
+          }
+        }
       }
       if (options.Has("print") && options.Get("print").IsFunction()) {
         InstallPrintHandler(options.Get("print").As<Napi::Function>());  // E1
@@ -2279,6 +2539,41 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// Reads `{ chunkName }` from an optional options object at `index`, shared by
+// every door that loads Lua source (T3, August 7, 2026). Returns false with a
+// TypeError pending when the argument is unusable; an absent options object,
+// `undefined` or `null` all mean "no chunk name" and leave `out` alone.
+//
+// **It refuses a non-string rather than ignoring one**, which is a deliberate
+// break from how `compile()` read this key until today. A silently ignored
+// option is the failure mode CR-23 F4 is about — `strictConversion: 'yes'`
+// quietly meaning off — and it is worse here than elsewhere, because the whole
+// point of the option is to make an error message legible: a caller who
+// mistypes it would get the default name back and no hint why.
+static bool ParseChunkName(const Napi::CallbackInfo& info, const size_t index,
+                           const char* door, std::string& out) {
+  const Napi::Env env = info.Env();
+  if (info.Length() <= index) return true;
+  const Napi::Value opts = info[index];
+  if (opts.IsUndefined() || opts.IsNull()) return true;
+  if (!opts.IsObject() || opts.IsFunction()) {
+    Napi::TypeError::New(env, std::string(door) + " options must be an object")
+      .ThrowAsJavaScriptException();
+    return false;
+  }
+  // A property read can be an accessor, i.e. user JS — every caller of this
+  // helper is already inside a CallScope for that reason (CR-13 F1).
+  const Napi::Value name = opts.As<Napi::Object>().Get("chunkName");
+  if (name.IsUndefined() || name.IsNull()) return true;
+  if (!name.IsString()) {
+    Napi::TypeError::New(env, std::string(door) + " chunkName must be a string")
+      .ThrowAsJavaScriptException();
+    return false;
+  }
+  out = name.As<Napi::String>().Utf8Value();
+  return true;
+}
+
 Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
   if (RejectIfBusy()) return env.Undefined();
   if (info.Length() < 1 || !info[0].IsString()) {
@@ -2294,13 +2589,11 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
 
   bool strip_debug = false;
   std::string chunk_name;
+  if (!ParseChunkName(info, 1, "compile()", chunk_name)) return env.Undefined();
   if (info.Length() >= 2 && info[1].IsObject()) {
     auto options = info[1].As<Napi::Object>();
     if (options.Has("stripDebug") && options.Get("stripDebug").IsBoolean()) {
       strip_debug = options.Get("stripDebug").As<Napi::Boolean>().Value();
-    }
-    if (options.Has("chunkName") && options.Get("chunkName").IsString()) {
-      chunk_name = options.Get("chunkName").As<Napi::String>().Utf8Value();
     }
   }
 
@@ -2417,7 +2710,16 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env env_, const int regis
   addMethod("length", TableHandleLength);
   addMethod("pairs", TableHandlePairs);
   addMethod("ipairs", TableHandleIPairs);
+  addMethod("keys", TableHandleKeys);
   addMethod("release", TableHandleRelease);
+  // `for (const [k, v] of handle)`. Rooted like the named methods above: a
+  // destructured `[Symbol.iterator]` keeps the handle data alive (H3 / L6).
+  {
+    const Napi::Function fn = Napi::Function::New(env_, TableHandleSymbolIterator,
+                                                 "[Symbol.iterator]", dataPtr);
+    DefineHiddenProp(env_, fn, "_tableOwner", external, /*writable=*/false);
+    (void)handle.Set(SymbolIteratorKey(env_), fn);
+  }
 
   return handle;
 }
@@ -2624,7 +2926,10 @@ Napi::Value LuaContext::ExecuteScriptIn(const Napi::CallbackInfo& info) {
   const std::string script = info[1].As<Napi::String>().Utf8Value();
 
   CallScope _cs(this);
-  const auto res = runtime->ExecuteScriptInEnvironment(data->tableRef.ref, script);
+  std::string chunk_name;
+  if (!ParseChunkName(info, 2, "execute_script_in()", chunk_name)) return env.Undefined();
+
+  const auto res = runtime->ExecuteScriptInEnvironment(data->tableRef.ref, script, chunk_name);
   if (std::holds_alternative<std::string>(res)) {
     ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
@@ -3175,7 +3480,10 @@ Napi::Value LuaContext::ExecuteScript(const Napi::CallbackInfo& info) {
   const std::string script = info[0].As<Napi::String>().Utf8Value();
 
   CallScope _cs(this);
-  const auto res = runtime->ExecuteScript(script);
+  std::string chunk_name;
+  if (!ParseChunkName(info, 1, "execute_script()", chunk_name)) return env.Undefined();
+
+  const auto res = runtime->ExecuteScript(script, chunk_name);
   if (std::holds_alternative<std::string>(res)) {
     ThrowLuaError(std::get<std::string>(res));
     return env.Undefined();
@@ -3358,11 +3666,21 @@ Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
   }
 
   const std::string script = info[0].As<Napi::String>().Utf8Value();
+
+  // Read before is_busy_ is set: the options read can be an accessor, i.e. user
+  // JS, and a throw from it must leave the context idle rather than wedged
+  // busy with no worker ever queued to clear it.
+  std::string chunk_name;
+  {
+    CallScope _cs(this);
+    if (!ParseChunkName(info, 1, "execute_script_async()", chunk_name)) return env.Undefined();
+  }
   is_busy_ = true;
 
   auto deferred = Napi::Promise::Deferred::New(env);
   auto* worker = new LuaScriptAsyncWorker(
-    runtime, script, this, Napi::Persistent(info.This().As<Napi::Object>()), deferred);
+    runtime, script, this, Napi::Persistent(info.This().As<Napi::Object>()), deferred,
+    chunk_name);
   worker->Queue();
   return deferred.Promise();
 }
@@ -3407,7 +3725,9 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
     // (CR-10 F1). Holding it open past this point would also leave call_depth_
     // raised across a suspended await.
     CallScope _cs(this);
-    co = runtime->CreateCoroutineFromScript(script);
+    std::string chunk_name;
+    if (!ParseChunkName(info, 1, "execute_async()", chunk_name)) return env.Undefined();
+    co = runtime->CreateCoroutineFromScript(script, chunk_name);
   } catch (const std::exception& e) {
     auto deferred = Napi::Promise::Deferred::New(env);
     deferred.Reject(Napi::Error::New(env, e.what()).Value());
@@ -4223,6 +4543,12 @@ Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // surface that as a JS error rather than unwinding out (the H1 class).
   try {
     if (!allow_bytecode_) runtime->SetAllowBytecode(false);
+    // The seal has to be re-applied, not remembered: reset() builds a fresh
+    // lua_State with stock libraries, so the doors are open again on it. Same
+    // rule as the sandbox preset's, and the reason SetFilesystemAccess is
+    // one-way rather than a toggle.
+    if (filesystem_denied_) runtime->SetFilesystemAccess(false);
+    if (table_as_map_) runtime->SetPreserveTableKeys(true);
     for (const auto& path : search_paths_) runtime->AddSearchPath(path);
     // Replay the JS searchers too (CR-9 F3): they are context configuration in
     // exactly the way the search paths above are, so dropping them made the two
@@ -4469,6 +4795,111 @@ Napi::Value LuaContext::SetHook(const Napi::CallbackInfo& info) {
 
 // remove_hook() — stop tracing. A no-op when no hook is set. The instruction
 // limit's own use of lua_sethook survives (the core re-installs it).
+// R1: read-only debug introspection. Both are callable from *inside* a
+// set_hook callback, which is the only place they are much use — that is what
+// makes the difference between a profiler and a debugger.
+//
+// `RejectIfBusy` rather than a new occupancy policy, and the distinction
+// matters: `is_busy_` marks a **worker-thread** run, where the lua_State
+// belongs to another thread and reading its stack would be a data race. A hook
+// callback on the main thread is not busy in that sense — the state is ours,
+// Lua has disabled the hook for the duration, and re-entering is already
+// documented as supported. §8.4 predicted this item would collide with the
+// occupancy model; it did not, because the model already draws the line in the
+// right place.
+Napi::Value LuaContext::GetStack(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+
+  // Scoped for the options read alone: `Get("maxLevels")` can be an accessor,
+  // i.e. user JS, which could `reset()` the context out from under the stack
+  // walk below (CR-13 F1). `check-invariants` scored the first draft NO_SCOPE
+  // and that is exactly what it is for.
+  int max_levels = 200;
+  {
+    CallScope _cs(this);
+    if (info.Length() > 0 && info[0].IsObject()) {
+      const Napi::Value lv = info[0].As<Napi::Object>().Get("maxLevels");
+      if (lv.IsNumber()) {
+        const int want = lv.As<Napi::Number>().Int32Value();
+        if (want < 0) {
+          Napi::RangeError::New(env, "maxLevels must be a non-negative integer")
+            .ThrowAsJavaScriptException();
+          return env.Undefined();
+        }
+        max_levels = want;
+      }
+    }
+  }
+
+  std::vector<lua_core::LuaRuntime::StackFrame> frames;
+  try {
+    frames = runtime->GetStack(max_levels);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  Napi::Array out = Napi::Array::New(env, frames.size());
+  for (size_t i = 0; i < frames.size(); ++i) {
+    const auto& f = frames[i];
+    Napi::Object o = Napi::Object::New(env);
+    (void)o.Set("level", Napi::Number::New(env, f.level));
+    (void)o.Set("source", Napi::String::New(env, f.source));
+    (void)o.Set("shortSource", Napi::String::New(env, f.short_src));
+    (void)o.Set("currentLine", Napi::Number::New(env, f.current_line));
+    (void)o.Set("lineDefined", Napi::Number::New(env, f.line_defined));
+    (void)o.Set("name", Napi::String::New(env, f.name));
+    (void)o.Set("nameWhat", Napi::String::New(env, f.name_what));
+    (void)o.Set("what", Napi::String::New(env, f.what));
+    (void)out.Set(static_cast<uint32_t>(i), o);
+  }
+  return out;
+}
+
+Napi::Value LuaContext::GetLocals(const Napi::CallbackInfo& info) {
+  if (RejectIfBusy()) return env.Undefined();
+  if (info.Length() < 1 || !info[0].IsNumber()) {
+    Napi::TypeError::New(env, "get_locals(level) requires a stack level")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const int level = info[0].As<Napi::Number>().Int32Value();
+  if (level < 0) {
+    Napi::RangeError::New(env, "level must be a non-negative integer")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // The conversion below runs registered from-Lua converters, i.e. user JS, so
+  // the scope is not optional (CR-9 F1 / CR-13 F1).
+  CallScope _cs(this);
+  std::optional<std::vector<std::pair<std::string, lua_core::LuaPtr>>> locals;
+  try {
+    locals = runtime->GetLocals(level);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (!locals) {
+    // A refusal rather than an empty array: "no such frame" and "a frame with
+    // no named locals" are different answers and a debugger needs to tell them
+    // apart.
+    Napi::RangeError::New(env, "no stack frame at level " + std::to_string(level)
+      + "; call get_stack() to see which levels exist")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  Napi::Array out = Napi::Array::New(env, locals->size());
+  for (size_t i = 0; i < locals->size(); ++i) {
+    Napi::Object o = Napi::Object::New(env);
+    (void)o.Set("name", Napi::String::New(env, (*locals)[i].first));
+    (void)o.Set("value", CoreToNapi(*(*locals)[i].second));
+    (void)out.Set(static_cast<uint32_t>(i), o);
+  }
+  return out;
+}
+
 Napi::Value LuaContext::RemoveHook(const Napi::CallbackInfo& /*info*/) {
   if (RejectIfBusy()) return env.Undefined();
 
@@ -5111,6 +5542,24 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const Napi::Value& value, int dept
     }
     ConversionPathEntry on_path(this, value);
 
+    // T1's inbound half, and it is a *third* silent loss, found by driving the
+    // round trip rather than by reading §5 — whose JS→Lua rows do not mention
+    // it. `ConvertBuiltinType` renders a Map into a `LuaTable`, which is
+    // string-keyed, so `new Map([[1,'int'],['1','str']])` arrives in Lua as one
+    // entry and `true` arrives as the string `"true"`. The same collapse as the
+    // outbound direction, in the other direction, for the same reason: the
+    // value type cannot carry a typed key.
+    //
+    // Under `tableAs: 'map'` the Map is therefore built as a **real Lua table**
+    // and passed by reference — `SetTableFieldKeyed` takes a typed key, and
+    // takes booleans since D1 — so the mode round-trips instead of being
+    // one-way. The default is untouched: "keys are stringified, matching
+    // plain-object behaviour" is documented, and a caller relying on it would
+    // break.
+    if (table_as_map_ && IsInstanceOfGlobal(value, "Map")) {
+      return MapToTableRef(value.As<Napi::Object>(), depth);
+    }
+
     // B1: common built-in JS types (binary data, Date, Map, Set, RegExp)
     if (auto builtin = ConvertBuiltinType(value, depth,
           [this](const Napi::Value& v, const int d) { return NapiToCoreInstance(v, d); })) {
@@ -5160,6 +5609,125 @@ Napi::Value LuaContext::ResultsToJs(const std::vector<lua_core::LuaPtr>& values)
 // Only object-valued results are offered, mirroring the JS->Lua direction's
 // "converters do not see primitives" rule — and keeping the common path (every
 // number and string crossing out of Lua) free of a JS call per value.
+// Materializes a plain Lua table as a JS `Map`, keys and all.
+//
+// **The keys are the point.** `TablePairs` reports the real key *values* —
+// number `1` and string `"1"` as distinct entries, booleans included (D1), and
+// byte-exact `Uint8Array`s under `binaryStrings` — none of which a JS object
+// can hold. Three of the four Lua→JS losses in `LIMITATIONS.md` §5 stop being
+// losses here; they become representations.
+//
+// **Depth is bounded the same way the deep copy is.** In the default mode a
+// self-referencing table is refused by `ToLuaValue`'s `kMaxDepth` guard. Under
+// this mode the recursion moved here, so the guard has to move with it — the
+// same limit, so the two modes refuse the same shapes at the same point.
+//
+// The `Map` constructor is read off the global, which user JS can patch. That
+// is the same exposure `DefineHiddenProp` and `SymbolIteratorKey` already
+// carry, and every caller is inside a CallScope for it.
+// The inbound mirror of TableRefToMap: a JS Map becomes a real Lua table with
+// its keys' types intact, handed back as a reference.
+//
+// A key that is neither string, number nor boolean cannot be a Lua table key
+// this API can address, and is refused rather than stringified — the same
+// ruling `pairs()` makes outbound (D1), so the two directions agree on what a
+// key *is*.
+lua_core::LuaValue LuaContext::MapToTableRef(const Napi::Object& map, const int depth) {
+  if (depth > kMaxTableDepth) {
+    throw std::runtime_error(
+      "Value nesting depth exceeds the maximum of " + std::to_string(kMaxTableDepth));
+  }
+  const Napi::Value arrayFrom =
+    env.Global().Get("Array").As<Napi::Object>().Get("from");
+  const Napi::Array entries =
+    arrayFrom.As<Napi::Function>().Call({map}).As<Napi::Array>();
+
+  int ref;
+  try {
+    ref = runtime->CreateTable();
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(env, e.what());
+  }
+  lua_core::LuaTableRef handle(ref, runtime->RawState());
+  for (uint32_t i = 0; i < entries.Length(); ++i) {
+    const auto pair = entries.Get(i).As<Napi::Array>();
+    const Napi::Value k = pair.Get(static_cast<uint32_t>(0));
+    lua_core::TableKey key;
+    if (!NapiToTableKey(k, key)) {
+      throw std::runtime_error(
+        "tableAs: 'map': a Map key that is not a string, number or boolean "
+        "cannot be a Lua table key this API can address");
+    }
+    auto val = std::make_shared<lua_core::LuaValue>(
+      NapiToCoreInstance(pair.Get(static_cast<uint32_t>(1)), depth + 1));
+    try {
+      runtime->SetTableFieldKeyed(ref, key, val);
+    } catch (const std::exception& e) {
+      throw Napi::Error::New(env, e.what());
+    }
+  }
+  return lua_core::LuaValue::from(std::move(handle));
+}
+
+Napi::Value LuaContext::TableRefToMap(const lua_core::LuaTableRef& ref, const int depth) {
+  // **A `Napi::Error`, not a `std::runtime_error`, and the difference is a
+  // process abort.** The first draft threw the latter and `libc++abi`
+  // terminated the process on the first self-referencing table — the CR-6 F1
+  // class, reachable from four lines of ordinary JavaScript. The outbound
+  // conversion path has no handler above it: `CoreToNapi` is called from ~40
+  // sites, most of which are not inside a try. The inbound direction can throw
+  // `std::runtime_error` (its circular-reference guard does) because its
+  // callers *do* catch; this direction cannot, so it raises the JS exception
+  // itself. Found by the test that exercises it, one minute after it was
+  // written.
+  if (depth > kMaxTableDepth) {
+    throw Napi::Error::New(env,
+      "Value nesting depth exceeds the maximum of " + std::to_string(kMaxTableDepth)
+      + " while converting a Lua table to a Map. A table that contains itself "
+        "cannot be materialized; read it in place with get_global_ref().");
+  }
+
+  // Guarded, and `check-invariants` is why this line looks like this: it scored
+  // the first draft UNGUARDED_AND_PROPAGATES — a `RunProtected`-backed core call
+  // reachable from the binding with no `try` above it, i.e. the CR-6 F1 abort
+  // class again, this time for an OOM under `maxMemory` rather than for a deep
+  // table. The depth guard above had already been caught aborting; this is the
+  // same hazard on the same path, found by the machine rather than by a crash.
+  std::vector<std::pair<lua_core::LuaPtr, lua_core::LuaPtr>> pairs;
+  try {
+    pairs = runtime->TablePairs(ref.ref);
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(env, e.what());
+  }
+  Napi::Array entries = Napi::Array::New(env, pairs.size());
+  for (size_t i = 0; i < pairs.size(); ++i) {
+    Napi::Array entry = Napi::Array::New(env, 2);
+    (void)entry.Set(static_cast<uint32_t>(0), CoreToNapi(*pairs[i].first));
+
+    // Nested plain tables recurse as Maps; everything else (including a
+    // metatabled table, which arrives as its own ref) goes through the ordinary
+    // conversion.
+    const lua_core::LuaValue& val = *pairs[i].second;
+    if (std::holds_alternative<lua_core::LuaTableRef>(val.value)) {
+      const auto& nested = std::get<lua_core::LuaTableRef>(val.value);
+      if (!runtime->RefHasMetatable(nested.ref)) {
+        (void)entry.Set(static_cast<uint32_t>(1), TableRefToMap(nested, depth + 1));
+        (void)entries.Set(static_cast<uint32_t>(i), entry);
+        continue;
+      }
+    }
+    (void)entry.Set(static_cast<uint32_t>(1), CoreToNapi(val));
+    (void)entries.Set(static_cast<uint32_t>(i), entry);
+  }
+
+  const Napi::Value ctor = env.Global().Get("Map");
+  if (!ctor.IsFunction()) {
+    throw Napi::Error::New(env, "tableAs: 'map' needs the global Map constructor, "
+                                "which is missing or has been replaced");
+  }
+  return ctor.As<Napi::Function>().New({entries});
+}
+
 Napi::Value LuaContext::CoreToNapi(const lua_core::LuaValue& value) {
   Napi::Value result = CoreToNapiBuiltin(value);
   if (from_lua_converters_.empty()) return result;
@@ -5348,6 +5916,16 @@ Napi::Value LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
             return handle;
           }
         } else if constexpr (std::is_same_v<T, lua_core::LuaTableRef>) {
+          // `tableAs: 'map'` (T1). A *plain* table reaches this branch only in
+          // map mode — ToLuaValue keeps it by reference there instead of
+          // flattening it to a string-keyed LuaTable — so materialize it with
+          // its real keys. A metatabled table is a live Proxy in every mode and
+          // falls through: the option governs how a table is *converted*, and a
+          // metatabled one deliberately is not.
+          if (table_as_map_ && !runtime->RefHasMetatable(v.ref)) {
+            return TableRefToMap(v, 0);
+          }
+
           // Create a JS Proxy that preserves Lua metamethods. The trap data is
           // owned by the External's finalizer, tied to the proxy target's life.
           Napi::Object target = Napi::Object::New(env);
@@ -5881,7 +6459,10 @@ Napi::Value LuaContext::CreateCoroutine(const Napi::CallbackInfo& info) {
     // Execute script and get function
     const std::string script = info[0].As<Napi::String>().Utf8Value();
     CallScope _cs(this);
-    const auto res = runtime->ExecuteScript(script);
+    std::string chunk_name;
+    if (!ParseChunkName(info, 1, "create_coroutine()", chunk_name)) return env.Undefined();
+
+    const auto res = runtime->ExecuteScript(script, chunk_name);
     if (std::holds_alternative<std::string>(res)) {
       ThrowLuaError(std::get<std::string>(res));
       return env.Undefined();

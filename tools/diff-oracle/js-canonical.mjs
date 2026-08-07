@@ -106,7 +106,40 @@ export function canon(v, depth = 0, seen = new Set()) {
   if (depth > 12) return 'deep';
   seen.add(v);
   let out;
-  if (Array.isArray(v)) {
+  if (v instanceof Map) {
+    // `tableAs: 'map'` (T1). A Map is the *faithful* rendering of a Lua table:
+    // its keys kept their types, so unlike the object branch below there is
+    // nothing to recover by guessing — a number key is already a number.
+    //
+    // **This branch was written believing it could not affect the other
+    // callers, and that was wrong — the run said so within a minute.**
+    // `tools/README.md` records the precedent: teaching this shared helper
+    // about `binaryStrings` changed canonicalization for every caller and sent
+    // 532 roundtrip ledger entries STALE at once. The reasoning here was
+    // "`diff-oracle` and `exec-parity` never set `tableAs`, so they never
+    // canonicalize a Map" — true of their *outputs*, and irrelevant, because
+    // the corpus contains a JS **Map as an input value** (`builtin:Map`). Its
+    // canonicalization used to be `{}` (a Map has no own enumerable keys) and
+    // is now its entries, in every mode. Result: **19 ledger entries went STALE
+    // immediately**, in the four pre-existing modes.
+    //
+    // Kept as written, because the new rendering is the correct one and the
+    // old `{}` was the helper failing to see a value it was handed. The lesson
+    // is the one already in `tools/README.md`, now with a second instance:
+    // check who else imports it, and then check the *corpus* too — a shared
+    // helper sees other harnesses' inputs, not just their outputs.
+    const parts = [...v.entries()].map(([k, val]) => {
+      const kk = typeof k === 'number' ? `num:${k}`
+        : typeof k === 'boolean' ? `bool:${k}`
+          : k instanceof Uint8Array ? fmtString(String.fromCharCode(...k))
+            : fmtString(String(k));
+      return `${kk}=${canon(val, depth + 1, seen)}`;
+    });
+    // Lua table order is unspecified, so a Map's insertion order is not
+    // meaningful and must not be compared as if it were.
+    parts.sort();
+    out = `{${parts.join(',')}}`;
+  } else if (Array.isArray(v)) {
     // A Lua sequence arrives as a JS array; its keys were 1..n.
     const parts = v.map((el, i) => `num:${i + 1}=${canon(el, depth + 1, seen)}`);
     out = `{${parts.join(',')}}`;

@@ -28,7 +28,14 @@ using LuaTable = std::unordered_map<std::string, LuaPtr>;
 // Contrast the plain std::string key overloads, which coerce a numeric-looking
 // string to an integer key (used by the Proxy path, where JS property keys are
 // always strings and `obj[1]` must address the array part).
-using TableKey = std::variant<std::string, int64_t, double>;
+// `bool` is last, and the ordering is documented because it is a trap the
+// standard defuses rather than one that is absent: with a `bool` alternative
+// present, `TableKey k = "text"` would historically have selected `bool` over
+// `std::string`. P0608R3 (a C++17 DR, implemented by libc++ and MSVC's STL)
+// excludes a boolean conversion from a non-bool source, so the string wins. Do
+// not assume that on an older toolchain — every construction site here passes an
+// already-typed value, and it should stay that way.
+using TableKey = std::variant<std::string, int64_t, double, bool>;
 
 class LuaRuntime;
 
@@ -376,7 +383,15 @@ public:
   LuaRuntime(LuaRuntime&&) = delete;
   LuaRuntime& operator=(LuaRuntime&&) = delete;
 
-  [[nodiscard]] ScriptResult ExecuteScript(const std::string& script) const;
+  // `chunk_name` is what Lua prints in an error or traceback for this chunk.
+  // Empty means "mirror luaL_loadstring": use the source itself (to its first
+  // NUL) as the display name, which is what every caller got before the doors
+  // gained the option, so the default is bit-identical to the old behaviour.
+  // Lua's own prefix conventions apply and are the caller's to choose —
+  // `@name` renders as a file (`name:1:`), `=name` renders verbatim, anything
+  // else renders as a source string (`[string "name"]:1:`).
+  [[nodiscard]] ScriptResult ExecuteScript(const std::string& script,
+                                           const std::string& chunk_name = "") const;
   [[nodiscard]] ScriptResult ExecuteFile(const std::string& filepath) const;
 
   [[nodiscard]] CompileResult CompileScript(const std::string& script,
@@ -414,8 +429,9 @@ public:
 
   // Coroutine-driven async execution (main thread; awaits JS promises).
   // Loads `script` as a chunk on a fresh coroutine thread.
+  // `chunk_name` as in ExecuteScript.
   [[nodiscard]] std::variant<LuaThreadRef, std::string> CreateCoroutineFromScript(
-      const std::string& script) const;
+      const std::string& script, const std::string& chunk_name = "") const;
   // Resumes the async coroutine one step. `args` are the values to resume with
   // (the resolved promise value, or the rejection message when arg_is_error).
   //
@@ -652,6 +668,42 @@ public:
   // rejected and Lua's load() is forced to text-only mode (binary chunks fail).
   void SetAllowBytecode(bool allow);
 
+  // Closes every door from Lua to the host filesystem, in one call.
+  //
+  // **The door list is derived from the source, not from the docs, and it was
+  // larger than the docs said** (T2, August 7, 2026). `LIMITATIONS.md` §1
+  // named five; driving `libraries: 'safe'` found nine, and the two the list
+  // had no row for are the strongest: `package.loadlib` links an arbitrary
+  // shared library into the process, and `package.searchers[3]`/`[4]` reach it
+  // through `require` — native code, where §1 claimed the worst case was
+  // executing a readable `.lua` file.
+  //
+  //   base     dofile, loadfile
+  //   package  searchers[2] (path), searchers[3]/[4] (cpath -> native),
+  //            loadlib, searchpath
+  //   io       open, lines, input, output   (only when `io` is loaded)
+  //   os       remove, rename, tmpname      (only when `os` is loaded)
+  //
+  // Every one refuses loudly — `LIMITATIONS.md` §8's contract, never
+  // accept-and-do-nothing. `require` keeps working for preloaded modules and
+  // for JS searchers, which is the configuration that had no expression before:
+  // `safe` reaches the disk and `sandbox` has no `require` at all.
+  //
+  // **What it deliberately does not close**, so the bound is stated rather than
+  // assumed: process execution (`os.execute`, `io.popen`) is not filesystem
+  // access and is not touched. Omit `os`/`io` if you need that gone.
+  void SetFilesystemAccess(bool allow);
+
+  // `tableAs: 'map'` (T1). Must be set before any conversion; the binding sets
+  // it at construction and re-applies it across reset().
+  void SetPreserveTableKeys(const bool on) { preserve_table_keys_ = on; }
+  [[nodiscard]] bool PreserveTableKeysEnabled() const { return preserve_table_keys_; }
+  // Does the table behind `registry_ref` carry a metatable? The binding needs
+  // it to tell a plain table (materialize as a Map) from a metatabled one
+  // (still a live Proxy, in every mode).
+  [[nodiscard]] bool RefHasMetatable(int registry_ref) const;
+  [[nodiscard]] bool FilesystemAllowed() const { return filesystem_allowed_; }
+
   // Dynamic require (E2): append a package.searchers entry that resolves an
   // unknown module by calling the named host function (returning Lua source).
   void AddJsSearcher(const std::string& host_func_name) const;
@@ -734,6 +786,11 @@ public:
   void SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const;
   [[nodiscard]] bool HasTableField(int registry_ref, const std::string& key) const;
   [[nodiscard]] LuaPtr GetTableFieldKeyed(int registry_ref, const TableKey& key) const;
+  // Raw read — no `__index`, so it sees what a `pairs()` traversal would see
+  // rather than what a metatable would answer. Backs the lazy JS iterator,
+  // whose whole contract is "the same entries `pairs()` reports". A released or
+  // non-table ref reads as nil rather than raising.
+  [[nodiscard]] LuaPtr RawGetTableFieldKeyed(int registry_ref, const TableKey& key) const;
   void SetTableFieldKeyed(int registry_ref, const TableKey& key, const LuaPtr& value) const;
   [[nodiscard]] bool HasTableFieldKeyed(int registry_ref, const TableKey& key) const;
   [[nodiscard]] std::vector<std::string> GetTableKeys(int registry_ref) const;
@@ -758,6 +815,12 @@ public:
   // table (including nil), matching GetGlobalRef's contract.
   [[nodiscard]] std::variant<int, std::string> GetTableFieldRef(
       int registry_ref, const TableKey& key) const;
+  // The key set alone, snapshotted. Cheaper than TablePairs by exactly the
+  // values — which is the expensive half, since converting one can mint a
+  // handle or run a registered converter — and it is the basis of the lazy JS
+  // iterator: keys up front (no cursor may outlive the traversal), values read
+  // one at a time as the caller advances.
+  [[nodiscard]] std::vector<LuaPtr> TableKeys(int registry_ref) const;
   [[nodiscard]] std::vector<std::pair<LuaPtr, LuaPtr>> TablePairs(int registry_ref) const;
   [[nodiscard]] std::vector<std::pair<int64_t, LuaPtr>> TableIPairs(int registry_ref) const;
   void ReleaseTableRef(int registry_ref);
@@ -783,8 +846,10 @@ public:
   // reads and writes resolve against that table instead of `_G`. Same result /
   // error contract as ExecuteScript, and subject to the same memory and
   // instruction limits.
+  // `chunk_name` as in ExecuteScript.
   [[nodiscard]] ScriptResult ExecuteScriptInEnvironment(
-      int env_ref, const std::string& script) const;
+      int env_ref, const std::string& script,
+      const std::string& chunk_name = "") const;
 
   [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
   [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
@@ -968,6 +1033,41 @@ public:
   // reason.
   [[nodiscard]] bool IsExecuting() const { return lua_depth_ > 0; }
 
+  // --- R1: read-only debug introspection ------------------------------------
+  //
+  // One Lua activation record, flattened. What `lua_getinfo` fills for "nSl",
+  // and nothing else: this is a *reader*, and it stays one. There is no stack
+  // manipulation, no pushing, no `lua_State` handed out — `LIMITATIONS.md` §7
+  // ("no raw Lua C API") is a deliberate design decision and R1 is scoped to
+  // stay on this side of it. What it enables is the difference between a
+  // profiler (already possible with set_hook) and a debugger (not), which is
+  // showing a caller which frames are live and what their locals hold.
+  struct StackFrame {
+    int level = 0;
+    std::string source;      // "@file", "=name", or the chunk text
+    std::string short_src;   // what an error message would print
+    int current_line = -1;
+    int line_defined = -1;
+    std::string name;        // "" when Lua cannot infer one
+    std::string name_what;   // "global" / "local" / "method" / "field" / ""
+    std::string what;        // "Lua" / "C" / "main"
+  };
+
+  // Frames of the current call stack, innermost first, capped at `max_levels`.
+  // Empty when nothing is executing — which is the honest answer rather than an
+  // error, because "is Lua running right now" is exactly what a caller asking
+  // for a stack wants to find out.
+  [[nodiscard]] std::vector<StackFrame> GetStack(int max_levels) const;
+
+  // Named locals visible at `level` (0 = the innermost frame), in Lua's own
+  // order. Temporaries — the `(temporary)` slots Lua names in parentheses — are
+  // skipped: they are compiler bookkeeping, not the caller's variables.
+  // Returns nullopt when the level does not exist, which the binding turns into
+  // a refusal rather than an empty result, so "no such frame" and "a frame with
+  // no locals" stay distinguishable.
+  [[nodiscard]] std::optional<std::vector<std::pair<std::string, LuaPtr>>>
+    GetLocals(int level) const;
+
   // Debug hooks (lua_sethook): line / call / return / count tracing, for
   // profilers and debugger integrations.
   //
@@ -1146,6 +1246,11 @@ private:
   int io_synthesized_ref_ = LUA_NOREF;
   std::shared_ptr<FileReader> file_reader_;        // null = real filesystem
   bool allow_bytecode_ = true;          // false = reject binary chunks
+  bool filesystem_allowed_ = true;      // false = every host file door refuses
+  // `tableAs: 'map'`: keep plain tables as registry references instead of
+  // deep-copying them into a string-keyed LuaTable, so their real keys survive
+  // for the binding to render. See PreserveTableKeys in the .cpp.
+  bool preserve_table_keys_ = false;
 
   // Hands `text` to the output handler, if one is installed and this is not a
   // worker-thread run. Returns false when the caller should write to stdout
@@ -1383,6 +1488,13 @@ private:
   static int SafeLoadFile(lua_State* L);
   static int SafeDoFile(lua_State* L);
   static int SafeLuaSearcher(lua_State* L);
+  // The two shapes a denied filesystem door takes: raise (a function a script
+  // called directly) or report (a `require` searcher, whose contract is to
+  // return a reason string so the next searcher still gets its turn).
+  static bool PreserveTableKeys(lua_State* L);
+  static int DeniedFileDoor(lua_State* L);
+  static int DeniedFileDoorNil(lua_State* L);
+  static int DeniedSearcher(lua_State* L);
   void InstallBytecodeFileGuards() const;
   void RemoveBytecodeFileGuards() const;
   static int JsSearcher(lua_State* L);

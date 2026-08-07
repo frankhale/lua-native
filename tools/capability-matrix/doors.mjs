@@ -106,6 +106,16 @@ export const ENTRY_POINTS = [
 // exist in a configuration (no `dofile` under `sandbox`), which is ABSENT — a
 // distinct outcome from a refusal, because a door that is gone proves nothing
 // about the guard.
+// A door that goes through Lua's own file functions is unreachable when the
+// context was built with `filesystem: 'deny'` — the door exists but another
+// policy closed it, which is ABSENT rather than "closed without cause". Added
+// with T2 (August 7, 2026): the first run of the two `nofs` configs reported
+// four findings and a harness fault, and every one was this model gap. The
+// host-side doors (`execute_file`, `compile_file`, `load_bytecode`) are
+// deliberately NOT listed — `filesystem` governs what *Lua* can reach, and the
+// host asking for a file by name is the caller's own decision.
+const fsReachable = (config) => config?.options?.filesystem !== 'deny';
+
 export const BYTECODE_DOORS = [
   {
     id: 'load_bytecode',
@@ -130,26 +140,26 @@ export const BYTECODE_DOORS = [
   },
   {
     id: 'lua:loadfile',
-    precondition: (lua) => lua.execute_script('return loadfile ~= nil'),
+    precondition: (lua, config) => fsReachable(config) && lua.execute_script('return loadfile ~= nil'),
     run: (lua) => lua.execute_script(
       `local f = loadfile(${q(join(SCRATCH, 'chunk.luac'))}); return f == nil and "REFUSED" or "LOADED"`),
   },
   {
     id: 'lua:dofile',
-    precondition: (lua) => lua.execute_script('return dofile ~= nil'),
+    precondition: (lua, config) => fsReachable(config) && lua.execute_script('return dofile ~= nil'),
     run: (lua) => lua.execute_script(
       `local ok = pcall(dofile, ${q(join(SCRATCH, 'chunk.luac'))}); return ok and "LOADED" or "REFUSED"`),
   },
   {
     id: 'lua:require-package-path',
-    precondition: (lua) => lua.execute_script('return package ~= nil'),
+    precondition: (lua, config) => fsReachable(config) && lua.execute_script('return package ~= nil'),
     run: (lua) => lua.execute_script(
       `package.path = ${q(join(SCRATCH, '?.lua'))}
        local ok = pcall(require, "binmod"); return ok and "LOADED" or "REFUSED"`),
   },
   {
     id: 'host:add_search_path+require',
-    precondition: (lua) => lua.execute_script('return package ~= nil'),
+    precondition: (lua, config) => fsReachable(config) && lua.execute_script('return package ~= nil'),
     run: (lua) => {
       lua.add_search_path(join(SCRATCH, '?.lua'));
       return lua.execute_script('local ok = pcall(require, "binmod"); return ok and "LOADED" or "REFUSED"');

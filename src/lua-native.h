@@ -493,6 +493,9 @@ public:
     Napi::Value SetFileReader(const Napi::CallbackInfo& info);
     Napi::Value SetHook(const Napi::CallbackInfo& info);
     Napi::Value RemoveHook(const Napi::CallbackInfo& info);
+    // R1: read-only debug introspection (get_stack / get_locals).
+    Napi::Value GetStack(const Napi::CallbackInfo& info);
+    Napi::Value GetLocals(const Napi::CallbackInfo& info);
     Napi::Value Release(const Napi::CallbackInfo& info);
     Napi::Value Reset(const Napi::CallbackInfo& info);
     Napi::Value GC(const Napi::CallbackInfo& info);
@@ -652,7 +655,18 @@ public:
     // Helper functions whose user JS counts as their caller's: `LuaFunctionDataFrom`
     // and `TableRefDataFrom` (Has/Get on a caller-supplied object), plus
     // `DefineHiddenProp` and `SymbolIteratorKey`, which read `Object` /
-    // `Symbol` off the global and are called from eight sites between them.
+    // `Symbol` off the global and are called from eight sites between them —
+    // `TableRefToMap` and `MapToTableRef` (T1) join them: both read and write
+    // JS objects (a Map's entries, the Map constructor off the global) and both
+    // are reached only through `CoreToNapi` / `NapiToCore`, whose entry points
+    // already hold a scope for exactly that reason.
+    // And, since August 7, 2026, `ParseChunkName`, whose `Get("chunkName")` on
+    // a caller-supplied options object can be an accessor. Its five callers all
+    // hold a scope across the call, and `execute_script_async` grew one for
+    // exactly this reason: it had none, because until then it read nothing off
+    // a caller's object. That scope is also why the read happens *before*
+    // `is_busy_` is set — a throwing getter must leave the context idle rather
+    // than busy with no worker queued to clear it.
     //
     // Members that deliberately have no scope and run no user JS at all:
     // `remove_hook`, `get_memory_usage`, `info`, `register_type_converter`,
@@ -934,6 +948,13 @@ private:
     // converter pass, and it is what every recursive call goes through, so a
     // converter reaches values nested inside tables and arrays too.
     Napi::Value CoreToNapiBuiltin(const lua_core::LuaValue& value);
+    // `tableAs: 'map'` (T1): render a plain Lua table as a JS Map with its real
+    // keys. Recursive; `depth` is bounded by kMaxTableDepth for the reason the
+    // definition states.
+    Napi::Value TableRefToMap(const lua_core::LuaTableRef& ref, int depth);
+    // Inbound mirror of the above: a JS Map -> a real Lua table, by reference.
+    lua_core::LuaValue MapToTableRef(const Napi::Object& map, int depth);
+    static constexpr int kMaxTableDepth = 100;  // matches the core's kMaxDepth
 
     // Userdata reference tracking. next_userdata_id_ keys the int-based userdata
     // maps and the in-userdata-block storage, so it stays int; the remaining
@@ -1149,6 +1170,16 @@ private:
     // Mirrors runtime->SetAllowBytecode: the E3 guard is applied after
     // construction, so it isn't carried by RuntimeConfig.
     bool allow_bytecode_ = true;
+
+    // `filesystem: 'deny'` (T2). Mirrors runtime->SetFilesystemAccess for the
+    // same reason as the flag above: the seal is applied after the libraries
+    // are open, so reset() has to re-apply it to the fresh state.
+    bool filesystem_denied_ = false;
+
+    // `tableAs: 'map'` (T1). The core keeps plain tables by reference under
+    // this mode; this flag is what tells CoreToNapiBuiltin to materialize one
+    // as a Map rather than hand back a live Proxy.
+    bool table_as_map_ = false;
 
     // `binaryStrings`: return every Lua string as a Uint8Array of its raw bytes
     // instead of decoding it as UTF-8 (LIMITATIONS.md §2).

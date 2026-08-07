@@ -210,6 +210,39 @@ export const CONTAINERS = [
 // exclusions of scope, not suppressions of a result, and the census requires one
 // of these or a CONTAINERS row for every member it finds.
 export const NOT_COUNTED = {
+  // --- iteration cursors ----------------------------------------------------
+  //
+  // The three below entered this ledger on August 7, 2026, when `surface-census`
+  // widened census F's universe from `lua-native.h` to both translation units.
+  // They had been invisible, not excused: cursor states are declared in the
+  // .cpp, and `LuaCoroIterState::coro` predates the census entirely. Ruled
+  // together because they are one shape.
+  //
+  // **Why no counter, argued rather than asserted.** `bindingRefs` counts what a
+  // *context* retains, and a cursor retains nothing on the context's behalf: its
+  // reference is owned by an External rooted on the iterator object, so it lives
+  // exactly as long as the iterator and dies with it. Counting it would mean a
+  // per-cursor accessor on an object the caller already holds — it can see its
+  // own iterator — and a context-level number that changed with how many `for`
+  // loops happened to be live would report churn, not lifetime.
+  //
+  // **Driven, not assumed** (T4): 200 cursors abandoned mid-iteration plus 200
+  // drained, under forced GC, leave every `info().bindingRefs` counter
+  // unchanged. `gc-stress` and `lifecycle-matrix` cover the coroutine side.
+  coro: 'A field of LuaCoroIterState: the coroutine object a `for...of` cursor is '
+    + 'walking, held strongly so the coroutine cannot be collected mid-loop. Per '
+    + 'cursor, not per context; owned by an External rooted on the iterator '
+    + 'object and released with it.',
+  handle: 'A field of LuaTableIterState: the table handle a `for...of` cursor is '
+    + 'walking (T4). Same lifetime as `coro` above and for the same reason.',
+  self: 'A field of LuaCoroIterState: a shared_ptr to the state itself, which is '
+    + 'what lets a method destructured off the cursor keep it alive (the H3 / L6 '
+    + 'discipline the table handles use). It is a deliberate cycle, broken by the '
+    + "External's finalizer, which resets it — so the state outlives every "
+    + 'borrowed method and nothing outlives the iterator object. Not a retained '
+    + 'JS value at all in the sense this census means: the reference is to C++ '
+    + 'state, and it qualifies only because that state transitively holds `coro`.',
+
   subscribers_: 'A member of SharedTable, not LuaContext, so it is outside this '
     + 'harness\'s subject: the count is per shared table rather than per context, '
     + 'and no context can read it. It holds *weak* references and prunes collected '

@@ -34,7 +34,7 @@ npm run test-ts-tsan    # addon under TSan, via the async vitest suite
 npm run check-invariants
 node tools/invariants/run.mjs --update      # re-freeze after a reviewed change
 
-# Exception-escape matrix (39 Lua C frames x 11 throw kinds, 1 process/cell)
+# Exception-escape matrix (39 Lua C frames x 13 throw kinds, 1 process/cell)
 npm run exception-matrix
 
 # Differential oracle vs stock Lua 5.5 (2678 cases)
@@ -42,7 +42,7 @@ npm run exception-matrix
 npm run oracle
 
 # JS -> Lua -> JS round-trip and entry-point parity
-# (4 context modes x 19 doors x 50 values)
+# (5 context modes x 19 doors x 50 values)
 npm run roundtrip-matrix
 node tools/roundtrip-matrix/run.mjs --mode=strict   # one mode
 
@@ -55,7 +55,7 @@ npm run lifecycle-matrix
 # Two contexts exchanging values: handles refused, data intact, contexts independent
 npm run cross-context
 
-# What a libraries/allowBytecode configuration grants (8 configs x 28 doors)
+# What a libraries/allowBytecode/filesystem configuration grants (10 configs x 28 doors)
 npm run capability-matrix
 
 # Does the binding's own bookkeeping return to baseline?
@@ -136,10 +136,10 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   oracle prints both Lua versions and warns if they differ. Checks whether an
   answer is *right* rather than whether nothing crashed, for the embedded VM and
   for values coming out of Lua. See `docs/DIFFERENTIAL-ORACLE.md`.
-- `npm run roundtrip-matrix` — the other direction: 4 context modes × 19 entry
+- `npm run roundtrip-matrix` — the other direction: 5 context modes × 19 entry
   points × 50 values, checking that a JS value survives the crossing *into* Lua
-  and that all nineteen doors agree with each other — under `strictConversion`
-  and `binaryStrings` as well as the defaults. **A mode must prove its option is
+  and that all nineteen doors agree with each other — under `strictConversion`,
+  `binaryStrings` and `tableAs: 'map'` as well as the defaults. **A mode must prove its option is
   in effect before its cells count**; a silently ignored option would otherwise
   report a clean column that searched nothing. See
   `docs/reviews/CODE-REVIEW-20.md` and `docs/reviews/CODE-REVIEW-23.md`.
@@ -156,11 +156,13 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   context must be refused by another, a plain value must cross unchanged, and
   neither context may observe the other. The boundary no earlier list contained
   (CR-22 F2). See `docs/reviews/CODE-REVIEW-22.md`.
-- `npm run capability-matrix` — what a `libraries` / `allowBytecode`
-  configuration actually grants: an entry point must **work or refuse loudly**,
-  never accept-and-retain (`LIMITATIONS.md` §8); each preset must load the
-  libraries it claims and no others; and a bytecode door must refuse iff the
-  guard is on. **Not an eighth boundary** — an axis across the seven; see
+- `npm run capability-matrix` — what a `libraries` / `allowBytecode` /
+  `filesystem` configuration actually grants: an entry point must **work or
+  refuse loudly**, never accept-and-retain (`LIMITATIONS.md` §8); each preset
+  must load the libraries it claims and no others; and a bytecode door must
+  refuse iff the guard is on. `filesystem: 'deny'` joined it on August 7, 2026,
+  and the config caught `add_search_path` accepting a path `require` could never
+  consult — accept-and-retain, found the moment the configuration existed. **Not an eighth boundary** — an axis across the seven; see
   `docs/CORRECTNESS.md` §15.1. It exists because `libraries` and `allowBytecode`
   were the two options no instrument could cover, and ruling on them found the
   E3 guard five doors short of its own claim. See

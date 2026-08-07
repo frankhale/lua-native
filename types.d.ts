@@ -217,13 +217,62 @@ export interface MetatableDefinition {
 }
 
 /**
+ * What Lua calls a chunk in an error message or traceback.
+ *
+ * Without one, a chunk loaded from a string is named after the source itself,
+ * so an error reads `[string "local x = nil..."]:2:` — which identifies nothing
+ * when the source came from a file, a database row, or a user.
+ *
+ * **Lua's prefix conventions apply, and they are the whole of the formatting
+ * story:**
+ *
+ * | `chunkName` | Error reads |
+ * |---|---|
+ * | *(omitted)* | `[string "local x = nil..."]:2:` |
+ * | `'config.lua'` | `[string "config.lua"]:2:` |
+ * | `'@config.lua'` | `config.lua:2:` — `@` means "this is a file" |
+ * | `'=config'` | `config:2:` — `=` means "print verbatim" |
+ *
+ * `@` is almost always the one you want: it is what `execute_file` and
+ * `compile_file` use, so a named string chunk reports like a real file.
+ *
+ * A non-string value is **rejected**, not ignored — an option whose purpose is
+ * legible errors would otherwise fail silently and hand back the default name.
+ */
+/**
+ * One frame of the Lua call stack, as {@link LuaContext.get_stack} reports it.
+ * The fields are Lua's own (`lua_getinfo` with `"nSl"`), renamed to JS casing.
+ */
+export interface LuaStackFrame {
+  /** 0 is the innermost frame. */
+  level: number;
+  /** The chunk as Lua records it: `@file`, `=name`, or the source text. */
+  source: string;
+  /** What an error message would print for this chunk. */
+  shortSource: string;
+  /** Current line, or -1 where Lua has no line information (a C frame). */
+  currentLine: number;
+  /** Line where the function was defined, or -1. */
+  lineDefined: number;
+  /** The function's name if Lua can infer one from the call site, else `''`. */
+  name: string;
+  /** How the name was found: `'global'`, `'local'`, `'method'`, `'field'`, or `''`. */
+  nameWhat: string;
+  /** `'Lua'`, `'C'`, or `'main'`. */
+  what: string;
+}
+
+export interface ChunkNameOptions {
+  /** Name for this chunk in errors and tracebacks. See {@link ChunkNameOptions}. */
+  chunkName?: string;
+}
+
+/**
  * Options for bytecode compilation
  */
-export interface CompileOptions {
+export interface CompileOptions extends ChunkNameOptions {
   /** Strip debug info (line numbers, local variable names) for smaller bytecode. Default: false */
   stripDebug?: boolean;
-  /** Chunk name used in error messages. Default: source prefix or "@filepath" */
-  chunkName?: string;
 }
 
 /**
@@ -415,8 +464,14 @@ export interface LuaTableHandle {
    * a genuine string key like `"123"` distinct from integer key `123`
    * (`t.get("123")` vs `t.get(123)`), unlike Proxy-based access where JS
    * property keys are always strings.
+   *
+   * A `boolean` addresses a genuine boolean key — `t[true]`, which Lua allows
+   * and which is distinct from integer key `1`. This is the key type
+   * {@link pairs} emits and every accessor here accepts; a table, function or
+   * userdata key can be neither passed nor read back, and {@link pairs} skips
+   * those rather than emitting an entry nothing could address.
    */
-  get(key: string | number): LuaValue;
+  get(key: string | number | boolean): LuaValue;
 
   /**
    * Get a nested table field as a live handle rather than a copy.
@@ -446,22 +501,45 @@ export interface LuaTableHandle {
    * lua.set_metatable(db, { __index: () => null });
    * db.release();
    */
-  get_ref(key: string | number): LuaTableHandle;
+  get_ref(key: string | number | boolean): LuaTableHandle;
 
   /** Set a field by key. Triggers __newindex if the table has a metatable. See {@link get} for how the key's JS type maps to the Lua key type. */
-  set(key: string | number, value: LuaInput): void;
+  set(key: string | number | boolean, value: LuaInput): void;
 
   /** Check if a key exists in the table. See {@link get} for how the key's JS type maps to the Lua key type. */
-  has(key: string | number): boolean;
+  has(key: string | number | boolean): boolean;
 
   /** Get the table length (# operator). Triggers __len metamethod. */
   length(): number;
 
   /**
-   * Get all key-value pairs (like Lua pairs()).
-   * Returns an array of [key, value] tuples.
+   * Get the table's key-value pairs (like Lua `pairs()`), as an array of
+   * `[key, value]` tuples.
+   *
+   * **Which keys are emitted, stated exactly** — this is the escape hatch
+   * `LIMITATIONS.md` §5 points at for keys a plain converted object cannot
+   * hold, so its own edges matter:
+   *
+   * - `string`, `number` and `boolean` keys are emitted. A boolean key is a
+   *   real Lua key (`t[true]`) and stays distinct from integer key `1`.
+   * - Under {@link LuaInitOptions.binaryStrings} a string key arrives as a
+   *   `Uint8Array` of its exact bytes — the mode's whole point, and the reason
+   *   this is the remedy for a key whose bytes are not valid UTF-8. Without the
+   *   option a key is decoded as text, so a non-UTF-8 key is mangled here just
+   *   as it would be as a property name (§5).
+   * - **A table, function, userdata or thread key is skipped.** None can be
+   *   passed to {@link get}/{@link set}/{@link has}, so emitting one would
+   *   produce an entry the caller could see and never address. The omission is
+   *   deliberate and is the one loss this method still has.
+   *
+   * Unlike a converted object, a number key and a string key with the same text
+   * do **not** collide here — each is its own tuple.
+   *
+   * The traversal is a snapshot taken under protection, not a live cursor: it
+   * fires no metamethod (`lua_next` is raw), and a `__gc` finalizer running
+   * mid-conversion cannot corrupt it.
    */
-  pairs(): Array<[string | number, LuaValue]>;
+  pairs(): Array<[string | number | boolean | Uint8Array, LuaValue]>;
 
   /**
    * Get integer-keyed sequence entries (like Lua ipairs()).
@@ -469,6 +547,47 @@ export interface LuaTableHandle {
    * Returns an array of [index, value] tuples.
    */
   ipairs(): Array<[number, LuaValue]>;
+
+  /**
+   * The table's keys, without converting a single value.
+   *
+   * Same key rule as {@link pairs} — string, number and boolean keys, as
+   * `Uint8Array` under `binaryStrings`, with table/function/userdata keys
+   * skipped. Use it when you want to know what is in a table without paying to
+   * marshal what it holds.
+   */
+  keys(): Array<string | number | boolean | Uint8Array>;
+
+  /**
+   * Iterate the table lazily: `for (const [key, value] of handle)`.
+   *
+   * Yields the same entries as {@link pairs}, in the same order, but converts
+   * each value **as you reach it** rather than all of them up front — so
+   * stopping early costs only what you consumed. Measured on a 200-entry table
+   * of tables: `pairs()` runs 200 value conversions, a loop that `break`s after
+   * one runs one.
+   *
+   * **What is snapshotted and what is live.** The *key set* is captured when
+   * iteration begins; the *values* are read as you advance. That split is not a
+   * convenience — a cursor left open across a return into JavaScript would make
+   * any mutation of the table mid-loop undefined behaviour in Lua's traversal,
+   * and JS runs between every two steps. The consequences are worth knowing:
+   *
+   * - A key added after iteration begins is not visited.
+   * - A key deleted before its turn is skipped rather than yielded as nil.
+   * - A value replaced before its turn yields the new value.
+   * - Reads are **raw**, exactly as `pairs()` is: `__index` is never consulted.
+   *
+   * Each call mints an independent cursor, so two loops over one handle do not
+   * interfere. Releasing the handle mid-loop ends the iteration; a `reset()`
+   * mid-loop makes the next step throw rather than read the retired state.
+   *
+   * @example
+   * for (const [key, value] of lua.get_global_ref('config')) {
+   *   console.log(key, value);
+   * }
+   */
+  [Symbol.iterator](): IterableIterator<[string | number | boolean | Uint8Array, LuaValue]>;
 
   /**
    * Release the registry reference. After calling release(),
@@ -711,8 +830,21 @@ export interface LuaContext {
    * trip at the boundary: `set_global('n', 2 ** 53)` reads back as
    * `9007199254740992n`, a BigInt, not a number. Values inside the safe range
    * are unaffected.
+   *
+   * **Naming the chunk.** Pass `{ chunkName: '@name.lua' }` to control how this
+   * script is identified in errors and tracebacks — without it an error names
+   * the source itself (`[string "local x = nil..."]:2:`), which identifies
+   * nothing when the script came from a file or a user. Every door that loads
+   * Lua source takes the same option; see {@link ChunkNameOptions}.
+   *
+   * @example
+   * lua.execute_script(src, { chunkName: `@${path}` });
+   * // an error now reads:  scripts/init.lua:12: attempt to index a nil value
    */
-  execute_script<T extends LuaValue | LuaValue[] = LuaValue>(script: string): T;
+  execute_script<T extends LuaValue | LuaValue[] = LuaValue>(
+    script: string,
+    options?: ChunkNameOptions
+  ): T;
 
   /**
    * Executes a Lua file and returns the result.
@@ -884,6 +1016,8 @@ export interface LuaContext {
    *
    * The returned coroutine is iterable — see {@link LuaCoroutine}.
    *
+   * Takes `{ chunkName }` like {@link execute_script} — see {@link ChunkNameOptions}.
+   *
    * @param body A Lua script that returns a function, or a Lua function
    * @returns A coroutine object that can be resumed or iterated
    * @example
@@ -899,7 +1033,7 @@ export interface LuaContext {
    * const fn = lua.get_global('producer') as LuaFunction;
    * for (const item of lua.create_coroutine(fn)) console.log(item);
    */
-  create_coroutine(body: string | LuaFunction): LuaCoroutine;
+  create_coroutine(body: string | LuaFunction, options?: ChunkNameOptions): LuaCoroutine;
 
   /**
    * Resumes a suspended coroutine with optional arguments.
@@ -1015,10 +1149,15 @@ export interface LuaContext {
    * way.
    *
    * @param script The Lua script to execute
+   * Takes `{ chunkName }` like {@link execute_script} — see {@link ChunkNameOptions}.
+   *
    * @returns Promise resolving with the result of the script execution
    * @throws If this thread already holds the Lua state (see above)
    */
-  execute_script_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
+  execute_script_async<T extends LuaValue | LuaValue[] = LuaValue>(
+    script: string,
+    options?: ChunkNameOptions
+  ): Promise<T>;
 
   /**
    * Executes a Lua file asynchronously on a worker thread.
@@ -1054,6 +1193,8 @@ export interface LuaContext {
    * doors: this one, {@link call_async}, or {@link resume_async}.
    *
    * @param script The Lua script to execute
+   * Takes `{ chunkName }` like {@link execute_script} — see {@link ChunkNameOptions}.
+   *
    * @returns Promise resolving with the script's return value(s)
    * @example
    * const lua = new lua_native.init({
@@ -1064,7 +1205,10 @@ export interface LuaContext {
    *   return user.name
    * `);
    */
-  execute_async<T extends LuaValue | LuaValue[] = LuaValue>(script: string): Promise<T>;
+  execute_async<T extends LuaValue | LuaValue[] = LuaValue>(
+    script: string,
+    options?: ChunkNameOptions
+  ): Promise<T>;
 
   /**
    * Calls a Lua function **asynchronously**, so it may `await` host Promises.
@@ -1286,6 +1430,8 @@ export interface LuaContext {
    * {@link create_table} or {@link get_global_ref}, or a metatabled-table
    * Proxy.
    *
+   * Takes `{ chunkName }` like {@link execute_script} — see {@link ChunkNameOptions}.
+   *
    * @param env The environment (or any table reference) to run against
    * @param script The Lua script to execute
    * @returns The result of the script execution
@@ -1299,7 +1445,8 @@ export interface LuaContext {
    */
   execute_script_in<T extends LuaValue | LuaValue[] = LuaValue>(
     env: LuaEnvironment | LuaTableHandle,
-    script: string
+    script: string,
+    options?: ChunkNameOptions
   ): T;
 
   /**
@@ -1655,6 +1802,62 @@ export interface LuaContext {
    * underlying hook and keep working.
    */
   remove_hook(): void;
+
+  /**
+   * Read-only view of the Lua call stack, innermost frame first.
+   *
+   * **This is the half of debugger support that {@link set_hook} does not
+   * provide.** A hook tells you *where* execution is; this tells you what the
+   * stack looks like there, and {@link get_locals} tells you what its variables
+   * hold. Together they are enough to build a breakpoint UI; a hook alone is
+   * enough only for a profiler.
+   *
+   * Most useful from *inside* a hook callback or a host function, which is when
+   * a stack exists. Outside execution it returns `[]` — the honest answer, and
+   * usually the one the caller wanted to know.
+   *
+   * Each frame carries what Lua's own `lua_getinfo` reports: `level` (0 is
+   * innermost), `source` and `shortSource` (the chunk name — see
+   * {@link ChunkNameOptions}, which is what makes these legible), `currentLine`
+   * and `lineDefined`, and `name` / `nameWhat` / `what` (`'Lua'`, `'C'` or
+   * `'main'`). `name` is `''` where Lua cannot infer one.
+   *
+   * Refused while a worker-thread run is in flight
+   * ({@link execute_script_async}), where the Lua state belongs to another
+   * thread. A hook callback on the main thread is not that case and is allowed.
+   *
+   * @param options `maxLevels` caps how deep to walk (default 200)
+   * @example
+   * lua.set_hook((event, line) => {
+   *   if (line === breakpoint) {
+   *     console.log(lua.get_stack().map((f) => `${f.shortSource}:${f.currentLine}`));
+   *     console.log(lua.get_locals(0));
+   *   }
+   * }, { line: true });
+   */
+  get_stack(options?: { maxLevels?: number }): LuaStackFrame[];
+
+  /**
+   * The named local variables visible at a stack level, with their values.
+   *
+   * `level` is as {@link get_stack} reports it — 0 is the innermost frame.
+   * Values cross the boundary by the ordinary conversion rules, so
+   * {@link LuaContextOptions.tableAs} and
+   * {@link LuaContextOptions.binaryStrings} apply here too.
+   *
+   * Lua's compiler temporaries (the slots it names in parentheses, such as
+   * `(temporary)` and `(for state)`) are **skipped**: they are bookkeeping, not
+   * the caller's variables. A variable declared but not yet reached on the
+   * current line is simply not there yet, which is Lua's scoping and not an
+   * omission by this method.
+   *
+   * @param level Stack level, 0 = innermost
+   * @returns The named locals in Lua's own order
+   * @throws RangeError if no frame exists at `level` — deliberately not an
+   *   empty array, so "no such frame" stays distinguishable from "a frame with
+   *   no locals"
+   */
+  get_locals(level: number): Array<{ name: string; value: LuaValue }>;
 
   /**
    * Adds a module searcher backed by JavaScript, enabling dynamic/virtual
@@ -2111,6 +2314,49 @@ export interface LuaInitOptions {
   strictConversion?: boolean;
 
   /**
+   * How a Lua table arrives in JavaScript. Default `'object'`.
+   *
+   * `'map'` returns a **`Map`** instead of a plain object, which turns three of
+   * the four Lua→JS key losses in `LIMITATIONS.md` §5 from losses into
+   * representations — a `Map` can hold what a JS object cannot:
+   *
+   * | Lua table | `'object'` (default) | `'map'` |
+   * |---|---|---|
+   * | `{[1]="int", ["1"]="str"}` | `{ "1": "int" }` — one entry, one value **gone** | `Map { 1 => "int", "1" => "str" }` |
+   * | `{[true]="yes"}` | `{}` — the key is dropped | `Map { true => "yes" }` |
+   * | `{["\xFF"]=1}` under `binaryStrings` | key mangled to U+FFFD | `Map { Uint8Array[255] => 1 }` |
+   *
+   * **Every table becomes a Map, including sequences.** `{"a","b"}` arrives as
+   * `Map { 1 => "a", 2 => "b" }`, not as an array — its keys are 1 and 2, and
+   * in this mode you asked to see the keys. Making the shape depend on whether
+   * the table *happened* to be a sequence is the data-dependent return type
+   * that {@link binaryStrings} and {@link strictConversion} both refuse.
+   *
+   * **It round-trips.** A `Map` passed back into Lua keeps its key types in
+   * this mode, so `1` and `"1"` stay distinct going in as well as coming out.
+   * (In the default mode a Map's keys are stringified, matching plain-object
+   * behaviour — that is unchanged.) A Map key that is not a string, number or
+   * boolean is refused rather than stringified, the same rule
+   * {@link LuaTableHandle.pairs} applies on the way out.
+   *
+   * **Composes with {@link strictConversion}**: there is nothing left for strict
+   * mode to refuse on those three rows, so it refuses nothing — the pair is the
+   * first configuration with **no silent loss and no refusal** in either
+   * direction.
+   *
+   * A **metatabled** table is unaffected: it is still returned as a live Proxy
+   * that preserves metamethods, in both modes. This option governs how a table
+   * is *converted by value*, and a metatabled table deliberately is not.
+   *
+   * @example
+   * const lua = new lua_native.init({}, { libraries: 'all', tableAs: 'map' });
+   * const t = lua.execute_script('return {[1]="int", ["1"]="str"}');
+   * t.get(1);     // 'int'
+   * t.get('1');   // 'str'   — both survive
+   */
+  tableAs?: 'object' | 'map';
+
+  /**
    * Whether this context will load **precompiled bytecode**. Defaults to `true`
    * everywhere except `libraries: 'sandbox'`, which defaults it to `false`; an
    * explicit value always wins.
@@ -2148,6 +2394,55 @@ export interface LuaInitOptions {
    * lua.execute_script('dofile("/tmp/precompiled.lua")');            // throws
    */
   allowBytecode?: boolean;
+
+  /**
+   * Whether Lua may reach the host filesystem at all. Default `'allow'`.
+   *
+   * `'deny'` closes **every** door from Lua to the disk in one option, which
+   * previously took three calls and a caveat — `set_file_reader` covered
+   * `dofile`/`loadfile`, `add_searcher` covered `require`, and `package.path`
+   * stayed writable from inside the sandbox regardless.
+   *
+   * | Library | Denied |
+   * |---|---|
+   * | `base` | `dofile`, `loadfile` |
+   * | `package` | `searchers[2]` (path), `searchers[3]`/`[4]` (cpath → **native code**), `loadlib`, `searchpath` |
+   * | `io` | `open`, `lines`, `input`, `output` |
+   * | `os` | `remove`, `rename`, `tmpname` |
+   *
+   * **`require` keeps working** for {@link LuaContext.register_module} modules
+   * and {@link LuaContext.add_searcher} searchers — only the searchers that
+   * read the disk are closed. That configuration had no expression before:
+   * `'safe'` reaches the disk and `'sandbox'` has no `require` at all.
+   *
+   * **Each door refuses in its own idiom**, so scripts that already handle a
+   * missing file keep working: `loadfile`, `io.open`, `os.remove`, `os.rename`,
+   * `package.loadlib` and `package.searchpath` return `nil, message`, while
+   * `dofile`, `io.lines`, `io.input`, `io.output` and `os.tmpname` raise — the
+   * same shapes the real functions use to report failure. Every message names
+   * the door and the policy. {@link LuaContext.add_search_path} refuses too,
+   * rather than accepting a path `require` could never consult.
+   *
+   * **What it does not do, stated so the bound is not assumed.** It governs
+   * what *Lua* can reach, not what the host can: {@link LuaContext.execute_file},
+   * {@link LuaContext.compile_file} and a {@link LuaContext.set_file_reader}
+   * handler all keep working, because the host asking for a file by name is the
+   * caller's own decision. A file reader therefore re-opens `dofile`/`loadfile`
+   * backed by the *host*, never by the disk. And it is not a general sandbox:
+   * process execution (`os.execute`, `io.popen`) is not filesystem access and
+   * is untouched — omit `os`/`io` if you need that gone.
+   *
+   * The seal is re-applied across {@link LuaContext.reset}, and cannot be
+   * lifted for the lifetime of the context.
+   *
+   * @example
+   * // Modules from the host, nothing from the disk.
+   * const lua = new lua_native.init({}, { libraries: 'safe', filesystem: 'deny' });
+   * lua.register_module('config', { env: 'prod' });
+   * lua.execute_script('return require("config").env');   // 'prod'
+   * lua.execute_script('dofile("/etc/passwd")');          // throws
+   */
+  filesystem?: 'allow' | 'deny';
 
   /**
    * Shared tables to publish as globals in this context, keyed by the global

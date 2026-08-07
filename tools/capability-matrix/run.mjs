@@ -279,7 +279,7 @@ function main() {
     for (const door of BYTECODE_DOORS) {
       const lua = new lua_native.init({}, config.options);
       let reachable = true;
-      try { reachable = door.precondition(lua) === true; } catch { reachable = false; }
+      try { reachable = door.precondition(lua, config) === true; } catch { reachable = false; }
       if (!reachable) {
         console.log(`  ${'ABSENT'.padEnd(18)} bytecode:${door.id}`);
         continue;

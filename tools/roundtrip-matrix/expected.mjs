@@ -40,7 +40,7 @@ export const EXPECTED = [
       + 'pinned, as is the DAG control that keeps the detection path-based.',
   },
   {
-    valuePattern: '^builtin:',
+    valuePattern: '^builtin:(?!Map$)',
     modes: ['default', 'strict'],
     reason:
       'The built-in conversions are one-way by specification. `LuaInput` says so '
@@ -52,7 +52,7 @@ export const EXPECTED = [
       + 'stops being true under `binaryStrings` — see the next two entries.',
   },
   {
-    valuePattern: '^builtin:(Date|Map|Set|ArrayBuffer|RegExp)$',
+    valuePattern: '^builtin:(Date|Set|ArrayBuffer|RegExp)$',
     modes: ['binary', 'strict+binary'],
     reason:
       'The same one-way specification, still true under `binaryStrings` for the '
@@ -89,6 +89,61 @@ export const EXPECTED = [
       + 'the three container values and the mixed array are listed beside the '
       + 'nine string values. Table *keys* stay strings in this mode; the values '
       + 'under them do not.',
+  },
+  {
+    // The second "the loss stops here" entry, and this one was *hiding* behind
+    // the instrument rather than behind the product. `builtin:Map` was ledgered
+    // as a one-way conversion in all four text modes until August 7, 2026 — on
+    // the strength of a canonicalization that rendered every JS Map as `{}`,
+    // because a Map has no own enumerable properties. Teaching `canon` about
+    // Maps for T1's new column made 19 of these cells round-trip at once, which
+    // is what a STALE report is for.
+    value: 'builtin:Map',
+    modes: ['default', 'strict', 'binary', 'strict+binary'],
+    roundTripsInstead: true,
+    reason:
+      'ROUND-TRIPS by content, and always did — the ledger was covering the '
+      + "harness's blind spot, not the binding's behaviour. A Map goes in as a "
+      + 'Lua table and comes back as a plain object holding the same entries, '
+      + 'which canonicalizes identically; what does not survive is the '
+      + '*container type*, and canon deliberately does not distinguish one — a '
+      + 'Lua table is a Lua table. `LuaInput`\'s "the built-ins are one-way" is '
+      + 'still true of the type and is now false of the data, which is the same '
+      + 'shape as the Uint8Array entry above. Under `tableAs: \'map\'` the '
+      + 'container survives too, so there is no entry for this value in that '
+      + 'mode at all.',
+  },
+  {
+    valuePattern: '^builtin:(Date|Set|ArrayBuffer|RegExp|Uint8Array)$',
+    modes: ['map'],
+    reason:
+      'The same one-way specification `LuaInput` states, unchanged by '
+      + "`tableAs: 'map'`: the option governs how a Lua *table* is rendered on "
+      + 'the way out, and none of these five is a table on the way back. A Date '
+      + 'is a number, a Set a sequence, a RegExp its source text, an ArrayBuffer '
+      + 'and a Uint8Array a byte string. `builtin:Map` is deliberately absent: '
+      + 'in this mode it round-trips as a Map, container and all, which is the '
+      + 'headline property of the option.',
+  },
+  {
+    valuePattern: '^obj:(numeric-keys|key-collision)$',
+    modes: ['map'],
+    reason:
+      'NOT a loss — a rendering difference between the two sides of the '
+      + 'comparison, and it is worth stating exactly because the shape looks '
+      + 'alarming. A JavaScript object key is always a *string*: `{1: "one"}` has '
+      + 'the key `"1"`, and that string is what crosses into Lua and what comes '
+      + 'back. `canon` renders the input through a heuristic that reads a '
+      + 'numeric-looking key as a number — correct for the oracle, whose values '
+      + 'are Lua-produced and really were numeric — while this mode reports the '
+      + 'string key that actually crossed. So `in` reads `num:1` and `out` reads '
+      + 'str:"1" for the same unchanged datum. Driven both ways before ledgering: '
+      + 'under the default mode the Lua-side keys are strings too '
+      + '(`type(k) == "string"`), so nothing about the crossing differs between '
+      + 'the modes — only what the instrument prints. The mode\'s own vacuity '
+      + 'control covers the property this value would otherwise be asked to '
+      + 'prove: a Lua-side number key and string key with the same text staying '
+      + 'distinct.',
   },
   {
     value: 'symbol',

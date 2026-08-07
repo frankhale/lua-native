@@ -83,6 +83,45 @@ export const CONFIGS = [
         'local f = load(string.dump(function() return 1 end)); return f == nil and io == nil'),
     },
   },
+  // T2, August 7, 2026. `filesystem: 'deny'` is a capability option, so it is a
+  // config here rather than a roundtrip mode — the split W1 had to draw.
+  //
+  // Both presets are carried because the option means different things on each:
+  // under `all` it has io and os to close as well, and under `safe` it closes
+  // the doors that make that preset "not a sandbox" while leaving `require`
+  // working for host-supplied modules. That second configuration is the one
+  // that had no expression before — `safe` reaches the disk, `sandbox` has no
+  // `require` at all.
+  {
+    id: 'all+nofs',
+    options: { libraries: 'all', filesystem: 'deny' },
+    describe: 'every library present, every filesystem door closed — including '
+      + 'io/os, which only this config has to close',
+    proves: {
+      // Both refuse in the `nil, msg` idiom their real counterparts use, so the
+      // control asserts the *return*, not a raise. The first draft asserted
+      // `pcall(...) == false` and failed here — correctly: it was pinning the
+      // wrong contract, and the run refused to count the config's cells rather
+      // than scoring them against a claim nobody had checked.
+      describe: 'the strongest door refuses: package.loadlib linked a native library until today',
+      run: (lua) => lua.execute_script(
+        'local lib = package.loadlib("/usr/lib/libSystem.B.dylib", "*")\n'
+        + 'local fh = io.open("/etc/hosts")\n'
+        + 'return lib == nil and fh == nil'),
+    },
+  },
+  {
+    id: 'safe+nofs',
+    options: { libraries: 'safe', filesystem: 'deny' },
+    describe: "the configuration that had no expression before: require works for "
+      + 'host-supplied modules, and nothing reaches the disk',
+    proves: {
+      describe: 'dofile refuses while require itself still functions',
+      run: (lua) => lua.execute_script(
+        'local ok = pcall(dofile, "/etc/hosts")\n'
+        + 'return ok == false and type(require) == "function"'),
+    },
+  },
   {
     id: 'sandbox+bytecode',
     options: { libraries: 'sandbox', allowBytecode: true },
@@ -125,6 +164,12 @@ export const EXPECTED_LIBRARIES = {
   'all+nobytecode': ['base', 'coroutine', 'debug', 'io', 'math', 'os', 'package', 'string', 'table', 'utf8'],
   'safe+nobytecode': ['base', 'coroutine', 'math', 'package', 'string', 'table', 'utf8'],
   'sandbox+bytecode': ['base', 'coroutine', 'math', 'string', 'table', 'utf8'],
+  // `filesystem` closes doors *inside* libraries; it loads or unloads none, so
+  // both rows are their preset's. That distinction is the point of scoring
+  // libraries and doors separately: a policy that quietly dropped `io` would
+  // show up here rather than being mistaken for the seal working.
+  'all+nofs': ['base', 'coroutine', 'debug', 'io', 'math', 'os', 'package', 'string', 'table', 'utf8'],
+  'safe+nofs': ['base', 'coroutine', 'math', 'package', 'string', 'table', 'utf8'],
 };
 
 // A global that proves a library is loaded. `base` has no table of its own, so

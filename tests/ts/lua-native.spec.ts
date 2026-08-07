@@ -2928,6 +2928,385 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // DEBUG INTROSPECTION (R1, FIDELITY-AND-REACH-PLAN, August 7, 2026)
+  // ============================================
+  describe('get_stack / get_locals', () => {
+    it('reports an empty stack when nothing is executing', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(lua.get_stack()).toEqual([]);
+    });
+
+    it('reports the live frames from inside a host callback', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let frames: ReturnType<typeof lua.get_stack> = [];
+      lua.set_global('inspect', () => { frames = lua.get_stack({ maxLevels: 5 }); });
+      lua.execute_script(
+        'function outer(a) local secret = a * 2 inspect() return secret end',
+        { chunkName: '@demo.lua' }
+      );
+      lua.execute_script('return outer(21)');
+
+      expect(frames.length).toBeGreaterThanOrEqual(2);
+      expect(frames[0].what).toBe('C');           // the host callback itself
+      const lua_frame = frames.find((f) => f.what === 'Lua');
+      expect(lua_frame).toBeDefined();
+      // The chunk name from T3 is what makes this legible.
+      expect(lua_frame!.shortSource).toBe('demo.lua');
+      expect(lua_frame!.currentLine).toBeGreaterThan(0);
+    });
+
+    it('reads the values of a running function\'s locals', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let locals: Array<{ name: string; value: unknown }> = [];
+      lua.set_global('inspect', () => { locals = lua.get_locals(1); });
+      lua.execute_script('function outer(a) local secret = a * 2 local tag = "hi" inspect() end');
+      lua.execute_script('outer(21)');
+
+      expect(locals).toEqual([
+        { name: 'a', value: 21 },
+        { name: 'secret', value: 42 },
+        { name: 'tag', value: 'hi' },
+      ]);
+    });
+
+    it('works from inside a debug hook, which is the breakpoint case', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let snapshot: { frame: string; locals: Array<{ name: string; value: unknown }> } | null = null;
+      lua.set_hook((_event, line) => {
+        if (line === 3 && !snapshot) {
+          const st = lua.get_stack({ maxLevels: 3 });
+          snapshot = { frame: `${st[0].shortSource}:${st[0].currentLine}`, locals: lua.get_locals(0) };
+          lua.remove_hook();
+        }
+      }, { line: true });
+      lua.execute_script(
+        'local function f(n)\n  local doubled = n * 2\n  local tag = "row"\n  return doubled\nend\nreturn f(5)',
+        { chunkName: '@work.lua' }
+      );
+
+      expect(snapshot).not.toBeNull();
+      expect(snapshot!.frame).toBe('work.lua:3');
+      // `tag` is declared on the line that has not run yet, so it is not in
+      // scope — Lua's scoping, not an omission.
+      expect(snapshot!.locals).toEqual([
+        { name: 'n', value: 5 },
+        { name: 'doubled', value: 10 },
+      ]);
+    });
+
+    it('refuses a level that does not exist rather than returning nothing', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.get_locals(99))
+        .toThrow(/no stack frame at level 99/);
+      expect(() => lua.get_locals(-1)).toThrow(/non-negative/);
+      expect(() => (lua as any).get_locals()).toThrow(/requires a stack level/);
+      expect(() => lua.get_stack({ maxLevels: -1 })).toThrow(/non-negative/);
+    });
+
+    it('is refused while a worker-thread run holds the state', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const running = lua.execute_script_async('local s = 0 for i = 1, 200000 do s = s + i end return s');
+      expect(() => lua.get_stack()).toThrow(/async operation|in flight|busy/i);
+      await running;
+      expect(lua.get_stack()).toEqual([]);
+    });
+  });
+
+  // ============================================
+  // tableAs: 'map' (T1, FIDELITY-AND-REACH-PLAN, August 7, 2026)
+  // ============================================
+  describe("tableAs: 'map'", () => {
+    const mapCtx = (extra: Record<string, unknown> = {}) =>
+      new lua_native.init({}, { libraries: 'all', tableAs: 'map', ...extra });
+
+    it('keeps a number key and a string key with the same text distinct', () => {
+      // The headline: this table loses a value in the default mode.
+      const lua = mapCtx();
+      const t = lua.execute_script('return {[1]="int", ["1"]="str"}') as Map<unknown, unknown>;
+      expect(t).toBeInstanceOf(Map);
+      expect(t.size).toBe(2);
+      expect(t.get(1)).toBe('int');
+      expect(t.get('1')).toBe('str');
+
+      const plain = new lua_native.init({}, { libraries: 'all' });
+      expect(plain.execute_script('return {[1]="int", ["1"]="str"}')).toEqual({ '1': 'int' });
+    });
+
+    it('carries boolean and float keys', () => {
+      const lua = mapCtx();
+      const t = lua.execute_script('return {[true]="yes", [false]="no", [3.5]="f"}') as Map<unknown, unknown>;
+      expect(t.get(true)).toBe('yes');
+      expect(t.get(false)).toBe('no');
+      expect(t.get(3.5)).toBe('f');
+    });
+
+    it('renders a sequence as a Map keyed 1..n, not as an array', () => {
+      // Deliberate: the shape must not depend on whether the table happened to
+      // be a sequence.
+      const lua = mapCtx();
+      const t = lua.execute_script('return {"a","b"}') as Map<unknown, unknown>;
+      expect(t).toBeInstanceOf(Map);
+      expect([...t]).toEqual([[1, 'a'], [2, 'b']]);
+    });
+
+    it('recurses into nested tables', () => {
+      const lua = mapCtx();
+      const t = lua.execute_script('return {outer={inner=1}}') as Map<string, Map<string, unknown>>;
+      expect(t.get('outer')).toBeInstanceOf(Map);
+      expect(t.get('outer')!.get('inner')).toBe(1);
+    });
+
+    it('gives byte-exact keys under binaryStrings', () => {
+      const lua = mapCtx({ binaryStrings: true });
+      lua.execute_script('t = {["\\xFF"]=1, ["\\xFE"]=2}');
+      const keys = [...(lua.execute_script('return t') as Map<Uint8Array, unknown>).keys()];
+      expect(keys.length).toBe(2);
+      expect(keys.every((k) => k instanceof Uint8Array)).toBe(true);
+    });
+
+    it('round-trips a Map back into Lua with its key types intact', () => {
+      // The inbound half — a silent loss LIMITATIONS §5 had no row for until T1.
+      const lua = mapCtx();
+      const out = lua.execute_script('return {[1]="int", ["1"]="str", [true]="bool"}');
+      lua.set_global('rt', out);
+      expect(lua.execute_script(
+        'return tostring(rt[1]) .. "/" .. tostring(rt["1"]) .. "/" .. tostring(rt[true])'
+      )).toBe('int/str/bool');
+    });
+
+    it('leaves the default mode stringifying Map keys, as documented', () => {
+      const plain = new lua_native.init({}, { libraries: 'all' });
+      plain.set_global('m', new Map<unknown, unknown>([[1, 'int'], [true, 'bool']]));
+      expect(plain.execute_script('return type(next(m))')).toBe('string');
+    });
+
+    it('refuses a Map key that cannot be a Lua table key', () => {
+      const lua = mapCtx();
+      expect(() => lua.set_global('m', new Map([[{}, 'v']])))
+        .toThrow(/cannot be a Lua table key/);
+    });
+
+    it('composes with strictConversion, which then has nothing to refuse', () => {
+      const lua = mapCtx({ strictConversion: true });
+      const t = lua.execute_script('return {[1]="a", ["1"]="b", [true]="c"}') as Map<unknown, unknown>;
+      expect(t.size).toBe(3);
+    });
+
+    it('still returns a metatabled table as a live Proxy', () => {
+      const lua = mapCtx();
+      const p = lua.execute_script(
+        'return setmetatable({}, { __index = function() return 7 end })'
+      ) as Record<string, unknown>;
+      expect(p).not.toBeInstanceOf(Map);
+      expect(p.anything).toBe(7);
+    });
+
+    it('refuses a self-referencing table instead of recursing forever', () => {
+      const lua = mapCtx();
+      expect(() => lua.execute_script('local t = {} t.self = t return t'))
+        .toThrow(/nesting depth exceeds the maximum/);
+    });
+
+    it("defaults to 'object', and rejects anything that is neither", () => {
+      const plain = new lua_native.init({}, { libraries: 'all', tableAs: 'object' });
+      expect(plain.execute_script('return {a=1}')).toEqual({ a: 1 });
+      expect(() => new lua_native.init({}, { libraries: 'all', tableAs: 'dict' as never }))
+        .toThrow("tableAs must be 'object' or 'map', got 'dict'");
+      expect(() => new lua_native.init({}, { libraries: 'all', tableAs: 1 as never }))
+        .toThrow("tableAs must be 'object' or 'map'");
+    });
+
+    it('survives reset()', () => {
+      const lua = mapCtx();
+      lua.reset();
+      expect(lua.execute_script('return {a=1}')).toBeInstanceOf(Map);
+    });
+  });
+
+  // ============================================
+  // FILESYSTEM POLICY (T2, FIDELITY-AND-REACH-PLAN, August 7, 2026)
+  // ============================================
+  describe("filesystem: 'deny'", () => {
+    const deny = (libraries: 'all' | 'safe' = 'all') =>
+      new lua_native.init({}, { libraries, filesystem: 'deny' });
+
+    // The door list is derived from the source, not from LIMITATIONS §1 — which
+    // named five and missed the two strongest (package.loadlib and the cpath
+    // searchers reach *native* code, not a .lua file).
+    it.each([
+      ['dofile', 'dofile("/etc/hosts")', 'raises'],
+      ['io.lines', 'io.lines("/etc/hosts")', 'raises'],
+      ['io.input', 'io.input("/etc/hosts")', 'raises'],
+      ['io.output', 'io.output("/tmp/x")', 'raises'],
+      ['os.tmpname', 'os.tmpname()', 'raises'],
+    ])('denies %s', (_name, expr, _shape) => {
+      const lua = deny();
+      expect(() => lua.execute_script(expr)).toThrow(/filesystem access denied/);
+    });
+
+    it.each([
+      ['loadfile', 'loadfile("/tmp/x.lua")'],
+      ['package.loadlib', 'package.loadlib("/usr/lib/libSystem.B.dylib", "*")'],
+      ['package.searchpath', 'package.searchpath("x", "/?.lua")'],
+      ['io.open', 'io.open("/etc/hosts")'],
+      ['os.remove', 'os.remove("/tmp/x")'],
+      ['os.rename', 'os.rename("/tmp/a", "/tmp/b")'],
+    ])('denies %s in its own nil-plus-message idiom', (_name, expr) => {
+      // Refusing the way the real function reports failure keeps scripts that
+      // already handle a missing file working — and is what the real ones do.
+      const lua = deny();
+      const [value, message] = lua.execute_script(
+        `local a, b = ${expr}; return a, b`
+      ) as [unknown, string];
+      expect(value).toBeNull();
+      expect(message).toMatch(/filesystem access denied/);
+    });
+
+    it('denies every filesystem require searcher but keeps require working', () => {
+      const lua = deny();
+      // Preload and JS searchers still resolve — the configuration that had no
+      // expression before: 'safe' reaches the disk, 'sandbox' has no require.
+      lua.register_module('hostmod', { answer: 42 });
+      expect(lua.execute_script('return require("hostmod").answer')).toBe(42);
+
+      lua.add_searcher((name) => (name === 'jsmod' ? 'return { via = "searcher" }' : null));
+      expect(lua.execute_script('return require("jsmod").via')).toBe('searcher');
+
+      // ...and the file searchers report denial rather than searching.
+      expect(() => lua.execute_script('return require("nosuchmodule")'))
+        .toThrow(/filesystem access denied/);
+    });
+
+    it('refuses add_search_path instead of accepting a path it can never consult', () => {
+      // capability-matrix found this the moment the config existed: appending to
+      // package.path with the path searchers denied is accept-and-retain.
+      const lua = deny();
+      expect(() => lua.add_search_path('/tmp/?.lua'))
+        .toThrow(/filesystem access denied.*register_module\(\) or add_searcher\(\)/s);
+    });
+
+    it('holds under the safe preset, where the doors are otherwise open', () => {
+      const lua = deny('safe');
+      expect(() => lua.execute_script('dofile("/etc/hosts")')).toThrow(/filesystem access denied/);
+      expect(lua.execute_script('local lib = package.loadlib("/usr/lib/libSystem.B.dylib", "*"); return lib')).toBeNull();
+      expect(lua.execute_script('return type(require)')).toBe('function');
+    });
+
+    it('survives reset(), which builds a fresh state with stock libraries', () => {
+      const lua = deny();
+      lua.reset();
+      expect(() => lua.execute_script('dofile("/etc/hosts")')).toThrow(/filesystem access denied/);
+      expect(lua.execute_script('local lib = package.loadlib("/x", "y"); return lib')).toBeNull();
+    });
+
+    it('lets a file reader serve host content without re-opening the disk', () => {
+      // The documented interaction: the option denies the *host filesystem*, not
+      // the host. A reader is the host choosing to serve content itself.
+      const lua = deny();
+      lua.set_file_reader((p) => (p === '/v/x.lua' ? 'return 99' : null));
+      expect(lua.execute_script('return dofile("/v/x.lua")')).toBe(99);
+      expect(() => lua.execute_script('return dofile("/etc/hosts")')).toThrow(/cannot open/);
+    });
+
+    it('leaves process execution alone, which is the documented bound', () => {
+      const lua = deny();
+      expect(lua.execute_script('return type(os.execute)')).toBe('function');
+      expect(lua.execute_script('return type(io.popen)')).toBe('function');
+      // ...and the non-file parts of io/os are untouched.
+      expect(lua.execute_script('return type(io.write) .. type(os.time)')).toBe('functionfunction');
+    });
+
+    it("defaults to 'allow', and rejects anything that is neither", () => {
+      const open = new lua_native.init({}, { libraries: 'all' });
+      expect(open.execute_script('return type(dofile)')).toBe('function');
+      const explicit = new lua_native.init({}, { libraries: 'all', filesystem: 'allow' });
+      expect(explicit.execute_script('return type(dofile)')).toBe('function');
+
+      expect(() => new lua_native.init({}, { libraries: 'all', filesystem: 'nope' as never }))
+        .toThrow("filesystem must be 'allow' or 'deny', got 'nope'");
+      expect(() => new lua_native.init({}, { libraries: 'all', filesystem: true as never }))
+        .toThrow("filesystem must be 'allow' or 'deny'");
+    });
+  });
+
+  // ============================================
+  // CHUNK NAMES (T3, FIDELITY-AND-REACH-PLAN, August 7, 2026)
+  // ============================================
+  describe('chunkName on the source-loading doors', () => {
+    // A chunk with a runtime error on line 2, so the name and the line are both
+    // visible in the message.
+    const FAILS = 'local x = nil\nreturn x.y';
+
+    it('names the chunk in execute_script errors', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.execute_script(FAILS)).toThrow(/\[string "local x = nil/);
+      expect(() => lua.execute_script(FAILS, { chunkName: '@config.lua' }))
+        .toThrow(/^config\.lua:2:/);
+    });
+
+    it("honours Lua's @ and = prefix conventions", () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      // No prefix: still a "source string", so Lua decorates it.
+      expect(() => lua.execute_script(FAILS, { chunkName: 'plain' }))
+        .toThrow(/\[string "plain"\]:2:/);
+      // '=' means print verbatim.
+      expect(() => lua.execute_script(FAILS, { chunkName: '=literal' }))
+        .toThrow(/^literal:2:/);
+    });
+
+    it('names the chunk through execute_script_async (worker thread)', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_script_async(FAILS, { chunkName: '@worker.lua' }))
+        .rejects.toThrow(/^worker\.lua:2:/);
+    });
+
+    it('names the chunk through execute_async', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      await expect(lua.execute_async(FAILS, { chunkName: '@async.lua' }))
+        .rejects.toThrow(/^async\.lua:2:/);
+    });
+
+    it('names the chunk through execute_script_in', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const env = lua.create_environment({});
+      expect(() => lua.execute_script_in(env, FAILS, { chunkName: '@env.lua' }))
+        .toThrow(/^env\.lua:2:/);
+      env.release();
+    });
+
+    it('names the chunk of a coroutine body', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const coro = lua.create_coroutine(
+        'return function() local x = nil; return x.y end',
+        { chunkName: '@co.lua' }
+      );
+      expect(lua.resume(coro).error).toMatch(/^co\.lua:1:/);
+    });
+
+    it('refuses a non-string chunkName and a non-object options bag', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(() => lua.execute_script('return 1', { chunkName: 42 } as never))
+        .toThrow('execute_script() chunkName must be a string');
+      expect(() => lua.execute_script('return 1', 'nope' as never))
+        .toThrow('execute_script() options must be an object');
+      // Absent, undefined and null all mean "no name" rather than an error.
+      expect(lua.execute_script('return 1')).toBe(1);
+      expect(lua.execute_script('return 2', undefined)).toBe(2);
+      expect(lua.execute_script('return 3', null as never)).toBe(3);
+    });
+
+    it('leaves the context idle when the options read throws', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      // A getter that throws is user JS running before the worker is queued;
+      // is_busy_ must not be left set by it.
+      const hostile = { get chunkName(): string { throw new Error('from getter'); } };
+      expect(() => lua.execute_script_async('return 1', hostile as never)).toThrow('from getter');
+      expect(lua.is_busy()).toBe(false);
+      await expect(lua.execute_script_async('return 7')).resolves.toBe(7);
+    });
+  });
+
+  // ============================================
   // BYTECODE PRECOMPILATION
   // ============================================
   describe('bytecode precompilation', () => {
@@ -2967,6 +3346,14 @@ describe('lua-native Node adapter', () => {
         // If compile executed the code, the global would be set
         lua.compile('x = 999');
         expect(lua.get_global('x')).toBeNull();
+      });
+
+      // T3: chunkName was read leniently here — a non-string was ignored and
+      // the caller got the default name with no hint why.
+      it('refuses a non-string chunkName instead of ignoring it', () => {
+        const lua = new lua_native.init();
+        expect(() => lua.compile('return 1', { chunkName: 42 } as never))
+          .toThrow('compile() chunkName must be a string');
       });
     });
 
@@ -3262,6 +3649,188 @@ describe('lua-native Node adapter', () => {
       });
     });
 
+    // T4 (FIDELITY-AND-REACH-PLAN, August 7, 2026): iterate without
+    // materializing every value first.
+    describe('handle iteration', () => {
+      const bigTable = () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = {} for i = 1, 200 do t["k" .. i] = { v = i } end');
+        let converted = 0;
+        lua.register_from_lua_converter(() => { converted += 1; return false; }, (v) => v);
+        return { lua, handle: lua.get_global_ref('t'), converted: () => converted };
+      };
+
+      it('yields exactly what pairs() yields', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = { a = 1, b = 2, [3] = "three", [true] = "yes" }');
+        const t = lua.get_global_ref('t');
+
+        expect([...t]).toEqual(t.pairs());
+        t.release();
+      });
+
+      it('converts values one at a time rather than all up front', () => {
+        // The whole point of the feature, and the only claim here a reader
+        // cannot check by eye: a from-Lua converter fires once per value
+        // converted, so its call count *is* the laziness.
+        const eager = bigTable();
+        eager.handle.pairs();
+        expect(eager.converted()).toBe(200);
+
+        const lazy = bigTable();
+        for (const _entry of lazy.handle) break;
+        expect(lazy.converted()).toBe(1);
+
+        const partial = bigTable();
+        let n = 0;
+        for (const _entry of partial.handle) { if (++n === 10) break; }
+        expect(partial.converted()).toBe(10);
+      });
+
+      it('keys() converts no values at all', () => {
+        const { handle, converted } = bigTable();
+        expect(handle.keys().length).toBe(200);
+        expect(converted()).toBe(0);
+      });
+
+      it('reads values raw, so __index cannot invent entries', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script(`
+          t = { real = 1 }
+          setmetatable(t, { __index = function() return "PHANTOM" end })
+        `);
+        const t = lua.get_global_ref('t');
+
+        expect([...t]).toEqual([['real', 1]]);
+        t.release();
+      });
+
+      it('mints independent cursors', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2 });
+
+        const first = t[Symbol.iterator]();
+        const second = t[Symbol.iterator]();
+        expect(first.next().value).toEqual(second.next().value);
+        t.release();
+      });
+
+      it('skips a key deleted between the snapshot and its turn', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2, c: 3 });
+
+        const iter = t[Symbol.iterator]();
+        const [firstKey] = iter.next().value as [string, unknown];
+        // Remove the two not yet visited.
+        for (const k of ['a', 'b', 'c']) if (k !== firstKey) t.set(k, null);
+
+        expect(iter.next().done).toBe(true);
+        t.release();
+      });
+
+      it('is iterable with spread, Object.fromEntries and destructuring', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2 });
+
+        expect(Object.fromEntries([...t])).toEqual({ a: 1, b: 2 });
+        const iter = t[Symbol.iterator]();
+        expect(iter[Symbol.iterator]()).toBe(iter);
+        t.release();
+      });
+
+      it('ends the loop when the handle is released mid-iteration', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1, b: 2, c: 3 });
+
+        const iter = t[Symbol.iterator]();
+        iter.next();
+        t.release();
+        expect(iter.next().done).toBe(true);
+      });
+
+      it('refuses after reset() rather than reading the retired state', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = { a = 1, b = 2 }');
+        const t = lua.get_global_ref('t');
+
+        const iter = t[Symbol.iterator]();
+        iter.next();
+        lua.reset();
+        expect(() => iter.next()).toThrow(/replaced by reset|not usable/);
+      });
+
+      it('refuses to start on a released handle', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table({ a: 1 });
+        t.release();
+        expect(() => [...t]).toThrow('table handle has been released');
+        expect(() => t.keys()).toThrow('table handle has been released');
+      });
+
+      it('handles an empty table', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+        expect([...t]).toEqual([]);
+        expect(t.keys()).toEqual([]);
+        t.release();
+      });
+    });
+
+    // The other half of D1: a key pairs() emits must be addressable, or the
+    // emission is a worse limitation than the drop it replaced.
+    describe('handle boolean keys', () => {
+      it('round-trips through get, set and has', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+
+        t.set(true, 'yes');
+        t.set(false, 'no');
+        expect(t.get(true)).toBe('yes');
+        expect(t.get(false)).toBe('no');
+        expect(t.has(true)).toBe(true);
+        expect(t.has(false)).toBe(true);
+
+        // Lua sees genuine boolean keys, not the strings "true"/"false".
+        lua.set_global('bt', t);
+        expect(lua.execute_script('return bt[true], bt["true"]')).toEqual(['yes', null]);
+        t.release();
+      });
+
+      it('does not alias integer key 1 or the string "true"', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+
+        t.set(true, 'bool');
+        t.set(1, 'int');
+        t.set('true', 'str');
+        expect(t.get(true)).toBe('bool');
+        expect(t.get(1)).toBe('int');
+        expect(t.get('true')).toBe('str');
+        t.release();
+      });
+
+      it('removes a boolean-keyed entry when set to null', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+
+        t.set(true, 'present');
+        expect(t.has(true)).toBe(true);
+        t.set(true, null);
+        expect(t.has(true)).toBe(false);
+        t.release();
+      });
+
+      it('still refuses a key type no accessor can express', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        const t = lua.create_table();
+
+        expect(() => t.get({} as never)).toThrow('key must be a string, number, or boolean');
+        expect(() => t.set([] as never, 1)).toThrow('key must be a string, number, or boolean');
+        expect(() => t.has(null as never)).toThrow('key must be a string, number, or boolean');
+        t.release();
+      });
+    });
+
     describe('handle.length', () => {
       it('returns sequence length for array-like tables', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
@@ -3303,6 +3872,46 @@ describe('lua-native Node adapter', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         const t = lua.create_table();
         expect(t.pairs()).toEqual([]);
+        t.release();
+      });
+
+      // D1 (FIDELITY-AND-REACH-PLAN, August 7, 2026). pairs() skipped every key
+      // that was not a string or number, so a boolean key was neither
+      // enumerable nor readable — LIMITATIONS.md §5's silent-loss class inside
+      // the API §5 offers as the way out of it.
+      it('emits boolean keys, which stay distinct from integer key 1', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = { [true] = "yes", [false] = "no", [1] = "one" }');
+        const t = lua.get_global_ref('t');
+
+        const map = new Map(t.pairs());
+        expect(map.get(true)).toBe('yes');
+        expect(map.get(false)).toBe('no');
+        expect(map.get(1)).toBe('one');
+        expect(map.size).toBe(3);
+        t.release();
+      });
+
+      it('skips table/function keys, which no accessor could address', () => {
+        const lua = new lua_native.init({}, ALL_LIBS);
+        lua.execute_script('t = { [{}] = "tbl", [print] = "fn", ok = 1 }');
+        const t = lua.get_global_ref('t');
+
+        expect(t.pairs()).toEqual([['ok', 1]]);
+        t.release();
+      });
+
+      // D2: the declared key type omitted Uint8Array, which this mode returns.
+      it('emits exact bytes for string keys under binaryStrings', () => {
+        const lua = new lua_native.init({}, { ...ALL_LIBS, binaryStrings: true });
+        lua.execute_script('t = { ["\\xFF"] = 1, ["\\xFE"] = 2 }');
+        const t = lua.get_global_ref('t');
+
+        const keys = t.pairs().map(([k]) => k) as Uint8Array[];
+        expect(keys.length).toBe(2);
+        expect(keys.every((k) => k instanceof Uint8Array)).toBe(true);
+        // Distinct bytes, where a JS property name would collapse both to U+FFFD.
+        expect(keys.map((k) => k[0]).sort()).toEqual([0xfe, 0xff]);
         t.release();
       });
 
@@ -7849,7 +8458,7 @@ describe('lua-native Node adapter', () => {
       lua.execute_script('t = { c = {} }');
       const t = lua.get_global_ref('t');
       expect(() => (t as any).get_ref()).toThrow(/requires a key argument/);
-      expect(() => (t as any).get_ref(Symbol('x'))).toThrow(/must be a string or number/);
+      expect(() => (t as any).get_ref(Symbol('x'))).toThrow(/must be a string, number, or boolean/);
 
       t.release();
       expect(() => t.get_ref('c')).toThrow(/has been released/);

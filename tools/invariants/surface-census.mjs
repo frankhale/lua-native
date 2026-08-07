@@ -203,7 +203,7 @@ export function hostCallbackMembers(header) {
 // section up: a method reaches the host if it names a callback member, or calls
 // a method that does.
 // Members that retain a JS value beyond the call that supplied it — the
-// universe of census F.
+// universe of census F, over `lua-native.h` **and** `lua-native.cpp`.
 //
 // > A member qualifies iff its type mentions a `Napi::*Reference`, **or a
 // > struct that transitively does**.
@@ -269,8 +269,19 @@ export function retainingMembers(header) {
     }
   }
 
+  // **Fields, not indented declarations** — a distinction the header did not
+  // force and the .cpp does. Scanning the raw text for `^\s+Type name;` finds
+  // struct fields in a header, where everything indented is a member, and finds
+  // *function locals* in a translation unit: widening the universe on
+  // August 7, 2026 turned up `sub`, `entry`, `acc` and `accessors`, all of them
+  // stack variables inside a function body. A local does not retain anything
+  // beyond its scope, so scoring it would be asking a lifetime question of
+  // something with no lifetime. Members are therefore collected from inside
+  // struct/class bodies only, which is what "member" meant all along.
   const members = new Set();
-  for (const m of header.matchAll(/^\s+((?:const\s+)?[\w:<>,\s*&]+?)\s+(\w+_?);/gm)) {
+  const memberDecl = /^\s+((?:const\s+)?[\w:<>,\s*&]+?)\s+(\w+_?);/gm;
+  for (const [, body] of structs)
+  for (const m of body.matchAll(memberDecl)) {
     const type = m[1];
     // A raw pointer or reference to a retaining type does not itself retain —
     // it observes. Without this the RAII scope structs' `LuaContext* ctx`
@@ -778,7 +789,17 @@ export function surfaceCensus() {
   // `retainingMembers` on the two name-holding containers a type-directed scan
   // cannot derive. Reporting them as STALE would push whoever saw it to delete
   // real coverage to satisfy a rule that admits it cannot see them.
-  const retaining = retainingMembers(read('src/lua-native.h'));
+  // **Both translation units, since August 7, 2026.** The universe was the
+  // header alone, which silently excluded every retaining member declared in
+  // the .cpp — the iteration cursors, whose `Napi::ObjectReference` to the
+  // object being walked is exactly the shape §15.6 routes here. T4 noticed the
+  // gap while adding the *second* such member (`LuaCoroIterState::coro` was the
+  // first and predates it) and recorded it rather than smuggling a census
+  // change into a feature; this is that item. The rule is unchanged — a member
+  // qualifies iff its type mentions a `Napi::*Reference` or a struct that
+  // transitively does — only the text it ranges over is wider.
+  const retaining = retainingMembers(
+    read('src/lua-native.h') + '\n' + read('src/lua-native.cpp'));
   const containerCover = new Map();
   for (const c of CONTAINERS) {
     for (const mem of c.members) {

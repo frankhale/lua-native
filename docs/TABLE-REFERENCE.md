@@ -156,18 +156,18 @@ interface LuaTableHandle {
    * Get a field from the table.
    * Triggers __index metamethod if the table has a metatable.
    */
-  get(key: string | number): LuaValue;
+  get(key: string | number | boolean): LuaValue;
 
   /**
    * Set a field on the table.
    * Triggers __newindex metamethod if the table has a metatable.
    */
-  set(key: string | number, value: LuaValue): void;
+  set(key: string | number | boolean, value: LuaValue): void;
 
   /**
    * Check if a key exists in the table.
    */
-  has(key: string | number): boolean;
+  has(key: string | number | boolean): boolean;
 
   /**
    * Get the length of the table (equivalent to # in Lua).
@@ -177,11 +177,13 @@ interface LuaTableHandle {
   length(): number;
 
   /**
-   * Iterate all key-value pairs (equivalent to pairs() in Lua).
+   * Iterate the table's key-value pairs (equivalent to pairs() in Lua).
    * Returns an iterable of [key, value] tuples.
-   * Keys can be strings or numbers.
+   * Keys can be strings, numbers or booleans — and Uint8Arrays under
+   * `binaryStrings`. Table/function/userdata keys are skipped, because the
+   * accessors above cannot address them. See types.d.ts, which is authoritative.
    */
-  pairs(): IterableIterator<[string | number, LuaValue]>;
+  pairs(): IterableIterator<[string | number | boolean | Uint8Array, LuaValue]>;
 
   /**
    * Iterate the integer-keyed sequence part (equivalent to ipairs() in Lua).
@@ -189,6 +191,18 @@ interface LuaTableHandle {
    * Returns an iterable of [index, value] tuples.
    */
   ipairs(): IterableIterator<[number, LuaValue]>;
+
+  /**
+   * The keys alone, converting no values.
+   */
+  keys(): Array<string | number | boolean | Uint8Array>;
+
+  /**
+   * Lazy iteration: `for (const [k, v] of handle)`. Same entries as pairs(),
+   * but each value is converted as it is reached. The key set is snapshotted
+   * when iteration starts; see "Lazy iteration" below for why.
+   */
+  [Symbol.iterator](): IterableIterator<[string | number | boolean | Uint8Array, LuaValue]>;
 
   /**
    * Explicitly release the Lua registry reference.
@@ -303,7 +317,46 @@ lua.execute_script('print(config.host)');  // 10.0.0.1
 config.release();
 ```
 
+#### Lazy iteration
+
+A handle is directly iterable, and that is the form to reach for on a table of
+any size:
+
+```typescript
+for (const [key, value] of lua.get_global_ref('stats')) {
+  console.log(`${key} = ${value}`);
+}
+
+// Keys only, converting no values at all:
+lua.get_global_ref('stats').keys();
+```
+
+`pairs()` converts every value before returning the first one; iterating
+converts each as you reach it, so stopping early costs only what you consumed.
+Measured on a 200-entry table of tables, `pairs()` runs 200 value conversions
+and a loop that `break`s after one runs one.
+
+**The key set is snapshotted when iteration begins; the values are not.** That
+split is forced rather than chosen. A `lua_next` cursor left open across a
+return into JavaScript makes any mutation of the table mid-loop undefined in
+Lua's traversal — the hazard CR-15 F2 drove through a `__gc` finalizer, where a
+200-entry table yielded 2682 entries — and arbitrary JS runs between every two
+steps of a `for...of`. So the traversal completes up front and each step does an
+independent **raw** read. What follows from that:
+
+- a key added after iteration begins is not visited;
+- a key deleted before its turn is skipped, not yielded as nil;
+- a value replaced before its turn yields the new value;
+- `__index` is never consulted, exactly as in `pairs()`.
+
+Each `[Symbol.iterator]()` mints an independent cursor. Releasing the handle
+mid-loop ends iteration; a `reset()` mid-loop makes the next step throw rather
+than read the retired state.
+
 #### Iterating with `pairs()`
+
+`pairs()` remains the right call when you want the whole table as an array —
+it is one crossing rather than one per entry.
 
 ```typescript
 lua.execute_script(`
@@ -722,6 +775,10 @@ Revised type for `pairs()` and `ipairs()`:
 pairs(): Array<[string | number, LuaValue]>;
 ipairs(): Array<[number, LuaValue]>;
 ```
+
+(The `pairs()` key union widened on August 7, 2026 to
+`string | number | boolean | Uint8Array` — the array-vs-iterator decision this
+section records is unaffected. `types.d.ts` is authoritative.)
 
 The `ipairs()` native implementation:
 

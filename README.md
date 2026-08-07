@@ -1055,6 +1055,39 @@ lua.set_hook((event, line) => {
 }, { line: true });
 ```
 
+#### Inspecting the Stack — `get_stack()` / `get_locals()`
+
+A hook tells you *where* execution is. These tell you what the stack looks like
+there and what its variables hold — the difference between building a profiler
+and building a debugger:
+
+```javascript
+lua.set_hook((event, line) => {
+  if (line === breakpoint) {
+    for (const f of lua.get_stack()) {
+      console.log(`${f.shortSource}:${f.currentLine}  ${f.name || '?'} (${f.what})`);
+    }
+    console.log(lua.get_locals(0));   // [{ name: 'n', value: 5 }, ...]
+    lua.remove_hook();
+  }
+}, { line: true });
+```
+
+`get_stack()` returns frames innermost-first, each with `level`, `source` /
+`shortSource`, `currentLine`, `lineDefined`, `name`, `nameWhat` and `what`
+(`'Lua'`, `'C'` or `'main'`). Pass `{ maxLevels }` to cap the walk. Outside
+execution it returns `[]`.
+
+`get_locals(level)` returns the named locals of that frame with their values.
+Lua's compiler temporaries are skipped, and a level that does not exist is a
+`RangeError` rather than an empty array. Both are **read-only** — there is no
+stack manipulation and no `lua_State` handed to JavaScript, which keeps the
+design decision in [LIMITATIONS.md](docs/LIMITATIONS.md) §7 intact. Both are
+refused while `execute_script_async` holds the state on a worker thread.
+
+Chunk names make this legible: pass `{ chunkName: '@file.lua' }` when you run a
+script and `shortSource` reports it.
+
 #### What to Know Before Using It
 
 - **`line` is expensive.** It crosses into JavaScript for every source line
@@ -2154,12 +2187,46 @@ console.log(t.get(1.5)); //  'float key'
 only use string keys, since JavaScript property keys are always strings. Use a
 table handle's `get`/`set`/`has` when you need to distinguish the two.)
 
+#### Tables as Maps — `tableAs: 'map'`
+
+A Lua table's keys can be numbers, strings *and* booleans, and `1` is not
+`"1"`. A JavaScript object cannot hold that, so the default conversion loses
+some of it. `tableAs: 'map'` returns a `Map` instead:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all", tableAs: "map" });
+
+lua.execute_script('return {[1]="int", ["1"]="str", [true]="bool"}');
+// Map { 1 => 'int', '1' => 'str', true => 'bool' }
+
+// The default mode, for comparison — two entries collapse into one:
+// { '1': 'int' }
+```
+
+Every table becomes a `Map`, including sequences (`{"a","b"}` → `Map { 1 => "a",
+2 => "b" }`) — the shape never depends on what the table happens to contain. It
+round-trips: a `Map` passed back into Lua keeps its key types in this mode. A
+metatabled table is still returned as a live Proxy, in both modes.
+
+Combined with `strictConversion: true` there is nothing left to refuse, which
+makes the pair the only configuration with no silent loss **and** no refusal in
+either direction. See [LIMITATIONS.md](docs/LIMITATIONS.md) §5.
+
 #### Iterating Tables
 
 ```javascript
 const t = lua.create_table({ a: 1, b: 2, c: 3 });
 
-// pairs() — all key-value pairs (like Lua pairs())
+// The handle is directly iterable, and converts each value as it reaches it —
+// so stopping early costs only what you consumed. Prefer this on large tables.
+for (const [key, value] of t) {
+  console.log(key, value); // 'a' 1, 'b' 2, 'c' 3
+}
+
+// keys() — the keys alone, converting no values
+t.keys(); // ['a', 'b', 'c']
+
+// pairs() — every entry at once, as an array
 for (const [key, value] of t.pairs()) {
   console.log(key, value); // 'a' 1, 'b' 2, 'c' 3
 }
@@ -2683,7 +2750,8 @@ handle.set("z", 3);
 const val: LuaValue = handle.get("x"); // LuaValue
 const exists: boolean = handle.has("z");
 const len: number = handle.length();
-const entries: Array<[string | number, LuaValue]> = handle.pairs();
+const entries: Array<[string | number | boolean | Uint8Array, LuaValue]> = handle.pairs();
+for (const [k, v] of handle) { /* lazy: one value converted per step */ }
 const seq: Array<[number, LuaValue]> = handle.ipairs();
 lua.set_global("point", handle);
 handle.release();
@@ -2780,17 +2848,46 @@ model.
 - `sync(): void` — Re-publish the current value to every subscribed context. Use
   after mutating the shared object directly, or to retry a rejected `set()`.
 
-### `LuaContext.execute_script(script)`
+### `LuaContext.execute_script(script, options?)`
 
 Executes a Lua script and returns the result.
 
 **Parameters:**
 
 - `script`: String containing Lua code to execute
+- `options` (optional):
+  - `chunkName`: what Lua calls this chunk in errors and tracebacks. See
+    [Naming a Chunk](#naming-a-chunk). A non-string is rejected, not ignored.
 
 **Returns:** The result of the script execution (converted to the appropriate
 JavaScript type). Tables with metatables are returned as Proxy objects that
 preserve metamethods; plain tables are deep-copied into objects or arrays.
+
+#### Naming a Chunk
+
+Without a name, a chunk loaded from a string is identified by its own source, so
+an error reads `[string "local cfg = nil..."]:2:` — which says nothing useful
+when the script came from a file, a database row, or a user. Every door that
+loads Lua source takes `chunkName`: `execute_script`, `execute_script_async`,
+`execute_async`, `execute_script_in`, `create_coroutine` and `compile`.
+
+Lua's prefix conventions decide the formatting, and they are worth knowing
+because `@` is almost always the one you want:
+
+| `chunkName` | An error reads |
+| ----------- | -------------- |
+| *(omitted)* | `[string "local cfg = nil..."]:2:` |
+| `'config.lua'` | `[string "config.lua"]:2:` |
+| `'@config.lua'` | `config.lua:2:` — `@` means "this is a file" |
+| `'=config'` | `config:2:` — `=` means "print verbatim" |
+
+```javascript
+lua.execute_script(source, { chunkName: `@${path}` });
+// scripts/init.lua:12: attempt to index a nil value (local 'cfg')
+```
+
+`@` is what `execute_file` and `compile_file` use for real files, so a named
+string chunk reports exactly like one.
 
 ### `LuaContext.execute_file(filepath)`
 
@@ -3565,7 +3662,9 @@ and vice versa. Call `release()` when done to free the registry slot.
 - `set(key: string | number, value: LuaValue): void` — Set a field by key. Triggers `__newindex` if the table has a metatable.
 - `has(key: string | number): boolean` — Check if a key exists in the table.
 - `length(): number` — Get the table length (`#` operator). Triggers `__len` metamethod.
-- `pairs(): Array<[string | number, LuaValue]>` — Get all key-value pairs (like Lua `pairs()`).
+- `pairs(): Array<[string | number | boolean | Uint8Array, LuaValue]>` — Every entry at once. String, number and boolean keys (`Uint8Array` under `binaryStrings`); table/function/userdata keys are skipped, since no accessor here can address them.
+- `keys(): Array<string | number | boolean | Uint8Array>` — The keys alone, converting no values.
+- `[Symbol.iterator]()` — Lazy iteration: `for (const [k, v] of handle)`. Same entries as `pairs()`, but each value is converted as it is reached. The key set is snapshotted when iteration begins and reads are raw; see [TABLE-REFERENCE.md](docs/TABLE-REFERENCE.md) for what that means when the table is mutated mid-loop.
 - `ipairs(): Array<[number, LuaValue]>` — Get integer-keyed sequence entries (like Lua `ipairs()`). Iterates from index 1 until the first nil.
 - `release(): void` — Release the registry reference. After calling `release()`, all other methods throw. Safe to call multiple times.
 

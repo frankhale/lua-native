@@ -83,6 +83,8 @@ void PushTableKey(lua_State* L, const lua_core::TableKey& key) {
       lua_pushlstring(L, k.data(), k.size());
     } else if constexpr (std::is_same_v<T, int64_t>) {
       lua_pushinteger(L, static_cast<lua_Integer>(k));
+    } else if constexpr (std::is_same_v<T, bool>) {
+      lua_pushboolean(L, k ? 1 : 0);
     } else {  // double
       lua_pushnumber(L, static_cast<lua_Number>(k));
     }
@@ -126,15 +128,81 @@ int ProtectedTablePairsCollect(lua_State* L) {  // [t] -> [k1,v1,k2,v2,...]
   lua_Integer n = 0;
   lua_pushnil(L);
   while (lua_next(L, 1) != 0) {
-    // Only string and number keys survive the crossing; skip the rest here so
-    // the snapshot stays a faithful list of what the caller will emit.
-    if (const int kt = lua_type(L, -2); kt != LUA_TSTRING && kt != LUA_TNUMBER) {
+    // Skip keys the caller has no way to express, so the snapshot stays a
+    // faithful list of what will actually be emitted.
+    //
+    // **Booleans are emitted (August 7, 2026), and the reason the old rule
+    // excluded them is worth keeping.** It read "only string and number keys
+    // survive the crossing", which is true of a Lua table converted to a JS
+    // *object* — a property name is text — and was inherited from that path.
+    // It does not hold here: `TablePairs` has exactly one caller,
+    // `handle.pairs()`, which emits `[key, value]` tuples and converts the key
+    // as a *value*. A boolean key crosses as a JS boolean with nothing lost.
+    // The old rule dropped it silently, which is the §5 loss class appearing in
+    // the API `LIMITATIONS.md` §5 nominates as the way *out* of that class.
+    //
+    // Table/function/userdata keys are still skipped: `get`/`set`/`has` take
+    // no such key, so emitting one would produce an entry the caller could not
+    // address — an asymmetry worse than the honest omission. That residue is
+    // documented on `pairs()` rather than left to be discovered.
+    if (const int kt = lua_type(L, -2);
+        kt != LUA_TSTRING && kt != LUA_TNUMBER && kt != LUA_TBOOLEAN) {
       lua_pop(L, 1);
       continue;
     }
     lua_pushvalue(L, -2);       // key copy (lua_next needs the original kept)
     lua_rawseti(L, 2, ++n);
     lua_rawseti(L, 2, ++n);     // consumes the value, leaving the key on top
+  }
+  return 1;
+}
+
+// [t] -> [k1,k2,...]. The keys-only sibling of ProtectedTablePairsCollect, and
+// it exists for the same reason that one does: the traversal has to be over
+// before any conversion runs, because converting allocates and an allocation
+// can reach a __gc finalizer that adds a key to the very table under a live
+// lua_next cursor (CR-15 F2, where a 200-entry table yielded 2682 entries).
+//
+// **This is what makes a "lazy" table iterator possible at all.** A cursor that
+// stayed open across a JS `next()` return would hand that same undefined
+// behaviour to any caller who mutated the table mid-loop — a far wider window
+// than a finalizer, since arbitrary JS runs between two `next()` calls. So the
+// key *set* is snapshotted here, up front, and only the values are read lazily.
+// Same key filter as the pairs collector: what the caller can address.
+// Converts the snapshotted table key on top of the stack to a LuaValue. One
+// function rather than one per collector: TablePairs and TableKeys both need
+// it, and a key-type rule split across two sites is this tree's most repeated
+// defect shape (CORRECTNESS.md §15.3, "fix classes, not sites").
+LuaPtr KeyAtTop(lua_State* L) {
+  if (lua_type(L, -1) == LUA_TSTRING) {
+    size_t len;
+    const char* str = lua_tolstring(L, -1, &len);
+    return std::make_shared<LuaValue>(LuaValue::from(std::string(str, len)));
+  }
+  if (lua_type(L, -1) == LUA_TBOOLEAN) {
+    // Checked before the integer branch on purpose: lua_isinteger is false for
+    // a boolean, but lua_tonumber would coerce one to 0/1 in the fallthrough,
+    // so an unchecked order would report `t[true]` as the number key 1 and
+    // collide with a real integer key.
+    return std::make_shared<LuaValue>(LuaValue::from(lua_toboolean(L, -1) != 0));
+  }
+  if (lua_isinteger(L, -1)) {
+    return std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(lua_tointeger(L, -1))));
+  }
+  return std::make_shared<LuaValue>(LuaValue::from(static_cast<double>(lua_tonumber(L, -1))));
+}
+
+int ProtectedTableKeysCollect(lua_State* L) {  // [t] -> [k1,k2,...]
+  lua_newtable(L);
+  lua_Integer n = 0;
+  lua_pushnil(L);
+  while (lua_next(L, 1) != 0) {
+    lua_pop(L, 1);  // drop the value; only the key is wanted
+    if (const int kt = lua_type(L, -1);
+        kt == LUA_TSTRING || kt == LUA_TNUMBER || kt == LUA_TBOOLEAN) {
+      lua_pushvalue(L, -1);     // key copy (lua_next needs the original kept)
+      lua_rawseti(L, 2, ++n);
+    }
   }
   return 1;
 }
@@ -382,6 +450,54 @@ void LuaRuntime::DispatchDebugHook(lua_State* L, lua_Debug* ar) const {
   } catch (...) {
     // A throwing hook is swallowed rather than corrupting the VM.
   }
+}
+
+std::vector<LuaRuntime::StackFrame> LuaRuntime::GetStack(const int max_levels) const {
+  std::vector<StackFrame> frames;
+  // No RunProtected and no ExecutionScope: lua_getstack and lua_getinfo("nSl")
+  // read the activation records and push nothing, so neither allocates and
+  // neither can raise. That is what makes this callable from *inside* a hook,
+  // which is the only place a caller ever wants it.
+  lua_Debug ar;
+  for (int level = 0; level < max_levels; ++level) {
+    if (lua_getstack(L_, level, &ar) == 0) break;
+    if (lua_getinfo(L_, "nSl", &ar) == 0) break;
+    StackFrame f;
+    f.level = level;
+    f.source = ar.source ? ar.source : "";
+    f.short_src = ar.short_src;
+    f.current_line = ar.currentline;
+    f.line_defined = ar.linedefined;
+    f.name = ar.name ? ar.name : "";
+    f.name_what = ar.namewhat ? ar.namewhat : "";
+    f.what = ar.what ? ar.what : "";
+    frames.push_back(std::move(f));
+  }
+  return frames;
+}
+
+std::optional<std::vector<std::pair<std::string, LuaPtr>>> LuaRuntime::GetLocals(
+    const int level) const {
+  lua_Debug ar;
+  if (lua_getstack(L_, level, &ar) == 0) return std::nullopt;
+
+  std::vector<std::pair<std::string, LuaPtr>> locals;
+  // `lua_getlocal` *pushes* the value, so unlike GetStack this one allocates
+  // and needs the stack discipline the rest of the file uses. Converting is the
+  // part that can run user JS (a from-Lua converter), and ToLuaValueProtected
+  // is the same door every other read goes through.
+  StackGuard guard(L_);
+  for (int n = 1;; ++n) {
+    const char* name = lua_getlocal(L_, &ar, n);
+    if (!name) break;
+    // Lua names compiler temporaries in parentheses — "(temporary)", "(for
+    // state)". They are not the caller's variables and reporting them would be
+    // noise a debugger UI has to filter anyway.
+    if (name[0] == '(') { lua_pop(L_, 1); continue; }
+    locals.emplace_back(name, ToLuaValueProtected(L_, -1));
+    lua_pop(L_, 1);
+  }
+  return locals;
 }
 
 void LuaRuntime::InstallExecutionHook() {
@@ -1618,6 +1734,18 @@ void LuaRuntime::AddSearchPath(const std::string& path) const {
       "Cannot add search path: the 'package' library is not loaded. "
       "Include 'package' in the libraries option.");
   }
+  // Found by `capability-matrix` the moment `filesystem: 'deny'` existed, and
+  // it is the real thing that config caught: with the path searchers denied, a
+  // search path can never be consulted, so accepting one and appending it to
+  // `package.path` is accept-and-retain — an entry point that "returned
+  // normally and had no observable effect" (`LIMITATIONS.md` §8). Refusing is
+  // the contract, and it points at the two doors that do still work.
+  if (!filesystem_allowed_) {
+    throw std::runtime_error(
+      "Cannot add search path: this Lua context was created with filesystem "
+      "access denied, so require() never consults package.path. Use "
+      "register_module() or add_searcher() to serve modules from the host.");
+  }
 
   // Protected so the pushstring/setfield allocation (M3) — and a __newindex on
   // a metatabled package table — throw rather than abort.
@@ -2204,6 +2332,50 @@ void LuaRuntime::SetAllowBytecode(bool allow) {
   });
 }
 
+// Every denied file door lands here. Upvalue 1 is the door's name, so the
+// message says which one rather than "permission denied" — the script author
+// reading it is usually not the person who set the option.
+int LuaRuntime::DeniedFileDoor(lua_State* L) {
+  const char* name = lua_tostring(L, lua_upvalueindex(1));
+  return luaL_error(L, "%s is unavailable: this Lua context was created with "
+                       "filesystem access denied", name ? name : "this function");
+}
+
+// The same denial in the other idiom: `nil, message`.
+//
+// **Which door gets which shape is Lua's choice, not this option's**, and
+// getting it wrong is not cosmetic. `loadfile`, `io.open`, `os.remove`,
+// `os.rename`, `package.searchpath` and `package.loadlib` all report ordinary
+// failure as `nil, msg`, so a script that handles a missing file already
+// handles this — `local f = loadfile(p); if not f then ...` keeps working, and
+// the message says why. Raising there would turn a denied read into a crash in
+// code that was written to cope. `dofile`, `io.lines`, `io.input`, `io.output`
+// and `os.tmpname` raise on failure, so they raise here.
+//
+// The first draft raised from all of them, and `capability-matrix` reported it
+// as a HARNESS FAULT on `lua:loadfile` — the door returned neither LOADED nor
+// REFUSED because it had thrown. The dirt was in the subject, not the
+// instrument (`tools/README.md`).
+int LuaRuntime::DeniedFileDoorNil(lua_State* L) {
+  const char* name = lua_tostring(L, lua_upvalueindex(1));
+  lua_pushnil(L);
+  lua_pushfstring(L, "%s is unavailable: this Lua context was created with "
+                     "filesystem access denied", name ? name : "this function");
+  return 2;
+}
+
+// The `require` half. A searcher returns a *string* to mean "not me, and here
+// is why", which require collects into its final error — so denial arrives as
+// part of the ordinary "module not found" report instead of aborting a lookup
+// that a preloaded module or a JS searcher might still satisfy. That is the
+// difference between closing a door and breaking `require`.
+int LuaRuntime::DeniedSearcher(lua_State* L) {
+  const char* what = lua_tostring(L, lua_upvalueindex(1));
+  lua_pushfstring(L, "\n\tno %s searcher (filesystem access denied)",
+                  what ? what : "file");
+  return 1;
+}
+
 int LuaRuntime::SafeLoad(lua_State* L) {
   const int nargs = lua_gettop(L);
   lua_pushvalue(L, lua_upvalueindex(1));                       // original load
@@ -2220,6 +2392,95 @@ int LuaRuntime::SafeLoad(lua_State* L) {
   if (nargs >= 4) lua_pushvalue(L, 4);
   lua_call(L, forwarded, LUA_MULTRET);
   return lua_gettop(L) - nargs;
+}
+
+void LuaRuntime::SetFilesystemAccess(const bool allow) {
+  if (allow == filesystem_allowed_) return;
+  filesystem_allowed_ = allow;
+  if (allow) {
+    // Deliberately one-way. Re-opening would mean restoring nine originals
+    // across three libraries, several of which the caller may have replaced in
+    // the meantime — and a security boundary that can be re-opened from the
+    // same API that closed it is not much of one. Nothing in the binding calls
+    // this with `true` after construction; `reset()` re-applies the *closed*
+    // state onto a fresh state instead, which is why the flag is re-armed here.
+    filesystem_allowed_ = true;
+    return;
+  }
+
+  // Protected: every push allocates, and _G / package may carry a __newindex
+  // (the reasoning SetAllowBytecode states).
+  RunProtected([&]() {
+    // `raises` selects the idiom — see DeniedFileDoorNil for why it is per-door.
+    const auto denyGlobal = [&](const char* name, const bool raises) {
+      lua_getglobal(L_, name);
+      const bool present = !lua_isnil(L_, -1);
+      lua_pop(L_, 1);
+      if (!present) return;  // never loaded: nothing to deny, and no new global
+      lua_pushstring(L_, name);
+      lua_pushcclosure(L_, raises ? DeniedFileDoor : DeniedFileDoorNil, 1);
+      lua_setglobal(L_, name);
+    };
+    const auto denyField = [&](const int tableIdx, const char* table,
+                               const char* field, const bool raises) {
+      lua_getfield(L_, tableIdx, field);
+      const bool present = !lua_isnil(L_, -1);
+      lua_pop(L_, 1);
+      if (!present) return;
+      lua_pushfstring(L_, "%s.%s", table, field);
+      lua_pushcclosure(L_, raises ? DeniedFileDoor : DeniedFileDoorNil, 1);
+      lua_setfield(L_, tableIdx, field);
+    };
+
+    denyGlobal("dofile", /*raises=*/true);
+    denyGlobal("loadfile", /*raises=*/false);
+
+    if (HasPackageLibrary()) {
+      PushProtectedGlobal("package");
+      const int pkg = lua_gettop(L_);
+      denyField(pkg, "package", "loadlib", /*raises=*/false);
+      denyField(pkg, "package", "searchpath", /*raises=*/false);
+
+      // Searchers 2 (package.path), 3 (package.cpath) and 4 (the all-in-one
+      // root loader, also cpath). 1 is the preload searcher and stays: a
+      // preloaded module is host-supplied, which is the point of the option.
+      lua_getfield(L_, pkg, "searchers");
+      if (lua_istable(L_, -1)) {
+        const int searchers = lua_gettop(L_);
+        const char* names[] = {nullptr, nullptr, "Lua file", "C library", "all-in-one"};
+        for (int i = 2; i <= 4; ++i) {
+          lua_geti(L_, searchers, i);
+          const bool present = lua_isfunction(L_, -1);
+          lua_pop(L_, 1);
+          if (!present) continue;
+          lua_pushstring(L_, names[i]);
+          lua_pushcclosure(L_, DeniedSearcher, 1);
+          lua_seti(L_, searchers, i);
+        }
+      }
+      lua_pop(L_, 1);  // searchers
+      lua_pop(L_, 1);  // package
+    }
+
+    // io and os are only present when loaded. `io.read`/`io.write` are left
+    // alone: they act on the default streams, are the host's own channels
+    // (set_read_handler / set_print_handler), and are not filesystem access.
+    lua_getglobal(L_, "io");
+    if (lua_istable(L_, -1)) {
+      const int io = lua_gettop(L_);
+      denyField(io, "io", "open", /*raises=*/false);
+      for (const char* f : {"lines", "input", "output"}) denyField(io, "io", f, /*raises=*/true);
+    }
+    lua_pop(L_, 1);
+
+    lua_getglobal(L_, "os");
+    if (lua_istable(L_, -1)) {
+      const int os = lua_gettop(L_);
+      for (const char* f : {"remove", "rename"}) denyField(os, "os", f, /*raises=*/false);
+      denyField(os, "os", "tmpname", /*raises=*/true);
+    }
+    lua_pop(L_, 1);
+  });
 }
 
 // The file half of the guard.
@@ -3123,7 +3384,8 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
   return results;
 }
 
-ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
+ScriptResult LuaRuntime::ExecuteScript(const std::string& script,
+                                       const std::string& chunk_name) const {
   last_error_value_.reset();
   const int stackBefore = lua_gettop(L_);
 
@@ -3135,7 +3397,8 @@ ScriptResult LuaRuntime::ExecuteScript(const std::string& script) const {
   int loadStatus;
   {
     ExecutionScope exec(this);
-    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
+    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(),
+                                 chunk_name.empty() ? script.c_str() : chunk_name.c_str());
   }
   if (loadStatus != LUA_OK) {
     std::string error = CaptureError(L_);
@@ -3427,6 +3690,29 @@ bool LuaRuntime::StrictConversion(lua_State* L) {
   return runtime && runtime->config_.strict_conversion;
 }
 
+// `tableAs: 'map'` (T1). Read the same way as StrictConversion, and used at the
+// same site, because the loss it removes happens *there* — in the core, before
+// the binding sees anything.
+//
+// **This is where T1's design had to move to.** The option was drafted as a
+// binding-layer rendering switch: build a `Map` instead of an object. It cannot
+// be. `LuaTable` is a `std::unordered_map<std::string, LuaPtr>`, so the number
+// key `1` and the string key `"1"` have already merged, and a boolean key has
+// already been dropped, by the time `CoreToNapiBuiltin` runs. Rendering a Map
+// from that would have produced a faithful-looking container holding data that
+// was already lossy — the worst possible outcome for an option whose entire
+// purpose is fidelity.
+//
+// So the flag is read here instead, and its effect is to *not convert*: a plain
+// table is kept as a registry reference, exactly as a metatabled one already
+// was. The binding then materializes the Map by walking the real table with
+// `TablePairs`, whose keys are typed (D1) and byte-exact under `binaryStrings`
+// (T4's `keys()` shares the path). Nothing in `LuaValue::Variant` changed.
+bool LuaRuntime::PreserveTableKeys(lua_State* L) {
+  const LuaRuntime* runtime = detail::OwningRuntime(L);
+  return runtime && runtime->preserve_table_keys_;
+}
+
 bool LuaRuntime::IsNil(const LuaPtr& value) {
   return !value || std::holds_alternative<std::monostate>(value->value);
 }
@@ -3469,6 +3755,20 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
         int ref = luaL_ref(L, LUA_REGISTRYINDEX);
         return std::make_shared<LuaValue>(LuaValue::from(LuaTableRef(ref, L)));
       }
+      // `tableAs: 'map'`: keep plain tables by reference too, so the binding
+      // can materialize them with their real keys. Checked before the sequence
+      // branch on purpose — a sequence is a table whose keys happen to be
+      // 1..n, and under this mode those keys are part of what the caller asked
+      // to see, so it becomes a Map keyed 1..n rather than a JS array. Making
+      // the shape depend on whether the table *happened* to be a sequence is
+      // exactly the data-dependent return type LIMITATIONS §2 and §5 both
+      // refuse.
+      if (PreserveTableKeys(L)) {
+        lua_pushvalue(L, abs_index);
+        const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        return std::make_shared<LuaValue>(LuaValue::from(LuaTableRef(ref, L)));
+      }
+
       // Plain tables (no metatable) are deep-copied as before
       if (isSequentialArray(L, abs_index)) {
         LuaArray arr;
@@ -3813,6 +4113,28 @@ bool LuaRuntime::HasTableField(int registry_ref, const std::string& key) const {
   return present;
 }
 
+bool LuaRuntime::RefHasMetatable(const int registry_ref) const {
+  StackGuard guard(L_);
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  if (!lua_istable(L_, -1)) return false;
+  if (!lua_getmetatable(L_, -1)) return false;
+  lua_pop(L_, 1);
+  return true;
+}
+
+LuaPtr LuaRuntime::RawGetTableFieldKeyed(int registry_ref, const TableKey& key) const {
+  LuaPtr result;
+  RunProtected([&]() {
+    StackGuard guard(L_);
+    lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
+    if (!lua_istable(L_, -1)) return;                  // released/stale ref: nil
+    PushTableKey(L_, key);                             // key
+    lua_rawget(L_, -2);                                // raw: no __index
+    result = ToLuaValue(L_, -1);
+  });
+  return result;
+}
+
 LuaPtr LuaRuntime::GetTableFieldKeyed(int registry_ref, const TableKey& key) const {
   LuaPtr result;
   RunProtected([&]() {
@@ -4004,6 +4326,33 @@ std::variant<int, std::string> LuaRuntime::GetTableFieldRef(
   return ref;
 }
 
+std::vector<LuaPtr> LuaRuntime::TableKeys(const int registry_ref) const {
+  StackGuard guard(L_);
+  std::vector<LuaPtr> result;
+
+  lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
+  if (!lua_istable(L_, -1)) {
+    return result;
+  }
+
+  // Snapshot first, convert after — ProtectedTableKeysCollect states why, and
+  // it is load-bearing here in a second way: this snapshot is what lets the JS
+  // iterator be lazy in its *values* without ever holding a lua_next cursor
+  // across a return into JavaScript.
+  lua_pushcfunction(L_, ProtectedTableKeysCollect);
+  lua_pushvalue(L_, -2);     // the table
+  ProtectedTableCall(1, 1);  // -> flat array k1,k2,...
+
+  const auto n = static_cast<int>(lua_rawlen(L_, -1));
+  result.reserve(static_cast<size_t>(n));
+  for (int i = 1; i <= n; ++i) {
+    lua_rawgeti(L_, -1, i);
+    result.push_back(KeyAtTop(L_));
+    lua_pop(L_, 1);
+  }
+  return result;
+}
+
 std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(const int registry_ref) const {
   StackGuard guard(L_);
   std::vector<std::pair<LuaPtr, LuaPtr>> result;
@@ -4028,16 +4377,7 @@ std::vector<std::pair<LuaPtr, LuaPtr>> LuaRuntime::TablePairs(const int registry
   result.reserve(static_cast<size_t>(n) / 2);
   for (int i = 1; i + 1 <= n; i += 2) {
     lua_rawgeti(L_, -1, i);  // key
-    LuaPtr key;
-    if (lua_type(L_, -1) == LUA_TSTRING) {
-      size_t len;
-      const char* str = lua_tolstring(L_, -1, &len);
-      key = std::make_shared<LuaValue>(LuaValue::from(std::string(str, len)));
-    } else if (lua_isinteger(L_, -1)) {
-      key = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(lua_tointeger(L_, -1))));
-    } else {
-      key = std::make_shared<LuaValue>(LuaValue::from(static_cast<double>(lua_tonumber(L_, -1))));
-    }
+    LuaPtr key = KeyAtTop(L_);
     lua_pop(L_, 1);
 
     lua_rawgeti(L_, -1, i + 1);  // value
@@ -4120,7 +4460,8 @@ int LuaRuntime::CreateEnvironment(const std::vector<std::string>& whitelist,
 }
 
 ScriptResult LuaRuntime::ExecuteScriptInEnvironment(const int env_ref,
-                                                    const std::string& script) const {
+                                                    const std::string& script,
+                                                    const std::string& chunk_name) const {
   if (env_ref == LUA_NOREF || env_ref == LUA_REFNIL) {
     return std::string("invalid environment reference");
   }
@@ -4134,7 +4475,8 @@ ScriptResult LuaRuntime::ExecuteScriptInEnvironment(const int env_ref,
   int loadStatus;
   {
     ExecutionScope exec(this);
-    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
+    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(),
+                                 chunk_name.empty() ? script.c_str() : chunk_name.c_str());
   }
   if (loadStatus != LUA_OK) {
     std::string error = CaptureError(L_);
@@ -4363,7 +4705,7 @@ bool LuaRuntime::IsCancelRequested() const { return cancel_requested_; }
 void LuaRuntime::ClearCancel() { cancel_requested_ = false; }
 
 std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
-    const std::string& script) const {
+    const std::string& script, const std::string& chunk_name) const {
   StackGuard guard(L_);
 
   // Load the script chunk as a function on the main stack (size-aware so
@@ -4374,7 +4716,8 @@ std::variant<LuaThreadRef, std::string> LuaRuntime::CreateCoroutineFromScript(
   int loadStatus;
   {
     ExecutionScope exec(this);
-    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(), script.c_str());
+    loadStatus = luaL_loadbuffer(L_, script.data(), script.size(),
+                                 chunk_name.empty() ? script.c_str() : chunk_name.c_str());
   }
   if (loadStatus != LUA_OK) {
     // Not one of the four barriers CR-18 F1 swept, and the difference is worth

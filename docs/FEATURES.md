@@ -1957,6 +1957,224 @@ still holding the JS callback.
 
 ---
 
+## Chunk Names on Every Source Door (August 2026)
+
+### Overview
+
+`compile()` had a `chunkName` option; the doors that *run* source did not, so a
+runtime error from an ordinary `execute_script` read
+`[string "local cfg = nil..."]` — the source quoted back at you, which
+identifies nothing when the script came from a file, a database row or a user.
+
+`chunkName` now reaches every door that loads Lua source: `execute_script`,
+`execute_script_async`, `execute_async`, `execute_script_in`,
+`create_coroutine(body)` and `compile`.
+
+### Architecture
+
+The enumeration is derived rather than listed: *every `luaL_loadbuffer` call
+reachable from a door that takes a JS string*, which is four core methods —
+`ExecuteScript`, `ExecuteScriptInEnvironment`, `CreateCoroutineFromScript` and
+`CompileScript`. Each gained an optional `chunk_name`, defaulting to empty,
+which means "mirror `luaL_loadstring`: use the source as the display name". The
+default is therefore bit-identical to the old behaviour.
+
+Lua's own prefix conventions decide formatting and are the caller's to choose:
+`@name` renders as a file (`name:1:`), `=name` renders verbatim, anything else
+renders as a source string (`[string "name"]:1:`).
+
+### Design Decisions
+
+**A non-string is rejected, not ignored.** `compile()` read the key leniently
+until August 2026 — a mistyped value silently produced the default name. For an
+option whose entire purpose is a legible error, failing quietly is the failure
+it exists to prevent, so all six doors share one `ParseChunkName` that refuses a
+non-string and a non-object options bag.
+
+**The options read happens before `is_busy_` is set** on the worker door. It can
+run an accessor — user JS — and a throwing getter must leave the context idle
+rather than wedged busy with no worker queued to clear it.
+
+---
+
+## Lazy Table Iteration (August 2026)
+
+### Overview
+
+`pairs()` and `ipairs()` return arrays, so iterating a large table materialized
+every value before the first was read. A `LuaTableHandle` is now directly
+iterable, and `keys()` returns the key set without converting a single value.
+
+Measured on a 200-entry table of tables: `pairs()` runs 200 value conversions,
+a `for...of` that breaks after one runs one, and `keys()` runs none.
+
+### Architecture
+
+**Eager keys, lazy values**, and the split is forced rather than chosen. A
+`lua_next` cursor left open across a return into JavaScript makes any mutation
+of the table mid-loop undefined in Lua's traversal — the CR-15 F2 hazard, where
+a `__gc` finalizer adding a key made a 200-entry table yield 2682 entries — and
+arbitrary JS runs between every two steps of a `for...of`. So `TableKeys`
+snapshots the key set up front and each step does an independent **raw** read
+(`RawGetTableFieldKeyed`), raw so the cursor reports what `pairs()` reports
+rather than what an `__index` metamethod would answer.
+
+### Design Decisions
+
+**The observable consequences are documented rather than hidden:** a key added
+after iteration begins is not visited, a key deleted before its turn is skipped
+rather than yielded as nil, a replaced value yields the new one, releasing the
+handle mid-loop ends iteration, and `reset()` mid-loop makes the next step throw
+rather than read the retired state. Each call mints an independent cursor.
+
+**Boolean keys are emitted (and addressable).** `pairs()` skipped every key that
+was not a string or number, under a rule inherited from the object-conversion
+path where a key becomes a property name. `handle.pairs()` emits tuples and
+converts the key as a *value*, so the rule never applied; `get`/`set`/`has`/
+`get_ref` take booleans too, because a key the caller can see and cannot read
+back would be worse than the drop it replaced. Table, function and userdata keys
+are still skipped, and `pairs()` says so.
+
+---
+
+## Filesystem Policy — `filesystem: 'deny'` (August 2026)
+
+### Overview
+
+Closing Lua's access to the disk took three calls and a caveat: `set_file_reader`
+covered `dofile`/`loadfile`, `add_searcher` covered `require`, and
+`package.path` stayed writable from inside the sandbox regardless. One option
+now closes every door.
+
+### Architecture
+
+The door list was derived from the source, and was four longer than
+`LIMITATIONS.md` §1 had recorded:
+
+| Library | Denied |
+|---------|--------|
+| `base` | `dofile`, `loadfile` |
+| `package` | `searchers[2]` (path), `searchers[3]`/`[4]` (cpath → **native code**), `loadlib`, `searchpath` |
+| `io` | `open`, `lines`, `input`, `output` |
+| `os` | `remove`, `rename`, `tmpname` |
+
+`package.loadlib` and the cpath searchers link an arbitrary shared library into
+the process, which is a stronger capability than executing a readable `.lua`
+file and was the bound §1 had wrong.
+
+`require` keeps working for `register_module` modules and `add_searcher`
+searchers — only the searchers that read the disk are closed. That configuration
+had no expression before: `'safe'` reaches the disk and `'sandbox'` has no
+`require` at all.
+
+### Design Decisions
+
+**Each door refuses in its own idiom.** `loadfile`, `io.open`, `os.remove`,
+`os.rename`, `loadlib` and `searchpath` return `nil, message`; `dofile`,
+`io.lines`, `io.input`, `io.output` and `os.tmpname` raise — the shapes the real
+functions use for failure, so a script that already handles a missing file keeps
+working.
+
+**`add_search_path` refuses rather than accepting a dead path.** With the path
+searchers denied a search path can never be consulted, so appending one would be
+accept-and-retain (`LIMITATIONS.md` §8).
+
+**It governs Lua, not the host.** `execute_file`, `compile_file` and a
+`set_file_reader` handler keep working — the host asking for a file by name is
+the caller's own decision, and a reader re-opens `dofile`/`loadfile` backed by
+the host rather than by the disk. Process execution (`os.execute`, `io.popen`)
+is not filesystem access and is untouched. The seal is re-applied across
+`reset()` and cannot be lifted for the life of the context.
+
+---
+
+## Tables as Maps — `tableAs: 'map'` (August 2026)
+
+### Overview
+
+A Lua table's keys can be numbers, strings and booleans, and `1` is not `"1"`.
+A JavaScript object cannot hold that, so `{[1]="int", ["1"]="str"}` arrived as
+`{ "1": "int" }` — two entries, one value gone. `tableAs: 'map'` returns a `Map`
+instead, turning three of the four Lua→JS key losses in `LIMITATIONS.md` §5 from
+losses into representations.
+
+### Architecture
+
+**The option could not live where it was designed to.** `LuaTable` is a
+`std::unordered_map<std::string, LuaPtr>`, so the number key `1` and the string
+key `"1"` have already merged, and a boolean key has already been dropped,
+before any binding-layer renderer sees a table. Rendering a Map from that would
+have produced a faithful-looking container full of already-lossy data.
+
+So the mode changes what the **core** produces: `ToLuaValue` keeps a plain table
+by reference — the branch metatabled tables always used — and the binding
+materializes the Map by walking the real table with `TablePairs`, whose keys are
+typed and byte-exact under `binaryStrings`. `LuaValue::Variant` is unchanged.
+
+The inbound direction is the mirror: a JS `Map` becomes a real Lua table built
+with `SetTableFieldKeyed`, which takes typed keys, so the mode round-trips
+instead of being one-way.
+
+### Design Decisions
+
+**Every table becomes a Map, including sequences.** `{"a","b"}` arrives as
+`Map { 1 => "a", 2 => "b" }`. Making the shape depend on whether the table
+*happened* to be a sequence is the data-dependent return type `binaryStrings`
+and `strictConversion` both refuse.
+
+**A metatabled table is unaffected** — still a live Proxy in both modes. The
+option governs conversion by value, and a metatabled table deliberately is not
+converted.
+
+**The default is untouched inbound.** "A Map's keys are stringified, matching
+plain-object behaviour" is documented, and a caller relying on it would break.
+
+---
+
+## Read-Only Debug Introspection (August 2026)
+
+### Overview
+
+`set_hook` reports *where* execution is. `get_stack()` and `get_locals(level)`
+report what the stack looks like there and what its variables hold — the
+difference between building a profiler and building a debugger.
+
+```
+frame  : work.lua:3
+locals : [ { name: 'n', value: 5 }, { name: 'doubled', value: 10 } ]
+```
+
+### Architecture
+
+`lua_getstack` / `lua_getinfo("nSl")` / `lua_getlocal`, and nothing else. Frames
+carry `level`, `source`, `shortSource`, `currentLine`, `lineDefined`, `name`,
+`nameWhat` and `what`; locals carry name and converted value, so `tableAs` and
+`binaryStrings` apply.
+
+`GetStack` needs no protected call: `lua_getstack` and `lua_getinfo` read the
+activation records and push nothing, so neither allocates and neither can raise.
+`GetLocals` does push, so it uses the same stack discipline and protected
+conversion as every other read.
+
+### Design Decisions
+
+**Read-only, deliberately.** No stack manipulation, no pushing, no `lua_State`
+handed to JavaScript — `LIMITATIONS.md` §7's "no raw Lua C API" is a design
+decision and this stays on its side of it.
+
+**Refused only while a worker-thread run holds the state.** `RejectIfBusy` marks
+an `execute_script_async` run, where the state belongs to another thread and
+reading its stack would be a data race. A hook callback on the main thread is
+not that case: the state is ours and Lua has disabled the hook for the duration.
+
+**An absent frame is a `RangeError`, not an empty array** — "no such frame" and
+"a frame with no named locals" are different answers. Compiler temporaries (the
+slots Lua names in parentheses) are skipped: bookkeeping, not the caller's
+variables. Outside execution the stack is `[]`, which is the honest answer to
+"is Lua running right now".
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -2001,3 +2219,8 @@ still holding the JS callback.
 | Awaiting through every door (`call_async`, `resume_async`, `Symbol.asyncIterator`) | High | August 2026 |
 | Coroutine close (`close()` — runs pending `<close>` variables) | Low | August 2026 |
 | Input redirection (`set_read_handler`) and virtual files (`set_file_reader`) | Moderate | August 2026 |
+| Chunk names on every source door (`chunkName`) | Low | August 2026 |
+| Lazy table iteration (`handle[Symbol.iterator]`, `keys()`) | Moderate | August 2026 |
+| Filesystem policy (`filesystem: 'deny'`) | Moderate | August 2026 |
+| Tables as Maps (`tableAs: 'map'`) | High | August 2026 |
+| Read-only debug introspection (`get_stack()` / `get_locals()`) | Moderate | August 2026 |

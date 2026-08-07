@@ -16,7 +16,10 @@ public:
     std::string script,
     LuaContext* context,
     Napi::ObjectReference contextRef,
-    Napi::Promise::Deferred deferred)
+    Napi::Promise::Deferred deferred,
+    // Copied across the thread boundary with the source, for the same reason
+    // the source is: the worker thread must not touch a JS string.
+    std::string chunkName = "")
     : Napi::AsyncWorker(deferred.Env()),
       runtime_(std::move(runtime)),
       script_(std::move(script)),
@@ -25,7 +28,8 @@ public:
       // ObjectWrap) alive until this worker is destroyed, so OnOK/OnError can
       // safely use context_ even if JS drops its last reference meanwhile.
       contextRef_(std::move(contextRef)),
-      deferred_(deferred) {}
+      deferred_(deferred),
+      chunkName_(std::move(chunkName)) {}
 
 protected:
 
@@ -42,7 +46,7 @@ protected:
       lua_core::LuaRuntime* rt;
       ~Teardown() { rt->SetAsyncMode(false); rt->EndWorkerUnrefDeferral(); }
     } teardown{runtime_.get()};
-    result_ = runtime_->ExecuteScript(script_);
+    result_ = runtime_->ExecuteScript(script_, chunkName_);
   }
 
   void OnOK() override;
@@ -54,6 +58,7 @@ private:
   LuaContext* context_;
   Napi::ObjectReference contextRef_;
   Napi::Promise::Deferred deferred_;
+  std::string chunkName_;
   lua_core::ScriptResult result_;
 };
 
