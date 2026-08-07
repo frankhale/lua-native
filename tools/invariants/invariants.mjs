@@ -30,6 +30,7 @@ import {
 } from '../cpp-scan.mjs';
 import { surfaceCensus } from './surface-census.mjs';
 import { perfClaims } from './perf-claims.mjs';
+import { livenessGuarding } from './liveness-guarding.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const BINDING = join(ROOT, 'src/lua-native.cpp');
@@ -642,6 +643,12 @@ export const INVARIANTS = [
     title: 'Every piece of new surface is covered by an instrument or ledgered',
     compute: surfaceCensus,
     note: 'CORRECTNESS.md §15.6 computed. UNCLASSIFIED means nobody has ruled on that option / entry point / marker / frame — a review item, not automatically a defect. STALE LEDGER ENTRY and BROKEN LINK mean an excuse or a coverage claim that no longer refers to anything.',
+  },
+  {
+    id: 'liveness-guarding',
+    title: 'Binding paths that reach the core without establishing the state is still there',
+    compute: livenessGuarding,
+    note: 'C1 of CONTEXT-TEARDOWN-PLAN. An UNCHECKED row is NOT a defect today — nothing can retire a state under a live context. It is the set a context-level close() must rule on, and the plan classifies them: all but `Cancel -> RequestCancel` are covered by kRetireState\'s existing claims (AsyncInFlight | LuaExecuting | BindingCall), which refuse a close while any of them holds. A NEW row is a review item: it means a path reaches the core in a state the claim set may not cover.',
   },
   {
     id: 'perf-claims',

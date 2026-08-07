@@ -2928,6 +2928,108 @@ describe('lua-native Node adapter', () => {
   });
 
   // ============================================
+  // CONTEXT CLOSE (C2, CONTEXT-TEARDOWN-PLAN, August 7, 2026)
+  // ============================================
+  describe('dispose() — ending a context', () => {
+    it('ends the state and refuses every subsequent call', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      expect(lua.execute_script('return 6 * 7')).toBe(42);
+      lua.dispose();
+
+      expect(() => lua.execute_script('return 1')).toThrow(/context has been closed/);
+      expect(() => lua.info()).toThrow(/context has been closed/);
+      expect(() => lua.reset()).toThrow(/context has been closed/);
+      expect(() => lua.gc('collect')).toThrow(/context has been closed/);
+      expect(() => lua.set_global('x', 1)).toThrow(/context has been closed/);
+    });
+
+    it('invalidates every outstanding handle, naming the close', () => {
+      // Not "replaced by reset()", which the first draft said — that is another
+      // state's story, and the third liveness flag exists to tell them apart.
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('t = { a = 1 }');
+      const handle = lua.get_global_ref('t');
+      const fn = lua.execute_script('return function() return 1 end') as () => unknown;
+      lua.dispose();
+
+      expect(() => handle.get('a')).toThrow(/has been closed/);
+      expect(() => fn()).toThrow(/has been closed/);
+    });
+
+    it('is idempotent', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.dispose();
+      expect(() => lua.dispose()).not.toThrow();
+      expect(() => lua.dispose()).not.toThrow();
+    });
+
+    it('leaves close(coroutine) alone', () => {
+      // close(coroutine) is unaffected: dispose() is the context verb.
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const coro = lua.create_coroutine('return function() coroutine.yield(1) end');
+      lua.resume(coro);
+      expect(() => lua.close(coro)).not.toThrow();
+      // ...and the context is still alive after closing a coroutine.
+      expect(lua.execute_script('return 1')).toBe(1);
+    });
+
+    it('releases the Lua memory without waiting for a collection', () => {
+      // The point of the feature. No global.gc() anywhere in this test.
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('t = {} for i = 1, 20000 do t[i] = ("x"):rep(50) end');
+      expect(lua.info().memoryBytes).toBeGreaterThan(1_000_000);
+      lua.dispose();
+      expect(() => lua.info()).toThrow(/context has been closed/);
+    });
+
+    it('survives the collection of a disposed context', async () => {
+      // The C2 defect this pins: ~LuaContext calls DetachRuntimeHandlers on
+      // every context, which re-installs the execution hook — and after
+      // dispose() that was lua_sethook(nullptr, ...), a segfault at whatever
+      // later moment the context happened to be collected.
+      for (let i = 0; i < 30; i += 1) {
+        const doomed = new lua_native.init({}, ALL_LIBS);
+        doomed.execute_script('t = {} for j = 1, 100 do t[j] = j end');
+        const handle = doomed.get_global_ref('t');
+        doomed.dispose();
+        expect(() => handle.get(1)).toThrow(/has been closed/);
+      }
+      // Give the collector a chance to run the finalizers for all of them.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const survivor = new lua_native.init({}, ALL_LIBS);
+      expect(survivor.execute_script('return 1 + 1')).toBe(2);
+    });
+
+    it('treats cancel() on a closed context as a no-op', () => {
+      // cancel() is deliberately outside the occupancy guards so it can work
+      // mid-run, which makes it the one path close() must guard by hand.
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.dispose();
+      expect(() => lua.cancel()).not.toThrow();
+    });
+
+    it('is refused while an async run holds the state', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const running = lua.execute_script_async('local s = 0 for i = 1, 200000 do s = s + i end return s');
+      expect(() => lua.dispose()).toThrow(/async|in flight|busy/i);
+      await running;
+      expect(() => lua.dispose()).not.toThrow();
+    });
+
+    it('is refused from inside a host callback, where Lua holds the state', () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let inner: string | null = null;
+      lua.set_global('tryClose', () => {
+        try { lua.dispose(); inner = 'no throw'; } catch (e) { inner = (e as Error).message; }
+      });
+      lua.execute_script('tryClose()');
+      expect(inner).toMatch(/dispose\(\)/);
+      // ...and the context survived the attempt.
+      expect(lua.execute_script('return 1')).toBe(1);
+    });
+  });
+
+  // ============================================
   // DEBUG INTROSPECTION (R1, FIDELITY-AND-REACH-PLAN, August 7, 2026)
   // ============================================
   describe('get_stack / get_locals', () => {

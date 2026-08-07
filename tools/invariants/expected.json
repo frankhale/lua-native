@@ -105,6 +105,7 @@
     "<kSyncApi default>": "kSyncApi",
     "execute_script_async()": "kExclusive",
     "execute_file_async()": "kExclusive",
+    "dispose()": "kRetireState",
     "reset()": "kRetireState"
   },
   "greppable-counts": {
@@ -121,8 +122,8 @@
   },
   "assertion-strength": {
     "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
-    "toThrow assertions examined": 471,
-    "negative (.not) — exempt by design": 37,
+    "toThrow assertions examined": 486,
+    "negative (.not) — exempt by design": 42,
     "BARE positive assertions": 0
   },
   "exception-surface": {
@@ -134,13 +135,13 @@
     "lua_pcall calls (core)": 8
   },
   "scanner-coverage": {
-    "binding: functions found": 146,
+    "binding: functions found": 147,
     "binding: static Napi::Value SymbolIteratorKey(Napi::Env env);": "declaration",
     "binding: static LuaTableRefData* TableRefDataFrom(const Napi::Value& value);": "declaration",
     "binding: static LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value);": "declaration",
     "binding: NODE_API_MODULE(NODE_GYP_MODULE_NAME, InitModule)": "macro-invocation",
     "binding: unattributed": 0,
-    "core: functions found": 176,
+    "core: functions found": 178,
     "core: unattributed": 0
   },
   "core-call-guarding": {
@@ -327,6 +328,31 @@
     "F. binding-balance containers": 13,
     "F. members covered beyond the universe": 2,
     "F. retaining members UNCLASSIFIED": 0
+  },
+  "liveness-guarding": {
+    "LuaContext::StageJsError -> get": "UNCHECKED",
+    "LuaContext::StageJsError -> SetPendingErrorValue": "UNCHECKED",
+    "LuaContext::LuaErrorToJsValue -> TakeLastErrorValue": "UNCHECKED",
+    "LuaContext::CreateJsCallbackWrapper -> get": "UNCHECKED",
+    "LuaContext::CreateJsCallbackWrapper -> IsAwaitDriverMode": "UNCHECKED",
+    "LuaContext::CreateJsCallbackWrapper -> RequestAwaitYield": "UNCHECKED",
+    "LuaContext::DriveAsync -> ResumeAsyncStep": "UNCHECKED",
+    "LuaContext::DriveAsync -> IsCancelRequested": "UNCHECKED",
+    "LuaContext::OnAwaitSettled -> HasPendingErrorValue": "UNCHECKED",
+    "LuaContext::OnAwaitSettled -> TakePendingErrorValue": "UNCHECKED",
+    "LuaContext::FinishAsync -> SetAwaitDriverMode": "UNCHECKED",
+    "LuaContext::FinishAsync -> SetAwaitDriverThread": "UNCHECKED",
+    "LuaContext::FinishAsync -> ClearCancel": "UNCHECKED",
+    "LuaContext::Cancel -> RequestCancel": "UNCHECKED",
+    "LuaContext::NapiToCoreImpl -> RegisterReclaimableHostFunction": "UNCHECKED",
+    "LuaContext::NapiToCoreImpl -> get": "UNCHECKED",
+    "LuaContext::TableRefToMap -> TablePairs": "UNCHECKED",
+    "LuaContext::TableRefToMap -> RefHasMetatable": "UNCHECKED",
+    "LuaContext::CoreToNapi -> Call": "UNCHECKED",
+    "LuaContext::RefForThisRuntime -> get": "UNCHECKED",
+    "LuaContext::CoreToNapiBuiltin -> RefHasMetatable": "UNCHECKED",
+    "binding -> core edges": 143,
+    "UNCHECKED": 21
   },
   "perf-claims": {
     "README.md: Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_b...": "COVERED by A4-bytecode-start (C4)",

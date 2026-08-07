@@ -29,6 +29,38 @@ export const EVENTS = [
     expect: 'refuses',
     apply: (lua) => lua.reset(),
   },
+  // C2 (CONTEXT-TEARDOWN-PLAN, August 7, 2026). `close()` retires the state for
+  // good, so every handle kind must refuse — and must say *closed*, not
+  // "replaced by reset()", which the first draft did. These events are the
+  // reason the third liveness flag exists.
+  //
+  // **Prefixed `context-`, and the first run is why.** They were `close` and
+  // `close-twice`, which are *already event ids here* — meaning
+  // `close(coroutine)` and closing it twice. The ids collided silently and
+  // `coroutine x close-twice` resolved against the wrong expectation, which is
+  // how a matrix reports a finding that is really a name clash. One vocabulary,
+  // two subjects: say which.
+  {
+    id: 'context-close',
+    expect: 'refuses',
+    retiresContext: true,
+    apply: (lua) => lua.dispose(),
+  },
+  {
+    id: 'context-close-twice',
+    expect: 'refuses',
+    retiresContext: true,
+    // Idempotent by contract, matching release() and close(coroutine).
+    apply: (lua) => { lua.dispose(); lua.dispose(); },
+  },
+  {
+    id: 'reset-then-context-close',
+    expect: 'refuses',
+    retiresContext: true,
+    // The two retirement paths in sequence: a handle stranded by the reset must
+    // not start answering again because a second retirement re-minted anything.
+    apply: (lua) => { lua.reset(); lua.dispose(); },
+  },
   {
     id: 'reset-twice',
     expect: 'refuses',

@@ -56,6 +56,7 @@ Current; changed when the feature changes.
 | [`INTEROP-PARITY-PLAN.md`](reviews/INTEROP-PARITY-PLAN.md) | The August 5, 2026 interop work: five gaps the survey's enumeration had no row for, because it was organised by capability and every capability answered yes. All implemented; the banner carries the three defects found while building that the plan itself did not predict. |
 | [`UNSEARCHED-REGIONS-PLAN.md`](reviews/UNSEARCHED-REGIONS-PLAN.md) | The August 6, 2026 unsearched-region work (W1–W5), planned and executed the same day. Read for the execution records, three of which contradict the premise that motivated the work. Its closing condition survives in [`CORRECTNESS.md`](CORRECTNESS.md) §15.10. |
 | [`FIDELITY-AND-REACH-PLAN.md`](reviews/FIDELITY-AND-REACH-PLAN.md) | The August 7, 2026 fidelity and reach work. Three defects found by driving the addon (a silent key drop in the documented remedy for silent key drops, a wrong shipped type, and a JS→Lua loss `LIMITATIONS.md` §5 had no row for), plus `chunkName`, lazy table iteration, `filesystem: 'deny'`, `tableAs: 'map'` and read-only debug introspection. Read it for the six defects the machinery caught *while the work was happening* — that ratio is the argument for the machinery. |
+| [`CONTEXT-TEARDOWN-PLAN.md`](reviews/CONTEXT-TEARDOWN-PLAN.md) | The August 7, 2026 context-lifetime work: `dispose()`, the `liveness-guarding` census, and `LIMITATIONS.md` §10. Read §0 for a finding measured before it was designed for — and disproved in the direction that would have justified the most work. |
 | [`PERFORMANCE-PLAN.md`](reviews/PERFORMANCE-PLAN.md) | The August 6, 2026 cost search, planned and executed the same day. Read for the four things it got wrong — two of them defects in the plan rather than in the harness or the product, including a control that would have failed against a correct classifier. The instrument is `tools/crossing-cost`. |
 
 **There is no roadmap document.** New work must not start from either survey's
@@ -66,7 +67,7 @@ task*: a `LuaRuntime` is single-threaded by construction, so parallelism means N
 contexts plus a scheduler, which userland can build over `execute_script_async`
 today.
 
-**Four plan documents have been written and executed, and all four are now in
+**Five plan documents have been written and executed, and all five are now in
 `reviews/`.** They are worth knowing about because between them they set the bar
 for the next one.
 

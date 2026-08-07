@@ -501,6 +501,20 @@ std::optional<std::vector<std::pair<std::string, LuaPtr>>> LuaRuntime::GetLocals
 }
 
 void LuaRuntime::InstallExecutionHook() {
+  // **A closed state has no hook to install** (C2, August 7, 2026). This is the
+  // one core method the binding legitimately reaches *after* `dispose()`:
+  // `~LuaContext` calls `DetachRuntimeHandlers()` unconditionally, which calls
+  // `RemoveDebugHook()`, which re-installs. With `L_` already null that is
+  // `lua_sethook(nullptr, ...)` — and it segfaulted every disposed context at
+  // its later collection, which only showed up in a full suite run because a
+  // short one never got round to collecting.
+  //
+  // This is exactly the risk `CONTEXT-TEARDOWN-PLAN` §2 named for option (B) —
+  // *every core method assumes `L_` is valid* — arriving at the one path C1's
+  // census could not see, because C1 ranges over JS-reachable paths and this one
+  // is reached from a destructor.
+  if (!L_) return;
+
   // One installation serves every consumer: OR the masks, and when more than
   // one wants the count event use the finest interval (each tallies to its own).
   int mask = debug_hook_ ? debug_hook_mask_ : 0;
@@ -779,7 +793,23 @@ LuaRuntime::LuaRuntime(const RuntimeConfig& config) : config_(config) {
   InitState();
 }
 
-LuaRuntime::~LuaRuntime() {
+// C2 (CONTEXT-TEARDOWN-PLAN): end the state now, on request.
+//
+// **This is the destructor's body, extracted rather than copied.** Every line
+// below is ordering that took several review passes to get right — error values
+// unref'd while the state is still open, the five bridging handlers cleared
+// before `lua_close` fires the `__gc` metamethods that reach them (M2, CR-11
+// F5), the count-hook removed so a finalizer cannot trip the instruction limit.
+// A second teardown path that reimplemented any of that would be wrong within a
+// commit, so `~LuaRuntime` now calls this and does nothing else.
+//
+// Idempotent: `L_ == nullptr` is the closed state, and every caller of this
+// class already guards on it (the `if (L_)` tests below predate this method).
+void LuaRuntime::CloseState() {
+  if (!L_) return;
+  // Before anything else: every outstanding registry-slot owner reads this, and
+  // from here their unref must become a no-op (see MakeRegistryOwner).
+  if (state_open_) state_open_->store(false);
   // Drop any registry-backed error values while the Lua state is still open;
   // their RAII owners call luaL_unref, which must run before lua_close.
   last_error_value_.reset();
@@ -817,6 +847,8 @@ LuaRuntime::~LuaRuntime() {
     L_ = nullptr;
   }
 }
+
+LuaRuntime::~LuaRuntime() { CloseState(); }
 
 // --- Userdata metatable registration ---
 
@@ -1038,6 +1070,11 @@ LuaRuntime* detail::OwningRuntime(lua_State* L) {
   lua_pop(L, 1);
   if (!mainL) mainL = L;  // defensive, as in MakeRegistryOwner
   return *static_cast<LuaRuntime**>(lua_getextraspace(mainL));
+}
+
+std::shared_ptr<std::atomic<bool>> detail::StateOpenToken(lua_State* L) {
+  if (const LuaRuntime* runtime = OwningRuntime(L)) return runtime->StateOpenFlag();
+  return nullptr;
 }
 
 void detail::UnrefRegistrySlot(lua_State* mainL, int ref) {

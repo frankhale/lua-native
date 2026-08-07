@@ -114,7 +114,16 @@ function classify(r, event) {
   // the correction to CR-22 F1's first draft, which expected refusals here and
   // reported the resulting deep copies as an encapsulation break.
   const spec = HANDLES.find((h) => h.id === r.handleId);
-  const expectation = (spec && spec.notAHandle && event.expect === 'refuses')
+  // …**unless the event retires the context itself** (C2's `close`, August 7,
+  // 2026). The override above assumes the *state* went away and the context
+  // survived, which is true of `reset` and false of `close`: every `use` in
+  // this matrix goes through the context (`set_global`, `execute_script`), so
+  // when the context is gone nothing is usable, the caller's own JS object
+  // included. Without this clause the three `notAHandle` kinds reported
+  // UNEXPECTED-REFUSAL on all three close events — nine cells, and the dirt was
+  // the harness's model, not the product's behaviour.
+  const contextGone = event.retiresContext === true;
+  const expectation = (spec && spec.notAHandle && event.expect === 'refuses' && !contextGone)
     ? 'works' : event.expect;
 
   if (expectation === 'works') {

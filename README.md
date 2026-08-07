@@ -3608,6 +3608,29 @@ fn(21); // throws: Lua function has been released
 **Throws:** `TypeError` if the value holds no Lua reference; Error if the value
 belongs to a different Lua context
 
+### `LuaContext.dispose()`
+
+Ends the context: closes its Lua state now rather than at some later garbage
+collection.
+
+Afterwards every method on the context refuses, and every outstanding handle
+refuses too. Idempotent. Refused while the state is held — during execution,
+from inside a host callback, or with an async run in flight.
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "sandbox" });
+try {
+  lua.execute_script(untrusted);
+} finally {
+  lua.dispose();
+}
+```
+
+Dropping the last reference to a context does **not** end it — V8 decides when,
+and a single outstanding handle pins the whole state
+([LIMITATIONS.md](docs/LIMITATIONS.md) §10). `dispose()` is the verb for "I am
+done with this". It is not `close()`, which belongs to coroutines.
+
 ### `LuaContext.reset()`
 
 Discards the Lua state and replaces it with a fresh one carrying the same

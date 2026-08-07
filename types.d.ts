@@ -1973,6 +1973,47 @@ export interface LuaContext {
    * lua.execute_script('return x');   // null — the state was reset
    * lua.execute_script('log("hi")');  // callbacks still work
    */
+  /**
+   * Ends this context: closes its Lua state now, rather than when the garbage
+   * collector gets to it.
+   *
+   * Named `dispose()` rather than overloading `close()`, deliberately: a bare
+   * `close()` is an error ("requires a coroutine object"), and that error is
+   * the guard against a typo. Making it destroy the context instead would put a
+   * destructive branch behind a forgotten argument.
+   *
+   * After it returns, every method on this context refuses with "the Lua
+   * context has been closed", and **every outstanding handle refuses too** —
+   * table handles, function handles, coroutines — naming the close rather than
+   * a reset. Idempotent: closing a closed context is a no-op, like
+   * {@link release}.
+   *
+   * **Why you would call it.** Dropping the last reference to a context does
+   * *not* end it — V8 decides when, and a single outstanding handle pins the
+   * whole state indefinitely (`LIMITATIONS.md` §10). If you are creating
+   * contexts in a loop, or want a sandbox's capabilities to stop at a moment
+   * you choose, this is the verb.
+   *
+   * Refused while the state is held: during execution, from inside a host
+   * callback, and while an async run is in flight — the same policy `reset()`
+   * uses, for the same reason. `cancel()` on a closed context is a no-op rather
+   * than an error, since cancelling something already ended is a request that
+   * has been granted.
+   *
+   * **What it frees:** the `lua_State`, which is where the memory is. The C++
+   * wrapper survives while any handle still holds a reference to it — that is
+   * what keeps a stale handle from reaching freed memory.
+   *
+   * @example
+   * const lua = new lua_native.init({}, { libraries: 'sandbox' });
+   * try {
+   *   lua.execute_script(untrusted);
+   * } finally {
+   *   lua.dispose();    // the state ends here, not at some later GC
+   * }
+   */
+  dispose(): void;
+
   reset(): void;
 
   /**

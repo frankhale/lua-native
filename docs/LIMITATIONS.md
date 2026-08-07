@@ -564,6 +564,64 @@ than part-way through a port.
 
 ---
 
+## 10. A context's Lua state ends when the garbage collector says so
+
+**Driven August 7, 2026**, because the shape of this is easy to guess wrong in
+both directions.
+
+A `LuaContext` owns a `lua_State`, and that state is freed when the JavaScript
+wrapper is collected. Two consequences, neither of them previously written down
+outside a code comment:
+
+**A live handle pins the entire runtime.** Every handle — `get_global_ref`,
+`create_table`, a returned `LuaFunction`, a coroutine — holds a share of the
+runtime, deliberately: it is what guarantees a handle can never outlive the
+state its registry reference points into. The cost is that **one forgotten
+handle keeps a whole `lua_State` alive**, with everything in it, for as long as
+the handle is reachable. Driven: twenty contexts dropped and collected, and a
+twenty-first with a single `get_global_ref` outstanding **was not collected**.
+Call `release()` on handles you are finished with; it is not only about the
+registry slot.
+
+**Collection is not deterministic.** Dropping the last reference to a context
+does not end it — V8 decides when. Driven: twenty contexts, references dropped,
+**none** collected after half a second of ordinary operation; nineteen of twenty
+after one forced collection. If you are creating contexts in a loop, the states
+accumulate until a collection happens.
+
+> **What is *not* true**, because the obvious measurement suggests it: process
+> RSS does not fall when contexts are collected — 127 MB before and 130 MB after,
+> in the probe above. That is the process allocator declining to return pages,
+> not a leak, and not something this binding controls. The states really are
+> closed; `~LuaRuntime` runs `lua_close`.
+
+### The fix: `dispose()` (added August 7, 2026)
+
+```js
+const lua = new lua_native.init({}, { libraries: 'sandbox' });
+try {
+  lua.execute_script(untrusted);
+} finally {
+  lua.dispose();     // the state ends here, not at some later collection
+}
+```
+
+`dispose()` closes the `lua_State` immediately. Afterwards every method on the
+context refuses, and **every outstanding handle refuses too** — naming the
+dispose rather than a reset. Idempotent, and refused while the state is held
+(during execution, inside a host callback, or with an async run in flight), the
+same policy `reset()` uses.
+
+It is `dispose()` and not `close()` deliberately: `close(coroutine)` already
+exists, and a bare `close()` is an error. Making that error destroy the context
+instead would put a destructive branch behind a forgotten argument.
+
+**`reset()` remains the tool for the other job** — retire this state and give me
+a fresh one — which releases everything the old state held without ending the
+context.
+
+---
+
 ## Checked and *not* limitations
 
 Recorded so they are not re-investigated. Each was verified on August 4, 2026.

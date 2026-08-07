@@ -1172,6 +1172,7 @@ Napi::Object LuaContext::Init(const Napi::Env env, const Napi::Object exports) {
     InstanceMethod("get_locals", &LuaContext::GetLocals),
     InstanceMethod("add_searcher", &LuaContext::AddSearcher),
     InstanceMethod("release", &LuaContext::Release),
+    InstanceMethod("dispose", &LuaContext::Dispose),
     InstanceMethod("reset", &LuaContext::Reset),
     InstanceMethod("gc", &LuaContext::GC)
   });
@@ -3586,6 +3587,21 @@ bool LuaContext::RejectIfOccupied(const char* op,
                                   const lua_occupancy::Claim disallowed,
                                   const char* detail) const {
   using lua_occupancy::Claim;
+
+  // C2: a closed context refuses everything, and the check lives *here* rather
+  // than in each method because that is what makes it complete. Every entry
+  // point that reaches the core through a guard already calls this or
+  // `RejectIfBusy`, which delegates to it — so `liveness-guarding`'s CHECKED
+  // rows are closed-safe by construction, and its 21 UNCHECKED rows are exactly
+  // the list that had to be ruled on by hand (twenty covered by the claim set
+  // below, one — `cancel()` — guarded explicitly at its own site).
+  if (closed_) {
+    Napi::Error::New(env, op
+      ? std::string(op) + " is unavailable: the Lua context has been closed"
+      : std::string("the Lua context has been closed"))
+      .ThrowAsJavaScriptException();
+    return true;
+  }
   const auto wants = [disallowed](const Claim c) {
     return lua_occupancy::Any(disallowed & c);
   };
@@ -4275,6 +4291,17 @@ Napi::Value LuaContext::OnAwaitRejectStatic(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value LuaContext::Cancel(const Napi::CallbackInfo& info) {
+  // C1's one outlier. `cancel()` is deliberately outside the occupancy guards —
+  // it has to work *while* a run is in flight, which is the whole point of it —
+  // so it is the single binding→core path that the `kRetireState` claim set
+  // does not cover for a closed context. Guarded here, explicitly, rather than
+  // by weakening the policy that makes cancel useful.
+  //
+  // A no-op rather than a throw: cancelling a context that has already ended is
+  // a request that has already been granted, and code that cancels on a timer
+  // or an abort signal should not have to know which happened first.
+  if (closed_) return env.Undefined();
+
   if (AsyncDriverEngaged()) {
     if (async_resuming_) {
       // Called re-entrantly from a host callback while the coroutine is still
@@ -4432,6 +4459,87 @@ Napi::Value LuaContext::Release(const Napi::CallbackInfo& info) {
 // runtime.get()` identity checks elsewhere (resume, release, round-trip markers)
 // stop recognizing pre-reset coroutines and userdata as belonging to this
 // context.
+// C2 (CONTEXT-TEARDOWN-PLAN): end this context now.
+//
+// **Named `dispose()`, and the first name was wrong.** It shipped for an hour as
+// a no-argument `close()`, dispatching on arity beside `close(coroutine)` — on
+// the reasoning that a bare `close()` already threw, so nothing could depend on
+// it. The suite disproved that immediately: a P3 test pins
+// `close()` -> "requires a coroutine object", and it exists because that throw
+// is the *guard* against a typo. Under arity dispatch, `lua.close()` written
+// while meaning `lua.close(coro)` would have silently destroyed the context
+// instead of refusing — a destructive branch reached by omission, which is the
+// accept-and-do-something-else shape this tree refuses everywhere else. One
+// verb per subject: `close(coroutine)` ends a coroutine, `dispose()` ends the
+// context.
+//
+// **The retire half of `reset()` without the rebuild half**, which is exactly
+// what the plan's §2 (B) asked for: the same guard, the same unbinding order,
+// and then `CloseState()` instead of a swap. Sharing the ordering with the
+// destructor (via `CloseState`) is what keeps this from being a third teardown
+// path that drifts.
+//
+// Guarded by `kRetireState` — `AsyncInFlight | LuaExecuting | BindingCall |
+// Resetting` — which is the whole reason this method can exist. C1 enumerated
+// the 21 binding paths that reach the core without a liveness check; twenty of
+// them run only while Lua executes, while a binding call is in flight, or as an
+// async continuation, and each of those states is a claim this policy refuses.
+// So a close cannot be granted while anything that could still touch the state
+// is outstanding.
+//
+// **What it does not free:** the C++ `LuaRuntime` shell, while any handle still
+// holds a share of it. That is `shared_ptr` semantics and deliberately not
+// fought; what it frees is the `lua_State`, which is where the memory is.
+Napi::Value LuaContext::Dispose(const Napi::CallbackInfo& /*info*/) {
+  // Idempotent, and tested *before* the guard: closing a closed context is a
+  // no-op rather than an error, matching `release()` and `close(coroutine)`.
+  // Ordering matters — the guard would otherwise refuse the second call with
+  // "the context has been closed", which is true and useless.
+  if (closed_) return env.Undefined();
+  if (RejectIfOccupied("dispose()", lua_occupancy::kRetireState)) {
+    return env.Undefined();
+  }
+
+  // Set first: `CloseState()` below fires `__gc` metamethods, and a finalizer
+  // that re-enters the host must find a context that refuses rather than one
+  // half-way through teardown. This is the same hazard `in_reset_` covers for
+  // reset(), answered by the flag that is about to be permanent anyway.
+  closed_ = true;
+  if (closed_flag_) closed_flag_->store(true);
+
+  // Unbind the runtime's handlers before anything can call them, exactly as
+  // reset() does before its swap.
+  DetachRuntimeHandlers();
+
+  if (async_co_) {
+    async_co_->release();
+    async_co_.reset();
+  }
+  async_borrowed_ = nullptr;
+  async_coro_obj_.Reset();
+  async_coroutine_mode_ = false;
+
+  // Every outstanding handle refuses from here: `RejectIfWorkerBusy` and the
+  // handle methods test `ContextLive()`, which reads this flag. Not re-minted,
+  // unlike reset()'s — there is no successor state to hand out.
+  if (alive_) alive_->store(false);
+
+  // The bookkeeping described the contents of a state that is about to stop
+  // existing. The id counters stay monotonic, as in reset().
+  js_callbacks_.clear();
+  js_userdata_.clear();
+  ud_method_fns_.clear();
+  js_error_registry_.clear();
+  registered_classes_.clear();
+  class_accessors_.clear();
+
+  if (runtime) {
+    runtime->ClearHostFunctions();
+    runtime->CloseState();
+  }
+  return env.Undefined();
+}
+
 Napi::Value LuaContext::Reset(const Napi::CallbackInfo& /*info*/) {
   // reset() retires the lua_State, so *any* holder is a conflict — which is
   // what kRetireState says, and saying it is the entire guard. Four separate

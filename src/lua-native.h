@@ -231,10 +231,19 @@ inline constexpr Claim kRetireState = kExclusive | Claim::Resetting;
 struct ContextLiveness {
   std::shared_ptr<std::atomic<bool>> handles;
   std::shared_ptr<std::atomic<bool>> context;
+  // C2: set once by close(), never cleared. A third flag rather than an
+  // inference, because from a handle's side a closed context and a reset one
+  // are identical — `handles` is false in both — and the *first* draft of
+  // close() therefore told the caller its state "was replaced by reset()".
+  // That is another state's story, which is the defect class this tree calls
+  // answering with another state's data.
+  std::shared_ptr<std::atomic<bool>> closed;
 
   [[nodiscard]] bool HandlesLive() const { return handles && handles->load(); }
   [[nodiscard]] bool ContextObjectLive() const { return context && context->load(); }
+  [[nodiscard]] bool Closed() const { return closed && closed->load(); }
   [[nodiscard]] const char* DeadReason() const {
+    if (Closed()) return "its Lua context has been closed";
     return ContextObjectLive()
       ? "its Lua state was replaced by reset(); acquire a new handle"
       : "its Lua context has been destroyed";
@@ -497,6 +506,8 @@ public:
     Napi::Value GetStack(const Napi::CallbackInfo& info);
     Napi::Value GetLocals(const Napi::CallbackInfo& info);
     Napi::Value Release(const Napi::CallbackInfo& info);
+    // C2: end the context now (CONTEXT-TEARDOWN-PLAN).
+    Napi::Value Dispose(const Napi::CallbackInfo& info);
     Napi::Value Reset(const Napi::CallbackInfo& info);
     Napi::Value GC(const Napi::CallbackInfo& info);
 
@@ -930,7 +941,7 @@ private:
     // The liveness pair every handle this context mints must carry. One place
     // that assembles it, so the two flags cannot be paired up wrongly at a new
     // mint site (see ContextLiveness for why there are two).
-    [[nodiscard]] ContextLiveness Liveness() const { return {alive_, context_alive_}; }
+    [[nodiscard]] ContextLiveness Liveness() const { return {alive_, context_alive_, closed_flag_}; }
 
     // Returns `ref` unchanged if it belongs to this context's current runtime,
     // and an already-released copy of it otherwise. Every registry-backed
@@ -1180,6 +1191,14 @@ private:
     // this mode; this flag is what tells CoreToNapiBuiltin to materialize one
     // as a Map rather than hand back a live Proxy.
     bool table_as_map_ = false;
+
+    // C2: set by close(), never cleared. Every guard consults it, so a closed
+    // context refuses instead of touching a state that is gone. The shared flag
+    // beside it is the one handles read — minted once, so a handle taken before
+    // the close sees the same object the close flips.
+    bool closed_ = false;
+    std::shared_ptr<std::atomic<bool>> closed_flag_ =
+        std::make_shared<std::atomic<bool>>(false);
 
     // `binaryStrings`: return every Lua string as a Uint8Array of its raw bytes
     // instead of decoding it as UTF-8 (LIMITATIONS.md §2).

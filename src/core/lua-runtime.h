@@ -75,13 +75,28 @@ void UnrefRegistrySlot(lua_State* mainL, int ref);
 // every conversion path rather than the ones someone remembered to annotate.
 LuaRuntime* OwningRuntime(lua_State* L);
 
+// The owning runtime's "state still open" flag, captured while it certainly is.
+// Shared, so it stays readable after the LuaRuntime itself is gone.
+std::shared_ptr<std::atomic<bool>> StateOpenToken(lua_State* L);
+
 inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   if (!L || ref == LUA_NOREF || ref == LUA_REFNIL) return nullptr;
   lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
   lua_State* mainL = lua_tothread(L, -1);
   lua_pop(L, 1);
   if (!mainL) mainL = L;  // defensive: LUA_RIDX_MAINTHREAD is always populated
-  return {nullptr, [mainL, ref](void*) {
+  // **The token is what makes `close()` survivable, and the sentence above is
+  // why it had to exist** (C2, August 7, 2026). "The main thread stays valid
+  // until lua_close" was true when `lua_close` ran only from `~LuaRuntime` —
+  // which cannot happen while a handle lives, because every handle holds a
+  // share of the runtime. `CloseState()` broke that: the state can now end
+  // while handles are outstanding, and the first build without this segfaulted
+  // (exit 139) the moment one was finalized afterwards — `luaL_unref` into a
+  // freed state. The slot died with the state, so the deleter's job is to
+  // notice and do nothing.
+  auto token = StateOpenToken(mainL);
+  return {nullptr, [mainL, ref, token](void*) {
+    if (token && !token->load()) return;
     UnrefRegistrySlot(mainL, ref);
   }};
 }
@@ -692,6 +707,14 @@ public:
   // **What it deliberately does not close**, so the bound is stated rather than
   // assumed: process execution (`os.execute`, `io.popen`) is not filesystem
   // access and is not touched. Omit `os`/`io` if you need that gone.
+  // Ends the Lua state now instead of at destruction (C2). Idempotent; after it
+  // returns, `IsClosed()` is true and **no method on this object may be called**
+  // — the binding is responsible for that, and `liveness-guarding` is the census
+  // that says which paths could still try.
+  void CloseState();
+  [[nodiscard]] std::shared_ptr<std::atomic<bool>> StateOpenFlag() const { return state_open_; }
+  [[nodiscard]] bool IsClosed() const { return L_ == nullptr; }
+
   void SetFilesystemAccess(bool allow);
 
   // `tableAs: 'map'` (T1). Must be set before any conversion; the binding sets
@@ -1251,6 +1274,10 @@ private:
   // deep-copying them into a string-keyed LuaTable, so their real keys survive
   // for the binding to render. See PreserveTableKeys in the .cpp.
   bool preserve_table_keys_ = false;
+  // Flipped by CloseState() before lua_close. Registry-slot owners capture it
+  // so a handle finalized after the state ended unrefs nothing.
+  std::shared_ptr<std::atomic<bool>> state_open_ =
+      std::make_shared<std::atomic<bool>>(true);
 
   // Hands `text` to the output handler, if one is installed and this is not a
   // worker-thread run. Returns false when the caller should write to stdout
