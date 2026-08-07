@@ -1459,11 +1459,11 @@ process for a crash to be a data point rather than the end of the run.
 
 ## 3. The one thing that would outrank it
 
-**If shipping to Windows x64 or Intel macOS is on the roadmap, do platform
-verification and CI first.**
+**If shipping to Windows x64 is on the roadmap, do platform verification and CI
+first.**
 
-Two of three declared targets have never had a single test executed against
-them. That is a *certain* correctness gap for those users, against a *probable*
+One of the two declared targets has never had a single test executed against
+it. That is a *certain* correctness gap for those users, against a *probable*
 one from exception escape. And with no CI, 850 tests, four sanitizer harnesses
 and three matrices all depend on someone remembering to run them — a fair amount
 of what seventeen passes bought is currently protected by habit rather than by
@@ -1471,8 +1471,8 @@ process.
 
 If this stays a macOS/arm64 project for now, that reverses and CR-18 leads.
 
-Minimum useful version: build + TypeScript suite + C++ suite on macOS arm64,
-macOS x64 and Windows x64; `test-ts-asan` on at least one Linux or macOS runner.
+Minimum useful version: build + TypeScript suite + C++ suite on macOS arm64
+and Windows x64; `test-ts-asan` on at least one Linux or macOS runner.
 The sanitizer harnesses are documented as local-only in `CLAUDE.md`, which was a
 reasonable decision when they were new and is now the main thing standing
 between a regression and a release.
@@ -1531,7 +1531,7 @@ This is the largest of the three items and should follow CR-18, not precede it.
 | Priority | Task | Effort | Rationale |
 |---|---|---|---|
 | **1** | CR-18: exception-escape matrix | Medium | Last known-live family with no generated coverage; sanitizers blind to it; proven recipe |
-| **1 (if shipping cross-platform)** | CI + macOS x64 / Windows x64 verification | Medium | Two of three declared targets never executed; no automated regression protection |
+| **1 (if shipping cross-platform)** | CI + Windows x64 verification | Medium | One of two declared targets never executed; no automated regression protection |
 | **2** | Mechanize the remaining comment invariants | ~1 day | The only intervention that has stopped a class recurring |
 | **3** | Differential oracle against reference Lua | Large | Addresses the failure mode the code has moved to; no harness currently checks truth |
 
@@ -1802,15 +1802,15 @@ not the clean runs.
 > should be carried into a future pass.
 
 The only item here that is a decision rather than work, and the only one that
-can invalidate the end state. Two of three targets declared in `binding.gyp`
-have never had a test executed against them, there is no CI, and
+can invalidate the end state. One of the two targets declared in `binding.gyp`
+has never had a test executed against it, there is no CI, and
 `CODE-REVIEW-LEDGER` M5 (`MACOSX_DEPLOYMENT_TARGET` at `"26.0"`, a documented
 release blocker) sits in the same decision. Pick one:
 
-- **Narrow.** Drop the untested targets from `binding.gyp`, and the end state is
+- **Narrow.** Drop the untested target from `binding.gyp`, and the end state is
   honest and small: verified on macOS/arm64, which is what has actually been
   tested.
-- **Broaden.** CI on macOS arm64 + x64 and Windows x64, plus `test-ts-asan` on
+- **Broaden.** CI on macOS arm64 and Windows x64, plus `test-ts-asan` on
   one runner, and resolve M5.
 
 Doing neither means everything §§8–10 bought stays protected by habit.

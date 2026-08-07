@@ -390,7 +390,7 @@ state-of-tree caveats that stay open until acted on:
 
 ### F8 — prebuild coverage *(low, state-of-tree)* — 📄 DOCUMENTED (release-time task)
 - `prebuilds/` still contains **`darwin-arm64` only** (re-checked July 22,
-  2026) of the three declared platforms (macOS arm64/x64, Windows x64).
+  2026) of the two declared platforms (macOS arm64, Windows x64).
   Resolved by documentation: `docs/RELEASING.md` records the per-platform
   prebuild requirement, the legacy `lua-native.node` name to delete once real
   prebuilds exist, and the CR-3 M5 un-deferral — all release-time work, not
@@ -560,8 +560,8 @@ What remains, in the order it should be acted on:
 
 1. **Before the first publish for outside consumers** (release blockers, both
    already recorded in `docs/RELEASING.md`): lower `MACOSX_DEPLOYMENT_TARGET`
-   to `"11.0"` (CR-3 M5) and produce the missing `darwin-x64` / `win32-x64`
-   prebuilds (CR-5 F8).
+   to `"11.0"` (CR-3 M5) and produce the missing `win32-x64`
+   prebuild (CR-5 F8).
 2. **If the CMake build is ever offered as a supported Windows path:** verify
    the node-gyp-cache discovery on a real Windows machine or CI job (CR-5 F3
    caveat).

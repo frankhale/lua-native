@@ -35,10 +35,6 @@ supported platforms) and the still-deferred CODE-REVIEW-3 M5.
    prebuilds/win32-x64/node.napi.node
    ```
 
-   A macOS x64 consumer is not a supported target and falls through to the same
-   source build. That is the documented consequence of the scope decision, not a
-   packaging defect to fix here.
-
 3. **Reconcile the legacy prebuild name.** The committed
    `prebuilds/darwin-arm64/lua-native.node` predates `prebuildify` and does not
    follow its `node.napi.node` convention. `node-gyp-build` still resolves it

@@ -239,9 +239,9 @@ JSDoc claims spot-verified against the implementation (library lists,
   uses (`CMAKE_MSVC_RUNTIME_LIBRARY` needs 3.15); stock CMake 3.28–3.30
   installs fail to configure for no reason.
 
-### F8. Prebuilds cover one of three declared platforms as committed (low, state-of-tree) — ✅ DONE (documented in docs/RELEASING.md)
+### F8. Prebuilds cover one of two declared platforms as committed (low, state-of-tree) — ✅ DONE (documented in docs/RELEASING.md)
 
-`prebuilds/` contains only `darwin-arm64`. On win32-x64 and darwin-x64 a
+`prebuilds/` contains only `darwin-arm64`. On win32-x64 a
 published-package install falls back to `node-gyp rebuild`, which requires
 `VCPKG_ROOT` plus a vcpkg-installed Lua on the consumer's machine
 (`binding.gyp:17,21`) — i.e., install fails without a dev-style setup. Fine if

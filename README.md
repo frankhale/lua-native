@@ -17,10 +17,11 @@ data structures.
 - Pass JavaScript functions to Lua as callbacks
 - Bidirectional data exchange (numbers, strings, booleans, objects, arrays)
 - Type-system fidelity — `BigInt`, `Date`, `Map`, `Set`, `Buffer`/`TypedArray`, and `RegExp` convert to natural Lua representations, with 64-bit integer precision preserved in both directions; register app-specific converters in both directions with `register_type_converter()` and `register_from_lua_converter()`
+- Conversion controls — `binaryStrings` returns Lua strings as exact bytes for binary protocols, `tableAs: 'map'` preserves table keys a JS object cannot hold, and `strictConversion` turns every silent conversion loss into an error
 - Global variable management (get and set), including dotted paths (`set_global('config.db.host', v)`) that read and auto-create nested table fields
 - Call Lua functions by name with `call('greet', 'world')` — dotted paths included — without a `get_global` round-trip
 - Userdata support — pass JavaScript objects to Lua by reference with optional property access and method binding
-- Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, use overloaded operators, and inherit from another registered class with `extends`
+- Class / usertype binding — register a JS class with `register_class()` so Lua can construct instances (`Obj.new(...)`), call methods, access properties, use overloaded operators, and inherit from another registered class with `extends`; declare class-level members with `statics` and computed or validated fields with `properties`
 - Metatable support — attach metatables to Lua tables from JavaScript for operator overloading, custom indexing, and more, on a global name or any live table reference
 - Reference-based tables — metatabled tables returned from Lua are wrapped in JS Proxy objects, preserving metamethods across the boundary
 - Table reference API — create, read, write, and iterate Lua tables directly from JavaScript with `create_table()` and `get_global_ref()`, descending into nested tables by reference with `get_ref()`
@@ -28,19 +29,23 @@ data structures.
 - Shared state between contexts — publish one JS object as a global in several contexts with `createSharedTable()` and keep them in step with `set()` / `sync()`
 - Reference lifecycle — explicitly free the registry reference behind a returned Lua function, coroutine, or table reference with `release()`, so long-lived contexts don't accumulate Lua-side memory
 - Context reset — `reset()` swaps in a fresh Lua state with the same options and replays your callbacks, so a long-lived process can drop accumulated global state without rebuilding the context
+- Explicit teardown — `dispose()` tears the Lua state down for good and makes every later call refuse loudly, rather than leaving release up to the garbage collector
 - Module / require integration — register JS modules, add search paths, or resolve modules dynamically with a JS searcher (`add_searcher`) for Lua's `require()`
 - Output redirection — route Lua `print()` / `io.write()` to a JS handler via `set_print_handler` or the `print` option
+- Input redirection and virtual files — route `io.read` to a JS handler with `set_read_handler()`, and resolve `dofile` / `loadfile` through a JS callback with `set_file_reader()`, so a sealed context can serve files that never touch the disk
 - Bytecode guard — `allowBytecode: false` refuses untrusted binary chunks (blocks `load_bytecode` and forces `load()` to text-only)
-- Opt-in standard library loading with `'all'`, `'safe'`, and per-library presets
+- Opt-in standard library loading with the `'all'`, `'safe'` and `'sandbox'` presets, or an explicit list of libraries — `'sandbox'` is the sealed one, dropping `require`, `dofile`/`loadfile` and bytecode loading rather than just the `io`/`os`/`debug` libraries
+- Filesystem policy — `filesystem: 'deny'` closes every door Lua has to the disk in one option (`dofile`, `loadfile`, the `package` path/cpath searchers, `loadlib`, `io.open`, `os.remove`, …), while `require` keeps working for host-registered modules
 - Bytecode precompilation — compile Lua to bytecode with `compile()`, load with `load_bytecode()` for faster startup
 - Async execution via `execute_script_async` / `execute_file_async` — runs Lua on worker threads, returns Promises
 - Promise-aware async via `execute_async` — runs Lua as a main-thread coroutine that transparently `await`s JS Promises returned by host functions (with working callbacks and `cancel()`)
+- Awaiting through every door — `call_async()` awaits inside a function you hold (by name or as a `LuaFunction` reference, with no chunk compiled per call) and `resume_async()` does the same for a coroutine you drive yourself
 - Memory limits — cap Lua memory usage with `maxMemory` option, monitor with `get_memory_usage()`
 - State introspection — `info()` returns a diagnostics snapshot: Lua version, current memory, configured limits, and loaded libraries
-- Debug hooks — trace Lua execution from JavaScript with `set_hook()` (line, call, return, and instruction-count events) for profilers and debugger integrations
+- Debug hooks — trace Lua execution from JavaScript with `set_hook()` (line, call, return, and instruction-count events) for profilers and debugger integrations, and read the call stack from inside one with `get_stack()` / `get_locals()`
 - GC control — trigger, pause, step, and tune Lua's collector from JavaScript with `gc()`, using Lua's own `collectgarbage` command vocabulary
 - Execution limits — cap Lua VM instructions with `maxInstructions`, or wall-clock time with `timeout`, so infinite loops abort instead of hanging
-- Coroutine support with yield/resume semantics — created from a script or an existing Lua function, and iterable with `for..of` / `for await`
+- Coroutine support with yield/resume semantics — created from a script or an existing Lua function, and iterable with `for..of` / `for await`; `close()` runs a suspended coroutine's pending `<close>` handlers, which nothing else in the API will do
 - Error fidelity — Lua errors carry stack tracebacks, thrown JS `Error` objects round-trip with full fidelity (type, message, stack, custom props), and `pcall()` runs a function protected, returning `{ ok, value/error }`
 - Cross-platform support (Windows, macOS)
 - TypeScript support with full type definitions
@@ -56,14 +61,18 @@ the binary itself will load on older releases, but 20+ is the supported and
 tested floor (24 LTS recommended). Bun and Deno are supported through their
 N-API compatibility layers.
 
-NOTE: Prebuilt binaries are currently available for macOS (Apple Silicon/arm64).
-Intel Mac and Windows users will need to build from source. Linux has not been
-tested.
+NOTE: The supported targets are macOS (Apple Silicon/arm64) and Windows x64, and
+the published package ships a prebuilt binary for both — no C++ toolchain, no
+vcpkg, and no build step on install. Linux has not been tested.
 
 NOTE: The prebuilt binaries include Lua 5.5.0. If you need a
 different Lua version, you will need to build from source.
 
 ## Building from Source
+
+On a supported target you do not need any of this — the prebuilt binary is used
+automatically. Build from source to work on the addon itself, to link a
+different Lua version, or to run on a platform with no prebuild.
 
 Building compiles a native N-API addon that statically links Lua, so you need a
 C++17 toolchain and a Lua library in addition to Node.js. Linux has not been
@@ -160,7 +169,6 @@ chosen from your platform and architecture:
 | Platform            | Triplet             | Command                             |
 | ------------------- | ------------------- | ----------------------------------- |
 | macOS Apple Silicon | `arm64-osx`         | `vcpkg install lua`                 |
-| macOS Intel         | `x64-osx`           | `vcpkg install lua`                 |
 | Windows x64         | `x64-windows-static`| `vcpkg install lua:x64-windows-static` |
 
 On macOS the default triplets are already static, so a plain `vcpkg install lua`
@@ -740,20 +748,65 @@ lua.execute_script("print(math.floor(3.7))"); // 3
 lua.execute_script("print(os.clock())"); // works
 ```
 
-#### Safe preset (sandboxing)
+#### Safe preset
 
-The `'safe'` preset loads everything except `io`, `os`, and `debug` — ideal for
-running untrusted scripts:
+The `'safe'` preset loads everything except `io`, `os`, and `debug`:
 
 ```javascript
-const sandbox = new lua_native.init({}, { libraries: "safe" });
+const safe = new lua_native.init({}, { libraries: "safe" });
 
-sandbox.execute_script('print(string.upper("hello"))'); // "HELLO"
-sandbox.execute_script("print(math.floor(3.7))"); // 3
-sandbox.execute_script("print(type(io))"); // "nil" — io is not loaded
-sandbox.execute_script("print(type(os))"); // "nil" — os is not loaded
-sandbox.execute_script("print(type(debug))"); // "nil" — debug is not loaded
+safe.execute_script('print(string.upper("hello"))'); // "HELLO"
+safe.execute_script("print(math.floor(3.7))"); // 3
+safe.execute_script("print(type(io))"); // "nil" — io is not loaded
+safe.execute_script("print(type(os))"); // "nil" — os is not loaded
+safe.execute_script("print(type(debug))"); // "nil" — debug is not loaded
 ```
+
+**`'safe'` is not a sandbox**, and the name is about which libraries load rather
+than about what a script can reach. `base` still carries `dofile` and `loadfile`,
+and `package` still provides `require` with a writable `package.path` — so
+untrusted Lua under `'safe'` can execute any readable `.lua` file on the host.
+Use `'sandbox'` below, or add `filesystem: 'deny'`, if that is what you need.
+
+#### Sealed preset (`'sandbox'`)
+
+The `'sandbox'` preset is the sealed one. It loads the computational libraries
+and nothing that reaches outside the VM:
+
+```javascript
+const lua = new lua_native.init(
+  {},
+  {
+    libraries: "sandbox",
+    maxMemory: 256 * 1024,
+    maxInstructions: 1_000_000,
+  },
+);
+
+lua.execute_script('return string.upper("ok")'); // "OK" — base/string/math/table/utf8 are loaded
+lua.execute_script("return type(dofile)"); // "nil" — cleared from base
+lua.execute_script("return type(require)"); // "nil" — no package library
+lua.execute_script("return type(io)"); // "nil"
+```
+
+| | `'all'` | `'safe'` | `'sandbox'` |
+|---|---|---|---|
+| `io`, `os`, `debug` | ✅ | — | — |
+| `package` / `require` | ✅ | ✅ | — |
+| `dofile`, `loadfile` | ✅ | ✅ | — (cleared from `base`) |
+| bytecode loading | ✅ | ✅ | off by default |
+| `base`, `coroutine`, `table`, `string`, `math`, `utf8` | ✅ | ✅ | ✅ |
+
+`dofile` and `loadfile` are cleared after the libraries open, because they live
+in `base` and cannot be dropped by omitting a library without also losing
+`pairs`, `type` and `tostring`. `allowBytecode` defaults to `false` under this
+preset, since `string.dump` plus `load` would otherwise reach the bytecode
+loader; an explicit `allowBytecode: true` still wins. **The seal survives
+`reset()`** — it is part of the runtime config, not a constructor-only step.
+
+A sealed context is not a mute one: [`set_read_handler`](#input-redirection-and-virtual-files)
+and [`set_file_reader`](#input-redirection-and-virtual-files) give it input and
+files backed by JavaScript rather than by the disk.
 
 #### Selective loading (array)
 
@@ -1244,6 +1297,147 @@ lua.execute_script('print("captured")'); // [lua] captured
 lua.set_print_handler(null);              // back to stdout
 ```
 
+### Input Redirection and Virtual Files
+
+`set_print_handler` covers output. Two more handlers cover the ways Lua reads:
+`set_read_handler` routes `io.read`, and `set_file_reader` resolves `dofile` and
+`loadfile`. Both matter most in a sealed context, where the real ones are gone.
+
+#### Reading input — `set_read_handler()`
+
+Without it, a prompting script under a print handler has its output captured and
+then blocks on the process's real stdin:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all" });
+
+const lines = ["Ada", "42"];
+let i = 0;
+lua.set_read_handler(() => (i < lines.length ? lines[i++] : null));
+
+lua.execute_script("return io.read()"); // "Ada"
+lua.execute_script('return io.read("n")'); // 42 — a number, like real io.read("n")
+```
+
+The handler receives the format as Lua passes it — `'l'`, `'n'`, `'a'`, or a
+**number** for a byte count, with the Lua 5.3 `*` prefix already stripped so only
+one spelling is ever seen. Return `null` for end-of-input; an empty string is a
+valid empty line. Returning a `Uint8Array` or `Buffer` sends those exact bytes to
+Lua, which is the only way to feed it a sequence that is not valid UTF-8.
+
+It works in a sealed context, and does not widen the seal:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "sandbox" });
+
+lua.set_read_handler(() => "Ada"); // true — io.read is now wired
+lua.execute_script("return io.read()"); // "Ada"
+lua.execute_script("return type(io.open)"); // "nil" — still sealed
+```
+
+Under `'sandbox'` there is no `io` library, so an `io` table is synthesized to
+hold `read` and nothing else — no `open`, `lines`, `write` or `stdout`. The
+method **returns whether `io.read` is now wired to your handler**. The only
+`false` case is a global `io` that exists and is not a table (`io = 42`): that
+value belongs to the script, so it is left alone and the handler is not retained.
+
+Unlike a print handler, a throwing read handler is **not** swallowed — it
+surfaces as a Lua error, because a read that failed has no sensible value to
+continue with.
+
+#### Serving files — `set_file_reader()`
+
+`add_searcher` covers `require`; this covers the other two ways Lua reaches a
+file. Under `'sandbox'`, where `dofile` and `loadfile` are cleared, installing a
+reader brings them back backed only by what you choose to serve:
+
+```javascript
+const files = {
+  "/lib/util.lua": "return { add = function(a, b) return a + b end }",
+};
+
+const lua = new lua_native.init({}, { libraries: "sandbox" });
+lua.set_file_reader((path) => files[path] ?? null);
+
+lua.execute_script('return dofile("/lib/util.lua").add(2, 3)'); // 5
+```
+
+Return the Lua **source** for a path, or `null`/`undefined` for "no such file" —
+which `loadfile` reports as `nil, message` and `dofile` raises, the shapes the
+real ones use:
+
+```javascript
+lua.execute_script('local f, err = loadfile("/nope.lua"); return err');
+// "cannot open /nope.lua"
+```
+
+**While a reader is installed the real filesystem is never consulted** — this is
+deliberately not a fallback chain, because "the reader, or the disk if the reader
+declines" would make the meaning of a path depend on the reader's answer. A
+reader that wants disk access can read the disk itself. Source is loaded in
+text-only mode, so a reader cannot hand back bytecode and route around
+`allowBytecode`.
+
+Pass `null` to remove either handler. Both are re-installed automatically across
+`reset()`, so a sandboxed context that resets does not silently lose its virtual
+filesystem while still holding your callback.
+
+### Filesystem Policy
+
+Closing Lua's access to the disk otherwise takes several calls and still leaves
+`package.path` writable from inside the sandbox. `filesystem: 'deny'` closes
+every door in one option:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "safe", filesystem: "deny" });
+
+// Modules from the host still work.
+lua.register_module("config", { env: "prod" });
+lua.execute_script('return require("config").env'); // "prod"
+
+// The disk does not.
+lua.execute_script('dofile("/etc/passwd")'); // throws
+lua.execute_script('local f, err = loadfile("/etc/passwd"); return err');
+// "loadfile is unavailable: this Lua context was created with filesystem access denied"
+```
+
+The full door list, which is longer than it first appears:
+
+| Library | Denied |
+|---------|--------|
+| `base` | `dofile`, `loadfile` |
+| `package` | `searchers[2]` (path), `searchers[3]`/`[4]` (cpath → **native code**), `loadlib`, `searchpath` |
+| `io` | `open`, `lines`, `input`, `output` |
+| `os` | `remove`, `rename`, `tmpname` |
+
+`package.loadlib` and the cpath searchers link an arbitrary shared library into
+the process, which is a stronger capability than executing a readable `.lua`
+file.
+
+**`require` keeps working** for `register_module` modules and `add_searcher`
+searchers — only the searchers that read the disk are closed. That configuration
+has no other expression: `'safe'` reaches the disk, and `'sandbox'` has no
+`require` at all.
+
+Each door refuses in its own idiom — `loadfile`, `io.open`, `os.remove`,
+`os.rename`, `loadlib` and `searchpath` return `nil, message`, while `dofile`,
+`io.lines`, `io.input`, `io.output` and `os.tmpname` raise — so a script that
+already handles a missing file keeps working. `add_search_path()` refuses rather
+than accepting a path `require` could never consult:
+
+```javascript
+lua.add_search_path("./modules/?.lua");
+// throws: "Cannot add search path: this Lua context was created with filesystem
+//  access denied, so require() never consults package.path. Use register_module()
+//  or add_searcher() to serve modules from the host."
+```
+
+**It governs Lua, not the host.** `execute_file()`, `compile_file()` and a
+`set_file_reader` handler keep working — the host asking for a file by name is
+your own decision. Process execution (`os.execute`, `io.popen`) is not filesystem
+access and is untouched. The seal is re-applied across `reset()` and cannot be
+lifted for the life of the context.
+
 ### Async Execution
 
 By default, all Lua execution blocks the Node.js event loop. The async methods
@@ -1393,6 +1587,86 @@ Notes:
 - Calling a Promise-returning host function from **synchronous** `execute_script`
   throws — such functions must be awaited via `execute_async`.
 - Only native `Promise` results suspend; other values are converted as usual.
+
+#### Awaiting in a function you hold — `call_async()`
+
+`execute_async` needs a script to run. `call_async` is the awaiting counterpart
+to [`call()`](#luacontextcallname-args): it takes a global name (dotted paths
+included) or a `LuaFunction` reference this context produced.
+
+```javascript
+const lua = new lua_native.init(
+  { fetchName: async (id) => "Ada" }, // a host function returning a Promise
+  { libraries: "all" },
+);
+
+lua.execute_script('function greet(id) return "hi " .. fetchName(id) end');
+await lua.call_async("greet", 7); // "hi Ada"
+```
+
+It closes two things `execute_async` cannot. A `LuaFunction` held only on the
+JavaScript side — never stored as a global — has no name to route through, so it
+could not await at all:
+
+```javascript
+const fn = lua.execute_script("return function(id) return fetchName(id) end");
+await lua.call_async(fn, 7); // "Ada" — not reachable by name
+```
+
+And `execute_async('return f(1)')` compiles a fresh chunk on every call, where
+this keeps the function a reference. Everything else matches `execute_async`: the
+same driver, the same one-run-per-context rule, and the same `cancel()`
+behaviour.
+
+#### Awaiting in a coroutine you drive — `resume_async()`
+
+The awaiting counterpart to [`resume()`](#luacontextresumecoroutine-args), and a
+drop-in for it — the resolved value is the same `{ status, values, error? }`
+object, **including for a Lua error**, which is reported in the result rather
+than thrown.
+
+```javascript
+const lua = new lua_native.init(
+  { fetchUser: async (id) => ({ name: "Ada", id }) },
+  { libraries: "all" },
+);
+
+const co = lua.create_coroutine(`
+  return function(id)
+    local user = fetchUser(id)   -- suspends until the Promise settles
+    coroutine.yield(user.name)
+    return "done"
+  end
+`);
+
+const first = await lua.resume_async(co, 7);
+console.log(first.status, first.values); // "suspended" ["Ada"]
+
+const second = await lua.resume_async(co);
+console.log(second.status, second.values); // "dead" ["done"]
+```
+
+Under plain `resume()` the coroutine runs synchronously, so a host callback
+returning a Promise anywhere inside it hard-errors. Under `resume_async` the
+coroutine *is* the driven thread, so that call suspends it and then continues. A
+coroutine created *inside* it still cannot await, and says so.
+
+`for await` over a coroutine steps through `resume_async`, which is what makes an
+awaiting loop work:
+
+```javascript
+const co = lua.create_coroutine(`
+  return function()
+    for i = 1, 3 do coroutine.yield(delay(i)) end   -- delay returns a Promise
+  end
+`);
+
+for await (const v of co) console.log(v); // 2, 4, 6
+```
+
+Because the coroutine is yours rather than the binding's, `cancel()` leaves it
+**suspended and resumable** at the point it reached — exactly as breaking out of
+a `for await` loop does.
 
 ### Bytecode Precompilation
 
@@ -1585,7 +1859,40 @@ console.log([...co]); // [4, 5] — picks up where the loop stopped
 
 The coroutine's final `return` value arrives with `done: true`, which `for..of`
 discards — the same contract as a JS generator. `for await (const v of co)` works
-too, through JS's sync-iterable fallback.
+too, and steps through [`resume_async`](#awaiting-in-a-coroutine-you-drive--resume_async),
+so a coroutine that awaits a host Promise can be iterated the same way.
+
+#### Closing a coroutine — `close()`
+
+Breaking out of a `for..of` loop deliberately leaves the coroutine **suspended**,
+so producing an unclosed thread is an ordinary outcome of the documented API
+rather than an edge case. If that coroutine holds a to-be-closed variable
+(`local f <close> = …`), `close()` is the only way to run its handler from
+JavaScript — `release()` frees the registry slot without executing anything, and
+garbage collection runs `__gc` but not `__close`:
+
+```javascript
+lua.set_global("markClosed", () => console.log("resource released"));
+
+const co = lua.create_coroutine(`
+  return function()
+    local guard = setmetatable({}, { __close = function() markClosed() end })
+    local f <close> = guard
+    for i = 1, 100 do coroutine.yield(i) end
+  end
+`);
+
+for (const n of co) {
+  if (n === 3) break; // suspended — the guard is still open
+}
+
+lua.close(co); // "resource released" — __close runs now
+```
+
+`close()` is **idempotent**: closing an already-closed, finished, or released
+coroutine succeeds and does nothing, which is what lets you close defensively. It
+throws if a `__close` handler raises, but the thread is dead either way — a
+failed close still closed everything it reached.
 
 #### Coroutines from an existing function
 
@@ -1878,16 +2185,97 @@ lua.execute_script(`
 `);
 ```
 
-Two things are deliberately **not** inherited:
+Three things are deliberately **not** inherited:
 
 - **`construct`.** Each class supplies its own. The JavaScript class hierarchy
   already decides how an instance is built; `extends` only describes how Lua
   resolves names on it.
 - **`readable` / `writable`.** These are per-instance flags set by the
   constructor, not metatable state, so state them on each class that needs them.
+- **`statics`.** They live on the class table, which has no metatable and
+  therefore no lookup chain to extend. A derived class that wants a base's static
+  states it again. Named `properties` accessors *are* inherited, because those
+  resolve names on an instance.
 
 The base class must already be registered — a forward reference is rejected,
 which also makes inheritance cycles impossible.
+
+#### Class-level members — `statics`
+
+`statics` puts members on the class *table* rather than on instances, so Lua
+reaches them as `Player.count()` and `Player.VERSION`:
+
+```javascript
+class Player {
+  constructor(name) {
+    this._name = name;
+    Player.instances++;
+  }
+}
+Player.instances = 0;
+
+lua.register_class("Player", {
+  construct: (name) => new Player(name),
+  statics: {
+    count: () => Player.instances,
+    VERSION: "1.2.0",
+  },
+});
+
+lua.execute_script(`
+  local a, b = Player.new('a'), Player.new('b')
+  print(Player.count())    -- 2
+  print(Player.VERSION)    -- 1.2.0
+`);
+```
+
+Functions become callable as `ClassName.fn(...)` and receive the Lua call
+arguments with **no `self`**. Other values are converted **once, at
+registration** — a static is a class-level constant, not a live view of the
+JavaScript property, so reassigning `Player.VERSION` in JS afterwards does not
+change what Lua sees. The name `new` is reserved (it is the constructor) and is
+rejected.
+
+#### Computed and validated fields — `properties`
+
+`readable` / `writable` are blanket flags over every field. `properties` declares
+named accessors instead, which is what makes a computed property, a validated
+setter, and a read-only field on an otherwise writable instance expressible:
+
+```javascript
+lua.register_class("Player", {
+  construct: (name) => new Player(name),
+  properties: {
+    health: {
+      get: (self) => self._hp,
+      set: (self, v) => {
+        if (v < 0) throw new Error("hp must be >= 0");
+        self._hp = v;
+      },
+    },
+    name: { get: (self) => self._name }, // no setter — read-only from Lua
+  },
+});
+
+lua.execute_script(`
+  local p = Player.new('Ada')
+  p.health = 10          -- the setter runs
+  print(p.health, p.name) -- 10   Ada
+`);
+```
+
+Reading a set-only property or writing a get-only one is **refused with a message
+naming the class**, rather than silently answering `nil` or doing nothing:
+
+```javascript
+lua.execute_script("local p = Player.new('Ada'); p.name = 'x'");
+// throws: Error writing property 'name': property 'name' of class 'Player' is read-only
+```
+
+Precedence is **methods, then accessors, then `readable`/`writable`**. A method
+of the same name shadows an accessor, and an accessor beats the blanket flags —
+which is what lets a class with `readable: false` expose exactly the properties it
+declares and nothing else.
 
 ### Metatables
 
@@ -2211,6 +2599,76 @@ metatabled table is still returned as a live Proxy, in both modes.
 Combined with `strictConversion: true` there is nothing left to refuse, which
 makes the pair the only configuration with no silent loss **and** no refusal in
 either direction. See [LIMITATIONS.md](docs/LIMITATIONS.md) §5.
+
+#### Refusing Lossy Conversions — `strictConversion: true`
+
+Some conversions cannot be performed faithfully and are documented in
+[LIMITATIONS.md](docs/LIMITATIONS.md) §5. By default the lossy ones happen
+silently. `strictConversion: true` turns each into an error naming what would
+have been lost:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all", strictConversion: true });
+
+lua.set_global("rows", [1, null, 3]);
+// throws: strict conversion: null/undefined at array index 1 becomes a Lua nil,
+//   which ends the sequence there — #t and ipairs would stop before the later
+//   elements. Filter the array, or use false as a present placeholder.
+
+lua.set_global("rows", [1, false, 3]); // fine — false is a present value
+
+lua.execute_script('return {["1"]="a", [1]="b"}');
+// throws: strict conversion: the Lua table keys 1 (number) and "1" (string) both
+//   become the JavaScript property "1", so one value would be lost. Read the
+//   table in place with get_global_ref() to keep both.
+```
+
+| Direction | Refused under `strictConversion` |
+|---|---|
+| JS → Lua | `null`/`undefined` inside an **array** — it becomes a Lua nil, which ends the sequence there |
+| JS → Lua | `null`/`undefined` as an **object value** — a nil removes the key rather than storing one |
+| Lua → JS | a table key that is neither string nor number — dropped, since JS cannot key an object by boolean, table or function |
+| Lua → JS | a string key and a number key with the same text — `"1"` and `1` collapse, and *which* one survives depends on table order |
+
+The last two are refusals only in the default `tableAs: 'object'` mode; under
+`tableAs: 'map'` a `Map` can represent both, so there is nothing to refuse.
+
+#### Byte-Faithful Strings — `binaryStrings: true`
+
+Lua strings are **byte** strings; JavaScript strings are UTF-16. By default a
+string crossing out of Lua is decoded as UTF-8, so any byte sequence that is not
+valid UTF-8 comes back with U+FFFD in place of each bad byte — fine for text,
+lossy for anything else:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all" });
+lua.execute_script('return string.pack("i4", -2)');
+// "����" — the bytes are gone
+```
+
+With `binaryStrings: true`, every Lua string arrives as a `Uint8Array` of its
+exact bytes:
+
+```javascript
+const lua = new lua_native.init({}, { libraries: "all", binaryStrings: true });
+
+lua.execute_script('return string.pack("i4", 7)');
+// Uint8Array(4) [7, 0, 0, 0]
+
+new TextDecoder().decode(lua.execute_script('return "caf\\xC3\\xA9"')); // 'café'
+```
+
+Use it for `string.pack`/`unpack`, compression, crypto, image data, or any binary
+protocol. Three things to know:
+
+- **All-or-nothing per context.** Returning bytes only when the decode would have
+  been lossy would make the return type depend on the data — the failure mode
+  that is hardest to write correct code against. Either every string is text or
+  every string is bytes.
+- **Table keys are unaffected.** A JS property key is a string either way.
+- **Values round-trip.** A `Uint8Array` passed back into Lua was already
+  converted to a byte string, so `#b` and `string.byte(b, i)` see the original
+  bytes.
 
 #### Iterating Tables
 
@@ -2778,7 +3236,12 @@ creates a bare Lua state with no callbacks and no standard libraries.
   - `libraries` (optional): Which standard libraries to load. If omitted, **no
     libraries are loaded** (bare state). Accepts:
     - `'all'` — loads all 10 standard libraries
-    - `'safe'` — loads all except `io`, `os`, and `debug`
+    - `'safe'` — loads all except `io`, `os`, and `debug`. **Not a sandbox** —
+      `require`, `dofile` and `loadfile` still reach the disk.
+    - `'sandbox'` — the sealed preset: `base`, `coroutine`, `table`, `string`,
+      `math` and `utf8`, with `dofile`/`loadfile` cleared from `base`, no
+      `package`/`require`, and `allowBytecode` defaulting to `false`. Survives
+      `reset()`.
     - `LuaLibrary[]` — array of specific library names
     - `[]` — bare state (no libraries)
 
@@ -2804,7 +3267,31 @@ creates a bare Lua state with no callbacks and no standard libraries.
     formatted text (see `set_print_handler`). Takes precedence over a `print`
     in the callbacks object.
   - `allowBytecode` (optional): When `false`, refuses binary chunks —
-    `load_bytecode()` throws and `load()` is forced to text-only. Default `true`.
+    `load_bytecode()` throws and `load()` is forced to text-only. Defaults to
+    `true` everywhere except `libraries: 'sandbox'`, which defaults it to
+    `false`; an explicit value always wins.
+  - `filesystem` (optional): `'allow'` (default) or `'deny'`. Under `'deny'`,
+    every door Lua has to the disk is closed — `dofile`, `loadfile`, the
+    `package` path/cpath searchers, `loadlib`, `searchpath`, `io.open`/`lines`/
+    `input`/`output`, and `os.remove`/`rename`/`tmpname`. `require` keeps working
+    for `register_module` modules and `add_searcher` searchers, and
+    `add_search_path()` refuses rather than accepting a path that could never be
+    consulted. Governs Lua only: `execute_file()`, `compile_file()` and a
+    `set_file_reader` handler are unaffected. Re-applied across `reset()` and
+    cannot be lifted for the life of the context.
+  - `binaryStrings` (optional): When `true`, every Lua string arrives in JS as a
+    `Uint8Array` of its exact bytes instead of a UTF-8-decoded string, so binary
+    data survives the crossing. All-or-nothing per context; table keys are
+    unaffected. Default `false`.
+  - `strictConversion` (optional): When `true`, a conversion that would silently
+    lose data raises instead — `null`/`undefined` in an array or as an object
+    value, and (in `tableAs: 'object'` mode) a dropped or colliding Lua table
+    key. Default `false`.
+  - `tableAs` (optional): `'object'` (default) or `'map'`. Under `'map'` a Lua
+    table arrives as a `Map`, which can hold the number, string and boolean keys
+    a JS object cannot — `{[1]="a", ["1"]="b"}` keeps both entries. Applies to
+    every table including sequences; metatabled tables are still returned as
+    live Proxies in both modes.
   - `shared` (optional): Object mapping global names to `SharedTable` instances
     (see `createSharedTable`). Each one's current value is published as that
     global at construction, and the context receives every later update.
@@ -2955,6 +3442,35 @@ on error/cancellation.
 **Throws:** Error if the context is busy with another async operation. (Compile
 errors reject the returned Promise rather than throwing.)
 
+### `LuaContext.call_async(nameOrFn, ...args)`
+
+The awaiting counterpart to `call()` — calls a Lua function on the **main
+thread** as a coroutine, so host functions it invokes may return Promises.
+
+**Parameters:**
+
+- `nameOrFn`: A global name, a dotted path (like `get_global`), or a
+  `LuaFunction` this context produced
+- `...args`: Arguments to pass to the function
+
+Unlike `execute_async`, a `LuaFunction` held only on the JavaScript side can
+await — routing through `execute_async` needs a *name* to call. It also compiles
+no chunk per call. A callable table (`__call`) is refused, exactly as `call()`
+refuses it.
+
+```javascript
+lua.execute_script('function greet(id) return "hi " .. fetchName(id) end');
+await lua.call_async("greet", 7); // "hi Ada"
+
+const fn = lua.execute_script("return function(id) return fetchName(id) end");
+await lua.call_async(fn, 7); // "Ada" — not reachable by name
+```
+
+**Returns:** `Promise` resolving with the function's return value(s).
+
+**Throws:** Error if the context is busy with another async operation, or if
+argument validation fails. Failures past that point reject the Promise.
+
 ### `LuaContext.cancel()`
 
 Cancels an in-flight `execute_async` run: its Promise rejects with an "execution
@@ -2966,7 +3482,16 @@ script is suspended awaiting a Promise (not during a synchronous Lua loop).
 
 ### `LuaContext.is_busy()`
 
-Returns whether the context is currently busy with an async operation.
+Returns whether the context is currently busy with an async operation. Only one
+runs per context at a time, so this is the check that tells you whether a second
+async call would throw.
+
+```javascript
+const p = lua.execute_script_async("local s = 0; for i=1,200000 do s = s + i end; return s");
+lua.is_busy(); // true
+await p;
+lua.is_busy(); // false
+```
 
 **Returns:** `boolean` — `true` while an async operation is in progress, `false`
 otherwise.
@@ -3104,6 +3629,68 @@ the fully-formatted output text. Pass `null` to restore output to stdout.
 
 - `handler`: `((text: string) => void) | null`
 
+### `LuaContext.set_read_handler(handler)`
+
+Routes `io.read` to a JavaScript handler — the input counterpart to
+`set_print_handler`. Pass `null` to clear. See
+[Input Redirection and Virtual Files](#input-redirection-and-virtual-files).
+
+**Parameters:**
+
+- `handler`: `((format: string | number) => string | Uint8Array | ArrayBuffer | null | undefined) | null`
+  - `format` is the format as Lua passes it — `'l'`, `'n'`, `'a'`, or a **number**
+    for a byte count, with the Lua 5.3 `*` prefix stripped so only one spelling is
+    ever seen. It is always a string or number, even under `binaryStrings`.
+  - Return `null` for end-of-input; an empty string is a valid empty line. A
+    `Uint8Array`/`Buffer` sends those exact bytes to Lua. The `'n'` format
+    converts to a number or `nil`, matching real `io.read("n")`.
+
+```javascript
+const lines = ["Ada", "42"];
+let i = 0;
+lua.set_read_handler(() => (i < lines.length ? lines[i++] : null));
+lua.execute_script("return io.read()"); // "Ada"
+lua.execute_script('return io.read("n")'); // 42
+```
+
+**Returns:** `boolean` — whether `io.read` is now wired to the handler. Under a
+bare or `'sandbox'` state an `io` table holding only `read` is synthesized, so
+this is normally `true`. The one `false` case is a global `io` that exists and is
+not a table (`io = 42`): that value belongs to the script, so it is left alone
+and the handler is not retained.
+
+**Notes:** Unlike a print handler, a throwing read handler is **not** swallowed —
+it surfaces as a Lua error, because a read that failed has no sensible value to
+continue with. Re-installed automatically across `reset()`.
+
+### `LuaContext.set_file_reader(reader)`
+
+Resolves `dofile` and `loadfile` through a JavaScript callback instead of the
+filesystem — a virtual filesystem for the two entry points `add_searcher` does
+not cover. Pass `null` to remove.
+
+**Parameters:**
+
+- `reader`: `((path: string) => string | null | undefined) | null` — return the
+  Lua **source** for a path, or `null`/`undefined` for "no such file", which
+  `loadfile` reports as `nil, message` and `dofile` raises. An empty string is a
+  valid empty file.
+
+```javascript
+const files = { "/lib/util.lua": "return { add = function(a,b) return a+b end }" };
+const lua = new lua_native.init({}, { libraries: "sandbox" });
+lua.set_file_reader((path) => files[path] ?? null);
+lua.execute_script('return dofile("/lib/util.lua").add(2, 3)'); // 5
+```
+
+**Notes:** While a reader is installed, `dofile`/`loadfile` resolve through it
+**exclusively** — the real filesystem is never consulted. Deliberately not a
+fallback chain, since "the reader, or the disk if the reader declines" would make
+the meaning of a path depend on the reader's answer. Source loads in text-only
+mode, so a reader cannot hand back bytecode and route around `allowBytecode`.
+`require` is unaffected — use `add_searcher()` for that. Re-installed
+automatically across `reset()`.
+
 ### `LuaContext.set_hook(callback, options)`
 
 Installs a debug hook (`lua_sethook`) that reports execution events to a JS
@@ -3139,6 +3726,46 @@ set, and safe to call from inside the hook callback. `maxInstructions` and
 `cancel()` are unaffected.
 
 **Throws:** Error if an async operation is in flight.
+
+### `LuaContext.get_stack(options?)`
+
+Returns the current Lua call stack, innermost frame first. Read-only
+introspection over `lua_getstack`/`lua_getinfo` — intended to be called from
+inside a `set_hook()` callback or a host function, where there is a stack to
+read. See [Inspecting the Stack](#inspecting-the-stack--get_stack--get_locals).
+
+**Parameters:**
+
+- `options` (optional):
+  - `maxLevels`: cap on how many frames to walk
+
+**Returns:** `LuaStackFrame[]`, each with `level`, `source`, `shortSource`,
+`currentLine`, `lineDefined`, `name`, `nameWhat`, and `what`.
+
+```javascript
+lua.set_hook(() => {
+  for (const f of lua.get_stack()) {
+    console.log(`${f.level}: ${f.name || "?"} at ${f.shortSource}:${f.currentLine}`);
+  }
+}, { call: true });
+```
+
+### `LuaContext.get_locals(level)`
+
+Returns the named local variables of one stack frame, with their values.
+
+**Parameters:**
+
+- `level`: The stack level to inspect — `0` is the innermost frame, matching the
+  `level` field of a `get_stack()` entry
+
+**Returns:** `Array<{ name: string; value: LuaValue }>`. Lua's internal temporaries
+(names beginning with `(`) are not included, and a frame with no named locals
+returns an empty array.
+
+```javascript
+lua.get_locals(0); // [{ name: 'n', value: 5 }, ...]
+```
 
 ### `LuaContext.set_global(name, value)`
 
@@ -3446,8 +4073,8 @@ for (const n of co) console.log(n); // 1, 2, 3
   dead coroutine".
 - `next(...args)` forwards its arguments as the resume values, so a
   generator-style coroutine can be fed from JS.
-- `for await (const v of co)` also works, via JS's sync-iterable fallback — the
-  resume itself is synchronous.
+- `for await (const v of co)` also works, and steps through `resume_async()`, so
+  a coroutine whose host functions return Promises can be iterated this way.
 
 ### `LuaContext.resume(coroutine, ...args)`
 
@@ -3464,6 +4091,67 @@ Resumes a suspended coroutine with optional arguments.
 - `status`: `'suspended'` | `'running'` | `'dead'`
 - `values`: Array of values yielded or returned by the coroutine
 - `error`: Error message if the coroutine failed (optional)
+
+### `LuaContext.resume_async(coroutine, ...args)`
+
+Resumes a coroutine **asynchronously**, so host functions it calls may return
+Promises. A drop-in for `resume()`: the resolved value is the same
+`CoroutineResult`, **including for a Lua error**, which is reported in the result
+rather than thrown.
+
+**Parameters:**
+
+- `coroutine`: The `LuaCoroutine` object to resume
+- `...args`: Arguments to pass to the coroutine
+
+```javascript
+const step = await lua.resume_async(co, 7);
+// step.status === 'suspended', step.values === ['Ada']
+```
+
+Under `resume()` the coroutine runs synchronously, so a callback returning a
+Promise inside it hard-errors. Under `resume_async` the coroutine *is* the driven
+thread, so such a call suspends it until the Promise settles. A coroutine created
+*inside* it still cannot await, and says so.
+
+`cancel()` abandons the run and rejects the Promise, and — because the coroutine
+is yours, not the binding's — leaves it **suspended and resumable** at the point
+it reached.
+
+**Returns:** `Promise<CoroutineResult>`
+
+**Throws:** Error if the context is busy with another async operation.
+
+### `LuaContext.close(coroutine)`
+
+Closes a coroutine: runs its pending to-be-closed variables
+(`local x <close> = …`) and marks the thread dead. Mirrors Lua's own
+`coroutine.close`.
+
+**This is the only way to run those handlers from JavaScript.** `release()` frees
+the registry slot without executing anything, and garbage collection runs `__gc`
+but not `__close`. Because breaking out of a `for..of` loop deliberately leaves
+the coroutine suspended, an unclosed thread is an ordinary outcome of the
+documented API rather than an edge case.
+
+**Parameters:**
+
+- `coroutine`: The `LuaCoroutine` object to close
+
+```javascript
+for (const n of co) {
+  if (n === 3) break; // suspended, the <close> guard still open
+}
+lua.close(co); // __close runs now
+```
+
+Idempotent — closing an already-closed, finished, or released coroutine succeeds
+and does nothing, which is what lets you close defensively.
+
+**Returns:** `void`
+
+**Throws:** If a `__close` handler raises. The thread is dead either way, since a
+failed close still closed everything it reached.
 
 ### `LuaContext.compile(script, options?)`
 
@@ -3764,4 +4452,4 @@ Frank Hale &lt;frankhale@gmail.com&gt;
 
 ## Date
 
-29 July 2026
+7 August 2026
