@@ -474,7 +474,16 @@ async function a7ParseOverhead(noise) {
 // ---------------------------------------------------------------------------
 async function a8JsToLuaScan(noise) {
   const pts = [];
-  for (const k of [1, 10, 100]) {
+  // One decade further than the other scan cells, and it is the classifier's own
+  // "why the largest pair decides" note being taken at its word. `set_global`
+  // carries a fixed per-call cost that the scan has to outgrow before the log-log
+  // slope means anything, and that cost is platform-sized: on Windows it measured
+  // ~12µs against ~0.13µs per converter, so at k=100 the scan had only just drawn
+  // level with the overhead and the largest pair still read 0.28 — CONSTANT, for a
+  // scan whose per-converter increment was in fact dead linear (0.134µs from
+  // k=1→10, 0.133µs from k=10→100). k=1000 puts the asymptotic pair where the
+  // linear term dominates, which is the regime the claim is about.
+  for (const k of [1, 10, 100, 1000]) {
     const lua = ctx();
     for (let i = 0; i < k; i++) lua.register_type_converter(() => false, (v) => v);
     const obj = { a: 1, b: 2 };

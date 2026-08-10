@@ -50,7 +50,29 @@
             "kernel32.lib",
             "advapi32.lib"
           ],
+          # node's common.gypi defines _HAS_EXCEPTIONS=0 for every addon target,
+          # because node itself is built without C++ exceptions. This project is
+          # not: it compiles with /EHsc (ExceptionHandling: 1) and reports every
+          # failure by throwing. The pair is inconsistent, and silently so.
+          #
+          # With _HAS_EXCEPTIONS=0 the MSVC STL substitutes a std::exception
+          # whose constructor stores the message POINTER instead of deep-copying
+          # it (<vcruntime_exception.h> is bypassed). So for the shape used
+          # throughout this codebase --
+          #
+          #     std::string msg = ...; throw std::runtime_error(msg);
+          #
+          # what() aliases msg's heap buffer, which is freed when msg is
+          # destroyed during unwinding. Every error message the addon reports
+          # then reads freed memory: the /RTC1 0xDD fill pattern, not text.
+          # libc++ on macOS always deep-copies, which is why the identical
+          # source is correct there and only Windows shows garbage.
+          #
+          # Removing the 0 rather than just appending a 1 keeps the two
+          # definitions from colliding (C4005).
+          "defines!": [ "_HAS_EXCEPTIONS=0" ],
           "defines": [
+            "_HAS_EXCEPTIONS=1",
             "WIN32_LEAN_AND_MEAN",
             "NOMINMAX"
           ],
@@ -212,9 +234,16 @@
                 "user32.lib",
                 "gdi32.lib",
                 "kernel32.lib",
-                "advapi32.lib"                
+                "advapi32.lib"
               ],
+              # See the addon target: node's common.gypi forces
+              # _HAS_EXCEPTIONS=0, which makes std::exception alias the message
+              # it was handed instead of copying it, so what() dangles after
+              # unwinding. The C++ suite asserts on error text, so it reads that
+              # freed memory directly.
+              "defines!": [ "_HAS_EXCEPTIONS=0" ],
               "defines": [
+                "_HAS_EXCEPTIONS=1",
                 "WIN32_LEAN_AND_MEAN",
                 "NOMINMAX"
               ],
@@ -266,7 +295,7 @@
                       "LinkIncremental": 0,
                       "AdditionalDependencies": [
                         "libcpmt.lib",
-                        "libcmt.lib"                        
+                        "libcmt.lib"
                       ],
                       "AdditionalOptions": [
                         "/NODEFAULTLIB:MSVCRT",

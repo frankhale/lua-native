@@ -195,6 +195,33 @@ TEST(LuaRuntimeCore, EmptyTableIsArray) {
   EXPECT_TRUE(arr.empty());
 }
 
+// Every "throws with this message" assertion in this file, and every error the
+// binding forwards to JS, rests on one std::exception guarantee: the message is
+// deep-copied at construction, so what() outlives the std::string it came from.
+//
+// That guarantee is a *build* property, not a language one. MSVC honours it only
+// when _HAS_EXCEPTIONS is 1; with 0 the STL substitutes an exception class that
+// stores the pointer, and what() dangles the moment the source string is
+// destroyed during unwinding. node's common.gypi defines _HAS_EXCEPTIONS=0 for
+// every addon target, so binding.gyp has to override it (see the Windows blocks
+// there) — and if that override is ever dropped, ~70 tests across the C++ and
+// TS suites start comparing against freed heap instead of text.
+//
+// This test states the invariant directly, so the cause is named in one line
+// rather than inferred from a wall of garbled diffs. It is trivially true on
+// libc++/libstdc++ and is aimed at the Windows build.
+TEST(ExceptionMessageLifetime, WhatOutlivesTheSourceString) {
+  const std::string original = "message that must survive unwinding intact";
+  try {
+    // Scoped so the source string is destroyed before what() is read — the
+    // exact sequence that produced 0xDD fill bytes under _HAS_EXCEPTIONS=0.
+    std::string transient = original;
+    throw std::runtime_error(transient);
+  } catch (const std::runtime_error& e) {
+    EXPECT_EQ(std::string(e.what()), original);
+  }
+}
+
 TEST(LuaRuntimeCore, DeepRecursionCap) {
   const LuaRuntime rt(LuaRuntime::AllLibraries());
   // Build a nested table 105 levels deep: t.child.child....

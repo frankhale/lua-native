@@ -12,6 +12,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Load all standard libraries (opt-in since bare state is the default) */
 const ALL_LIBS = { libraries: 'all' as const };
 
+/** The null device, named per platform: `NUL` on Windows, `/dev/null` elsewhere.
+ *  Tests that need a *Lua-created userdata* open it with `io.open` — the file is
+ *  incidental, the handle is the point — so it has to be a path that exists on
+ *  the platform running the suite. `/dev/null` does not on Windows, where
+ *  `io.open` then returns nil and the test reads a non-handle. */
+const NULL_DEVICE = os.platform() === 'win32' ? 'NUL' : '/dev/null';
+
 /**
  * Process-global leak guard (NEXT-STEPS A2).
  *
@@ -11474,9 +11481,15 @@ describe('lua-native Node adapter', () => {
         });
 
         it('refuses an embedded NUL key, which truncates rather than replaces', () => {
-          // "a\0b" arrives as the property "a", colliding with a real "a".
-          expect(lossy().execute_script('return {["a\\0b"]="v1", ["a"]="v2"}'))
-            .toEqual({ a: 'v1' });
+          // "a\0b" arrives as the property "a", colliding with a real "a", so
+          // two Lua entries land on one JS property and one value is lost.
+          const back = lossy().execute_script('return {["a\\0b"]="v1", ["a"]="v2"}');
+          expect(Object.keys(back)).toEqual(['a']);
+          // *Which* value survives is decided by `lua_next` traversal order,
+          // which Lua does not specify and which differs between platforms (it
+          // is "v1" on macOS and "v2" on Windows for these two keys). Pinning
+          // the winner tested the hash layout; the collision is the finding.
+          expect(['v1', 'v2']).toContain(back.a);
           expect(() => strict().execute_script('return {["a\\0b"]="v1"}'))
             .toThrow(/strict conversion.*embedded NUL is truncated/s);
         });
@@ -11775,7 +11788,7 @@ describe('lua-native Node adapter', () => {
       it('a Lua file handle pushed into another context is refused, not emptied', () => {
         const a: any = new lua_native.init({}, ALL_LIBS);
         const b: any = new lua_native.init({}, ALL_LIBS);
-        const f = a.execute_script('return io.open("/dev/null", "r")');
+        const f = a.execute_script(`return io.open("${NULL_DEVICE}", "r")`);
         expect(Object.getOwnPropertyNames(f)).toEqual(['_userdata']);
         expect(() => b.set_global('x', f))
           .toThrow(/userdata handle belongs to a different Lua context/);
@@ -11784,7 +11797,7 @@ describe('lua-native Node adapter', () => {
       it('the same handle still round-trips within its OWN context', () => {
         // The refusal must not break the legitimate case.
         const a: any = new lua_native.init({}, ALL_LIBS);
-        const f = a.execute_script('return io.open("/dev/null", "r")');
+        const f = a.execute_script(`return io.open("${NULL_DEVICE}", "r")`);
         a.set_global('back', f);
         expect(a.execute_script('return type(back)')).toBe('userdata');
       });

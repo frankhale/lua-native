@@ -296,7 +296,16 @@ export function perfClaims() {
   for (const rel of files) {
     let src;
     try { src = readFileSync(join(ROOT, rel), 'utf8'); } catch { continue; }
-    const lines = src.split('\n');
+    // `\r?\n`, not `\n`: with `core.autocrlf=true` (the default on Windows) every
+    // file in the tree is checked out CRLF, and a split on `\n` leaves a trailing
+    // `\r` on every line. That is not cosmetic here — JS regex `.` excludes line
+    // terminators, `\r` among them, so the heading pattern's `(.*)$` could never
+    // reach `$` and **not one heading in the tree matched**. With an empty
+    // heading stack nothing was scoped as hypothetical, and the ten Phase-2
+    // estimates this census exists to skip were reported as UNCLAIMED instead.
+    // A scanner that silently sees no headings is exactly the "believing the
+    // zero" failure the totals below are frozen to catch.
+    const lines = src.split(/\r?\n/);
     const stack = [];
     let inFence = false;
 

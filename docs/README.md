@@ -42,7 +42,8 @@ Current; changed when the feature changes.
 [`USERDATA-METHOD-BINDING.md`](USERDATA-METHOD-BINDING.md) ·
 [`TABLE-REFERENCE.md`](TABLE-REFERENCE.md) ·
 [`ELECTRON.md`](ELECTRON.md) ·
-[`RELEASING.md`](RELEASING.md)
+[`RELEASING.md`](RELEASING.md) ·
+[`WINDOWS-FIXES.md`](WINDOWS-FIXES.md)
 
 ## [`reviews/`](reviews/) — frozen
 

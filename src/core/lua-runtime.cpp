@@ -7,6 +7,33 @@
 namespace lua_core {
 
 namespace {
+// Restores the Lua stack top when it goes out of scope.
+//
+// **Never declare one inside a RunProtected / ProtectedTableCall thunk.** It is
+// redundant there and, on Windows, actively destroys the error being reported.
+//
+// Redundant, because every protected frame is entered as `lua_pcall(L, n, 0, 0)`
+// and a pcall truncates to the called function's slot on *all three* exits: a
+// normal return, a C++ throw the trampoline catches and turns into `return 0`,
+// and a Lua error. Nothing the thunk leaves on the stack can survive the call.
+//
+// Destructive, because whether a longjmp runs C++ destructors is
+// platform-defined, and the two platforms this project targets disagree. Lua is
+// linked as C, so `luaD_throw` is a `longjmp`. Under clang/macOS that jump skips
+// destructors — the assumption this file is written against, stated in the
+// HostCallOutcome comment below and in the field-accessor block further down.
+// MSVC's `longjmp`, in a translation unit built with /EHsc, unwinds instead and
+// runs them. A `lua_settop` firing there lands between the raise and Lua's own
+// bookkeeping, and `luaD_seterrorobj` then reads the error from `L->top - 1`:
+//
+//     setobjs2s(L, oldtop, L->top - 1);  /* error message on current top */
+//
+// With the stack already truncated, `L->top - 1` is whatever sits lower — in
+// practice the trampoline itself, so every raise from a guarded thunk was
+// reported to JS as "function: 000001E6FFCDBC30" instead of its real message.
+//
+// Use it at function scope outside a protected frame, where the restore happens
+// during ordinary C++ unwinding and is what you want.
 struct StackGuard {
   lua_State* L;
   int top;
@@ -3512,10 +3539,10 @@ void LuaRuntime::SetGlobal(const std::string& name, const LuaPtr& value) const {
   // __newindex metamethod on the globals table (M4) and an OOM building the
   // key or value (M5) surface as a std::runtime_error instead of an
   // unprotected panic. Staging the value in the caller, as this used to, left
-  // the whole of PushLuaValue outside the frame. StackGuard also clears a
-  // partially-built value if PushLuaValue throws a C++ exception.
+  // the whole of PushLuaValue outside the frame. A partially-built value left by
+  // a throwing PushLuaValue is discarded by the pcall itself; see StackGuard for
+  // why the thunk must not carry one of its own.
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // globals table
     lua_pushlstring(L_, name.data(), name.size());          // key
     PushLuaValue(L_, value);                                // value
@@ -3597,11 +3624,10 @@ LuaPtr LuaRuntime::GetGlobal(const std::string& name) const {
 void LuaRuntime::SetGlobalPath(const std::vector<std::string>& path, const LuaPtr& value) const {
   // One protected frame covers the whole traversal: an __index/__newindex
   // metamethod raise, an OOM building a key/table/value, or an attempt to index
-  // a non-table intermediate all surface as a std::runtime_error. StackGuard
-  // (a local of the lambda) restores the stack whether the lambda returns or
-  // throws — the ProtectedThunkRunner catches the C++ throw after unwinding.
+  // a non-table intermediate all surface as a std::runtime_error. The traversal
+  // leaves its working containers on the stack; the pcall truncates them on
+  // every exit, which is why no StackGuard belongs in here (see StackGuard).
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // current container
 
     // Walk every segment but the last, descending into (or creating) tables.
@@ -3645,7 +3671,6 @@ LuaPtr LuaRuntime::GetGlobalPath(const std::vector<std::string>& path) const {
   LuaPtr result;
   // Protected for the same reasons as GetGlobal, extended across each hop.
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);  // current container
 
     for (const auto & seg : path) {
@@ -4115,11 +4140,15 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
 // pcall, so an OOM there under an exhausted maxMemory panicked (M5). Only PODs
 // live in the thunks; the C++ results are declared outside, so an ERRMEM
 // longjmp has no destructor of consequence to skip.
+//
+// That last sentence is the rule, and each of these thunks used to break it with
+// a StackGuard — harmless where a longjmp skips destructors, fatal to the error
+// message where it runs them (MSVC). See StackGuard. The pcall already truncates
+// whatever the thunk leaves behind, so nothing was lost in removing them.
 
 LuaPtr LuaRuntime::GetTableField(int registry_ref, const std::string& key) const {
   LuaPtr result;
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     PushTableKey(L_, key);                             // key
     lua_gettable(L_, -2);                              // may trigger __index
@@ -4130,7 +4159,6 @@ LuaPtr LuaRuntime::GetTableField(int registry_ref, const std::string& key) const
 
 void LuaRuntime::SetTableField(int registry_ref, const std::string& key, const LuaPtr& value) const {
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     PushTableKey(L_, key);                             // key
     PushLuaValue(L_, value);                           // value
@@ -4141,7 +4169,6 @@ void LuaRuntime::SetTableField(int registry_ref, const std::string& key, const L
 bool LuaRuntime::HasTableField(int registry_ref, const std::string& key) const {
   bool present = false;
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     PushTableKey(L_, key);                             // key
     lua_gettable(L_, -2);                              // may trigger __index
@@ -4162,7 +4189,6 @@ bool LuaRuntime::RefHasMetatable(const int registry_ref) const {
 LuaPtr LuaRuntime::RawGetTableFieldKeyed(int registry_ref, const TableKey& key) const {
   LuaPtr result;
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     if (!lua_istable(L_, -1)) return;                  // released/stale ref: nil
     PushTableKey(L_, key);                             // key
@@ -4175,7 +4201,6 @@ LuaPtr LuaRuntime::RawGetTableFieldKeyed(int registry_ref, const TableKey& key) 
 LuaPtr LuaRuntime::GetTableFieldKeyed(int registry_ref, const TableKey& key) const {
   LuaPtr result;
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     PushTableKey(L_, key);                             // key
     lua_gettable(L_, -2);                              // may trigger __index
@@ -4186,7 +4211,6 @@ LuaPtr LuaRuntime::GetTableFieldKeyed(int registry_ref, const TableKey& key) con
 
 void LuaRuntime::SetTableFieldKeyed(int registry_ref, const TableKey& key, const LuaPtr& value) const {
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     PushTableKey(L_, key);                             // key
     PushLuaValue(L_, value);                           // value
@@ -4197,7 +4221,6 @@ void LuaRuntime::SetTableFieldKeyed(int registry_ref, const TableKey& key, const
 bool LuaRuntime::HasTableFieldKeyed(int registry_ref, const TableKey& key) const {
   bool present = false;
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);  // table
     PushTableKey(L_, key);                             // key
     lua_gettable(L_, -2);                              // may trigger __index
@@ -4213,7 +4236,6 @@ std::vector<std::string> LuaRuntime::GetTableKeys(int registry_ref) const {
   // partial result is simply discarded with the exception.
   std::vector<std::string> keys;
   RunProtected([&]() {
-    StackGuard guard(L_);
     lua_rawgeti(L_, LUA_REGISTRYINDEX, registry_ref);
     // A stale/released ref (or a non-table slot) must not reach lua_next: raw
     // traversal of a non-table is an API violation. Bail out with no keys.

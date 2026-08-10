@@ -26,6 +26,14 @@
 //            stale handle that reads the *new* state is detectable
 //   release— optional: (handle) => explicit release, when the kind has one
 
+import { platform } from 'node:os';
+
+// A Lua file handle is the only Lua-created userdata this matrix can mint, and
+// the null device is what it opens to get one. The name differs per platform and
+// a wrong one fails quietly: `io.open` returns nil, so the cell would hold a
+// non-handle and report on nothing.
+const NULL_DEVICE = platform() === 'win32' ? 'NUL' : '/dev/null';
+
 export const HANDLES = [
   {
     id: 'table-ref',
@@ -67,7 +75,7 @@ export const HANDLES = [
     // *is* a handle. Its own properties are `["_userdata"]` — the marker and
     // nothing else — so a deep copy of it carries no data at all.
     id: 'userdata-lua',
-    make: (lua) => lua.execute_script('return io.open("/dev/null", "r")'),
+    make: (lua) => lua.execute_script(`return io.open("${NULL_DEVICE}", "r")`),
     use: (h, lua) => { lua.set_global('back', h); return lua.execute_script('return type(back)'); },
   },
   {
