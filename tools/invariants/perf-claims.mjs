@@ -268,42 +268,16 @@ export const CLAIM_LEDGER = [
       + 'If a third of these appears, scope table columns rather than growing this list.',
   },
 
-  // --- an instrument's own reading, quoted in the record of a change to it ---
-  // `WINDOWS-FIXES.md`'s "The caveat that needs a second opinion" argues that
-  // `crossing-cost` A8's k-range, not its declared class, was what Windows
-  // falsified. Making that argument in the open means printing the numbers A8
-  // itself produced, which is why one short section carries nine hits.
-  //
-  // These pass the ledger's own test — *may not ledger a claim about the
-  // binding that nobody has measured* — because the claim under discussion is
-  // C8 and A8 is the cell that measures it. What the section adds is one
-  // machine's reading on one date, presented as the evidence for a threshold
-  // change and labelled as such. Nothing here offers a reader a figure to route
-  // on; the routing advice ("register only the converters you need") lives in
-  // the shipped docs and is C8's, measured.
-  //
-  // Kept as three entries rather than nine, split by what each line is doing:
-  // the classification argument, the two magnitudes it rests on, and the table
-  // those magnitudes are read off. If a second platform record arrives with the
-  // same shape, scope the section rather than growing this list.
-  {
-    match: /\bA8 declares the JS.{0,2}Lua converter scan|the scan is \*not\* non-linear|increment is dead linear|log-log slope was still depressed/i,
-    reason: 'The classification argument in `WINDOWS-FIXES.md` §caveat: whether `crossing-cost` A8 measuring '
-      + 'CONSTANT on Windows means the scan is non-linear (it does not) or that the k-range was too short to '
-      + 'clear a fixed term. A statement about an instrument\'s calibration, and about the claim A8 already '
-      + 'measures (C8) — not a new promise about the binding.',
-  },
-  {
-    match: /`set_global` costs ~12µs per call|~0\.13µs per converter/i,
-    reason: 'The two magnitudes the calibration argument rests on, both read off `crossing-cost` A8 on one '
-      + 'Windows machine on August 9, 2026, and both stated as "on this machine". Measured by the very cell '
-      + 'the section is about; offered as evidence for extending its k-range, not as a figure to route on.',
-  },
-  {
-    match: /^\|\s*k=\d+\s*(?:→|->)\s*\d+\s*\|/,
-    reason: 'A row of the Δ-per-converter table in `WINDOWS-FIXES.md` §caveat — the raw `crossing-cost` A8 '
-      + 'output the argument above is derived from. Same date, same machine, same cell.',
-  },
+  // Three entries here once excused `docs/WINDOWS-FIXES.md` §"The caveat that
+  // needs a second opinion" — nine lines of `crossing-cost` A8's own output,
+  // quoted as the evidence for extending its k-range. That record was retired to
+  // `docs/reviews/` on August 10, 2026, and `docs/reviews/` is outside this scan
+  // by design (see `shippedDocs` above), so the entries matched nothing and were
+  // removed rather than left to rot — an excuse may not outlive the text it
+  // excused. Nothing about the shipped claims changed: C8 is still measured by
+  // A8. If that record is ever promoted back into `docs/`, its nine hits return
+  // with it and want ledgering again; scope the section that time rather than
+  // re-listing its lines.
 ];
 
 function headingSkipReason(stack) {
