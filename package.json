@@ -7,7 +7,6 @@
   "version": "1.1.0",
   "main": "index.js",
   "types": "index.d.ts",
-  "gypfile": true,
   "keywords": [
     "lua",
     "scripting",
@@ -53,17 +52,21 @@
   },
   "files": [
     "index.js",
-    "src/**/*.cpp",
-    "src/**/*.h",
-    "binding.gyp",
-    "get_vcpkg_path.js",
-    "prebuilds/**/*",
+    "index.d.ts",
     "types.d.ts",
-    "index.d.ts"
+    "prebuilds/**/*"
   ],
   "dependencies": {
     "node-addon-api": "^8.9.1",
     "node-gyp-build": "^4.8.4"
+  },
+  "peerDependencies": {
+    "@types/node": "*"
+  },
+  "peerDependenciesMeta": {
+    "@types/node": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^25.9.5",

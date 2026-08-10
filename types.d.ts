@@ -1,5 +1,20 @@
 // Type definitions for the Lua module
 
+// `compile()` and `compile_file()` return a real Node `Buffer`
+// (`Napi::Buffer<uint8_t>::Copy` in the binding), and `load_bytecode()` takes
+// one, so these definitions need Node's ambient types. Declared explicitly
+// rather than left to whatever the consumer happens to have hoisted: without
+// it, a consumer building with `skipLibCheck: false` and no `@types/node` got
+// three `TS2591: Cannot find name 'Buffer'` errors out of *this* file.
+//
+// `@types/node` is an **optional peer** dependency (`*`), the same shape vite
+// and vitest use. It was devDependencies-only, which is why `Buffer` resolved
+// in this repo and nowhere else. Peer rather than a plain dependency so the
+// consumer's own copy is used: a pinned range would nest a second `@types/node`
+// for anyone on an older major, and two copies of ambient *global* declarations
+// conflict. Optional so a JavaScript-only consumer is not made to install types.
+/// <reference types="node" />
+
 /**
  * Represents a Lua table that has a metatable, returned as a JS Proxy object.
  * Property access flows through Lua metamethods (__index, __newindex, etc.).
