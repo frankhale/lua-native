@@ -50,7 +50,12 @@
 // Error messages are compared as part of the outcome (CR-17 F3's family: a
 // wrong message is a wrong answer). Two normalisations only, each because the
 // raw form cannot agree between doors for reasons that say nothing:
-//   * addresses in tostring output ("table: 0x...") — two contexts never agree;
+//   * addresses in tostring output ("table: 0x...") — two contexts never agree.
+//     The `0x` is optional in the pattern because Lua renders these with C's
+//     `%p`, whose format is implementation-defined: glibc/macOS print
+//     `0x7f8e4b405a30`, MSVC prints `0000011BC933B700` with no prefix. Requiring
+//     the prefix left every address unscrubbed on Windows, so 25 cells reported
+//     DISAGREE over nothing but the identity of equivalent objects;
 //   * the "stack traceback:" appendix — the doors genuinely stand in different
 //     frames (a plain call vs a coroutine resume), so the frame list is
 //     presentation; the message body ahead of it is what must agree, and does
@@ -107,13 +112,13 @@ function messageOf(e) {
 // would be a real difference and must survive to a row.
 function normaliseMessage(m) {
   return m
-    .replace(/\b(table|thread|function|userdata): 0x[0-9a-fA-F]+/g, '$1: 0xADDR')
+    .replace(/\b(table|thread|function|userdata): (?:0x)?[0-9a-fA-F]+/g, '$1: 0xADDR')
     .replace(/\nstack traceback:[\s\S]*$/, '');
 }
 
 function okCanon(values) {
   return `ok:${canon(values)}`
-    .replace(/\b(table|thread|function|userdata): 0x[0-9a-fA-F]+/g, '$1: 0xADDR');
+    .replace(/\b(table|thread|function|userdata): (?:0x)?[0-9a-fA-F]+/g, '$1: 0xADDR');
 }
 
 function outcomeSync(source) {

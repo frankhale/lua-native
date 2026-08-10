@@ -30,8 +30,16 @@
 //   3. **Contexts stay independent.** Work in B must not change A: no shared
 //      globals, no shared registry, no callback bleed.
 
+import { platform } from 'node:os';
 import lua_native from '../../index.js';
 import { VALUES } from '../roundtrip-matrix/values.mjs';
+
+// The only Lua-created userdata reachable without a library beyond `io` is a
+// file handle, so the matrix opens the null device to mint one. Its name is
+// platform-specific, and getting it wrong does not fail loudly: `io.open` returns
+// nil, the "handle" case mints a plain value, and part 1 reports it ACCEPTED —
+// a finding about the null device rather than about contexts.
+const NULL_DEVICE = platform() === 'win32' ? 'NUL' : '/dev/null';
 
 const argv = process.argv.slice(2);
 const arg = (n) => {
@@ -71,7 +79,7 @@ const HANDLE_CASES = [
   { id: 'table-created', make: (l) => l.create_table({ v: 1 }) },
   { id: 'table-proxy', make: (l) => l.execute_script('return setmetatable({v=1},{__index=function() return 7 end})') },
   { id: 'coroutine',   make: (l) => l.create_coroutine('return function() coroutine.yield(1) end') },
-  { id: 'userdata-lua', make: (l) => l.execute_script('return io.open("/dev/null","r")') },
+  { id: 'userdata-lua', make: (l) => l.execute_script(`return io.open("${NULL_DEVICE}","r")`) },
 ];
 
 // **A coroutine iteration cursor is deliberately NOT listed above — either the

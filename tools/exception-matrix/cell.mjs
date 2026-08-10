@@ -153,8 +153,14 @@ async function run() {
     // Kill the process the way `std::terminate` does, mid-cell, with no JSON
     // written. If the runner scores this as anything but ABORTED it cannot see
     // the failure mode the matrix exists for.
-    process.kill(process.pid, 'SIGABRT');
-    await new Promise((r) => setTimeout(r, 5_000));
+    //
+    // `process.abort()`, not `process.kill(process.pid, 'SIGABRT')`: Windows has
+    // no POSIX signals, and libuv's `uv_kill` honours only SIGTERM/SIGKILL/SIGINT
+    // there — SIGABRT raises EINVAL, so the cell survived its own control, wrote
+    // its JSON and was scored HARNESS_ERROR. The control failed closed, which is
+    // the design working, but it made the whole matrix unrunnable on Windows.
+    // `abort()` is what the comment above always meant, and it is portable.
+    process.abort();  // does not return
   }
 
   try {

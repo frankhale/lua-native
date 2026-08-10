@@ -89,7 +89,13 @@ print(canonical.run_batch(cases))`;
     input: chunk, encoding: 'utf8', timeout: 60_000, maxBuffer: 256 << 20,
   });
   const byId = new Map();
-  for (const line of out.split('\n')) {
+  // `\r?\n`: the reference interpreter is a subprocess, and on Windows its
+  // stdout arrives CRLF-terminated. Splitting on `\n` alone leaves a trailing
+  // `\r` on the *last* tab-separated field of every line — which is `b`, half of
+  // the very comparison this oracle exists to make. Every one of the 1339 cases
+  // then reported DISAGREE while printing two values that looked identical,
+  // because the difference was an invisible byte.
+  for (const line of out.split(/\r?\n/)) {
     if (!line) continue;
     const [id, a, b] = line.split('\t');
     if (id !== undefined) byId.set(id, { a, b });
@@ -215,7 +221,11 @@ function runEmbeddedModeB(caseSource) {
 // Everything else is left alone on purpose, including whitespace and quoting.
 function normalise(c) {
   return c
-    .replace(/\b(table|thread|function|userdata): 0x[0-9a-fA-F]+/g, '$1: 0xADDR')
+    // `0x` optional: Lua renders addresses with C's `%p`, which is
+    // implementation-defined — `0x7f8e4b405a30` on glibc/macOS,
+    // `0000011BC933B700` on MSVC. A prefix-only pattern scrubs nothing on
+    // Windows and every address then compares unequal.
+    .replace(/\b(table|thread|function|userdata): (?:0x)?[0-9a-fA-F]+/g, '$1: 0xADDR')
     .replace(/\[string \\x22[\s\S]*?\\x22\]:\d+:/g, 'CHUNK:LINE:')
     .replace(/\bcase:\d+:/g, 'CHUNK:LINE:')
     // Strip the traceback but keep whatever closed the canonical form — taking

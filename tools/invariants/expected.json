@@ -375,11 +375,11 @@
     "docs/BYTECODE.md: Compile Lua source code to bytecode with `compile()` and load precompiled bytecode wi...": "COVERED by A4-bytecode-start (C4)",
     "docs/CORRECTNESS.md: forwards (August 7, 2026).** F1 — hook overhead is a fixed floor plus a per-fire": "COVERED by A10-hook-fixed-floor (C10)",
     "docs/TABLE-REFERENCE.md: 1. **Parsing overhead.** Every `execute_script` call compiles Lua source. For": "COVERED by A7-parse-overhead (C7)",
-    "files scanned": 16,
-    "claim-shaped lines examined": 56,
+    "files scanned": 17,
+    "claim-shaped lines examined": 65,
     "skipped: under a hypothetical heading": 10,
     "COVERED by a cell": 20,
-    "LEDGERED with a reason": 26,
+    "LEDGERED with a reason": 35,
     "UNCLAIMED": 0
   }
 }
