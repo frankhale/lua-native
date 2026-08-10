@@ -37,7 +37,7 @@
     "clean": "node-gyp clean && node -e \"for (const d of ['prebuilds','cmake-build-debug','cmake-build-release','cmake-build-debug-visual-studio','cmake-build-release-visual-studio']) require('node:fs').rmSync(d, {recursive: true, force: true})\"",
     "start": "vitest",
     "test": "vitest",
-    "test-cpp": "node-gyp build --debug && node run-tests.js",
+    "test-cpp": "npm run build-debug && node run-tests.js",
     "check-invariants": "node tools/invariants/run.mjs",
     "oracle": "node tools/diff-oracle/run.mjs",
     "exception-matrix": "node tools/exception-matrix/run.mjs",
