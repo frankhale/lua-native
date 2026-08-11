@@ -167,12 +167,26 @@ the release notes.
 
 ### 3. Dry-run the publish
 
-`--dry-run` does everything except upload, and prints the file list and the
-resolved version:
+**`npm publish` packs the tarball itself** — there is no need to `npm pack`
+first and publish the resulting file. It runs `prepublishOnly` → `prepack` →
+`prepare` → builds the tarball → `postpack` → uploads. `npm pack` runs the same
+hooks and produces the same tarball, just written to disk instead of uploaded;
+step 5 above uses it only because the consumer smoke test needs a real file to
+install from. (Publishing an explicit tarball — `npm publish ./lua-native-1.1.0.tgz` —
+is supported, and is the one case where packing separately matters, e.g. a
+tarball built elsewhere.)
+
+So `--dry-run` does everything except the upload, and prints the same file list
+and the resolved version:
 
 ```bash
 npm publish --dry-run
 ```
+
+Worth knowing when reading that list: `prebuilds/` is in `.gitignore`, and npm
+normally honours `.gitignore` when deciding what to include — but an explicit
+`files` array in `package.json` takes precedence, and `prebuilds/**/*` is listed
+there. That is why the gitignored binaries do ship.
 
 Confirm the version is what you intend and the contents match step 4 above —
 8 files: `index.js`, `index.d.ts`, `types.d.ts`, `package.json`, `README.md`,
