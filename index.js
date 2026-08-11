@@ -1,7 +1,11 @@
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import os from 'node:os';
+
+const REPO_URL = 'https://github.com/frankhale/lua-native';
+const ISSUES_URL = `${REPO_URL}/issues`;
 
 const require = createRequire(import.meta.url);
 
@@ -88,14 +92,69 @@ function loadModule() {
     lastError = error;
   }
 
-  // Nothing worked — report every location we tried plus the last error.
+  // Nothing worked. Three very different people reach this line, and a single
+  // message serves none of them well: a contributor with no local build, a
+  // consumer on a platform we ship no binary for, and a consumer whose binary
+  // is present but unloadable. Which one this is can be read off the
+  // `prebuilds/` directory, so say so — the consumer cases end at the issue
+  // tracker, because a published package cannot be compiled here (source is not
+  // in the tarball) and "run npm run build-debug" is advice they cannot take.
+  const prebuildsDir = path.join(currentDir, 'prebuilds');
+  let shipped = [];
+  try {
+    shipped = fs.readdirSync(prebuildsDir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .sort();
+  } catch {
+    // No prebuilds directory — a source checkout, handled just below.
+  }
+
+  const current = `${platform}-${arch}`;
+
+  // Case 1: no prebuilds shipped at all, so this is a source checkout.
+  if (shipped.length === 0) {
+    throw new Error(
+      `Could not load the ${baseName} native binary (${current}).\n` +
+      `No prebuilds directory and no local build output were found.\n` +
+      `Tried the following locations:\n` +
+      paths.map(p => `  - ${p}`).join('\n') + '\n' +
+      `and node-gyp-build resolution in ${currentDir}.\n` +
+      `If you are developing locally, run 'npm run build-debug' first.` +
+      (lastError ? `\nLast error: ${lastError.message}` : '')
+    );
+  }
+
+  // Case 2: prebuilds shipped, but none for this platform.
+  if (!shipped.includes(platformDir)) {
+    throw new Error(
+      `${baseName} has no prebuilt binary for this platform.\n` +
+      `\n` +
+      `  your platform:  ${current}\n` +
+      `  prebuilt for:   ${shipped.join(', ')}\n` +
+      `\n` +
+      `This package ships prebuilt binaries only — it cannot be compiled\n` +
+      `during install. If you would like ${current} supported, please open an\n` +
+      `issue and include the two lines above:\n` +
+      `\n` +
+      `  ${ISSUES_URL}\n` +
+      `\n` +
+      `Project: ${REPO_URL}`
+    );
+  }
+
+  // Case 3: the binary for this platform is right there and still would not
+  // load — a corrupt download or an ABI mismatch. Worth reporting verbatim.
   throw new Error(
-    `Could not load the ${baseName} native binary.\n` +
-    `Tried the following locations:\n` +
-    paths.map(p => `  - ${p}`).join('\n') + '\n' +
-    `and node-gyp-build resolution in ${currentDir}.\n` +
-    `If you are developing locally, run 'npm run build-debug' first.` +
-    (lastError ? `\nLast error: ${lastError.message}` : '')
+    `${baseName} found a prebuilt binary for ${current} but could not load it.\n` +
+    `\n` +
+    `  binary: ${path.join(prebuildsDir, platformDir, `${baseName}.node`)}\n` +
+    `  error:  ${lastError ? lastError.message : 'unknown'}\n` +
+    `\n` +
+    `This usually means the file is corrupt or was built for a different ABI.\n` +
+    `Please report it, including the lines above:\n` +
+    `\n` +
+    `  ${ISSUES_URL}`
   );
 }
 

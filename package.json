@@ -17,6 +17,10 @@
     "type": "git",
     "url": "git+https://github.com/frankhale/lua-native.git"
   },
+  "homepage": "https://github.com/frankhale/lua-native#readme",
+  "bugs": {
+    "url": "https://github.com/frankhale/lua-native/issues"
+  },
   "scripts": {
     "prebuildify": "prebuildify --napi --strip",
     "install": "node-gyp-build",
@@ -48,7 +52,8 @@
     "binding-balance": "node --expose-gc tools/binding-balance/run.mjs",
     "crossing-cost": "node tools/crossing-cost/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
-    "get-vcpkg-lib": "node get_vcpkg_path.js lib"
+    "get-vcpkg-lib": "node get_vcpkg_path.js lib",
+    "vcpkg-lua": "\"$VCPKG_ROOT/vcpkg\" remove lua:arm64-osx --recurse >/dev/null 2>&1; \"$VCPKG_ROOT/vcpkg\" install \"lua[tools]:arm64-osx\" --overlay-triplets=./triplets && otool -l \"$VCPKG_ROOT/installed/arm64-osx/lib/liblua.a\" | grep -m1 minos"
   },
   "files": [
     "index.js",

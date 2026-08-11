@@ -9,6 +9,10 @@ lua-native is a native Node.js addon (N-API) that embeds Lua 5.5 into JavaScript
 ## Build & Test Commands
 
 ```bash
+# (Re)install the vcpkg Lua at the project's macOS deployment target.
+# Use this INSTEAD of a bare `vcpkg install lua` — see Prerequisites below.
+npm run vcpkg-lua
+
 # Build (debug, includes C++ test binary)
 npm run build-debug
 
@@ -73,7 +77,28 @@ node tools/crossing-cost/run.mjs --claims             # just the documented clai
 npm run clean
 ```
 
-**Prerequisites:** Lua must be available via vcpkg. The `get_vcpkg_path.js` script resolves include/lib/interpreter paths from the `VCPKG_ROOT` environment variable. Building and testing the addon needs only the library; `npm run oracle` additionally needs the port's interpreter (`vcpkg install lua[tools]`).
+**Prerequisites:** Lua must be available via vcpkg. The `get_vcpkg_path.js` script resolves include/lib/interpreter paths from the `VCPKG_ROOT` environment variable. Building and testing the addon needs only the library; `npm run oracle` additionally needs the port's interpreter, which is why `vcpkg-lua` installs `lua[tools]` rather than bare `lua`.
+
+**Install Lua with `npm run vcpkg-lua`, not `vcpkg install lua`** (macOS). vcpkg's
+stock `arm64-osx` triplet sets no deployment target, so it builds `liblua.a`
+against the host SDK — on a macOS 26 machine that produced a `minos 26.0` static
+library, one `built for newer 'macOS' version` warning per Lua object at link
+time, and an addon claiming support for an OS it was never linked for.
+`triplets/arm64-osx.cmake` is an overlay that adds
+`VCPKG_OSX_DEPLOYMENT_TARGET 13.5`, matching `binding.gyp`'s two
+`MACOSX_DEPLOYMENT_TARGET` settings and the minos of the official Node 24 macOS
+arm64 build. It deliberately **shadows** the built-in triplet name so it installs
+to the same `installed/arm64-osx` path that `get_vcpkg_path.js` and
+`CMakeLists.txt` both hardcode — a new triplet name would mean editing both.
+
+The overlay is **not sticky**: vcpkg only applies it when `--overlay-triplets`
+points at that directory, so a bare `vcpkg install lua` silently rebuilds at the
+SDK default and the warnings return. The script passes the flag, removes first
+(vcpkg reports "already installed" and skips otherwise, leaving a stale library
+in place), and ends by printing the resulting `minos` so it proves its own
+result. After changing the target, `npm run prebuildify` is required for the
+change to reach consumers — `prebuilds/` is gitignored, so the shipped binary is
+regenerated locally and published, never committed.
 
 **Important:** After C++ changes, you must `npm run build-debug` before running `npm test`. The debug build is required for testing — do not use prebuilt binaries.
 

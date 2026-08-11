@@ -161,7 +161,7 @@
             "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
             "GCC_ENABLE_CPP_RTTI": "YES",
-            "MACOSX_DEPLOYMENT_TARGET": "26.0"
+            "MACOSX_DEPLOYMENT_TARGET": "13.5"
           }
         }],
         # ASan+UBSan on the addon (addon_asan) — run via run-sanitized-ts.js,
@@ -332,7 +332,7 @@
                 "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
                 "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
                 "GCC_ENABLE_CPP_RTTI": "YES",
-                "MACOSX_DEPLOYMENT_TARGET": "26.0"
+                "MACOSX_DEPLOYMENT_TARGET": "13.5"
               }
             }],
             # AddressSanitizer + UBSan for the standalone test binary. Enabled by

@@ -168,14 +168,32 @@ chosen from your platform and architecture:
 
 | Platform            | Triplet             | Command                             |
 | ------------------- | ------------------- | ----------------------------------- |
-| macOS Apple Silicon | `arm64-osx`         | `vcpkg install lua`                 |
+| macOS Apple Silicon | `arm64-osx`         | `npm run vcpkg-lua`                 |
 | Windows x64         | `x64-windows-static`| `vcpkg install lua:x64-windows-static` |
 
-On macOS the default triplets are already static, so a plain `vcpkg install lua`
-is enough. **On Windows you must ask for `x64-windows-static` explicitly** — the
-default `x64-windows` triplet builds a DLL and installs to the wrong directory,
-and the addon is built against the static CRT (`/MT`), so it must link a static
-Lua.
+**On macOS, use `npm run vcpkg-lua` rather than a bare `vcpkg install lua`.**
+The default triplets are already static, so a plain install *links* fine — but
+vcpkg's stock `arm64-osx` triplet sets no deployment target, so it builds
+`liblua.a` against whatever SDK the machine has. Building on macOS 26 that way
+yields a `minos 26.0` static library, one `built for newer 'macOS' version`
+warning per Lua object at link time, and an addon whose recorded minimum macOS
+is a claim it was never actually linked for.
+
+`triplets/arm64-osx.cmake` in this repo is an overlay triplet that adds
+`VCPKG_OSX_DEPLOYMENT_TARGET 13.5`, matching the two `MACOSX_DEPLOYMENT_TARGET`
+settings in `binding.gyp`. It is named `arm64-osx` on purpose so it shadows the
+built-in triplet and installs to the same `installed/arm64-osx` directory that
+`get_vcpkg_path.js` and `CMakeLists.txt` already hardcode. The overlay applies
+only when `--overlay-triplets` is passed, which is exactly what the script does —
+along with removing the package first (vcpkg otherwise reports "already
+installed" and leaves the previous library in place) and printing the resulting
+`minos` so you can see the target it actually produced. It installs
+`lua[tools]`, since `npm run oracle` needs the port's interpreter.
+
+**On Windows you must ask for `x64-windows-static` explicitly** — the default
+`x64-windows` triplet builds a DLL and installs to the wrong directory, and the
+addon is built against the static CRT (`/MT`), so it must link a static Lua.
+Windows has no deployment-target equivalent, so no overlay is involved there.
 
 vcpkg's `lua` port is currently **5.5.0**, which is what this project targets.
 The code uses Lua 5.5 APIs (`luaL_openselectedlibs`, the 5.5 `lua_gc` arities,
@@ -236,6 +254,10 @@ does not need the submodule.
 ### 5. Build
 
 ```bash
+# macOS only, and only once per vcpkg tree: install Lua at this project's
+# deployment target (see "vcpkg and Lua" above for why a bare install differs).
+npm run vcpkg-lua
+
 # Debug build — includes the C++ test binary. Required before `npm test`.
 npm run build-debug
 
@@ -244,7 +266,10 @@ npm run build-release
 ```
 
 Output lands in `build/Debug/` or `build/Release/` as `lua-native.node`;
-`index.js` searches `prebuilds/` → debug → release → `node-gyp-build`.
+`index.js` searches local build output (debug → release → the CMake layouts)
+first, then `prebuilds/`, then `node-gyp-build`. Local builds deliberately win,
+so a freshly compiled binary is always what loads during development even when a
+prebuild is present.
 
 **After any C++ change, re-run `npm run build-debug` before `npm test`** — the
 test suite loads the freshly built binary, not a prebuilt one.
