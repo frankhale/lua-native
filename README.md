@@ -72,7 +72,10 @@ different Lua version, you will need to build from source.
 
 On a supported target you do not need any of this — the prebuilt binary is used
 automatically. Build from source to work on the addon itself, to link a
-different Lua version, or to run on a platform with no prebuild.
+different Lua version, or to run on a platform with no prebuild. Note that this
+means building **from a clone**: the published tarball contains prebuilds only,
+so `npm install lua-native` on an unshipped platform reports that fact rather
+than attempting a compile.
 
 Building compiles a native N-API addon that statically links Lua, so you need a
 C++17 toolchain and a Lua library in addition to Node.js. Linux has not been
@@ -106,20 +109,25 @@ npm install
 
 **Runtime dependencies** (installed into consumers of the package too):
 
-- **`node-addon-api`** (`^8.5.0`) — the C++ wrapper around N-API. `binding.gyp`
+- **`node-addon-api`** (`^8.9.1`) — the C++ wrapper around N-API. `binding.gyp`
   asks it for its header directory with
   `node -p "require('node-addon-api').include"`, so the build fails without it
   even though nothing imports it from JavaScript.
 - **`node-gyp-build`** (`^4.8.4`) — runs as the package's `install` script. On a
-  consumer machine it selects a prebuilt binary from `prebuilds/`, falling back
-  to a source build.
+  consumer machine it resolves the prebuilt binary in `prebuilds/` and does
+  nothing further. Its usual source-build fallback cannot fire: the published
+  tarball ships prebuilds only (no `src/`, no `binding.gyp`), so an unshipped
+  platform gets a clear error from `index.js` instead of a failed compile.
 
 **Dev dependencies:**
 
-- **`vitest`** (`^4.0.18`) — the TypeScript/JavaScript test suite (`npm test`).
+- **`vitest`** (`^4.1.10`) — the TypeScript/JavaScript test suite (`npm test`).
 - **`prebuildify`** (`^6.0.1`) — produces the prebuilt binaries in `prebuilds/`
   (`npm run prebuildify`).
-- **`@types/node`** (`^25.3.0`) — types for the test suite and build scripts.
+- **`@types/node`** (`^25.9.5`) — types for the test suite and build scripts.
+  Also declared as an **optional peer dependency**, so a consumer using
+  TypeScript gets the Node types the `.d.ts` files assume without it being
+  forced on a plain-JS install.
 
 **`node-gyp` is not in `package.json`.** It ships inside npm, and npm puts it on
 the `PATH` for `npm run` scripts, which is how `build-debug` / `build-release`
@@ -233,9 +241,13 @@ or an unresolved-symbol link failure) is much less obvious.
 
   A full Xcode install works too, but the Command Line Tools alone are enough.
 - Apple Clang with `libc++`, C++17, exceptions and RTTI enabled.
-- `binding.gyp` sets `MACOSX_DEPLOYMENT_TARGET` to **26.0**. If you're on an
-  older macOS, lower that value in `binding.gyp` (and in `CMakeLists.txt` if you
-  use the CMake path) to your OS version.
+- `binding.gyp` sets `MACOSX_DEPLOYMENT_TARGET` to **13.5**, in both places it
+  appears (the addon target and the C++ test target), matching the `minos` of
+  the official Node 24 macOS arm64 build. Lua must be built to the same target,
+  which is what `npm run vcpkg-lua` and the `triplets/arm64-osx.cmake` overlay
+  are for — see "vcpkg and Lua" above. If you change the target, change it in
+  all three (both `binding.gyp` settings and the overlay triplet), reinstall Lua
+  with `npm run vcpkg-lua`, and regenerate any prebuild.
 - Both arm64 and x64 are supported; prebuilt binaries only cover arm64.
 
 ### 4. Google Test Submodule (Debug Builds)

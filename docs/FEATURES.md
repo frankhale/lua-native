@@ -368,14 +368,32 @@ Metatabled Lua tables are kept as Lua registry references and wrapped in JS Prox
 
 The loader tries multiple paths in priority order:
 
-1. **Prebuilds** (`prebuilds/<platform>-<arch>/lua-native`) — for distributed packages
-2. **CMake output** (`build/Debug/<platform>/`, `build/Release/<platform>/`) — for development
-3. **node-gyp output** (`build/Debug/`, `build/Release/`) — for standard builds
-4. **`node-gyp-build` fallback** — scans the build directory using the standard prebuild detection library
+1. **node-gyp output** (`build/Debug/`, `build/Release/`) — for standard builds
+2. **CMake output** (`build/Debug/<os>/`, `build/Release/<os>/`) — for the alternative build path
+3. **Prebuilds** (`prebuilds/<platform>-<arch>/lua-native.node`) — what a distributed package ships
+4. **`node-gyp-build` fallback** — resolves `prebuildify`'s own `node.napi.node` naming convention
 
-The loader uses `createRequire(import.meta.url)` for ESM compatibility. If no binary is found, it throws a descriptive error pointing the user to `npm run build-debug`.
+**Local build output deliberately wins over a prebuild.** The order used to be
+the other way around, and the effect was that the test suite silently exercised
+a checked-in prebuild instead of the binary just compiled (CODE-REVIEW-2 P2).
+A consumer installing from the registry has no `build/` directory, so for them
+the first two groups simply don't exist and resolution falls through to
+`prebuilds/`.
 
-**Why this complexity:** The native binary can end up in different locations depending on the build system (node-gyp vs CMake), build type (Debug vs Release), and platform. Rather than requiring users to copy binaries to a fixed location, the loader searches all reasonable paths. The prebuild path is checked first for installed packages; development paths are fallbacks.
+The loader uses `createRequire(import.meta.url)` for ESM compatibility. A
+candidate that is missing (`MODULE_NOT_FOUND`) or unloadable
+(`ERR_DLOPEN_FAILED`, e.g. a prebuild for another arch) is skipped rather than
+fatal; any other error surfaces immediately.
+
+If nothing loads, the error depends on which of three very different people hit
+it, read off the `prebuilds/` directory: a **source checkout** with no build
+output is told to run `npm run build-debug`; a **consumer on an unshipped
+platform** is given their platform, the list of shipped ones and the issue
+tracker, because the published tarball contains no source and cannot be
+compiled there; a **consumer whose binary is present but won't load** gets the
+path and the underlying `dlopen` error as a corruption/ABI report.
+
+**Why this complexity:** The native binary can end up in different locations depending on the build system (node-gyp vs CMake), build type (Debug vs Release), and platform. Rather than requiring users to copy binaries to a fixed location, the loader searches all reasonable paths.
 
 ---
 

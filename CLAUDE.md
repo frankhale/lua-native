@@ -255,7 +255,7 @@ Lua objects that cross the C++ boundary (functions, coroutines, userdata, metata
 
 ### Module Entry Point
 
-`index.js` is an ES module loader that tries multiple paths (prebuilds → debug → release → node-gyp-build) to find the compiled `.node` binary. It exports the native module as default.
+`index.js` is an ES module loader that tries multiple paths (node-gyp debug → node-gyp release → CMake layouts → `prebuilds/<platform>-<arch>/lua-native.node` → `node-gyp-build`) to find the compiled `.node` binary. It exports the native module as default. **Local build output deliberately precedes `prebuilds/`** so a freshly compiled binary always wins during development; the reverse order once had the suite testing a stale prebuild (CODE-REVIEW-2 P2). The published package ships prebuilds only — no `src/` or `binding.gyp` — so a consumer on an unshipped platform gets a "no prebuilt binary" error pointing at the issue tracker rather than a source build.
 
 ### Type Definitions
 

@@ -60,12 +60,17 @@ automatically — no changes to `index.js` are needed.
 
 ## 3. Ship a prebuild (do not rely on a source build)
 
-End users will not have vcpkg, node-gyp, or a C++ toolchain, so the
-`get_vcpkg_path.js` resolution would fail at their install time. Therefore:
+End users will not have vcpkg, node-gyp, or a C++ toolchain, and there is no
+source build to fall back on: the published package ships prebuilds only (no
+`src/`, no `binding.gyp`, no `get_vcpkg_path.js`), so an unshipped platform ends
+at a "no prebuilt binary for this platform" error rather than a compile.
+Therefore:
 
-- Run `npm run prebuildify` (which uses `prebuildify --napi --strip`) to produce a
-  binary under `prebuilds/<platform>-<arch>/`, and make sure that ships in the
-  app.
+- Produce a binary under `prebuilds/<platform>-<arch>/` and make sure it ships
+  in the app. Note the filename: `index.js` looks for `lua-native.node` there
+  explicitly, while `npm run prebuildify` emits `node.napi.node` (found only via
+  the `node-gyp-build` fallback). Ship one binary per directory named
+  `lua-native.node` — see `docs/RELEASING.md` step 3.
 - Because Lua is statically linked (`LUA_STATIC` in `binding.gyp`), there is
   **no external Lua `.dylib` / `.dll` to bundle** — the prebuilt `.node` is
   self-contained. This is a real advantage over a dynamically-linked Lua.
@@ -74,11 +79,15 @@ End users will not have vcpkg, node-gyp, or a C++ toolchain, so the
 
 ## 4. Check the macOS deployment target
 
-`binding.gyp` sets `MACOSX_DEPLOYMENT_TARGET: "26.0"`. That means the prebuilt
-binary **requires macOS 26+ to load**. If you distribute an Electron app to
-users on older macOS, the addon will fail to `dlopen` even though Electron
-itself runs. Lower this to match the oldest macOS you intend to support
-(Electron itself typically supports back several versions).
+`binding.gyp` sets `MACOSX_DEPLOYMENT_TARGET: "13.5"`, so the prebuilt binary
+**requires macOS 13.5+ to load** — the same floor as the official Node 24 macOS
+arm64 build. If you distribute an Electron app to users on older macOS than
+that, the addon will fail to `dlopen` even though Electron itself runs; lower
+the target to match the oldest macOS you intend to support, rebuild Lua at that
+target with `npm run vcpkg-lua`, and regenerate the prebuild. (The value was
+`26.0` until August 10, 2026 — a binary prebuilt before then still carries that
+floor, so check the binary rather than the setting:
+`otool -l …/lua-native.node | grep -A3 LC_BUILD_VERSION`.)
 
 ## Summary
 
