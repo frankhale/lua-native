@@ -170,7 +170,7 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
 ## Publishing to npm
 
 `lua-native` is an **unscoped, public** package. It is already on the registry —
-`latest` is `1.0.4`; the working tree is at `1.1.0`. Publishing happens from a
+`latest` is `1.1.0`; the working tree is at `1.1.1`. Publishing happens from a
 maintainer's macOS machine, with the Windows binary copied in by hand (step 2),
 because `npm publish` packs whatever `prebuilds/` contains locally.
 
@@ -203,8 +203,9 @@ npm version major     # 1.1.0 -> 2.0.0
 `npm version` writes `package.json`, creates a commit and an annotated tag in
 one step. If you would rather control the commit yourself, edit the `version`
 field by hand and tag afterwards (`git tag -a v1.1.0 -m 'v1.1.0'`). Either way
-**tag it** — the repo has only `v1.0.0`, so `1.0.1` and `1.0.4` shipped without
-tags and there is no commit on record for what those users received.
+**tag it** — the repo has `v1.0.0` and `v1.1.0` only, so `1.0.1` and `1.0.4`
+shipped without tags and there is no commit on record for what those users
+received.
 
 Choose the number by what changed for a *consumer*, not by how much code moved.
 1.1.0 is a case in point: no API changed, but the package stopped shipping
