@@ -40,13 +40,13 @@ using TableKey = std::variant<std::string, int64_t, double, bool>;
 class LuaRuntime;
 
 namespace detail {
-// Unrefs `ref` from mainL's registry, unless a worker thread is mid-run on that
-// state — in which case it defers the unref to a queue drained after the worker
-// finishes (H9c). Defined in lua-runtime.cpp, where LuaRuntime is complete; the
-// runtime is resolved from mainL's extra space (set in InitState), so this reads
-// no registry and takes no Lua lock. Always runs on the main (JS) thread at GC /
+// Unrefs `ref` from main_state's registry, unless a worker thread is mid-run
+// on that state — in which case it defers the unref to a queue drained after
+// the worker finishes (H9c). Defined in lua-runtime.cpp, where LuaRuntime is
+// complete; the runtime is resolved from main_state's extra space (set in
+// InitState), so this reads no registry and takes no Lua lock. Always runs on the main (JS) thread at GC /
 // value-destruction time.
-void UnrefRegistrySlot(lua_State* mainL, int ref);
+void UnrefRegistrySlot(lua_State* main_state, int ref);
 
 // Produces a shared owner whose deleter unrefs `ref` from the registry when the
 // last copy is destroyed. Returns null for the no-op refs (LUA_NOREF/LUA_REFNIL)
@@ -82,9 +82,9 @@ std::shared_ptr<std::atomic<bool>> StateOpenToken(lua_State* L);
 inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   if (!L || ref == LUA_NOREF || ref == LUA_REFNIL) return nullptr;
   lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
-  lua_State* mainL = lua_tothread(L, -1);
+  lua_State* main_state = lua_tothread(L, -1);
   lua_pop(L, 1);
-  if (!mainL) mainL = L;  // defensive: LUA_RIDX_MAINTHREAD is always populated
+  if (!main_state) main_state = L;  // defensive: LUA_RIDX_MAINTHREAD is always populated
   // **The token is what makes `close()` survivable, and the sentence above is
   // why it had to exist** (C2, August 7, 2026). "The main thread stays valid
   // until lua_close" was true when `lua_close` ran only from `~LuaRuntime` —
@@ -94,10 +94,10 @@ inline std::shared_ptr<void> MakeRegistryOwner(lua_State* L, int ref) {
   // (exit 139) the moment one was finalized afterwards — `luaL_unref` into a
   // freed state. The slot died with the state, so the deleter's job is to
   // notice and do nothing.
-  auto token = StateOpenToken(mainL);
-  return {nullptr, [mainL, ref, token](void*) {
+  const auto token = StateOpenToken(main_state);
+  return {nullptr, [main_state, ref, token](void*) {
     if (token && !token->load()) return;
-    UnrefRegistrySlot(mainL, ref);
+    UnrefRegistrySlot(main_state, ref);
   }};
 }
 }  // namespace detail
@@ -119,6 +119,7 @@ struct LuaFunctionRef {
   LuaFunctionRef& operator=(const LuaFunctionRef&) = default;
   LuaFunctionRef(LuaFunctionRef&&) noexcept = default;
   LuaFunctionRef& operator=(LuaFunctionRef&&) noexcept = default;
+  ~LuaFunctionRef() = default;
 
   void release() {
     owner_.reset();  // unrefs iff this was the last owner
@@ -137,14 +138,15 @@ struct LuaThreadRef {
   lua_State* L;        // Main state
   lua_State* thread;   // The coroutine thread
 
-  LuaThreadRef(int r, lua_State* mainState, lua_State* threadState)
-      : ref(r), L(mainState), thread(threadState),
-        owner_(detail::MakeRegistryOwner(mainState, r)) {}
+  LuaThreadRef(int r, lua_State* main_state, lua_State* thread_state)
+      : ref(r), L(main_state), thread(thread_state),
+        owner_(detail::MakeRegistryOwner(main_state, r)) {}
 
   LuaThreadRef(const LuaThreadRef&) = default;
   LuaThreadRef& operator=(const LuaThreadRef&) = default;
   LuaThreadRef(LuaThreadRef&&) noexcept = default;
   LuaThreadRef& operator=(LuaThreadRef&&) noexcept = default;
+  ~LuaThreadRef() = default;
 
   void release() {
     owner_.reset();
@@ -182,6 +184,7 @@ struct LuaUserdataRef {
   LuaUserdataRef& operator=(const LuaUserdataRef&) = default;
   LuaUserdataRef(LuaUserdataRef&&) noexcept = default;
   LuaUserdataRef& operator=(LuaUserdataRef&&) noexcept = default;
+  ~LuaUserdataRef() = default;
 
   void release() {
     owner_.reset();
@@ -206,6 +209,7 @@ struct LuaTableRef {
   LuaTableRef& operator=(const LuaTableRef&) = default;
   LuaTableRef(LuaTableRef&&) noexcept = default;
   LuaTableRef& operator=(LuaTableRef&&) noexcept = default;
+  ~LuaTableRef() = default;
 
   void release() {
     owner_.reset();
@@ -254,7 +258,7 @@ struct RuntimeConfig {
 
 struct MetatableEntry {
   std::string key;
-  bool is_function;
+  bool is_function = false;
   std::string func_name;  // Used when is_function == true
   LuaPtr value;           // Used when is_function == false
 };
@@ -285,7 +289,7 @@ enum class CoroutineStatus {
 };
 
 struct CoroutineResult {
-  CoroutineStatus status;
+  CoroutineStatus status = CoroutineStatus::Dead;
   std::vector<LuaPtr> values;
   std::optional<std::string> error;
 };
@@ -433,14 +437,14 @@ public:
   void SetGlobalPath(const std::vector<std::string>& path, const LuaPtr& value) const;
   [[nodiscard]] LuaPtr GetGlobalPath(const std::vector<std::string>& path) const;
 
-  [[nodiscard]] ScriptResult CallFunction(const LuaFunctionRef& funcRef,
+  [[nodiscard]] ScriptResult CallFunction(const LuaFunctionRef& func_ref,
                                           const std::vector<LuaPtr>& args) const;
 
   // Coroutine support
-  [[nodiscard]] std::variant<LuaThreadRef, std::string> CreateCoroutine(const LuaFunctionRef& funcRef) const;
-  [[nodiscard]] CoroutineResult ResumeCoroutine(const LuaThreadRef& threadRef,
+  [[nodiscard]] std::variant<LuaThreadRef, std::string> CreateCoroutine(const LuaFunctionRef& func_ref) const;
+  [[nodiscard]] CoroutineResult ResumeCoroutine(const LuaThreadRef& thread_ref,
                                                  const std::vector<LuaPtr>& args) const;
-  [[nodiscard]] static CoroutineStatus GetCoroutineStatus(const LuaThreadRef& threadRef);
+  [[nodiscard]] static CoroutineStatus GetCoroutineStatus(const LuaThreadRef& thread_ref);
 
   // Coroutine-driven async execution (main thread; awaits JS promises).
   // Loads `script` as a chunk on a fresh coroutine thread.
@@ -458,7 +462,7 @@ public:
   // value" attributed it to an operation the caller never performed. Every
   // later step really is a resume — the awaited promise's result — so the
   // default is the right answer for all but the opening call.
-  [[nodiscard]] AsyncStepResult ResumeAsyncStep(const LuaThreadRef& threadRef,
+  [[nodiscard]] AsyncStepResult ResumeAsyncStep(const LuaThreadRef& thread_ref,
       const std::vector<LuaPtr>& args, bool arg_is_error,
       const char* arg_role = "resume value");
   /// Close a coroutine (P3): run its pending to-be-closed variables
@@ -479,7 +483,7 @@ public:
   /// Closing an already-dead or already-closed coroutine is a no-op that
   /// succeeds — a close is a statement about the end state, so making it
   /// idempotent is what lets a caller close defensively.
-  [[nodiscard]] std::optional<std::string> CloseCoroutine(const LuaThreadRef& threadRef) const;
+  [[nodiscard]] std::optional<std::string> CloseCoroutine(const LuaThreadRef& thread_ref) const;
 
   void SetAwaitDriverMode(bool enabled);
   [[nodiscard]] bool IsAwaitDriverMode() const;
@@ -1316,7 +1320,7 @@ private:
   // Wall-clock timeout (see SetTimeout). deadline_ is the instant the current
   // execution must finish by; it is only read when timeout_ms_ > 0.
   size_t timeout_ms_ = 0;                   // 0 = no timeout
-  mutable std::chrono::steady_clock::time_point deadline_{};
+  mutable std::chrono::steady_clock::time_point deadline_;
 
   // Debug hook state (see SetDebugHook). The callback lives behind a shared_ptr
   // so a dispatch in flight can hold it alive: a hook that calls set_hook or
@@ -1391,6 +1395,44 @@ private:
   static int UserdataMethodCall(lua_State* L);
   static int ClassIndex(lua_State* L);
   static int AsyncContinuation(lua_State* L, int status, lua_KContext ctx);
+
+  // Outcome of a host-function bridge body, decided while C++ objects are still
+  // alive and acted on only after they have been destroyed. lua_error/lua_yieldk
+  // longjmp (skipping C++ destructors), so any error value must be staged on the
+  // Lua stack by a function that then *returns*, and the jump performed from a
+  // scope with no non-trivial locals.
+  enum class HostCallOutcome { Return1, Raise, Yield };
+  struct HostCallMessages;
+
+  // The host-call bridge shared by LuaCallHostFunction and UserdataMethodCall:
+  // RunHostCall is the body, the three below it are its steps, and
+  // FinishHostCall performs the longjmp. See lua-runtime.cpp.
+  static HostCallOutcome RunHostCall(lua_State* L, LuaRuntime* runtime,
+                                     std::shared_ptr<Function> fn,
+                                     const char* func_name,
+                                     const HostCallMessages& msgs);
+  static bool CollectHostCallArgs(lua_State* L, const char* func_name,
+                                  const HostCallMessages& msgs,
+                                  std::vector<LuaPtr>& args);
+  static bool InvokeHostCallable(lua_State* L, LuaRuntime* runtime, const Function& fn,
+                                 const std::vector<LuaPtr>& args,
+                                 const char* func_name,
+                                 const HostCallMessages& msgs, LuaPtr& result);
+  static HostCallOutcome DeliverHostCallResult(lua_State* L, LuaRuntime* runtime,
+                                               const LuaPtr& result,
+                                               const char* func_name,
+                                               const HostCallMessages& msgs);
+  static int FinishHostCall(lua_State* L, HostCallOutcome outcome);
+
+  // The two halves of `__index`: a method (own table, or the class chain), then
+  // a host property. Each returns having destroyed its own C++ locals.
+  static bool PushUserdataMethod(lua_State* L, int ref_id, const char* key,
+                                 bool& has_method_table);
+  static bool PushMethodClosure(lua_State* L, int methods_idx, const char* key);
+  static bool PushClassMethod(lua_State* L, const char* class_name, const char* key,
+                              bool& has_methods);
+  static bool StagePropertyRead(lua_State* L, const LuaRuntime* runtime, int ref_id,
+                                const char* key, bool has_methods, bool with_position);
 
   // Error handling: message handler that appends a Lua traceback (leaving
   // structured JS-error tables untouched), a protected-call helper that installs
@@ -1493,6 +1535,8 @@ private:
   // io.read wrapper (P4a). Upvalue 1 is the original io.read, used whenever no
   // handler is installed.
   static int LuaIoRead(lua_State* L);
+  static bool ReadThroughInputHandler(lua_State* L, const LuaRuntime* runtime,
+                                      int nargs, int& pushed);
   // Returns false only when a non-table global `io` blocks the install; see
   // SetInputHandler. Sets io_synthesized_ when it creates the table itself.
   bool InstallInputRedirection();
@@ -1519,10 +1563,30 @@ private:
   // called directly) or report (a `require` searcher, whose contract is to
   // return a reason string so the next searcher still gets its turn).
   static bool PreserveTableKeys(lua_State* L);
+
+  // ToLuaValue and PushLuaValue, one function per kind of value that needs
+  // more than a line. They recurse through the two public entry points, so the
+  // depth and stack-headroom checks there cover every level.
+  static LuaPtr TableToLuaValue(lua_State* L, int abs_index, int depth);
+  static LuaPtr PlainTableToMap(lua_State* L, int abs_index, int depth);
+  static LuaPtr UserdataToLuaValue(lua_State* L, int abs_index);
+  static void PushArrayValue(lua_State* L, const LuaArray& array, int depth);
+  static void PushMapValue(lua_State* L, const LuaTable& map, int depth);
+  static void PushUserdataValue(lua_State* L, const LuaUserdataRef& ref);
   static int DeniedFileDoor(lua_State* L);
   static int DeniedFileDoorNil(lua_State* L);
   static int DeniedSearcher(lua_State* L);
   void InstallBytecodeFileGuards() const;
+  static bool IsTextOnlyFileLoader(lua_State* L, int idx);
+  void InstallDofileBytecodeGuard() const;
+  void InstallSearcherBytecodeGuard() const;
+  // SetFilesystemAccess's three ways of closing a door.
+  void DenyFileGlobal(const char* name, bool raises) const;
+  void DenyFileField(int table_idx, const char* table, const char* field,
+                     bool raises) const;
+  void DenyFileSearchers(int pkg) const;
+  // RegisterClass's copy of the base class's metamethods (C4).
+  void InheritClassMetamethods(int mt_idx, const char* parent_mt_name) const;
   void RemoveBytecodeFileGuards() const;
   static int JsSearcher(lua_State* L);
 };

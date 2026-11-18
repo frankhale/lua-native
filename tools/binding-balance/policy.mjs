@@ -253,9 +253,9 @@ export const NOT_COUNTED = {
     + 'API decision and belongs to whoever makes it.',
   value_: 'A member of SharedTable: the shared object itself, held for the life of '
     + 'the table by construction — that is what a shared table is.',
-  contextConstructor: 'A member of AddonData: one reference for the life of the '
+  context_constructor: 'A member of AddonData: one reference for the life of the '
     + 'addon instance, by design, so the exported class survives.',
-  sharedTableConstructor: 'As above.',
+  shared_table_constructor: 'As above.',
   object: 'A field of UserdataEntry, counted through `userdata` rather than on its '
     + 'own — one entry holds exactly one, so a second column would always equal '
     + 'the first.',

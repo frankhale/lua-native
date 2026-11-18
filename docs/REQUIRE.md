@@ -55,11 +55,11 @@ See [Phase 2.2 — Preferred approach](#22-add-registermodule-instance-method) f
 **Core idea:** Register each JS function as a global host function using the existing `RegisterFunction` + `CreateJsCallbackWrapper` machinery (same as `set_global` with function values). Then retrieve the `LuaFunctionRef` via `GetGlobal`, store it in a `LuaTable`, nil out the temporary global, and pass the table to a simple `RegisterModule` core method that sets it in `package.loaded`.
 
 **Steps:**
-1. For each function in the module object, call `runtime->RegisterFunction("__module_<name>_<key>", ...)` — this creates a Lua global.
-2. Retrieve it: `auto funcValue = runtime->GetGlobal("__module_<name>_<key>")`.
+1. For each function in the module object, call `runtime_->RegisterFunction("__module_<name>_<key>", ...)` — this creates a Lua global.
+2. Retrieve it: `auto funcValue = runtime_->GetGlobal("__module_<name>_<key>")`.
 3. Store the `LuaFunctionRef` in a `LuaTable`.
-4. Nil out the global: `runtime->SetGlobal("__module_<name>_<key>", nil)`.
-5. Pass the `LuaTable` to `runtime->RegisterModule(name, moduleValue)`.
+4. Nil out the global: `runtime_->SetGlobal("__module_<name>_<key>", nil)`.
+5. Pass the `LuaTable` to `runtime_->RegisterModule(name, moduleValue)`.
 
 **Pros:**
 - Reuses 100% existing infrastructure — no new core methods beyond a simple `RegisterModule` that sets `package.loaded[name]`.
@@ -293,34 +293,34 @@ Napi::Value AddSearchPath(const Napi::CallbackInfo& info);
 ```cpp
 Napi::Value LuaContext::AddSearchPath(const Napi::CallbackInfo& info) {
   if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation")
+    Napi::Error::New(env_, "Lua context is busy with an async operation")
       .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
   if (info.Length() < 1 || !info[0].IsString()) {
-    Napi::TypeError::New(env, "Expected string argument")
+    Napi::TypeError::New(env_, "Expected string argument")
       .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const std::string path = info[0].As<Napi::String>().Utf8Value();
 
   // Validate the path contains a '?' placeholder
   if (path.find('?') == std::string::npos) {
-    Napi::Error::New(env,
+    Napi::Error::New(env_,
       "Search path must contain a '?' placeholder (e.g., './modules/?.lua')")
       .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   try {
-    runtime->AddSearchPath(path);
+    runtime_->AddSearchPath(path);
   } catch (const std::runtime_error& e) {
-    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-    return env.Undefined();
+    Napi::Error::New(env_, e.what()).ThrowAsJavaScriptException();
+    return env_.Undefined();
   }
 
-  return env.Undefined();
+  return env_.Undefined();
 }
 ```
 
@@ -343,51 +343,51 @@ Napi::Value RegisterModule(const Napi::CallbackInfo& info);
 ```cpp
 Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
   if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation")
+    Napi::Error::New(env_, "Lua context is busy with an async operation")
       .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
-    Napi::TypeError::New(env, "Expected (string, object)")
+    Napi::TypeError::New(env_, "Expected (string, object)")
       .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const std::string name = info[0].As<Napi::String>().Utf8Value();
-  const auto moduleObj = info[1].As<Napi::Object>();
+  const auto module_obj = info[1].As<Napi::Object>();
 
   // Build a LuaTable from the module object.
   // Functions need to be registered as host functions first.
   lua_core::LuaTable moduleTable;
-  Napi::Array keys = moduleObj.GetPropertyNames();
+  Napi::Array keys = module_obj.GetPropertyNames();
 
   for (uint32_t i = 0; i < keys.Length(); i++) {
     const std::string key = keys[i].As<Napi::String>().Utf8Value();
-    const Napi::Value val = moduleObj.Get(key);
+    const Napi::Value val = module_obj.Get(key);
 
     if (val.IsFunction()) {
       // Register as a host function (same pattern as RegisterCallbacks)
       const std::string funcName = "__module_" + name + "_" + key;
       js_callbacks[funcName] = Napi::Persistent(val.As<Napi::Function>());
-      runtime->RegisterFunction(funcName, CreateJsCallbackWrapper(funcName));
+      runtime_->RegisterFunction(funcName, CreateJsCallbackWrapper(funcName));
 
       // Store a LuaFunctionRef for the registered function
       // We need to get the function from the global where RegisterFunction put it,
       // then store its reference in the module table.
-      auto funcValue = runtime->GetGlobal(funcName);
+      auto funcValue = runtime_->GetGlobal(funcName);
       moduleTable.emplace(key, funcValue);
 
       // Clean up the global - the function is accessible via the module table,
       // no need to pollute the global namespace
-      runtime->SetGlobal(funcName,
+      runtime_->SetGlobal(funcName,
         std::make_shared<lua_core::LuaValue>(lua_core::LuaValue::nil()));
     } else {
       try {
         moduleTable.emplace(key,
           std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
       } catch (const std::exception& e) {
-        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-        return env.Undefined();
+        Napi::Error::New(env_, e.what()).ThrowAsJavaScriptException();
+        return env_.Undefined();
       }
     }
   }
@@ -396,13 +396,13 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
     lua_core::LuaValue::from(std::move(moduleTable)));
 
   try {
-    runtime->RegisterModule(name, moduleValue);
+    runtime_->RegisterModule(name, moduleValue);
   } catch (const std::runtime_error& e) {
-    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-    return env.Undefined();
+    Napi::Error::New(env_, e.what()).ThrowAsJavaScriptException();
+    return env_.Undefined();
   }
 
-  return env.Undefined();
+  return env_.Undefined();
 }
 ```
 
@@ -460,32 +460,32 @@ Napi::Value LuaContext::RegisterModule(const Napi::CallbackInfo& info) {
 
   for (uint32_t i = 0; i < keys.Length(); i++) {
     const std::string key = keys[i].As<Napi::String>().Utf8Value();
-    const Napi::Value val = moduleObj.Get(key);
+    const Napi::Value val = module_obj.Get(key);
 
     if (val.IsFunction()) {
       const std::string funcName = "__module_" + name + "_" + key;
       js_callbacks[funcName] = Napi::Persistent(val.As<Napi::Function>());
-      runtime->StoreHostFunction(funcName, CreateJsCallbackWrapper(funcName));
+      runtime_->StoreHostFunction(funcName, CreateJsCallbackWrapper(funcName));
       entries.emplace_back(key, funcName);
     } else {
       try {
         entries.emplace_back(key,
           std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(val)));
       } catch (const std::exception& e) {
-        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-        return env.Undefined();
+        Napi::Error::New(env_, e.what()).ThrowAsJavaScriptException();
+        return env_.Undefined();
       }
     }
   }
 
   try {
-    runtime->RegisterModuleTable(name, entries);
+    runtime_->RegisterModuleTable(name, entries);
   } catch (const std::runtime_error& e) {
-    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
-    return env.Undefined();
+    Napi::Error::New(env_, e.what()).ThrowAsJavaScriptException();
+    return env_.Undefined();
   }
 
-  return env.Undefined();
+  return env_.Undefined();
 }
 ```
 

@@ -68,8 +68,8 @@ Therefore:
 
 - Produce a binary under `prebuilds/<platform>-<arch>/` and make sure it ships
   in the app. Note the filename: `index.js` looks for `lua-native.node` there
-  explicitly, while `npm run prebuildify` emits `node.napi.node` (found only via
-  the `node-gyp-build` fallback). Ship one binary per directory named
+  explicitly, and that is the name `npm run prebuildify` writes (prebuildify 6
+  names the file after the package). Ship one binary per directory named
   `lua-native.node` — see `docs/RELEASING.md` step 3.
 - Because Lua is statically linked (`LUA_STATIC` in `binding.gyp`), there is
   **no external Lua `.dylib` / `.dll` to bundle** — the prebuilt `.node` is

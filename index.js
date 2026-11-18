@@ -81,8 +81,11 @@ function loadModule() {
     }
   }
 
-  // Last resort: let node-gyp-build resolve a prebuild using its own naming
-  // convention (this is what `prebuildify` output follows).
+  // Last resort: let node-gyp-build resolve a prebuild that follows its own
+  // naming convention — `node.napi.node`, say, which older `prebuildify`
+  // releases produced. `prebuildify` 6 names its output after the package
+  // (`lua-native.node`), which the explicit prebuilds entry above already
+  // finds, so this only matters for a binary that arrived some other way.
   try {
     const prebuild = require('node-gyp-build')(currentDir);
     if (prebuild) {

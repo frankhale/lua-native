@@ -288,14 +288,14 @@ After reading `readable` and `writable` from options, also read `methods`:
 
 ```cpp
 if (options.Has("methods") && options.Get("methods").IsObject()) {
-  auto methodsObj = options.Get("methods").As<Napi::Object>();
-  Napi::Array methodKeys = methodsObj.GetPropertyNames();
-  for (uint32_t i = 0; i < methodKeys.Length(); i++) {
-    std::string methodName = methodKeys[i].As<Napi::String>().Utf8Value();
-    Napi::Value methodVal = methodsObj.Get(methodName);
-    if (methodVal.IsFunction()) {
-      entry.methods[methodName] =
-        Napi::Persistent(methodVal.As<Napi::Function>());
+  auto methods_obj = options.Get("methods").As<Napi::Object>();
+  Napi::Array method_keys = methods_obj.GetPropertyNames();
+  for (uint32_t i = 0; i < method_keys.Length(); i++) {
+    std::string method_name = method_keys[i].As<Napi::String>().Utf8Value();
+    Napi::Value method_val = methods_obj.Get(method_name);
+    if (method_val.IsFunction()) {
+      entry.methods[method_name] =
+        Napi::Persistent(method_val.As<Napi::Function>());
     }
   }
 }
@@ -308,9 +308,9 @@ method lookups):
 ```cpp
 bool needs_proxy = readable || writable || !entry.methods.empty();
 if (needs_proxy) {
-  runtime->CreateProxyUserdataGlobal(name, ref_id);
+  runtime_->CreateProxyUserdataGlobal(name, ref_id);
 } else {
-  runtime->CreateUserdataGlobal(name, ref_id);
+  runtime_->CreateUserdataGlobal(name, ref_id);
 }
 ```
 
@@ -405,7 +405,7 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
   auto* runtime = static_cast<LuaRuntime*>(lua_touserdata(L, -1));
   lua_pop(L, 1);
 
-  if (runtime && runtime->property_getter_) {
+  if (runtime && runtime_->property_getter_) {
     // ... property access
   }
   lua_pushnil(L);
@@ -456,9 +456,9 @@ int LuaRuntime::UserdataIndex(lua_State* L) {
   lua_pop(L, 1);  // pop method table (or nil if no table)
 
   // 2. Fall through to property access
-  if (runtime->property_getter_) {
+  if (runtime_->property_getter_) {
     try {
-      auto result = runtime->property_getter_(*block, key);
+      auto result = runtime_->property_getter_(*block, key);
       PushLuaValue(L, result);
       return 1;
     } catch (const std::exception& e) {
@@ -514,14 +514,14 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
     return 0;
   }
 
-  const auto it = runtime->host_functions_.find(func_name ? func_name : "");
-  if (it == runtime->host_functions_.end()) {
+  const auto it = runtime_->host_functions_.find(func_name ? func_name : "");
+  if (it == runtime_->host_functions_.end()) {
     lua_pushfstring(L, "Method '%s' not found", func_name ? func_name : "");
     lua_error(L);
     return 0;
   }
 
-  if (runtime->async_mode_) {
+  if (runtime_->async_mode_) {
     return luaL_error(L,
       "JS callbacks are not available in async mode (called method '%s')",
       func_name ? func_name : "<unknown>");
@@ -543,9 +543,9 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
   }
 
   // Call the host function
-  LuaPtr resultHolder;
+  LuaPtr result_holder;
   try {
-    resultHolder = it->second(args);
+    result_holder = it->second(args);
   } catch (const std::exception& e) {
     lua_pushfstring(L, "Method '%s' threw an exception: %s",
                     func_name ? func_name : "<unknown>", e.what());
@@ -559,7 +559,7 @@ int LuaRuntime::UserdataMethodCall(lua_State* L) {
   }
 
   try {
-    PushLuaValue(L, resultHolder);
+    PushLuaValue(L, result_holder);
   } catch (const std::exception& e) {
     lua_pushfstring(L, "Error converting return value from method '%s': %s",
                     func_name ? func_name : "<unknown>", e.what());
@@ -593,22 +593,22 @@ if (!entry.methods.empty()) {
   std::unordered_map<std::string, std::string> method_map;
   int method_id = next_method_id_++;
 
-  for (auto& [name, funcRef] : entry.methods) {
+  for (auto& [name, func_ref] : entry.methods) {
     // Create a unique host function name
     std::string func_name = "__ud_method_" + std::to_string(ref_id)
                           + "_" + name;
 
     // Store the JS callback
-    js_callbacks[func_name] = std::move(funcRef);
+    js_callbacks[func_name] = std::move(func_ref);
 
     // Register as a host function in the runtime
-    runtime->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
+    runtime_->StoreHostFunction(func_name, CreateJsCallbackWrapper(func_name));
 
     method_map[name] = func_name;
   }
 
   // Store the method lookup table in the Lua registry
-  runtime->SetUserdataMethodTable(ref_id, method_map);
+  runtime_->SetUserdataMethodTable(ref_id, method_map);
 }
 ```
 

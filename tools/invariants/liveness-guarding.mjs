@@ -61,7 +61,12 @@ const BINDING = join(ROOT, 'src/lua-native.cpp');
 
 // Any call through the runtime handle, not just the throwing ones: a read of a
 // closed `lua_State` is undefined whether or not the method can throw.
-const CORE_CALL = /(?:runtime|runtime_|rt)(?:->|\.)(\w+)\s*\(/g;
+//
+// The leading `\b` is load-bearing: without it `convert.Call(` and
+// `ctor.Call(` both end in "rt." and were scored as core calls named `Call`
+// (one such row, `CoreToNapi -> Call`, sat in the frozen answers until
+// November 18, 2026).
+const CORE_CALL = /\b(?:runtime|runtime_|rt)(?:->|\.)(\w+)\s*\(/g;
 
 // The guard forms above, as they appear in this file.
 const GUARD = new RegExp([

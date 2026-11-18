@@ -34,6 +34,10 @@ npm run test-ts-asan    # .node addon under ASan+UBSan, via the full vitest suit
 npm run test-cpp-tsan   # C++ core under TSan (single-threaded — regression guard)
 npm run test-ts-tsan    # addon under TSan, via the async vitest suite
 
+# clang-tidy over src/ with the checked-in .clang-tidy (controls first; exit 0 = clean)
+# Needs a clang-tidy binary: $CLANG_TIDY, PATH, Homebrew llvm, or a CLion install.
+npm run lint
+
 # Source invariants (generated lists vs their frozen answers)
 npm run check-invariants
 node tools/invariants/run.mjs --update      # re-freeze after a reviewed change
@@ -204,6 +208,19 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   all its own: churning *fresh* registrations measures the API's contract, not a
   defect. Read `tools/binding-balance/policy.mjs` before extending it.
 
+**Lint (`npm run lint`).** `tools/lint/run.mjs` runs clang-tidy over both
+translation units with `/.clang-tidy` (and over the C++ test file for the
+naming rules only) and fails on any finding, on a TU that
+does not compile, and on a bare `NOLINT`. Run it after C++ changes. The rules:
+a new suppression is a `NOLINTNEXTLINE(<check>)` with its reason beside it;
+switching a check off is an edit to `/.clang-tidy` with the reason in that
+file's list; and **never apply `--fix` unread** — a "fix clang-tidy issues"
+commit is how CR-11 F1 (a use-after-free) shipped, and the two
+`NOLINTNEXTLINE(modernize-loop-convert)` markers that resulted are load-bearing.
+New helpers change `scanner-coverage`'s function counts and a new `catch`
+changes `exception-surface`'s, so expect `check-invariants` to report drift
+after a lint fix and re-freeze once you have read what moved.
+
 **Reviews are sweeps now, not read-throughs** (§15.9, August 6, 2026): a pass
 declares the unsearched region it is aimed at, delivers an instrument plus a
 ledger entry rather than a document, and proves the instrument can report dirty
@@ -307,3 +324,29 @@ Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, 
 - All public `LuaRuntime` methods that can fail return `ScriptResult` (`variant<vector<LuaPtr>, string>`) where the string variant is an error message
 - `LuaValue` uses `std::variant` with `std::monostate` for nil — use the `LuaValue::from()` factory functions
 - Max recursion depth for table conversion: `kMaxDepth = 100`
+- Local variables and parameters are `snake_case`, enforced by `npm run lint`
+  (unified November 18, 2026). Exempt: `L` for a `lua_State*`, and
+  `kCamelCase` named constants. Data members are `snake_case` as well:
+  private and protected ones carry a trailing underscore (`runtime_`, `env_`,
+  `js_callbacks_`), public struct fields do not (`data->runtime`,
+  `data->table_ref`). The C++ test file follows the same naming rules.
+  `const` goes on the left (`const auto* p`).
+- No function exceeds clang-tidy's cognitive-complexity threshold (25), also
+  lint-enforced (the 22 that did were split November 18, 2026). Splitting one
+  moves rows between functions in four invariants, so expect drift and read it.
+  Three rules that pass cost something to learn: (1) a helper that reads a
+  caller-supplied JS object belongs in `SPLIT_HELPERS`
+  (`tools/invariants/invariants.mjs`), or its caller drops out of the CallScope
+  classification; (2) `liveness-guarding` looks **one** call level up for a
+  guard, so a core call two helpers below an entry point reads UNCHECKED — keep
+  installers and core calls within one hop of the guarded function; (3) a Lua C
+  frame's helper must **return** before the frame longjmps, which is what makes
+  its C++ locals safe — never fold the helper call into the `lua_error` /
+  `FinishHostCall` expression.
+- File-local functions and constants live in an anonymous namespace, not behind
+  `static` (also lint-enforced). Its contents are **not indented** — and that
+  is load-bearing: `tools/cpp-scan.mjs` only sees definitions that start at
+  column 0 with an identifier, and two helpers that sat indented inside a
+  nested namespace were invisible to every invariant until the blocks were
+  flattened. For the same reason an attribute such as `[[noreturn]]` goes on
+  its own line above the definition.

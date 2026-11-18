@@ -19,7 +19,7 @@ export const ACCEPTED = [
     reason:
       'A coroutine handle carries no liveness flag; it holds a shared_ptr to '
       + 'the runtime that minted it and is policed at use by the identity check '
-      + '(data->runtime.get() != runtime.get()). After a reset the context '
+      + '(data->runtime.get() != runtime_.get()). After a reset the context '
       + 'points at a new runtime, so the check fires and the message names a '
       + 'different context rather than naming the reset. Accurate — after a '
       + 'reset the handle genuinely does belong to a different (retired) state '

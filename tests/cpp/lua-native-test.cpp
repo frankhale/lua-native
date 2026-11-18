@@ -149,12 +149,12 @@ TEST(LuaRuntimeCore, GetGlobalPathNilShortCircuits) {
   const LuaRuntime rt(LuaRuntime::AllLibraries());
   (void)rt.ExecuteScript("config = {}");
   // Missing leaf and missing intermediate both yield nil (monostate), no throw.
-  const auto missingLeaf = rt.GetGlobalPath({"config", "db", "host"});
-  ASSERT_NE(missingLeaf, nullptr);
-  EXPECT_TRUE(std::holds_alternative<std::monostate>(missingLeaf->value));
-  const auto missingRoot = rt.GetGlobalPath({"nope", "db", "host"});
-  ASSERT_NE(missingRoot, nullptr);
-  EXPECT_TRUE(std::holds_alternative<std::monostate>(missingRoot->value));
+  const auto missing_leaf = rt.GetGlobalPath({"config", "db", "host"});
+  ASSERT_NE(missing_leaf, nullptr);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(missing_leaf->value));
+  const auto missing_root = rt.GetGlobalPath({"nope", "db", "host"});
+  ASSERT_NE(missing_root, nullptr);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(missing_root->value));
 }
 
 TEST(LuaRuntimeCore, GetGlobalPathThrowsOnNonIndexableIntermediate) {
@@ -429,10 +429,10 @@ TEST(LuaRuntimeUserdata, OpaqueUserdataReturnHasCorrectRefId) {
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
   ASSERT_EQ(vals.size(), 1u);
 
-  const auto& udRef = std::get<LuaUserdataRef>(vals[0]->value);
-  EXPECT_EQ(udRef.ref_id, 99);
-  EXPECT_FALSE(udRef.opaque);
-  EXPECT_FALSE(udRef.proxy);
+  const auto& ud_ref = std::get<LuaUserdataRef>(vals[0]->value);
+  EXPECT_EQ(ud_ref.ref_id, 99);
+  EXPECT_FALSE(ud_ref.opaque);
+  EXPECT_FALSE(ud_ref.proxy);
 }
 
 TEST(LuaRuntimeUserdata, ProxyUserdataReturnHasProxyFlag) {
@@ -444,10 +444,10 @@ TEST(LuaRuntimeUserdata, ProxyUserdataReturnHasProxyFlag) {
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
   ASSERT_EQ(vals.size(), 1u);
 
-  const auto& udRef = std::get<LuaUserdataRef>(vals[0]->value);
-  EXPECT_EQ(udRef.ref_id, 55);
-  EXPECT_FALSE(udRef.opaque);
-  EXPECT_TRUE(udRef.proxy);
+  const auto& ud_ref = std::get<LuaUserdataRef>(vals[0]->value);
+  EXPECT_EQ(ud_ref.ref_id, 55);
+  EXPECT_FALSE(ud_ref.opaque);
+  EXPECT_TRUE(ud_ref.proxy);
 }
 
 TEST(LuaRuntimeUserdata, RefCountIncrementDecrement) {
@@ -639,8 +639,8 @@ TEST(LuaRuntimeUserdata, UserdataPassthroughViaHostFunction) {
 
   rt.RegisterFunction("check", [&](const std::vector<LuaPtr>& args) -> LuaPtr {
     EXPECT_EQ(args.size(), 1u);
-    const auto& udRef = std::get<LuaUserdataRef>(args[0]->value);
-    received_ref_id = udRef.ref_id;
+    const auto& ud_ref = std::get<LuaUserdataRef>(args[0]->value);
+    received_ref_id = ud_ref.ref_id;
     // Return it back to Lua
     return args[0];
   });
@@ -654,8 +654,8 @@ TEST(LuaRuntimeUserdata, UserdataPassthroughViaHostFunction) {
   // The returned value should also be userdata with the same ref_id
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
   ASSERT_EQ(vals.size(), 1u);
-  const auto& udRef = std::get<LuaUserdataRef>(vals[0]->value);
-  EXPECT_EQ(udRef.ref_id, 77);
+  const auto& ud_ref = std::get<LuaUserdataRef>(vals[0]->value);
+  EXPECT_EQ(ud_ref.ref_id, 77);
 }
 
 TEST(LuaRuntimeUserdata, ProxyUserdataPassthroughPreservesProxyFlag) {
@@ -670,8 +670,8 @@ TEST(LuaRuntimeUserdata, ProxyUserdataPassthroughPreservesProxyFlag) {
   );
 
   rt.RegisterFunction("passthrough", [](const std::vector<LuaPtr>& args) -> LuaPtr {
-    const auto& udRef = std::get<LuaUserdataRef>(args[0]->value);
-    EXPECT_TRUE(udRef.proxy);
+    const auto& ud_ref = std::get<LuaUserdataRef>(args[0]->value);
+    EXPECT_TRUE(ud_ref.proxy);
     return args[0];
   });
 
@@ -697,10 +697,10 @@ TEST(LuaRuntimeUserdata, ForeignUserdataDetectedAsOpaque) {
   const auto& vals = std::get<std::vector<LuaPtr>>(res);
   ASSERT_EQ(vals.size(), 1u);
 
-  const auto& udRef = std::get<LuaUserdataRef>(vals[0]->value);
-  EXPECT_EQ(udRef.ref_id, -1);     // Not JS-created
-  EXPECT_TRUE(udRef.opaque);        // Foreign userdata is opaque
-  EXPECT_NE(udRef.registry_ref, LUA_NOREF);  // Has a registry reference
+  const auto& ud_ref = std::get<LuaUserdataRef>(vals[0]->value);
+  EXPECT_EQ(ud_ref.ref_id, -1);     // Not JS-created
+  EXPECT_TRUE(ud_ref.opaque);        // Foreign userdata is opaque
+  EXPECT_NE(ud_ref.registry_ref, LUA_NOREF);  // Has a registry reference
 }
 
 TEST(LuaRuntimeUserdata, ForeignUserdataRoundTripViaHostFunction) {
@@ -1691,16 +1691,16 @@ TEST(LuaRuntimeTableRef, GetTableFieldBasicRead) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
-  auto xVal = rt.GetTableField(tableRef.ref, "x");
-  EXPECT_EQ(std::get<int64_t>(xVal->value), 10);
+  auto x_val = rt.GetTableField(table_ref.ref, "x");
+  EXPECT_EQ(std::get<int64_t>(x_val->value), 10);
 
-  auto yVal = rt.GetTableField(tableRef.ref, "y");
-  EXPECT_EQ(std::get<std::string>(yVal->value), "hello");
+  auto y_val = rt.GetTableField(table_ref.ref, "y");
+  EXPECT_EQ(std::get<std::string>(y_val->value), "hello");
 
-  auto nilVal = rt.GetTableField(tableRef.ref, "missing");
-  EXPECT_TRUE(std::holds_alternative<std::monostate>(nilVal->value));
+  auto nil_val = rt.GetTableField(table_ref.ref, "missing");
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(nil_val->value));
 }
 
 TEST(LuaRuntimeTableRef, GetTableFieldTriggersIndex) {
@@ -1720,9 +1720,9 @@ TEST(LuaRuntimeTableRef, GetTableFieldTriggersIndex) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
-  auto val = rt.GetTableField(tableRef.ref, "foo");
+  auto val = rt.GetTableField(table_ref.ref, "foo");
   EXPECT_EQ(std::get<std::string>(val->value), "indexed_foo");
 }
 
@@ -1747,10 +1747,10 @@ TEST(LuaRuntimeTableRef, SetTableFieldTriggersNewindex) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
   auto val = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(99)));
-  rt.SetTableField(tableRef.ref, "mykey", val);
+  rt.SetTableField(table_ref.ref, "mykey", val);
 
   EXPECT_EQ(captured_key, "mykey");
   EXPECT_EQ(captured_value, 99);
@@ -1769,10 +1769,10 @@ TEST(LuaRuntimeTableRef, HasTableFieldBasicCheck) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
-  EXPECT_TRUE(rt.HasTableField(tableRef.ref, "x"));
-  EXPECT_FALSE(rt.HasTableField(tableRef.ref, "nonexistent"));
+  EXPECT_TRUE(rt.HasTableField(table_ref.ref, "x"));
+  EXPECT_FALSE(rt.HasTableField(table_ref.ref, "nonexistent"));
 }
 
 TEST(LuaRuntimeTableRef, GetTableKeysReturnsAllKeys) {
@@ -1788,9 +1788,9 @@ TEST(LuaRuntimeTableRef, GetTableKeysReturnsAllKeys) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
-  auto keys = rt.GetTableKeys(tableRef.ref);
+  auto keys = rt.GetTableKeys(table_ref.ref);
   std::sort(keys.begin(), keys.end());
   ASSERT_EQ(keys.size(), 3u);
   EXPECT_EQ(keys[0], "a");
@@ -1811,9 +1811,9 @@ TEST(LuaRuntimeTableRef, GetTableLengthBasic) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
-  EXPECT_EQ(rt.GetTableLength(tableRef.ref), 3);
+  EXPECT_EQ(rt.GetTableLength(table_ref.ref), 3);
 }
 
 TEST(LuaRuntimeTableRef, GetTableLengthWithMetamethod) {
@@ -1833,9 +1833,9 @@ TEST(LuaRuntimeTableRef, GetTableLengthWithMetamethod) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
-  EXPECT_EQ(rt.GetTableLength(tableRef.ref), 42);
+  EXPECT_EQ(rt.GetTableLength(table_ref.ref), 42);
 }
 
 TEST(LuaRuntimeTableRef, IntegerKeyHandling) {
@@ -1851,20 +1851,20 @@ TEST(LuaRuntimeTableRef, IntegerKeyHandling) {
   rt.SetGlobalMetatable("t", entries);
 
   auto ref = rt.GetGlobal("t");
-  const auto& tableRef = std::get<LuaTableRef>(ref->value);
+  const auto& table_ref = std::get<LuaTableRef>(ref->value);
 
   // Integer keys via string representation
-  auto v1 = rt.GetTableField(tableRef.ref, "1");
+  auto v1 = rt.GetTableField(table_ref.ref, "1");
   EXPECT_EQ(std::get<int64_t>(v1->value), 10);
-  auto v2 = rt.GetTableField(tableRef.ref, "2");
+  auto v2 = rt.GetTableField(table_ref.ref, "2");
   EXPECT_EQ(std::get<int64_t>(v2->value), 20);
-  auto v3 = rt.GetTableField(tableRef.ref, "3");
+  auto v3 = rt.GetTableField(table_ref.ref, "3");
   EXPECT_EQ(std::get<int64_t>(v3->value), 30);
 
   // Set via integer key
-  auto newVal = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(99)));
-  rt.SetTableField(tableRef.ref, "2", newVal);
-  auto updated = rt.GetTableField(tableRef.ref, "2");
+  auto new_val = std::make_shared<LuaValue>(LuaValue::from(static_cast<int64_t>(99)));
+  rt.SetTableField(table_ref.ref, "2", new_val);
+  auto updated = rt.GetTableField(table_ref.ref, "2");
   EXPECT_EQ(std::get<int64_t>(updated->value), 99);
 }
 
@@ -2646,16 +2646,16 @@ TEST(LuaRuntimeBytecode, LoadBytecodeReturnsFunction) {
   ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(values[0]->value));
 
   // Call the returned function
-  auto& funcRef = std::get<LuaFunctionRef>(values[0]->value);
+  auto& func_ref = std::get<LuaFunctionRef>(values[0]->value);
   std::vector<LuaPtr> args = {
     std::make_shared<LuaValue>(LuaValue::from(int64_t(10))),
     std::make_shared<LuaValue>(LuaValue::from(int64_t(32)))
   };
-  auto callResult = runtime.CallFunction(funcRef, args);
-  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(callResult));
-  auto& callValues = std::get<std::vector<LuaPtr>>(callResult);
-  ASSERT_EQ(callValues.size(), 1u);
-  EXPECT_EQ(std::get<int64_t>(callValues[0]->value), 42);
+  auto call_result = runtime.CallFunction(func_ref, args);
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(call_result));
+  auto& call_values = std::get<std::vector<LuaPtr>>(call_result);
+  ASSERT_EQ(call_values.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(call_values[0]->value), 42);
 }
 
 TEST(LuaRuntimeBytecode, CompileFileAndLoadBytecodeMatch) {
@@ -2664,30 +2664,30 @@ TEST(LuaRuntimeBytecode, CompileFileAndLoadBytecodeMatch) {
   auto compiled = runtime.CompileFile(RepoPath("tests/fixtures/return-values.lua"));
   ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(compiled));
 
-  auto fromBytecode = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
-  auto fromFile = runtime.ExecuteFile(RepoPath("tests/fixtures/return-values.lua"));
+  auto from_bytecode = runtime.LoadBytecode(std::get<std::vector<uint8_t>>(compiled));
+  auto from_file = runtime.ExecuteFile(RepoPath("tests/fixtures/return-values.lua"));
 
-  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fromBytecode));
-  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fromFile));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(from_bytecode));
+  ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(from_file));
 
-  auto& bcVals = std::get<std::vector<LuaPtr>>(fromBytecode);
-  auto& fileVals = std::get<std::vector<LuaPtr>>(fromFile);
-  ASSERT_EQ(bcVals.size(), fileVals.size());
+  auto& bc_vals = std::get<std::vector<LuaPtr>>(from_bytecode);
+  auto& file_vals = std::get<std::vector<LuaPtr>>(from_file);
+  ASSERT_EQ(bc_vals.size(), file_vals.size());
   // Matching arity is not "matching": compare the values themselves, or wrong
   // results of the right shape pass (F9).
-  for (size_t i = 0; i < bcVals.size(); ++i) {
-    ASSERT_NE(bcVals[i], nullptr);
-    ASSERT_NE(fileVals[i], nullptr);
-    EXPECT_EQ(bcVals[i]->value.index(), fileVals[i]->value.index())
+  for (size_t i = 0; i < bc_vals.size(); ++i) {
+    ASSERT_NE(bc_vals[i], nullptr);
+    ASSERT_NE(file_vals[i], nullptr);
+    EXPECT_EQ(bc_vals[i]->value.index(), file_vals[i]->value.index())
         << "type mismatch at result " << i;
-    if (std::holds_alternative<int64_t>(bcVals[i]->value)) {
-      EXPECT_EQ(std::get<int64_t>(bcVals[i]->value), std::get<int64_t>(fileVals[i]->value));
-    } else if (std::holds_alternative<double>(bcVals[i]->value)) {
-      EXPECT_DOUBLE_EQ(std::get<double>(bcVals[i]->value), std::get<double>(fileVals[i]->value));
-    } else if (std::holds_alternative<std::string>(bcVals[i]->value)) {
-      EXPECT_EQ(std::get<std::string>(bcVals[i]->value), std::get<std::string>(fileVals[i]->value));
-    } else if (std::holds_alternative<bool>(bcVals[i]->value)) {
-      EXPECT_EQ(std::get<bool>(bcVals[i]->value), std::get<bool>(fileVals[i]->value));
+    if (std::holds_alternative<int64_t>(bc_vals[i]->value)) {
+      EXPECT_EQ(std::get<int64_t>(bc_vals[i]->value), std::get<int64_t>(file_vals[i]->value));
+    } else if (std::holds_alternative<double>(bc_vals[i]->value)) {
+      EXPECT_DOUBLE_EQ(std::get<double>(bc_vals[i]->value), std::get<double>(file_vals[i]->value));
+    } else if (std::holds_alternative<std::string>(bc_vals[i]->value)) {
+      EXPECT_EQ(std::get<std::string>(bc_vals[i]->value), std::get<std::string>(file_vals[i]->value));
+    } else if (std::holds_alternative<bool>(bc_vals[i]->value)) {
+      EXPECT_EQ(std::get<bool>(bc_vals[i]->value), std::get<bool>(file_vals[i]->value));
     }
   }
 }
@@ -3061,10 +3061,10 @@ TEST(LuaRuntimeTimeout, AppliesToCoroutineResumes) {
 
   auto fn = rt.ExecuteScript("return function() while true do end end");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fn));
-  const auto& funcRef =
+  const auto& func_ref =
       std::get<LuaFunctionRef>(std::get<std::vector<LuaPtr>>(fn)[0]->value);
 
-  auto co = rt.CreateCoroutine(funcRef);
+  auto co = rt.CreateCoroutine(func_ref);
   ASSERT_TRUE(std::holds_alternative<LuaThreadRef>(co));
 
   auto result = rt.ResumeCoroutine(std::get<LuaThreadRef>(co), {});
@@ -3367,11 +3367,11 @@ TEST(LuaRuntimeDebugHook, CoroutinesCreatedAfterInstallInheritTheHook) {
 
   auto fn = rt.ExecuteScript("return function() local a = 1 return a end");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(fn));
-  const auto& fnVals = std::get<std::vector<LuaPtr>>(fn);
-  ASSERT_EQ(fnVals.size(), 1u);
-  const auto& funcRef = std::get<LuaFunctionRef>(fnVals[0]->value);
+  const auto& fn_vals = std::get<std::vector<LuaPtr>>(fn);
+  ASSERT_EQ(fn_vals.size(), 1u);
+  const auto& func_ref = std::get<LuaFunctionRef>(fn_vals[0]->value);
 
-  auto co = rt.CreateCoroutine(funcRef);
+  auto co = rt.CreateCoroutine(func_ref);
   ASSERT_TRUE(std::holds_alternative<LuaThreadRef>(co));
 
   const size_t before = rec.events.size();
@@ -4192,10 +4192,10 @@ TEST(LuaRuntimeProtectedAlloc, ResultConversionUnderExhaustedMemoryReportsInstea
     return function() return marked end
   )");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(setup));
-  const auto& setupValues = std::get<std::vector<LuaPtr>>(setup);
-  ASSERT_EQ(setupValues.size(), 1u);
-  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setupValues[0]->value));
-  const auto& funcRef = std::get<LuaFunctionRef>(setupValues[0]->value);
+  const auto& setup_values = std::get<std::vector<LuaPtr>>(setup);
+  ASSERT_EQ(setup_values.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setup_values[0]->value));
+  const auto& func_ref = std::get<LuaFunctionRef>(setup_values[0]->value);
 
   ExhaustLuaMemory(rt);
 
@@ -4204,12 +4204,12 @@ TEST(LuaRuntimeProtectedAlloc, ResultConversionUnderExhaustedMemoryReportsInstea
   // has to grow, an allocation that can no longer succeed. The assertion that
   // really matters is that the process is still alive to make it.
   std::vector<ScriptResult> held;
-  bool reportedError = false;
-  for (int i = 0; i < 512 && !reportedError; ++i) {
-    held.push_back(rt.CallFunction(funcRef, {}));
-    reportedError = std::holds_alternative<std::string>(held.back());
+  bool reported_error = false;
+  for (int i = 0; i < 512 && !reported_error; ++i) {
+    held.push_back(rt.CallFunction(func_ref, {}));
+    reported_error = std::holds_alternative<std::string>(held.back());
   }
-  EXPECT_TRUE(reportedError);
+  EXPECT_TRUE(reported_error);
 }
 
 // The other half of the M5 residual class: the bare-API entry points used to
@@ -4225,36 +4225,36 @@ TEST(LuaRuntimeProtectedAlloc, ArgumentStagingUnderExhaustedMemoryThrowsInsteadO
   config.max_memory = 1024 * 1024;
   LuaRuntime rt(config);
 
-  const int tableRef = rt.CreateTable();  // taken while there is still budget
-  ASSERT_NE(tableRef, LUA_NOREF);
+  const int table_ref = rt.CreateTable();  // taken while there is still budget
+  ASSERT_NE(table_ref, LUA_NOREF);
 
   // Well past 40 chars, so Lua allocates a fresh long string rather than reusing
   // an interned short one — and large enough that it cannot fit in the few
   // hundred bytes of slack the emergency GC hands back when the budget is hit.
-  const std::string longKey(64 * 1024, 'k');
-  const auto longValue = std::make_shared<LuaValue>(
+  const std::string long_key(64 * 1024, 'k');
+  const auto long_value = std::make_shared<LuaValue>(
     LuaValue::from(std::string(64 * 1024, 'v')));
 
   // Each failed attempt leaves a little slack behind — the emergency GC that
   // accompanies the failure reclaims the garbage that attempt made — so the
   // budget is driven back to the wall before every case.
-  const auto atTheWall = [&](const char* what, const std::function<void()>& op) {
+  const auto at_the_wall = [&](const char* what, const std::function<void()>& op) {
     ExhaustLuaMemory(rt);
     SCOPED_TRACE(what);
     EXPECT_THROW(op(), std::runtime_error);
   };
 
   // Reading a global: the key push inside PushProtectedGlobal.
-  atTheWall("GetGlobal", [&]() { (void)rt.GetGlobal(longKey); });
+  at_the_wall("GetGlobal", [&]() { (void)rt.GetGlobal(long_key); });
   // Writing a global: the key push AND the whole of PushLuaValue.
-  atTheWall("SetGlobal", [&]() { rt.SetGlobal(longKey, longValue); });
+  at_the_wall("SetGlobal", [&]() { rt.SetGlobal(long_key, long_value); });
   // The same two staging steps on the table-reference API, string and typed keys.
-  atTheWall("GetTableField", [&]() { (void)rt.GetTableField(tableRef, longKey); });
-  atTheWall("SetTableField", [&]() { rt.SetTableField(tableRef, longKey, longValue); });
-  atTheWall("HasTableFieldKeyed",
-            [&]() { (void)rt.HasTableFieldKeyed(tableRef, TableKey(longKey)); });
-  atTheWall("SetTableFieldKeyed",
-            [&]() { rt.SetTableFieldKeyed(tableRef, TableKey(longKey), longValue); });
+  at_the_wall("GetTableField", [&]() { (void)rt.GetTableField(table_ref, long_key); });
+  at_the_wall("SetTableField", [&]() { rt.SetTableField(table_ref, long_key, long_value); });
+  at_the_wall("HasTableFieldKeyed",
+            [&]() { (void)rt.HasTableFieldKeyed(table_ref, TableKey(long_key)); });
+  at_the_wall("SetTableFieldKeyed",
+            [&]() { rt.SetTableFieldKeyed(table_ref, TableKey(long_key), long_value); });
 }
 
 TEST(LuaRuntimeProtectedAlloc, RegisterFunctionAndCreateTableStillWorkUnderLimit) {
@@ -4303,16 +4303,16 @@ TEST(LuaRuntimeProtectedAlloc, HostFunctionResultPushUnderExhaustedMemoryReports
   // needs no compilation once the budget is gone.
   const auto setup = rt.ExecuteScript("return bigresult");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(setup));
-  const auto& setupValues = std::get<std::vector<LuaPtr>>(setup);
-  ASSERT_EQ(setupValues.size(), 1u);
-  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setupValues[0]->value));
-  const auto& funcRef = std::get<LuaFunctionRef>(setupValues[0]->value);
+  const auto& setup_values = std::get<std::vector<LuaPtr>>(setup);
+  ASSERT_EQ(setup_values.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setup_values[0]->value));
+  const auto& func_ref = std::get<LuaFunctionRef>(setup_values[0]->value);
 
   ExhaustLuaMemory(rt);
 
   // The 200k-element push cannot fit in the emergency-GC slack, so the first
   // call's result push fails and must surface as an ordinary error result.
-  const auto res = rt.CallFunction(funcRef, {});
+  const auto res = rt.CallFunction(func_ref, {});
   ASSERT_TRUE(std::holds_alternative<std::string>(res));
   EXPECT_NE(std::get<std::string>(res).find("memory"), std::string::npos);
 
@@ -4352,14 +4352,14 @@ TEST(LuaRuntimeProtectedAlloc, PropertyGetterPushUnderExhaustedMemoryReportsAndF
   // A closure taken up front, so the failing call needs no compilation.
   const auto setup = rt.ExecuteScript("return function() return obj.anything end");
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(setup));
-  const auto& setupValues = std::get<std::vector<LuaPtr>>(setup);
-  ASSERT_EQ(setupValues.size(), 1u);
-  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setupValues[0]->value));
-  const auto& funcRef = std::get<LuaFunctionRef>(setupValues[0]->value);
+  const auto& setup_values = std::get<std::vector<LuaPtr>>(setup);
+  ASSERT_EQ(setup_values.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<LuaFunctionRef>(setup_values[0]->value));
+  const auto& func_ref = std::get<LuaFunctionRef>(setup_values[0]->value);
 
   ExhaustLuaMemory(rt);
 
-  const auto res = rt.CallFunction(funcRef, {});
+  const auto res = rt.CallFunction(func_ref, {});
   ASSERT_TRUE(std::holds_alternative<std::string>(res));
   EXPECT_NE(std::get<std::string>(res).find("memory"), std::string::npos);
 

@@ -52,7 +52,30 @@ const CORE = join(ROOT, 'src/core/lua-runtime.cpp');
 // documents why each current one is inert — but a function that *changes*
 // class, or a new one that arrives in either class, is a review item, and that
 // is exactly what the frozen map makes impossible to miss.
-const USER_JS = /\.Get\(|\.Call\(|\.Has\(|GetPropertyNames\(|NapiToCoreInstance\(|CoreToNapi\(|LuaFunctionDataFrom\(|TableRefDataFrom\(|DefineHiddenProp\(|SymbolIteratorKey\(/;
+//
+// The second list is the helpers split out of those functions on November 18,
+// 2026 (the cognitive-complexity pass). Their user JS is their caller's in
+// exactly the sense the header means — the caller holds the scope — so a call
+// to one counts as a user-JS line. Without them the functions they were carved
+// from would either drop out of this classification or change class with
+// nothing about their behaviour having changed.
+const SPLIT_HELPERS = [
+  'ParseInitOptions', 'ApplyStateOptions', 'SubscribeSharedTables',      // LuaContext (ctor)
+  'ReadUserdataProperty', 'WriteUserdataProperty',                       // InstallRuntimeHandlers
+  'ReadUserdataOptions',                                                 // SetUserdata
+  'ReadClassExtends', 'ReadClassMetamethods', 'ReadClassStatics',        // RegisterClass
+  'ReadClassProperties', 'ReadClassMethods', 'BuildClassStatics',
+  'ReadEnvironmentOptions',                                              // CreateEnvironment
+  'ResolveAsyncCallTarget',                                              // CallAsync
+  'AttachToAwaitedPromise',                                              // DriveAsync
+  'ReleaseObjectHandle',                                                 // Release
+  'ObjectToCore',                                                        // NapiToCoreImpl
+  'ArrayToNapi', 'TableToNapi', 'FunctionRefToNapi', 'TableRefToNapi',   // CoreToNapiBuiltin
+];
+const USER_JS = new RegExp(
+  '\\.Get\\(|\\.Call\\(|\\.Has\\(|GetPropertyNames\\(|NapiToCoreInstance\\(|CoreToNapi\\(|'
+  + 'LuaFunctionDataFrom\\(|TableRefDataFrom\\(|DefineHiddenProp\\(|SymbolIteratorKey\\(|'
+  + SPLIT_HELPERS.map((n) => `\\b${n}\\(`).join('|'));
 const CALL_SCOPE = /CallScope\s+[A-Za-z_]/;
 
 export function callScopeClassification() {

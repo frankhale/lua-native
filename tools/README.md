@@ -35,6 +35,8 @@ tools/
   crossing-cost/          what does it cost, and are the docs right about that?
   gc-stress/              not a search: makes the addon do dangerous things
                           so a sanitizer has something to watch
+  lint/                   not a search either: clang-tidy over src/, with the
+                          checked-in /.clang-tidy
 ```
 
 | Harness | Run | What it searches | Docs |
@@ -162,6 +164,49 @@ route around it: `info().bindingRefs` ships, `binding-balance` searches it, and
 lifetime policy. The gap is recorded here rather than deleted because "an
 instrument cannot decide this, a person must" is a real category and this is what
 its resolution looks like.
+
+## The static check: `lint/`
+
+```bash
+npm run lint                         # controls, then src/
+node tools/lint/run.mjs --control    # just the controls
+node tools/lint/run.mjs --verbose    # every diagnostic with its source line
+```
+
+clang-tidy over both translation units and the three headers, using the one
+configuration in `/.clang-tidy`, plus `tests/cpp/lua-native-test.cpp` held to
+the **naming rules only** — the suite is gtest macros end to end, which the full
+check set reads as findings. Exit 0 means zero findings. It is not counted
+among the ten instruments above — it searches no boundary and runs no code —
+but it obeys the first convention for the same reason they do: it lints
+`lint/control.cpp` first, a file that is deliberately wrong, and refuses to go
+on unless the checks named there fire — the naming check once per kind of
+name, since each kind has its own option — **and** three checks the project
+disables stay silent. The second half is what proves `/.clang-tidy` is the configuration
+in effect rather than the tool's defaults.
+
+Two things it treats as failures that clang-tidy itself does not:
+
+- **A translation unit that does not compile.** clang-tidy carries on after a
+  compile error and reports whatever it managed to see. The first run of this
+  check's ancestor was missing an include path, produced a third of the
+  diagnostics, and exited 0.
+- **A bare `NOLINT`.** Every suppression must name its check; the run prints the
+  full list so a new one is visible in review.
+
+It never passes `--fix`, and nobody should without reading each change: that is
+how CR-11 F1 shipped. `/.clang-tidy` lists every disabled check with its reason;
+turning one off is a change to that file, not a `NOLINT` in the source.
+
+It needs a `clang-tidy` binary, which Xcode does not ship. It looks in
+`$CLANG_TIDY`, `PATH`, Homebrew's `llvm`, and a CLion install, in that order.
+
+Its first run (November 18, 2026) found what the ten above could not, each for a
+stated reason: a null test defeated by a dereference inside the branch it
+guarded (two sites; the four sibling sites had it right), and — by reading the
+constructor a lint pointed at — a `lua_State` leaked by every construction that
+threw after `lua_newstate`, which no sanitizer here can see because none of them
+sees a leak.
 
 ## Re-freezing the invariants
 

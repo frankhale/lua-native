@@ -583,7 +583,7 @@ to create handle objects:
 
 ```cpp
 // In LuaContext (private):
-Napi::Object CreateTableHandle(Napi::Env env, int registry_ref);
+Napi::Object CreateTableHandle(Napi::Env handle_env, int registry_ref);
 ```
 
 **File: `src/lua-native.cpp`**
@@ -595,36 +595,36 @@ and `release` methods. Stores the `LuaTableRefData` as an external so all
 closures share the same data.
 
 ```cpp
-Napi::Object LuaContext::CreateTableHandle(Napi::Env env, int registry_ref) {
+Napi::Object LuaContext::CreateTableHandle(Napi::Env handle_env, int registry_ref) {
   auto data = std::make_unique<LuaTableRefData>(
     runtime_, lua_core::LuaTableRef(registry_ref, runtime_->GetState()),
     this
   );
-  auto* dataPtr = data.get();
+  auto* data_ptr = data.get();
   lua_table_ref_data_.push_back(std::move(data));
 
-  Napi::Object handle = Napi::Object::New(env);
+  Napi::Object handle = Napi::Object::New(handle_env);
 
   // Store the external for round-trip detection (same pattern as Proxy)
-  auto external = Napi::External<LuaTableRefData>::New(env, dataPtr);
+  auto external = Napi::External<LuaTableRefData>::New(handle_env, data_ptr);
 
   // Non-enumerable _tableRef marker for set_global round-trip
-  auto Object = env.Global().Get("Object").As<Napi::Object>();
+  auto Object = handle_env.Global().Get("Object").As<Napi::Object>();
   auto defineProperty = Object.Get("defineProperty").As<Napi::Function>();
-  Napi::Object descriptor = Napi::Object::New(env);
+  Napi::Object descriptor = Napi::Object::New(handle_env);
   descriptor.Set("value", external);
-  descriptor.Set("enumerable", Napi::Boolean::New(env, false));
-  descriptor.Set("configurable", Napi::Boolean::New(env, true));
-  defineProperty.Call({handle, Napi::String::New(env, "_tableRef"), descriptor});
+  descriptor.Set("enumerable", Napi::Boolean::New(handle_env, false));
+  descriptor.Set("configurable", Napi::Boolean::New(handle_env, true));
+  defineProperty.Call({handle, Napi::String::New(handle_env, "_tableRef"), descriptor});
 
   // Attach methods as properties
-  handle.Set("get", Napi::Function::New(env, TableHandleGet, "get", dataPtr));
-  handle.Set("set", Napi::Function::New(env, TableHandleSet, "set", dataPtr));
-  handle.Set("has", Napi::Function::New(env, TableHandleHas, "has", dataPtr));
-  handle.Set("length", Napi::Function::New(env, TableHandleLength, "length", dataPtr));
-  handle.Set("pairs", Napi::Function::New(env, TableHandlePairs, "pairs", dataPtr));
-  handle.Set("ipairs", Napi::Function::New(env, TableHandleIPairs, "ipairs", dataPtr));
-  handle.Set("release", Napi::Function::New(env, TableHandleRelease, "release", dataPtr));
+  handle.Set("get", Napi::Function::New(handle_env, TableHandleGet, "get", data_ptr));
+  handle.Set("set", Napi::Function::New(handle_env, TableHandleSet, "set", data_ptr));
+  handle.Set("has", Napi::Function::New(handle_env, TableHandleHas, "has", data_ptr));
+  handle.Set("length", Napi::Function::New(handle_env, TableHandleLength, "length", data_ptr));
+  handle.Set("pairs", Napi::Function::New(handle_env, TableHandlePairs, "pairs", data_ptr));
+  handle.Set("ipairs", Napi::Function::New(handle_env, TableHandleIPairs, "ipairs", data_ptr));
+  handle.Set("release", Napi::Function::New(handle_env, TableHandleRelease, "release", data_ptr));
 
   return handle;
 }
@@ -655,7 +655,7 @@ that extracts the `LuaTableRefData*` from the callback's `Data()` pointer.
 ```cpp
 static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     throw Napi::Error::New(info.Env(), "table handle has been released");
   }
 
@@ -670,7 +670,7 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
     key = info[0].As<Napi::String>().Utf8Value();
   }
 
-  auto result = data->runtime->GetTableField(data->tableRef.ref, key);
+  auto result = data->runtime->GetTableField(data->table_ref.ref, key);
   return data->context->CoreToNapi(info.Env(), result);
 }
 ```
@@ -678,7 +678,7 @@ static Napi::Value TableHandleGet(const Napi::CallbackInfo& info) {
 ```cpp
 static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     throw Napi::Error::New(info.Env(), "table handle has been released");
   }
 
@@ -694,7 +694,7 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
   }
 
   auto value = data->context->NapiToCoreInstance(info[1]);
-  data->runtime->SetTableField(data->tableRef.ref, key, value);
+  data->runtime->SetTableField(data->table_ref.ref, key, value);
   return info.Env().Undefined();
 }
 ```
@@ -702,7 +702,7 @@ static Napi::Value TableHandleSet(const Napi::CallbackInfo& info) {
 ```cpp
 static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     throw Napi::Error::New(info.Env(), "table handle has been released");
   }
 
@@ -713,7 +713,7 @@ static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
     key = info[0].As<Napi::String>().Utf8Value();
   }
 
-  bool exists = data->runtime->HasTableField(data->tableRef.ref, key);
+  bool exists = data->runtime->HasTableField(data->table_ref.ref, key);
   return Napi::Boolean::New(info.Env(), exists);
 }
 ```
@@ -721,11 +721,11 @@ static Napi::Value TableHandleHas(const Napi::CallbackInfo& info) {
 ```cpp
 static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     throw Napi::Error::New(info.Env(), "table handle has been released");
   }
 
-  int len = data->runtime->GetTableLength(data->tableRef.ref);
+  int len = data->runtime->GetTableLength(data->table_ref.ref);
   return Napi::Number::New(info.Env(), len);
 }
 ```
@@ -733,11 +733,11 @@ static Napi::Value TableHandleLength(const Napi::CallbackInfo& info) {
 ```cpp
 static Napi::Value TableHandlePairs(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     throw Napi::Error::New(info.Env(), "table handle has been released");
   }
 
-  auto pairs = data->runtime->TablePairs(data->tableRef.ref);
+  auto pairs = data->runtime->TablePairs(data->table_ref.ref);
   Napi::Env env = info.Env();
 
   // Return an array of [key, value] arrays
@@ -785,11 +785,11 @@ The `ipairs()` native implementation:
 ```cpp
 static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     throw Napi::Error::New(info.Env(), "table handle has been released");
   }
 
-  auto ipairs = data->runtime->TableIPairs(data->tableRef.ref);
+  auto ipairs = data->runtime->TableIPairs(data->table_ref.ref);
   Napi::Env env = info.Env();
 
   Napi::Array result = Napi::Array::New(env, ipairs.size());
@@ -811,13 +811,13 @@ static Napi::Value TableHandleIPairs(const Napi::CallbackInfo& info) {
 ```cpp
 static Napi::Value TableHandleRelease(const Napi::CallbackInfo& info) {
   auto* data = static_cast<LuaTableRefData*>(info.Data());
-  if (data->tableRef.ref == LUA_NOREF) {
+  if (data->table_ref.ref == LUA_NOREF) {
     // Already released — no-op (not an error)
     return info.Env().Undefined();
   }
 
-  data->runtime->ReleaseTableRef(data->tableRef.ref);
-  data->tableRef.ref = LUA_NOREF;
+  data->runtime->ReleaseTableRef(data->table_ref.ref);
+  data->table_ref.ref = LUA_NOREF;
   return info.Env().Undefined();
 }
 ```
@@ -837,22 +837,22 @@ Napi::Value LuaContext::CreateTable(const Napi::CallbackInfo& info) {
     if (info[0].IsArray()) {
       // Array initializer
       auto arr = info[0].As<Napi::Array>();
-      lua_core::LuaArray luaArr;
+      lua_core::LuaArray lua_arr;
       for (uint32_t i = 0; i < arr.Length(); ++i) {
-        luaArr.push_back(NapiToCoreInstance(arr.Get(i)));
+        lua_arr.push_back(NapiToCoreInstance(arr.Get(i)));
       }
-      int ref = runtime_->CreateTableFrom(luaArr);
+      int ref = runtime_->CreateTableFrom(lua_arr);
       return CreateTableHandle(env, ref);
     } else if (info[0].IsObject()) {
       // Object initializer
       auto obj = info[0].As<Napi::Object>();
-      lua_core::LuaTable luaTbl;
+      lua_core::LuaTable lua_tbl;
       auto keys = obj.GetPropertyNames();
       for (uint32_t i = 0; i < keys.Length(); ++i) {
         std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
-        luaTbl[key] = NapiToCoreInstance(obj.Get(key));
+        lua_tbl[key] = NapiToCoreInstance(obj.Get(key));
       }
-      int ref = runtime_->CreateTableFrom(luaTbl);
+      int ref = runtime_->CreateTableFrom(lua_tbl);
       return CreateTableHandle(env, ref);
     }
   }
@@ -1061,7 +1061,7 @@ t.release(); // no-op (safe to call twice)
 
 ### Handle outlives `LuaContext`
 
-The `LuaTableRefData` destructor calls `luaL_unref` via `tableRef.release()`.
+The `LuaTableRefData` destructor calls `luaL_unref` via `table_ref.release()`.
 When the `LuaContext` is destroyed, its `lua_table_ref_data_` vector is
 cleared, which destroys all `LuaTableRefData` entries and releases their
 registry refs. Any dangling JS handle objects will have their `data` pointer

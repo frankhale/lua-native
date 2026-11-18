@@ -225,7 +225,7 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
     return std::string("Bytecode cannot be empty");
   }
 
-  const int stackBefore = lua_gettop(L_);
+  const int stack_before = lua_gettop(L_);
 
   // Use lua_load with a simple reader that provides the bytecode in one call.
   // The "b" mode restricts to binary-only, rejecting source text.
@@ -262,12 +262,12 @@ ScriptResult LuaRuntime::LoadBytecode(const std::vector<uint8_t>& bytecode,
     return error;
   }
 
-  const int nresults = lua_gettop(L_) - stackBefore;
+  const int nresults = lua_gettop(L_) - stack_before;
   std::vector<LuaPtr> results;
   results.reserve(nresults);
   try {
     for (int i = 0; i < nresults; ++i) {
-      results.push_back(ToLuaValue(L_, stackBefore + 1 + i));
+      results.push_back(ToLuaValue(L_, stack_before + 1 + i));
     }
   } catch (const std::exception& e) {
     lua_pop(L_, nresults);
@@ -316,14 +316,14 @@ InstanceMethod("load_bytecode", &LuaContext::LoadBytecode),
 ```cpp
 Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
   if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation")
+    Napi::Error::New(env_, "Lua context is busy with an async operation")
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
   if (info.Length() < 1 || !info[0].IsString()) {
-    Napi::TypeError::New(env, "Expected string argument")
+    Napi::TypeError::New(env_, "Expected string argument")
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const std::string script = info[0].As<Napi::String>().Utf8Value();
@@ -341,16 +341,16 @@ Napi::Value LuaContext::Compile(const Napi::CallbackInfo& info) {
     }
   }
 
-  const auto result = runtime->CompileScript(script, strip_debug, chunk_name);
+  const auto result = runtime_->CompileScript(script, strip_debug, chunk_name);
 
   if (std::holds_alternative<std::string>(result)) {
-    Napi::Error::New(env, std::get<std::string>(result))
+    Napi::Error::New(env_, std::get<std::string>(result))
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const auto& bytecode = std::get<std::vector<uint8_t>>(result);
-  return Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size());
+  return Napi::Buffer<uint8_t>::Copy(env_, bytecode.data(), bytecode.size());
 }
 ```
 
@@ -361,14 +361,14 @@ The bytecode is returned as a `Napi::Buffer<uint8_t>` — this maps to a Node.js
 ```cpp
 Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
   if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation")
+    Napi::Error::New(env_, "Lua context is busy with an async operation")
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
   if (info.Length() < 1 || !info[0].IsString()) {
-    Napi::TypeError::New(env, "Expected string argument")
+    Napi::TypeError::New(env_, "Expected string argument")
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const std::string filepath = info[0].As<Napi::String>().Utf8Value();
@@ -381,16 +381,16 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
     }
   }
 
-  const auto result = runtime->CompileFile(filepath, strip_debug);
+  const auto result = runtime_->CompileFile(filepath, strip_debug);
 
   if (std::holds_alternative<std::string>(result)) {
-    Napi::Error::New(env, std::get<std::string>(result))
+    Napi::Error::New(env_, std::get<std::string>(result))
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const auto& bytecode = std::get<std::vector<uint8_t>>(result);
-  return Napi::Buffer<uint8_t>::Copy(env, bytecode.data(), bytecode.size());
+  return Napi::Buffer<uint8_t>::Copy(env_, bytecode.data(), bytecode.size());
 }
 ```
 
@@ -399,14 +399,14 @@ Napi::Value LuaContext::CompileFile(const Napi::CallbackInfo& info) {
 ```cpp
 Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
   if (is_busy_) {
-    Napi::Error::New(env, "Lua context is busy with an async operation")
+    Napi::Error::New(env_, "Lua context is busy with an async operation")
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
   if (info.Length() < 1 || !info[0].IsBuffer()) {
-    Napi::TypeError::New(env, "Expected Buffer argument")
+    Napi::TypeError::New(env_, "Expected Buffer argument")
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   auto buffer = info[0].As<Napi::Buffer<uint8_t>>();
@@ -417,19 +417,19 @@ Napi::Value LuaContext::LoadBytecode(const Napi::CallbackInfo& info) {
     chunk_name = info[1].As<Napi::String>().Utf8Value();
   }
 
-  const auto res = runtime->LoadBytecode(bytecode, chunk_name);
+  const auto res = runtime_->LoadBytecode(bytecode, chunk_name);
 
   if (std::holds_alternative<std::string>(res)) {
-    Napi::Error::New(env, std::get<std::string>(res))
+    Napi::Error::New(env_, std::get<std::string>(res))
         .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   const auto& values = std::get<std::vector<lua_core::LuaPtr>>(res);
-  if (values.empty()) return env.Undefined();
+  if (values.empty()) return env_.Undefined();
   if (values.size() == 1) return CoreToNapi(*values[0]);
 
-  const Napi::Array array = Napi::Array::New(env, values.size());
+  const Napi::Array array = Napi::Array::New(env_, values.size());
   for (size_t i = 0; i < values.size(); ++i) {
     array.Set(i, CoreToNapi(*values[i]));
   }

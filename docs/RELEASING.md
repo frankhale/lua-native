@@ -56,8 +56,18 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
 
    ```bash
    npm install
-   npm run build-release
+   npm run prebuildify
    ```
+
+   **`prebuildify`, not `build-release`.** This step used to name
+   `build-release`, which compiles the same Release configuration but leaves
+   its output in `build/Release/` — nothing in `binding.gyp` copies it into
+   `prebuilds/`, so following the step as written produced no prebuild at all
+   and left whatever was already in the directory to be shipped.
+   `npm run prebuildify` does the Release build, strips the binary, and writes
+   it to `prebuilds/<platform>-<arch>/`; step 3 covers what it does to a file
+   that is already there. Like `build-release` it skips the C++ test target, so
+   it needs only the Lua library from step 1.
 
    Expected result, one per platform-arch:
 
@@ -66,18 +76,55 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
    prebuilds/win32-x64/lua-native.node
    ```
 
+   Confirm each one is the build you just made, and that it runs, before going
+   on — a stale binary in this directory looks exactly like a fresh one:
+
+   ```bash
+   node -e "const fs=require('fs'),p=require('path');for(const d of fs.readdirSync('prebuilds')){const f=p.join('prebuilds',d,'lua-native.node');if(fs.existsSync(f))console.log(f,fs.statSync(f).mtime.toISOString())}"
+   node -e "const f=require('path').resolve('prebuilds',process.platform+'-'+process.arch,'lua-native.node');console.log(new (require(f).init)({},{libraries:'all'}).execute_script('return 6*7'))"
+   ```
+
+   The first prints every prebuild with its modification time, which must be
+   after the last source change; the second loads **this machine's** prebuild
+   directly — bypassing `index.js`, which would prefer `build/` — and must
+   print `42`. Both are `node -e` rather than `ls` so the same two lines work
+   in a POSIX shell, `cmd.exe` and PowerShell: the script is double-quoted with
+   only single quotes inside, and deliberately contains no `$`, backtick or
+   `!`, each of which one of those shells would rewrite. The directory name is
+   built the way `index.js` builds it, `<platform>-<arch>`.
+
    Cross-building is not set up, so the Windows binary has to come from a
    Windows machine and be copied into `prebuilds/win32-x64/` by hand.
 
 3. **Keep one binary per platform directory, named `lua-native.node`.**
    `index.js` looks for `prebuilds/<platform>-<arch>/lua-native.node`
-   explicitly, and only falls through to `node-gyp-build` — which resolves
-   `prebuildify`'s `node.napi.node` convention instead — as a last resort. Both
-   names therefore load, but by different routes. `npm run prebuildify`
-   deposits `node.napi.node` *alongside* any existing `lua-native.node`,
-   leaving two binaries of unknown relative vintage in one directory, and the
-   older-named one wins. If you use `prebuildify`, rename its output to
-   `lua-native.node` rather than shipping both.
+   explicitly, and only falls through to `node-gyp-build` as a last resort.
+
+   `npm run prebuildify` writes exactly that file. prebuildify 6 names a
+   `--napi` prebuild after the package — `<package name>.node` — so its output
+   **replaces the existing `lua-native.node` in place** and there is nothing to
+   rename (checked against prebuildify 6.0.1 on November 18, 2026: one file in
+   the directory before, one after, with a new hash).
+
+   Two consequences of "in place":
+
+   - **The previous binary is gone, with no backup.** Copy `prebuilds/` aside
+     first if you might want it back.
+   - **Only the host platform's directory is written.** The other platform's
+     binary is left exactly as it was, so after a prebuild on one machine the
+     two can be builds of different source. `ls -la prebuilds/*/` shows the
+     dates; both must postdate the last source change before publishing.
+
+   This step used to say the opposite — that prebuildify deposits
+   `node.napi.node` *beside* `lua-native.node` and has to be renamed. That was
+   the convention of older prebuildify releases, and it is the failure to watch
+   for if the dependency ever changes major again: a second `.node` file in a
+   platform directory means the naming moved, and the loader will prefer
+   whichever one is called `lua-native.node`, however old it is.
+
+   ```bash
+   find prebuilds -name '*.node'      # expect exactly one per platform directory
+   ```
 
 4. **Verify the packed tarball.** `npm pack --dry-run` and confirm it contains
    exactly `index.js`, `index.d.ts`, `types.d.ts`, `package.json`, `README.md`,

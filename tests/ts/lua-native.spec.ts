@@ -5252,6 +5252,42 @@ describe('lua-native Node adapter', () => {
       });
     });
 
+    // A limit that cannot be read as a number of bytes / instructions / ms must
+    // be refused, not silently become "unlimited". NaN used to slip past the
+    // `< 0` test and reach a double -> size_t cast, which is undefined behaviour
+    // and on arm64 produced 0 — the value that means "no limit".
+    describe('numeric limits refuse NaN and saturate at Infinity', () => {
+      const limits = ['maxMemory', 'maxInstructions', 'timeout'] as const;
+
+      for (const key of limits) {
+        it(`${key}: NaN is refused`, () => {
+          expect(() => new lua_native.init({}, { libraries: 'all', [key]: NaN }))
+            .toThrow(`${key} must be a non-negative number`);
+        });
+
+        it(`${key}: Infinity is accepted and is not "unlimited by accident"`, () => {
+          const lua = new lua_native.init({}, { libraries: 'all', [key]: Infinity });
+          const info = lua.info();
+          const reported = key === 'maxMemory' ? info.memoryLimit : info[key];
+          // Saturated, not wrapped to 0: 0 is the "no limit" sentinel.
+          expect(reported).toBeGreaterThan(Number.MAX_SAFE_INTEGER);
+          expect(lua.execute_script<number>('return 1 + 1')).toBe(2);
+        });
+      }
+
+      it("gc('step', NaN) is refused", () => {
+        const lua = new lua_native.init({}, { libraries: 'all' });
+        expect(() => lua.gc('step', NaN)).toThrow(/stepSize must be non-negative/);
+      });
+
+      it('an unknown library name is refused before any state is created', () => {
+        // Regression guard for the message only; the leak this path used to
+        // have (a lua_State per failed construction) is not observable here.
+        expect(() => new lua_native.init({}, { libraries: ['bogus'] as any }))
+          .toThrow("Unknown Lua library: 'bogus'");
+      });
+    });
+
     describe('timeout and maxInstructions together', () => {
       it('aborts on instructions when that limit is tighter', () => {
         const lua = new lua_native.init({}, {

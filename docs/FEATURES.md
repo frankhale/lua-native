@@ -371,7 +371,7 @@ The loader tries multiple paths in priority order:
 1. **node-gyp output** (`build/Debug/`, `build/Release/`) — for standard builds
 2. **CMake output** (`build/Debug/<os>/`, `build/Release/<os>/`) — for the alternative build path
 3. **Prebuilds** (`prebuilds/<platform>-<arch>/lua-native.node`) — what a distributed package ships
-4. **`node-gyp-build` fallback** — resolves `prebuildify`'s own `node.napi.node` naming convention
+4. **`node-gyp-build` fallback** — resolves a prebuild that follows `node-gyp-build`'s own naming, such as the `node.napi.node` older `prebuildify` releases produced. Current `prebuildify` output is `lua-native.node`, which step 3 already finds
 
 **Local build output deliberately wins over a prebuild.** The order used to be
 the other way around, and the effect was that the test suite silently exercised
@@ -407,7 +407,7 @@ path and the underlying `dlopen` error as a corruption/ABI report.
 
 **Core layer:** `ExecuteFile` validates the filepath is non-empty (returning an early error string), then follows the exact same pattern as `ExecuteScript`: `luaL_loadfile` to compile, `lua_pcall` with `LUA_MULTRET` to execute, stack delta to count results, `ToLuaValue` to convert each result. Lua handles file-not-found errors naturally — `luaL_loadfile` returns a descriptive error string.
 
-**N-API layer:** `ExecuteFile` accepts a single string argument, delegates to `runtime->ExecuteFile(path)`, and converts results identically to `ExecuteScript` — single value returned directly, multiple values as `Napi::Array`, zero values as `undefined`, errors as JS exceptions.
+**N-API layer:** `ExecuteFile` accepts a single string argument, delegates to `runtime_->ExecuteFile(path)`, and converts results identically to `ExecuteScript` — single value returned directly, multiple values as `Napi::Array`, zero values as `undefined`, errors as JS exceptions.
 
 ### Design Decisions
 
@@ -552,11 +552,11 @@ All methods that touch the Lua stack use `StackGuard` for automatic stack balanc
 
 **N-API layer:**
 - Seven static table handle functions (`TableHandleGet`, `TableHandleSet`, `TableHandleHas`, `TableHandleLength`, `TableHandlePairs`, `TableHandleIPairs`, `TableHandleRelease`) are registered as methods on the handle object.
-- `CreateTableHandle(env, registry_ref)`: Creates a `LuaTableRefData` struct (pairing the registry ref with `shared_ptr<LuaRuntime>` and `LuaContext*`), stores it in the `lua_table_ref_data_` vector for lifetime management, and creates a plain JS object with:
+- `CreateTableHandle(handle_env, registry_ref)`: Creates a `LuaTableRefData` struct (pairing the registry ref with `shared_ptr<LuaRuntime>` and `LuaContext*`), stores it in the `lua_table_ref_data_` vector for lifetime management, and creates a plain JS object with:
   - A non-enumerable `_tableRef` property containing a `Napi::External<LuaTableRefData>` for round-trip detection
   - Seven method functions attached via `DefineProperties`, each receiving the `LuaTableRefData*` as function data
 - `CreateTableMethod`: Handles three cases — no arguments (empty table), array argument (`CreateTableFrom(LuaArray)`), and object argument (`CreateTableFrom(LuaTable)`)
-- `GetGlobalRef`: Validates the string argument, calls `runtime->GetGlobalRef()`, and on success creates a handle via `CreateTableHandle`
+- `GetGlobalRef`: Validates the string argument, calls `runtime_->GetGlobalRef()`, and on success creates a handle via `CreateTableHandle`
 - Both methods are registered as instance methods (`create_table`, `get_global_ref`) in `LuaContext::Init()`
 
 **Round-trip support:** Table handles carry a `_tableRef` external marker (same pattern as metatabled table Proxy objects). When a handle is passed back to Lua via `NapiToCoreInstance`, the marker is detected and the original `LuaTableRef` is reconstructed, pushing the actual Lua table rather than creating a copy.
@@ -598,7 +598,7 @@ All methods that touch the Lua stack use `StackGuard` for automatic stack balanc
 
 **N-API layer:**
 - `LuaContext` constructor parses `options.maxMemory` (number). Negative values throw a `TypeError`. When present, a `RuntimeConfig` is built and passed to the new core constructor.
-- `get_memory_usage()` instance method returns `runtime->GetMemoryUsage()` as a JS number.
+- `get_memory_usage()` instance method returns `runtime_->GetMemoryUsage()` as a JS number.
 
 ### Design Decisions
 
@@ -1071,9 +1071,9 @@ wrapper's `*Data` struct:
 
 | Wrapper | Marker | Ref struct |
 |---|---|---|
-| Lua function (JS callable) | `__luaFnOwner` External | `LuaFunctionData.funcRef` |
-| Coroutine object | `_coroutine` External | `LuaThreadData.threadRef` |
-| Table handle / metatabled Proxy | `_tableRef` External | `LuaTableRefData.tableRef` |
+| Lua function (JS callable) | `__luaFnOwner` External | `LuaFunctionData.func_ref` |
+| Coroutine object | `_coroutine` External | `LuaThreadData.thread_ref` |
+| Table handle / metatabled Proxy | `_tableRef` External | `LuaTableRefData.table_ref` |
 
 The ref structs use shared ownership (`MakeRegistryOwner`), so `release()`
 drops this wrapper's share and the slot is unref'd exactly once. The released
@@ -1230,7 +1230,7 @@ construction).
    means a host callback, metamethod, or table trap has re-entered JS from a
    live Lua frame; retiring the state there would free the `lua_State` those
    frames are still executing on.
-2. **Build the replacement first.** `make_shared<LuaRuntime>(runtime->GetConfig())`
+2. **Build the replacement first.** `make_shared<LuaRuntime>(runtime_->GetConfig())`
    runs before anything is torn down, so a construction failure leaves the
    context with its current, working state rather than no state at all.
 3. **Detach the outgoing runtime** (`DetachRuntimeHandlers`) — the userdata GC,
@@ -1276,7 +1276,7 @@ dangling state with no way to detect it.
 **Stale handles are invalidated, not silently repointed.** `alive_` is flipped
 and re-minted, so pre-reset function handles and table Proxies throw. Coroutines
 and opaque userdata are covered by the existing `data->runtime.get() ==
-runtime.get()` identity checks in `resume()`, `release()`, and the
+runtime_.get()` identity checks in `resume()`, `release()`, and the
 `NapiToCoreImpl` round-trip markers — after the swap those simply stop matching,
 so a pre-reset value is treated as foreign rather than indexing an unrelated
 slot in the new registry.

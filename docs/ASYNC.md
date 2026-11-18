@@ -140,13 +140,13 @@ current callback bridge in `src/lua-native.cpp`:
 ```cpp
 // CreateJsCallbackWrapper — creates the lambda stored in host_functions_
 return [this, name](const std::vector<lua_core::LuaPtr>& args) -> lua_core::LuaPtr {
-  std::vector<napi_value> jsArgs;
-  jsArgs.reserve(args.size());
+  std::vector<napi_value> js_args;
+  js_args.reserve(args.size());
   for (const auto& a : args) {
-    jsArgs.push_back(CoreToNapi(*a));    // N-API call — main thread only
+    js_args.push_back(CoreToNapi(*a));    // N-API call — main thread only
   }
   try {
-    const Napi::Value result = js_callbacks[name].Call(jsArgs);  // N-API call
+    const Napi::Value result = js_callbacks[name].Call(js_args);  // N-API call
     return std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(result));
   } catch (const Napi::Error& e) {
     throw std::runtime_error(e.Message());
@@ -635,7 +635,7 @@ public:
 int LuaRuntime::LuaCallHostFunction(lua_State* L) {
   // ... existing code to get runtime and function name ...
 
-  if (runtime->async_mode_) {
+  if (runtime_->async_mode_) {
     return luaL_error(L,
       "JS callbacks are not available in async mode "
       "(called '%s')", funcName.c_str());
@@ -676,10 +676,10 @@ Add busy-guard checks to all existing sync methods (`ExecuteScript`,
 
 ```cpp
 if (is_busy_) {
-  Napi::Error::New(env,
+  Napi::Error::New(env_,
     "Cannot call execute_script while an async operation "
     "is in progress on this context").ThrowAsJavaScriptException();
-  return env.Undefined();
+  return env_.Undefined();
 }
 ```
 
@@ -790,25 +790,25 @@ Implement `ExecuteScriptAsync`:
 ```cpp
 Napi::Value LuaContext::ExecuteScriptAsync(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsString()) {
-    Napi::TypeError::New(env, "Expected string argument")
+    Napi::TypeError::New(env_, "Expected string argument")
       .ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   if (is_busy_) {
-    Napi::Error::New(env,
+    Napi::Error::New(env_,
       "Cannot call execute_script_async while another async "
       "operation is in progress").ThrowAsJavaScriptException();
-    return env.Undefined();
+    return env_.Undefined();
   }
 
   std::string script = info[0].As<Napi::String>().Utf8Value();
 
-  auto deferred = Napi::Promise::Deferred::New(env);
+  auto deferred = Napi::Promise::Deferred::New(env_);
   is_busy_ = true;
 
   auto* worker = new LuaScriptAsyncWorker(
-    env, deferred, runtime, std::move(script), this);
+    env_, deferred, runtime_, std::move(script), this);
   worker->Queue();
 
   return deferred.Promise();

@@ -41,6 +41,7 @@
     "start": "vitest",
     "test": "vitest",
     "test-cpp": "npm run build-debug && node run-tests.js",
+    "lint": "node tools/lint/run.mjs",
     "check-invariants": "node tools/invariants/run.mjs",
     "oracle": "node tools/diff-oracle/run.mjs",
     "exception-matrix": "node tools/exception-matrix/run.mjs",

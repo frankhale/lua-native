@@ -1,0 +1,141 @@
+# clang-tidy configuration for lua-native. Run it with `npm run lint`
+# (tools/lint/run.mjs), which supplies the compile flags and treats any finding
+# as a failure.
+#
+# Policy: whole families on, individual checks off — each with its reason — so
+# a check added by a future clang-tidy is on by default and has to be ruled on
+# rather than silently never run. A suppression in the source is a
+# `NOLINTNEXTLINE(<check>)` with the reason beside it, never a bare NOLINT.
+#
+# Do not apply `--fix` blindly. A "fix clang-tidy issues" commit once converted
+# an indexed loop over a container that user JS can mutate mid-iteration into a
+# range-for, and shipped a heap-use-after-free (CODE-REVIEW-11 F1). Those loops
+# now carry a load-bearing NOLINTNEXTLINE(modernize-loop-convert).
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-signed-bitwise,
+  -cert-dcl50-cpp,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -clang-analyzer-optin.performance.Padding,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-do-while,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-narrowing-conversions,
+  -cppcoreguidelines-no-malloc,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -misc-header-include-cycle,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-use-trailing-return-type,
+  -performance-enum-size,
+  -portability-avoid-pragma-once,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-redundant-lambda-parameter-list,
+  -readability-trailing-comma
+
+# Why each disabled check is off:
+#
+#   bugprone-easily-swappable-parameters
+#       Fires on every (lua_State*, int, int) helper; the Lua C API's own shape.
+#   bugprone-signed-bitwise
+#       Lua's hook, GC and library masks are `int` by API (LUA_MASKCOUNT, ...).
+#   cert-dcl50-cpp, cppcoreguidelines-pro-type-vararg
+#       lua_pushfstring / luaL_error are variadic; the binding cannot avoid them.
+#   clang-analyzer-optin.core.EnumCastOutOfRange
+#       lua_occupancy::Claim is a bitmask enum with a fixed underlying type, for
+#       which every value of that type is valid ([dcl.enum]/8).
+#   clang-analyzer-optin.performance.Padding
+#       LuaRuntime / LuaContext exist once per context; members are grouped by
+#       meaning, and 40 bytes per context is not worth reordering them.
+#   cppcoreguidelines-avoid-c-arrays, -pro-bounds-*
+#       luaL_Reg tables and Lua's (ptr, len) strings are C arrays by contract.
+#       modernize-avoid-c-arrays stays on for arrays the code owns outright.
+#   cppcoreguidelines-avoid-do-while, -macro-usage, -avoid-magic-numbers,
+#   readability-magic-numbers, readability-identifier-length
+#       Style rules this code does not follow: `L`, `n`, `i` are the Lua
+#       idiom, and stack indices such as -1 / -2 are not magic.
+#   cppcoreguidelines-narrowing-conversions
+#       Alias of bugprone-narrowing-conversions, which stays on.
+#   cppcoreguidelines-no-malloc, cppcoreguidelines-owning-memory
+#       The lua_Alloc hook must realloc/free, and N-API finalizers and Lua
+#       userdata blocks own raw pointers by design. Lifetime is covered by the
+#       sanitizer harnesses and tools/binding-balance instead of gsl::owner.
+#   cppcoreguidelines-non-private-member-variables-in-classes,
+#   misc-non-private-member-variables-in-classes
+#       Plain data structs (the *Ref / *Data / options types) are deliberate.
+#   cppcoreguidelines-pro-type-reinterpret-cast
+#       unsigned char <-> char views of Lua string bytes.
+#   misc-header-include-cycle
+#       napi.h <-> napi-inl.h, in node-addon-api.
+#   misc-include-cleaner
+#       <lua.hpp> is the documented umbrella header; the check wants lua.h,
+#       lauxlib.h and lualib.h named at every use.
+#   misc-no-recursion
+#       Value conversion recurses over nested tables, bounded by kMaxDepth.
+#   modernize-use-trailing-return-type, readability-trailing-comma,
+#   readability-redundant-lambda-parameter-list
+#       Pure style preferences.
+#   performance-enum-size
+#       No enum here is stored in bulk.
+#   portability-avoid-pragma-once
+#       Every supported compiler implements it.
+
+WarningsAsErrors: ''
+# Every project header is src/**/lua-*.h; matching on that rather than on the
+# checkout directory's name keeps the headers linted wherever the repo lives.
+HeaderFilterRegex: '(^|.*/)src/(core/)?lua-[a-z-]+\.h$'
+FormatStyle: none
+
+CheckOptions:
+  # `if (ptr)` / `if (!count)` are idiomatic here; only genuinely surprising
+  # conversions are worth a diagnostic.
+  readability-implicit-bool-conversion.AllowPointerConditions: true
+  readability-implicit-bool-conversion.AllowIntegerConditions: true
+  # `if (x) return;` on one line is the house style; a body that spans lines
+  # still needs braces.
+  readability-braces-around-statements.ShortStatementLines: 2
+  # RAII guards delete their copy operations; that makes them immovable too,
+  # which is the intent.
+  cppcoreguidelines-special-member-functions.AllowMissingMoveFunctionsWhenCopyIsDeleted: true
+  cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor: true
+
+  # A deliberately empty handler says why in a comment containing one of these.
+  bugprone-empty-catch.IgnoreCatchWithKeywords: '@TODO;@FIXME;deliberate;Deliberate;intentional;Intentional;best-effort;Best-effort;swallow;Swallow'
+  # Locals and parameters are snake_case. `L` is the Lua C API's name for a
+  # lua_State* and stays; kCamelCase is the convention for named constants.
+  readability-identifier-naming.LocalVariableCase: lower_case
+  readability-identifier-naming.LocalConstantCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.LocalVariableIgnoredRegexp: '^L$'
+  readability-identifier-naming.LocalConstantIgnoredRegexp: '^(L|k[A-Z][A-Za-z0-9]*)$'
+  readability-identifier-naming.ParameterIgnoredRegexp: '^L$'
+  # Data members are snake_case too: private and protected ones carry a trailing
+  # underscore, public struct fields do not. `L` / `L_` stay, as above.
+  readability-identifier-naming.PrivateMemberCase: lower_case
+  readability-identifier-naming.PrivateMemberSuffix: '_'
+  readability-identifier-naming.PrivateMemberIgnoredRegexp: '^L_$'
+  readability-identifier-naming.ProtectedMemberCase: lower_case
+  readability-identifier-naming.ProtectedMemberSuffix: '_'
+  readability-identifier-naming.PublicMemberCase: lower_case
+  readability-identifier-naming.PublicMemberIgnoredRegexp: '^L$'

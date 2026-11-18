@@ -1,6 +1,7 @@
 #pragma once
 
 #include <napi.h>
+#include <array>
 #include <atomic>
 #include <string>
 #include <unordered_map>
@@ -20,7 +21,7 @@ class LuaContext;
 // `Napi::External` wrapping one of the *Data structs below: `_tableRef`,
 // `_userdata`, `_coroutine`, `__luaFnOwner`, `__luaClassOwner`. Each read site
 // used to validate only `IsExternal()` and then a
-// `data->runtime.get() == runtime.get()` identity comparison.
+// `data->runtime.get() == runtime_.get()` identity comparison.
 //
 // **That pair checks provenance but not *kind*.** JS cannot mint an External —
 // but it can take a genuine one the addon handed out and present it under a
@@ -97,9 +98,10 @@ constexpr bool SameTag(const napi_type_tag& a, const napi_type_tag& b) {
   return a.lower == b.lower && a.upper == b.upper;
 }
 constexpr bool AllTagsDistinct() {
-  constexpr napi_type_tag all[] = {kTableRefData, kFunctionData, kUserdataData,
-                               kThreadData, kRuntimeOwner, kSharedTable};
-  constexpr size_t n = std::size(all);
+  constexpr std::array<napi_type_tag, 6> all = {
+      kTableRefData, kFunctionData, kUserdataData,
+      kThreadData, kRuntimeOwner, kSharedTable};
+  constexpr size_t n = all.size();
   for (size_t i = 0; i < n; ++i) {
     for (size_t j = i + 1; j < n; ++j) {
       if (SameTag(all[i], all[j])) return false;
@@ -165,18 +167,18 @@ enum class Claim : unsigned {
   None = 0,
   // An async run owns the state: a libuv worker (execute_script_async /
   // execute_file_async) or a suspended coroutine-driven run (execute_async).
-  AsyncInFlight = 1u << 0,
+  AsyncInFlight = 1U << 0,
   // Lua is on this thread's C stack — a host callback, a metamethod, a __gc
   // finalizer, a debug hook. Maintained by the core, which is the only layer
   // that can see every entry into Lua (CR-9's relocation).
-  LuaExecuting = 1u << 1,
+  LuaExecuting = 1U << 1,
   // A binding method is mid-flight with user JS running above a conversion that
   // will touch Lua when it returns: a type converter, a definition-object
   // getter, a Proxy trap. Distinct from LuaExecuting — no Lua is running in
   // that window, which is exactly how CR-13 was missed.
-  BindingCall = 1u << 2,
+  BindingCall = 1U << 2,
   // reset() is between swapping the state and finishing its replay.
-  Resetting = 1u << 3,
+  Resetting = 1U << 3,
 };
 
 constexpr Claim operator|(const Claim a, const Claim b) {
@@ -206,7 +208,7 @@ inline constexpr Claim kExclusive =
     Claim::AsyncInFlight | Claim::LuaExecuting | Claim::BindingCall;
 
 // Policy: reset(), which is kExclusive plus its own reentrancy. A reset reached
-// from the retiring state's __gc finalizers runs with `runtime` already pointing
+// from the retiring state's __gc finalizers runs with `runtime_` already pointing
 // at the replacement, so no other claim can see it (CR-9 F1).
 inline constexpr Claim kRetireState = kExclusive | Claim::Resetting;
 }  // namespace lua_occupancy
@@ -250,6 +252,20 @@ struct ContextLiveness {
   }
 };
 
+// Raises a bool for the lifetime of a scope and lowers it on every exit path,
+// including a throw. Used for the "a resume is on the C stack" and "reset() is
+// mid-swap" windows, which a re-entrant call must be able to observe.
+class ScopedFlag {
+public:
+  explicit ScopedFlag(bool& flag) : flag_(&flag) { *flag_ = true; }
+  ~ScopedFlag() { *flag_ = false; }
+  ScopedFlag(const ScopedFlag&) = delete;
+  ScopedFlag& operator=(const ScopedFlag&) = delete;
+
+private:
+  bool* flag_;
+};
+
 // A returned Lua-function/table handle keeps its LuaRuntime alive (via the
 // shared_ptr) but the LuaContext wrapper is an independent GC root that can be
 // collected first. `contextAlive` is a liveness flag shared with the context:
@@ -257,7 +273,7 @@ struct ContextLiveness {
 // cleanly instead of dereferencing a freed `context`.
 struct LuaFunctionData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
-  lua_core::LuaFunctionRef funcRef;
+  lua_core::LuaFunctionRef func_ref;
   LuaContext* context;
   ContextLiveness liveness;
 
@@ -265,12 +281,15 @@ struct LuaFunctionData {
                   lua_core::LuaFunctionRef ref,
                   LuaContext* ctx,
                   ContextLiveness live)
-    : runtime(std::move(rt)), funcRef(std::move(ref)), context(ctx),
+    : runtime(std::move(rt)), func_ref(std::move(ref)), context(ctx),
       liveness(std::move(live)) {}
 
   ~LuaFunctionData() {
-    funcRef.release();
+    func_ref.release();
   }
+  // Owned by exactly one N-API finalizer; a copy would release the same share.
+  LuaFunctionData(const LuaFunctionData&) = delete;
+  LuaFunctionData& operator=(const LuaFunctionData&) = delete;
 
   // True while this handle's Lua state is still the context's current one.
   [[nodiscard]] bool ContextLive() const { return liveness.HandlesLive(); }
@@ -278,14 +297,17 @@ struct LuaFunctionData {
 
 struct LuaThreadData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
-  lua_core::LuaThreadRef threadRef;
+  lua_core::LuaThreadRef thread_ref;
 
   LuaThreadData(std::shared_ptr<lua_core::LuaRuntime> rt, lua_core::LuaThreadRef ref)
-    : runtime(std::move(rt)), threadRef(std::move(ref)) {}
+    : runtime(std::move(rt)), thread_ref(std::move(ref)) {}
 
   ~LuaThreadData() {
-    threadRef.release();
+    thread_ref.release();
   }
+  // Owned by exactly one N-API finalizer; a copy would release the same share.
+  LuaThreadData(const LuaThreadData&) = delete;
+  LuaThreadData& operator=(const LuaThreadData&) = delete;
 };
 
 // The context half of a bound C function that isn't tied to one Lua reference —
@@ -297,26 +319,29 @@ struct LuaContextBinding {
   ContextLiveness liveness;
 
   [[nodiscard]] bool ContextLive() const {
-    return context && liveness.HandlesLive();
+    return context != nullptr && liveness.HandlesLive();
   }
 };
 
 struct LuaUserdataData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
-  lua_core::LuaUserdataRef userdataRef;
+  lua_core::LuaUserdataRef userdata_ref;
 
   LuaUserdataData(std::shared_ptr<lua_core::LuaRuntime> rt,
                   lua_core::LuaUserdataRef ref)
-    : runtime(std::move(rt)), userdataRef(std::move(ref)) {}
+    : runtime(std::move(rt)), userdata_ref(std::move(ref)) {}
 
   ~LuaUserdataData() {
-    userdataRef.release();
+    userdata_ref.release();
   }
+  // Owned by exactly one N-API finalizer; a copy would release the same share.
+  LuaUserdataData(const LuaUserdataData&) = delete;
+  LuaUserdataData& operator=(const LuaUserdataData&) = delete;
 };
 
 struct LuaTableRefData {
   std::shared_ptr<lua_core::LuaRuntime> runtime;
-  lua_core::LuaTableRef tableRef;
+  lua_core::LuaTableRef table_ref;
   LuaContext* context;
   ContextLiveness liveness;
 
@@ -324,21 +349,47 @@ struct LuaTableRefData {
                   lua_core::LuaTableRef ref,
                   LuaContext* ctx,
                   ContextLiveness live)
-    : runtime(std::move(rt)), tableRef(std::move(ref)), context(ctx),
+    : runtime(std::move(rt)), table_ref(std::move(ref)), context(ctx),
       liveness(std::move(live)) {}
 
   ~LuaTableRefData() {
-    tableRef.release();
+    table_ref.release();
   }
+  // Owned by exactly one N-API finalizer; a copy would release the same share.
+  LuaTableRefData(const LuaTableRefData&) = delete;
+  LuaTableRefData& operator=(const LuaTableRefData&) = delete;
 
   // True while this handle's Lua state is still the context's current one.
   [[nodiscard]] bool ContextLive() const { return liveness.HandlesLive(); }
 };
 
+// What the constructor's options object asks of the Lua state's *construction*,
+// parsed before any state exists. `sandbox_preset` rides along because the
+// `allowBytecode` default it sets is applied later, to the live state.
+struct ContextInitOptions {
+  size_t max_memory = 0;
+  size_t max_instructions = 0;
+  size_t timeout_ms = 0;
+  bool has_max_memory = false;
+  bool has_max_instructions = false;
+  bool has_timeout = false;
+  std::vector<std::string> libraries;
+  bool has_libraries = false;
+  // Set by the 'sandbox' preset: clear dofile/loadfile after opening, and
+  // default allowBytecode to off. Both are part of what makes that preset
+  // sealed; see LuaRuntime::SandboxLibraries.
+  bool seal_base_filesystem = false;
+  bool sandbox_preset = false;
+  bool strict_conversion = false;
+};
+
+// The implicit move assignment can throw only because Napi::Reference's can
+// (napi_delete_reference failing); nothing here can make that noexcept.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 struct UserdataEntry {
   Napi::ObjectReference object;
-  bool readable;
-  bool writable;
+  bool readable = false;
+  bool writable = false;
   // Empty for set_userdata instances; the class name for register_class ones.
   // The property handlers use it to find named accessors (P2b) — which are
   // per-class, while readable/writable are per-instance, so the entry has to
@@ -419,6 +470,7 @@ private:
     // object it passed to createSharedTable can publish the change with sync().
     Napi::ObjectReference value_;
 
+    // NOLINTNEXTLINE(bugprone-exception-escape): see UserdataEntry.
     struct Subscriber {
       // Weak: a SharedTable must not keep a context alive. A collected context
       // reads back empty and is pruned on the next propagation.
@@ -441,8 +493,8 @@ private:
 // life of the addon instance, and gives the `shared` option a way to recognize
 // a genuine SharedTable (whose constructor is deliberately not exported).
 struct AddonData {
-  Napi::FunctionReference contextConstructor;
-  Napi::FunctionReference sharedTableConstructor;
+  Napi::FunctionReference context_constructor;
+  Napi::FunctionReference shared_table_constructor;
 };
 
 class LuaContext final : public Napi::ObjectWrap<LuaContext> {
@@ -450,6 +502,8 @@ public:
     static Napi::Object Init(Napi::Env env, Napi::Object exports);
     explicit LuaContext(const Napi::CallbackInfo& info);
     ~LuaContext() override;
+    LuaContext(const LuaContext&) = delete;
+    LuaContext& operator=(const LuaContext&) = delete;
 
     Napi::Value ExecuteScript(const Napi::CallbackInfo& info);
     Napi::Value ExecuteFile(const Napi::CallbackInfo& info);
@@ -459,11 +513,11 @@ public:
     Napi::Value CallAsync(const Napi::CallbackInfo& info);
     Napi::Value CloseCoroutine(const Napi::CallbackInfo& info);
     Napi::Value ResumeAsync(const Napi::CallbackInfo& info);
-    Napi::Value ResumeCoroutineObjectAsync(const Napi::Object& coroObj,
+    Napi::Value ResumeCoroutineObjectAsync(const Napi::Object& coro_obj,
                                            const std::vector<Napi::Value>& args_js,
                                            const Napi::Object& self);
     // Shared `{ status, values, error? }` marshalling for resume/resume_async.
-    Napi::Value CoroutineResultToJs(const Napi::Object& coroObj,
+    Napi::Value CoroutineResultToJs(const Napi::Object& coro_obj,
                                     lua_core::CoroutineStatus status,
                                     const std::vector<lua_core::LuaPtr>& values,
                                     const std::optional<std::string>& error);
@@ -540,7 +594,7 @@ public:
     // Wraps a registry table reference as a `LuaTableHandle` JS object. Public
     // so the handle's own `get_ref` free function can mint the nested handle it
     // returns.
-    Napi::Object CreateTableHandle(Napi::Env env_, int registry_ref);
+    Napi::Object CreateTableHandle(Napi::Env handle_env, int registry_ref);
 
     // Wraps `data` (whose ownership passes to the returned object's finalizer)
     // as the JS coroutine object: the `_coroutine` marker, a `status` string,
@@ -586,7 +640,7 @@ public:
     // universe is stated first, and it is the hazard's:
     //
     //   **Every function in lua-native.cpp that, on the main thread, reads
-    //   `runtime` / `alive_` / `js_userdata_` (or mints a handle from them) and
+    //   `runtime_` / `alive_` / `js_userdata_` (or mints a handle from them) and
     //   can also run user JS.** That is: the instance methods, the Proxy traps
     //   and table-handle methods, the coroutine-iterator callbacks, the
     //   SharedTable methods — and the N-API completion callbacks, which are not
@@ -644,12 +698,12 @@ public:
     //                          a reset to invalidate — but the inertness comes
     //                          from what SharedTable *is*, not from where the
     //                          value goes.
-    //   LuaContext (ctor)    — reads its options object before `runtime` exists;
+    //   LuaContext (ctor)    — reads its options object before `runtime_` exists;
     //                          there is no state to retire, by construction.
     //   Pcall                — runs the caller's function, then only packages
     //                          the result. Nothing to invalidate.
     //   Release              — its `Has`/`Get` can run traps, but the
-    //                          `data->runtime.get() != runtime.get()` check runs
+    //                          `data->runtime.get() != runtime_.get()` check runs
     //                          *after* them and fails closed on a foreign handle.
     //   RegisterCallbacks    — inert from the constructor (no state yet); from
     //                          reset() it is inside reset()'s own scope, which
@@ -671,6 +725,21 @@ public:
     // JS objects (a Map's entries, the Map constructor off the global) and both
     // are reached only through `CoreToNapi` / `NapiToCore`, whose entry points
     // already hold a scope for exactly that reason.
+    //
+    // And, since November 18, 2026, every helper carved out of a function on
+    // the lists above when the oversized functions were split: the constructor's
+    // option readers (`ParseInitOptions` and what it calls, `ApplyStateOptions`,
+    // `SubscribeSharedTables`), `ReadUserdataOptions`, the `ReadClass*` readers
+    // and `BuildClassStatics`, `ReadEnvironmentOptions`,
+    // `ResolveAsyncCallTarget`, `ReleaseObjectHandle`, `AttachToAwaitedPromise`,
+    // `ReadUserdataProperty` / `WriteUserdataProperty`, and the conversion
+    // pieces (`ObjectToCore` and the marker / converter functions under it; the
+    // `*ToNapi` family under `CoreToNapiBuiltin`). None opens a scope and none
+    // should: each runs under the one its caller already holds, or — for the
+    // constructor's — before there is a state to protect. The list the
+    // invariant actually uses is `SPLIT_HELPERS` in tools/invariants/invariants.mjs;
+    // a helper extracted later belongs there too, or its caller silently drops
+    // out of the classification.
     // And, since August 7, 2026, `ParseChunkName`, whose `Get("chunkName")` on
     // a caller-supplied options object can be an accessor. Its five callers all
     // hold a scope across the call, and `execute_script_async` grew one for
@@ -718,6 +787,8 @@ public:
         if (ctx->call_depth_++ == 0) ctx->js_error_registry_.clear();
       }
       ~CallScope() { --ctx->call_depth_; }
+      CallScope(const CallScope&) = delete;
+      CallScope& operator=(const CallScope&) = delete;
     };
 
     // RAII: collects the reclaimable __js_callback_ names minted while a
@@ -749,8 +820,12 @@ public:
         // contain anything unexpected rather than risking std::terminate.
         try {
           if (!names.empty()) ctx->SweepUnpushedJsCallbacks(names);
-        } catch (...) {}
+        } catch (...) {
+          // Deliberately swallowed; see above.
+        }
       }
+      JsCallbackCollectorScope(const JsCallbackCollectorScope&) = delete;
+      JsCallbackCollectorScope& operator=(const JsCallbackCollectorScope&) = delete;
       // Hands the collected names to the enclosing scope (if any) when this
       // conversion succeeds but an outer scope may still discard the value.
       void PropagateToParent() {
@@ -777,8 +852,8 @@ private:
     // methods because they all run on the same JS thread while this ObjectWrap is
     // alive. It must NOT be used from a worker thread (see the async workers,
     // which take their env from the AsyncWorker instead).
-    Napi::Env env;
-    std::shared_ptr<lua_core::LuaRuntime> runtime;
+    Napi::Env env_;
+    std::shared_ptr<lua_core::LuaRuntime> runtime_;
     std::unordered_map<std::string, Napi::FunctionReference> js_callbacks_;
     // The per-crossing wrapper data (LuaFunctionData / LuaThreadData /
     // LuaUserdataData / LuaTableRefData) is not held here: each is owned by an
@@ -889,6 +964,19 @@ private:
     Napi::Value BeginAsyncRun(const Napi::Object& self,
                               const std::vector<lua_core::LuaPtr>& args,
                               const char* arg_role = "resume value");
+    // The deferred of the run in flight, copied out. **Precondition: a run is
+    // in flight.** Every caller is on a path that exists only between
+    // BeginAsyncRun engaging `async_deferred_` and FinishAsync disengaging it,
+    // and re-checks AsyncRunSuperseded after anything that could have ended the
+    // run. One accessor rather than seven bare `*async_deferred_` so that
+    // precondition is stated once and asserted in the debug build the suite runs.
+    [[nodiscard]] Napi::Promise::Deferred ActiveAsyncDeferred() const;
+    // DriveAsync's three exits, one function each. Every one that marshals
+    // re-checks AsyncRunSuperseded between the marshal — which runs user JS —
+    // and the settle (CR-16 F1); keep that order when touching any of them.
+    void SettlePlainYield(const lua_core::AsyncStepResult& step);
+    void AttachToAwaitedPromise();
+    void SettleFinishedRun(const lua_core::AsyncStepResult& step);
     void DriveAsync(const std::vector<lua_core::LuaPtr>& args, bool is_error,
                     const char* arg_role = "resume value");
     Napi::Value OnAwaitSettled(const Napi::Value& value, bool is_error, uint64_t gen);
@@ -1034,7 +1122,7 @@ private:
 
     // True for the duration of Reset(). Guards the one reentrancy window the
     // core's LuaRuntime::IsExecuting() cannot see: the outgoing state's
-    // lua_close fires __gc finalizers after `runtime` already points at the
+    // lua_close fires __gc finalizers after `runtime_` already points at the
     // replacement, so a finalizer that calls reset() would see a fresh runtime
     // reporting depth 0 (CR-9 F1).
     bool in_reset_ = false;
@@ -1071,7 +1159,7 @@ private:
     // always this context's current runtime: reset() deliberately lets the
     // retiring state's __gc finalizers reach the still-live context (CR-10's
     // documented contract), so a callback that throws from one of those raises
-    // on the *old* state while `runtime` already points at the new one. Staging
+    // on the *old* state while `runtime_` already points at the new one. Staging
     // there would leave the new runtime holding a pending value from an
     // execution on a different Lua state — the M12 hazard reached through
     // generations (CR-12 F4) — so a mismatch falls back to the plain message,
@@ -1155,6 +1243,8 @@ private:
         saved.swap(ctx->conversion_path_);
       }
       ~ConversionPathScope() { ctx->conversion_path_.swap(saved); }
+      ConversionPathScope(const ConversionPathScope&) = delete;
+      ConversionPathScope& operator=(const ConversionPathScope&) = delete;
     };
 
     // Pushes `v` for the duration of one nested conversion.
@@ -1164,6 +1254,8 @@ private:
         ctx->conversion_path_.push_back(v);
       }
       ~ConversionPathEntry() { ctx->conversion_path_.pop_back(); }
+      ConversionPathEntry(const ConversionPathEntry&) = delete;
+      ConversionPathEntry& operator=(const ConversionPathEntry&) = delete;
     };
 
     // True if `v` is already an ancestor of itself on the current path.
@@ -1178,11 +1270,11 @@ private:
     // The callbacks object handed to the constructor. Held as a strong
     // reference so the same functions can be re-registered on a fresh state.
     Napi::ObjectReference callbacks_ref_;
-    // Mirrors runtime->SetAllowBytecode: the E3 guard is applied after
+    // Mirrors runtime_->SetAllowBytecode: the E3 guard is applied after
     // construction, so it isn't carried by RuntimeConfig.
     bool allow_bytecode_ = true;
 
-    // `filesystem: 'deny'` (T2). Mirrors runtime->SetFilesystemAccess for the
+    // `filesystem: 'deny'` (T2). Mirrors runtime_->SetFilesystemAccess for the
     // same reason as the flag above: the seal is applied after the libraries
     // are open, so reset() has to re-apply it to the fresh state.
     bool filesystem_denied_ = false;
@@ -1234,7 +1326,57 @@ private:
     // Installs the runtime-side handlers that bridge back into this context
     // (userdata GC, host-function GC, proxy property access). Shared by the
     // constructor and reset(), which must re-arm them on the new state.
+    // The constructor's phases; see LuaContext::LuaContext. Each bool-returning
+    // one returns false with a JS exception pending.
+    bool CreateRuntime(ContextInitOptions& init);
+    bool ApplyStateOptions(const Napi::Object& options, bool sandbox_preset);
+    bool ApplyFilesystemOption(const Napi::Object& options);
+    bool ApplyTableAsOption(const Napi::Object& options);
+    void SubscribeSharedTables(const Napi::Object& self, const Napi::Object& options);
+    // set_userdata's two fallible halves; see SetUserdata.
+    void RegisterUserdataMethods(
+        int ref_id,
+        const std::vector<std::pair<std::string, Napi::Function>>& method_funcs,
+        std::vector<std::string>& registered_method_fns);
+    void RollBackUserdata(const std::string& name, int ref_id,
+                          const std::vector<std::string>& registered_method_fns,
+                          bool global_installed);
+    // register_class: turns the statics snapshot into core entries. Converting
+    // a plain value runs user JS, hence a member and a bool.
+    bool BuildClassStatics(
+        uint64_t class_id,
+        const std::vector<std::pair<std::string, Napi::Function>>& static_fn_snapshot,
+        const std::vector<std::pair<std::string, Napi::Value>>& static_val_snapshot,
+        std::vector<std::pair<std::string, Napi::Function>>& deferred_fns,
+        std::vector<lua_core::MetatableEntry>& statics);
+    // call_async's first argument, resolved to a Lua function; see the .cpp.
+    std::optional<lua_core::LuaFunctionRef> ResolveAsyncCallTarget(
+        const Napi::Value& target_arg, std::string& reject_reason, bool& threw);
+    // release()'s coroutine / table-handle half; see the .cpp.
+    bool ReleaseObjectHandle(const Napi::Object& obj);
+    // reset()'s replay of context configuration onto the fresh state.
+    bool ReplayRuntimeSettings();
+    void ReplaySharedTables();
+    // NapiToCoreImpl's object branch, one function per question it asks.
+    lua_core::LuaValue ObjectToCore(const Napi::Value& value, int depth);
+    std::optional<lua_core::LuaValue> RoundTripMarkerToCore(const Napi::Object& obj);
+    std::optional<lua_core::LuaValue> ClassInstanceMarkerToCore(const Napi::Object& obj);
+    std::optional<lua_core::LuaValue> ApplyTypeConverters(const Napi::Value& value,
+                                                          int depth);
+    // CoreToNapiBuiltin, one function per kind of value.
+    Napi::Value IntegerToNapi(int64_t v);
+    Napi::Value StringToNapi(const std::string& v);
+    Napi::Value ArrayToNapi(const lua_core::LuaArray& v);
+    Napi::Value TableToNapi(const lua_core::LuaTable& v);
+    Napi::Value FunctionRefToNapi(const lua_core::LuaFunctionRef& v);
+    Napi::Value UserdataRefToNapi(const lua_core::LuaUserdataRef& v);
+    Napi::Value TableRefToNapi(const lua_core::LuaTableRef& v);
     void InstallRuntimeHandlers();
+    // The core's property getter / setter for proxy userdata and class
+    // instances; InstallRuntimeHandlers hands them over as lambdas.
+    lua_core::LuaPtr ReadUserdataProperty(int ref_id, const std::string& key);
+    void WriteUserdataProperty(int ref_id, const std::string& key,
+                               const lua_core::LuaPtr& value);
     // Unbinds the outgoing runtime from this context so nothing it does during
     // teardown (lua_close fires __gc) reaches a member being torn down or
     // repopulated. Shared by ~LuaContext and reset().
