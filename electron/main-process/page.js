@@ -127,6 +127,7 @@ stopButton.addEventListener('click', () => window.lua.stop());
 resetButton.addEventListener('click', reset);
 mode.addEventListener('change', applyMode);
 document.getElementById('open-canvas').addEventListener('click', () => window.lua.openCanvasDemo());
+document.getElementById('open-rpg').addEventListener('click', () => window.lua.openRpgDemo());
 
 source.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {

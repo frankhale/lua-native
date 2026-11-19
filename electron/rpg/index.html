@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aldermoor: an RPG in Lua</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body class="game">
+    <header>
+      <button id="restart" type="button">Restart</button>
+      <span id="status" role="status"></span>
+    </header>
+    <p id="hint">
+      <kbd>Arrows</kbd> or <kbd>WASD</kbd> walk · walk into people, chests, doors and monsters to
+      talk, open and fight · <kbd>P</kbd> drinks a potion · <kbd>Space</kbd> waits. The game is the
+      Lua in <code>rpg/game</code>; save a change there and it restarts.
+    </p>
+    <main>
+      <div class="stage">
+        <canvas id="stage" aria-label="The game"></canvas>
+      </div>
+      <pre id="output" aria-label="Output" aria-live="polite" hidden></pre>
+    </main>
+    <script src="page.js"></script>
+  </body>
+</html>

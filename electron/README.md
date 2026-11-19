@@ -3,7 +3,8 @@
 A small Electron app that runs Lua through
 [lua-native](https://www.npmjs.com/package/lua-native), two ways: with Lua in
 the **main process**, reached over IPC, and with Lua inside a **renderer
-process**, called directly.
+process**, called directly. A third window builds on the second: a small
+tile-based RPG whose game code is all Lua.
 
 ## Run it
 
@@ -14,7 +15,8 @@ npm start
 
 Electron downloads its own binary the first time it starts, so the first launch
 takes longer than the rest. The app opens on the main-process demo; its
-**Canvas demo** button opens the renderer-process one.
+**Canvas demo** button opens the renderer-process one, and **RPG demo** opens
+the game.
 
 ## The two demos
 
@@ -29,6 +31,7 @@ takes longer than the rest. The app opens on the main-process demo; its
 | Good for                | Scripting the app: files, windows, menus | Per-frame work: drawing, simulation, UI logic |
 
 In both, the page itself has no Node and no `require`. Only the preload differs.
+The RPG demo is put together the same way as the renderer-process demo.
 
 ## Files
 
@@ -39,7 +42,11 @@ In both, the page itself has no Node and no `require`. Only the preload differs.
 | `main-process/page.js`         | renderer | Editor and output pane                                       |
 | `renderer-process/preload.cjs` | preload  | Unsandboxed. Loads lua-native, owns the canvas and the frame loop |
 | `renderer-process/page.js`     | renderer | Editor and buttons; calls `window.canvasDemo`                |
-| `styles.css`                   | —        | Shared by both windows                                       |
+| `rpg/preload.cjs`              | preload  | Unsandboxed. Loads lua-native and the tilesheets, runs the game loop |
+| `rpg/page.js`                  | renderer | Restart button, status line, error pane                      |
+| `rpg/game/*.lua`               | Lua      | The game                                                     |
+| `assets/*.png`                 | —        | The tilesheet, in two animation frames                       |
+| `styles.css`                   | —        | Shared by all three windows                                  |
 
 ## Main-process demo
 
@@ -120,6 +127,60 @@ Two things to know before copying it:
 page code use the whole lua-native API directly. It also gives every script in
 the page full Node access, which is why this demo does not do it.
 
+## RPG demo
+
+A top-down adventure in the style of the early tile-based computer RPGs: an
+overworld, a town, a castle and a cave, a king with an errand, and two moons.
+Everything on screen comes from the tilesheet in `assets/`, the text included.
+
+| Key                 | What it does                                             |
+| ------------------- | -------------------------------------------------------- |
+| Arrows or WASD      | Walk. Hold to keep walking                               |
+| Walk into something | Talk to a person, open a chest or door, strike a monster |
+| P                   | Drink a potion                                           |
+| Space               | Let a turn pass                                          |
+
+Walking onto a town, castle or cave enters it; walking off the edge of a town
+leaves it. The ship moored south of Brightwater is boarded by walking onto it.
+
+The split between the two languages is the point of the demo:
+
+- **JavaScript is the machine.** `rpg/preload.cjs` loads the two tilesheets,
+  scales the canvas, forwards key presses, and calls the game's `update(dt)`
+  and `draw()` once per frame. It gives Lua three functions: `sprite` draws one
+  tile, `fill` draws a rectangle, `screen` sets the size of the game screen.
+- **Lua is the game.** The maps, movement, line of sight, people, monsters,
+  moons, the status panel and the text layout are all in `rpg/game`:
+
+  | File        | What is in it                                               |
+  | ----------- | ----------------------------------------------------------- |
+  | `main.lua`  | State, turns, movement, input, drawing the map              |
+  | `atlas.lua` | The four maps as rows of text, and who and what stands on them |
+  | `map.lua`   | A loaded map: cells, things, line of sight                  |
+  | `ui.lua`    | The frame, the status panel, the message log                |
+  | `text.lua`  | The bitmap fonts and word wrap                              |
+
+What it uses from lua-native beyond the canvas demo:
+
+- **`execute_file` and `add_search_path`.** The game is ordinary `.lua` files
+  that `require` each other. The context is created with `libraries: 'safe'`
+  rather than `'sandbox'`, because `require` needs the `package` library and
+  the files are the app's own.
+- **Lua functions held by JavaScript.** `update`, `draw`, `keypressed` and
+  `keyreleased` are fetched once with `get_global` and then called like any
+  other function, every frame and on every key press.
+- **`reset()` as a restart.** Restart, and saving any file in `rpg/game`,
+  swap in a fresh Lua state and run `main.lua` again. The search path and the
+  host functions carry over. A Lua error stops the game and shows the message
+  and traceback under it; fixing the file starts it again.
+
+A frame of the game is 400 to 650 calls from Lua into JavaScript, one per tile
+and one per letter. The status line shows the count and the time Lua took.
+
+To change the world, edit `atlas.lua`. A map is a list of strings, `legend`
+says what terrain each character is, and `spawn` says what stands on it. The
+loader reports a row of the wrong width or an unknown character by name.
+
 ## Notes
 
 - **No rebuild step.** lua-native ships N-API prebuilds, which load in Electron
@@ -128,7 +189,9 @@ the page full Node access, which is why this demo does not do it.
 - **Supported platforms** are the ones lua-native ships binaries for: macOS
   arm64 and Windows x64.
 - **Packaging.** If you bundle the app into an asar archive, keep lua-native's
-  `.node` file outside it (`asarUnpack` in electron-builder).
+  `.node` file outside it (`asarUnpack` in electron-builder). The same goes for
+  `rpg/game`: Lua's `require` opens files itself and cannot see inside an
+  archive.
 - **`await app.whenReady()` at the top level of `main.mjs` hangs.** Electron
   waits for an ES module entry point to finish loading before it fires `ready`,
   so that await never resolves. Use `.then()`, as `main.mjs` does.

@@ -12,4 +12,5 @@ contextBridge.exposeInMainWorld('lua', {
     ipcRenderer.on('lua:output', (_event, text) => listener(text));
   },
   openCanvasDemo: () => ipcRenderer.invoke('demo:open-canvas'),
+  openRpgDemo: () => ipcRenderer.invoke('demo:open-rpg'),
 });

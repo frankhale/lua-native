@@ -1,4 +1,5 @@
-// Main process. It opens two windows, one per way of using lua-native:
+// Main process. It opens three windows. The first two are one per way of
+// using lua-native, and the third builds something on the second way:
 //
 //   main-process/      Lua lives HERE, in the main process. The window is
 //                      sandboxed, so it sends source text over IPC and gets
@@ -6,8 +7,10 @@
 //   renderer-process/  Lua lives in that window's own renderer process, loaded
 //                      by an unsandboxed preload. Nothing in this file touches
 //                      it beyond creating the window.
+//   rpg/               A small game, also in a renderer process. The game is
+//                      Lua files; the window loads them the same way.
 
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import path from 'node:path';
 import { inspect } from 'node:util';
 import lua_native from 'lua-native';
@@ -16,6 +19,7 @@ const here = import.meta.dirname;
 
 let ipcWindow = null;
 let canvasWindow = null;
+let rpgWindow = null;
 
 // The first argument is what Lua can see: plain values become Lua values, and
 // functions become Lua functions that call back into this process.
@@ -111,6 +115,10 @@ ipcMain.handle('demo:open-canvas', () => {
   openCanvasWindow();
 });
 
+ipcMain.handle('demo:open-rpg', () => {
+  openRpgWindow();
+});
+
 function openIpcWindow() {
   ipcWindow = new BrowserWindow({
     width: 900,
@@ -153,6 +161,35 @@ function openCanvasWindow() {
     canvasWindow = null;
   });
   canvasWindow.loadFile(path.join(here, 'renderer-process', 'index.html'));
+}
+
+function openRpgWindow() {
+  if (rpgWindow) {
+    rpgWindow.focus();
+    return;
+  }
+  // The game screen is 768 x 384 and scales by whole device pixels. Open at
+  // twice that size if the display has room, otherwise at one and a half
+  // times, which is still a whole number of pixels on a high-density display.
+  const room = screen.getPrimaryDisplay().workAreaSize;
+  const double = room.width >= 1600 && room.height >= 900;
+  rpgWindow = new BrowserWindow({
+    width: double ? 1584 : 1200,
+    height: double ? 880 : 700,
+    useContentSize: true,
+    minWidth: 800,
+    minHeight: 500,
+    title: 'Aldermoor: an RPG in Lua',
+    webPreferences: {
+      preload: path.join(here, 'rpg', 'preload.cjs'),
+      // As for the canvas window: the preload needs Node to load lua-native.
+      sandbox: false,
+    },
+  });
+  rpgWindow.on('closed', () => {
+    rpgWindow = null;
+  });
+  rpgWindow.loadFile(path.join(here, 'rpg', 'index.html'));
 }
 
 app.whenReady().then(() => {

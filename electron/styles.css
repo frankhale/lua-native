@@ -117,6 +117,10 @@ button:disabled {
   margin-left: 8px;
 }
 
+#open-rpg {
+  margin-left: 0;
+}
+
 main {
   flex: 1;
   display: grid;
@@ -190,4 +194,42 @@ canvas {
   inset: 0;
   width: 100%;
   height: 100%;
+}
+
+/* RPG demo: the game screen, centered, at a whole-number scale. */
+
+.game main {
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.game .stage {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #17151f;
+}
+
+.game canvas {
+  position: static;
+  image-rendering: pixelated;
+}
+
+.game pre {
+  max-height: 9em;
+}
+
+.game pre[hidden] {
+  display: none;
+}
+
+kbd {
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font: 12px var(--mono);
+}
+
+code {
+  font: 12px var(--mono);
 }

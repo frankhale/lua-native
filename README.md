@@ -12,7 +12,8 @@ data structures.
 - Deno
 
 It also runs inside Electron, in the main process or in a renderer. The
-[Electron demo](electron/README.md) is a small app that shows both.
+[Electron demo](electron/README.md) is a small app that shows both, and
+includes a tile-based RPG written in Lua.
 
 ## Features
 
