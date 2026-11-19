@@ -179,7 +179,8 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
 ## Publishing to npm
 
 `lua-native` is an **unscoped, public** package. It is already on the registry —
-`latest` is `1.1.0`; the working tree is at `1.1.1`. Publishing happens from a
+`latest` was `1.1.1` as of November 19, 2026; `npm view lua-native dist-tags`
+gives the current answer. Publishing happens from a
 maintainer's macOS machine, with the Windows binary copied in by hand (step 2),
 because `npm publish` packs whatever `prebuilds/` contains locally.
 
@@ -212,8 +213,8 @@ npm version major     # 1.1.0 -> 2.0.0
 `npm version` writes `package.json`, creates a commit and an annotated tag in
 one step. If you would rather control the commit yourself, edit the `version`
 field by hand and tag afterwards (`git tag -a v1.1.0 -m 'v1.1.0'`). Either way
-**tag it** — the repo has `v1.0.0` and `v1.1.0` only, so `1.0.1` and `1.0.4`
-shipped without tags and there is no commit on record for what those users
+**tag it** — the repo has `v1.0.0`, `v1.1.0` and `v1.1.1` only, so `1.0.1` and
+`1.0.4` shipped without tags and there is no commit on record for what those users
 received.
 
 Choose the number by what changed for a *consumer*, not by how much code moved.
@@ -275,7 +276,11 @@ Consumers then get it only via `npm i lua-native@next`. Promote later with
 ### 5. Verify the published artifact
 
 Registry state, then a real consumer install from the registry (not from a local
-tarball — this is the one check that exercises the published bits end to end):
+tarball — this is the one check that exercises the published bits end to end).
+**Give it a minute first.** The 1.1.1 publish was answered with `PUT 202`
+(accepted, not yet processed), and for about 60 seconds afterwards `npm view`
+still reported `1.1.0` as `latest` and returned 404 for `lua-native@1.1.1`. That
+looks exactly like a publish that failed; it was not.
 
 ```bash
 npm view lua-native version
