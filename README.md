@@ -11,6 +11,9 @@ data structures.
 - Bun
 - Deno
 
+It also runs inside Electron, in the main process or in a renderer. The
+[Electron demo](electron/README.md) is a small app that shows both.
+
 ## Features
 
 - Execute Lua scripts and files from Node.js, Bun or Deno
