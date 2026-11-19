@@ -147,11 +147,20 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
      | grep -A3 LC_BUILD_VERSION
    ```
 
-   This step also exercises the `install` script (`node-gyp-build`), which is
-   the one place a consumer install can still reach for a compiler. It must
-   resolve the shipped `lua-native.node` and do nothing; if it instead falls
-   through to `node-gyp rebuild` it will fail, because the tarball has no
-   `binding.gyp`. A clean `npm i` here is the proof that it doesn't.
+   This step also confirms the package has **no `install` script**, which is
+   what keeps a consumer install from ever reaching for a compiler. It had one
+   (`node-gyp-build`) until November 19, 2026. On a supported platform that
+   script resolved the shipped binary and did nothing; on an unshipped one it
+   fell through to `node-gyp rebuild`, which failed on the missing
+   `binding.gyp` and took the whole `npm install` down before `index.js` could
+   give its "no prebuilt binary" error. The `npm i` above must finish with no
+   install-script warning and no `build/` directory under
+   `node_modules/lua-native`; either one means a script is back.
+
+   `"gypfile": false` in `package.json` is the other half: with `binding.gyp`
+   present and no `install` script, npm supplies `node-gyp rebuild` by default,
+   so without the flag every `npm install` in a clone would replace `build/`
+   with a fresh Release build.
 
 6. **Run both suites against a release build**, not just the debug one:
 

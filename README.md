@@ -113,11 +113,15 @@ npm install
   asks it for its header directory with
   `node -p "require('node-addon-api').include"`, so the build fails without it
   even though nothing imports it from JavaScript.
-- **`node-gyp-build`** (`^4.8.4`) — runs as the package's `install` script. On a
-  consumer machine it resolves the prebuilt binary in `prebuilds/` and does
-  nothing further. Its usual source-build fallback cannot fire: the published
-  tarball ships prebuilds only (no `src/`, no `binding.gyp`), so an unshipped
-  platform gets a clear error from `index.js` instead of a failed compile.
+- **`node-gyp-build`** (`^4.8.4`) — the last-resort loader in `index.js`,
+  consulted only when neither local build output nor
+  `prebuilds/<platform>-<arch>/lua-native.node` is found. It is **not** an
+  `install` script, and the package has none: installing never compiles
+  anything, so an unshipped platform installs cleanly and gets a clear error
+  from `index.js` on import instead of a failed `npm install`. `"gypfile": false`
+  in `package.json` keeps it that way in a clone — without it npm sees
+  `binding.gyp`, supplies a default `node-gyp rebuild` install step, and
+  replaces whatever is in `build/` on every `npm install`.
 
 **Dev dependencies:**
 

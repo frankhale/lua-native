@@ -7,6 +7,7 @@
   "version": "1.1.1",
   "main": "index.js",
   "types": "index.d.ts",
+  "gypfile": false,
   "keywords": [
     "lua",
     "scripting",
@@ -23,7 +24,6 @@
   },
   "scripts": {
     "prebuildify": "prebuildify --napi --strip",
-    "install": "node-gyp-build",
     "build-debug": "node-gyp rebuild --debug -- -Dskip_test=0",
     "build-release": "node-gyp rebuild --release -- -Dskip_test=1",
     "build-asan": "node-gyp rebuild --debug -- -Dskip_test=0 -Dsanitize=1",
