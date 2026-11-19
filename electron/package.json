@@ -1,0 +1,16 @@
+{
+  "name": "lua-native-electron-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A small Electron app demonstrating lua-native",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "lua-native": "^1.1.1"
+  },
+  "devDependencies": {
+    "electron": "^45.4.1"
+  }
+}

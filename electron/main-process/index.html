@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lua-native + Electron</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <header>
+      <button id="run" type="button">Run</button>
+      <button id="stop" type="button" disabled>Stop</button>
+      <button id="reset" type="button">Reset state</button>
+      <label for="mode">Run on</label>
+      <select id="mode">
+        <option value="main">Main thread</option>
+        <option value="worker">Worker thread</option>
+      </select>
+      <span id="status" role="status"></span>
+      <button id="open-canvas" type="button">Canvas demo</button>
+    </header>
+    <p id="hint"></p>
+    <main>
+      <textarea id="source" spellcheck="false" aria-label="Lua source"></textarea>
+      <pre id="output" aria-label="Output" aria-live="polite"></pre>
+    </main>
+    <script src="page.js"></script>
+  </body>
+</html>

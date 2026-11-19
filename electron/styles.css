@@ -1,0 +1,193 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --panel: #f5f5f4;
+  --border: #d9d9d6;
+  --text: #1c1c1a;
+  --muted: #6b6b66;
+  --accent: #2f5fd0;
+  --accent-text: #ffffff;
+  --error: #b3261e;
+  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1b1a;
+    --panel: #242423;
+    --border: #3a3a38;
+    --text: #ecece8;
+    --muted: #9a9a94;
+    --accent: #7ea2ff;
+    --accent-text: #10182c;
+    --error: #ff8a80;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+button {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+label {
+  margin-left: 8px;
+  color: var(--muted);
+}
+
+select {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+select:disabled {
+  opacity: 0.6;
+}
+
+#hint {
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+}
+
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+button:disabled {
+  opacity: 0.6;
+}
+
+#run {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+#status {
+  margin-left: auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+#open-canvas {
+  margin-left: 8px;
+}
+
+main {
+  flex: 1;
+  display: grid;
+  grid-template-rows: 2fr 1fr;
+  min-height: 0;
+}
+
+textarea,
+pre {
+  margin: 0;
+  padding: 12px;
+  border: 0;
+  font: 13px/1.5 var(--mono);
+  tab-size: 2;
+}
+
+textarea {
+  resize: none;
+  background: var(--bg);
+  color: var(--text);
+}
+
+pre {
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.result {
+  color: var(--accent);
+}
+
+.error {
+  color: var(--error);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* Renderer-process demo: editor on the left, canvas on the right. */
+
+.split main {
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: minmax(320px, 2fr) 3fr;
+}
+
+.editor {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.editor pre {
+  min-height: 3.5em;
+  max-height: 9em;
+}
+
+.stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background: #101418;
+}
+
+canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
