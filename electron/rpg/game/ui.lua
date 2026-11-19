@@ -1,21 +1,24 @@
 -- The screen around the map: a line frame, a status panel and a message log.
--- The screen is a grid of 16-pixel cells, 48 across and 24 down. The map
--- takes the left 22 by 22 of them and draws its tiles at double size.
+-- The screen is a grid of 16-pixel cells, 50 across and 24 down. The map
+-- takes 30 by 22 of them and draws its tiles at double size; the panel on
+-- the right is 17 cells wide.
 
 local text = require('text')
 
 local ui = {
-  WIDTH = 768,
+  WIDTH = 800,
   HEIGHT = 384,
   BACKGROUND = '#2d2a3a',
-  LOG_WIDTH = 22,  -- characters of message text per line
+  LOG_WIDTH = 16,  -- characters of message text per line
   LOG_LINES = 17,  -- lines the log has room for
 }
 
 local CELL = 16
-local COLS, ROWS = 48, 24
-local SPLIT = 23  -- column of the line between map and panel
-local PANEL = 24  -- first column inside the panel
+local COLS, ROWS = 50, 24
+local SPLIT = 31  -- column of the line between map and panel
+local PANEL = 32  -- first column inside the panel
+local SKY = 13    -- where the gap for the moons starts in the top edge
+local SCROLL_BAR = '#f0c544'
 local LOG_TOP = 6
 local LOG_GAP = 6  -- pixels between one message and the next
 local BULLET = 8 * 16 + 15  -- the gold dash
@@ -59,11 +62,11 @@ end
 -- The two moons sit in a gap in the top edge of the map frame. The line
 -- tapers to a point on either side of them.
 function ui.moons(first, second)
-  fill(9 * CELL, 0, 5 * CELL, CELL, ui.BACKGROUND)
-  put(TAPER_RIGHT, 9, 0)
-  put(MOON + first, 10, 0)
-  put(MOON + second, 12, 0)
-  put(TAPER_LEFT, 13, 0)
+  fill(SKY * CELL, 0, 5 * CELL, CELL, ui.BACKGROUND)
+  put(TAPER_RIGHT, SKY, 0)
+  put(MOON + first, SKY + 1, 0)
+  put(MOON + second, SKY + 3, 0)
+  put(TAPER_LEFT, SKY + 4, 0)
 end
 
 local function counter(icon, amount, col)
@@ -81,38 +84,59 @@ function ui.panel(game, title)
   end
   counter(COIN, game.gold, PANEL)
   counter(KEY, game.keys, PANEL + 6)
-  counter(POTION, game.potions, PANEL + 11)
+  counter(POTION, game.potions, PANEL + 10)
   if game.sunstone then
-    put(GEM, PANEL + 16, 4)
+    put(GEM, PANEL + 15, 4)
   end
 
-  ui.log(game.log)
+  ui.log(game.log, game.scroll)
 end
 
--- The message log. Each message starts with a gold dash, its later lines are
--- indented under the first, and a small gap separates it from the next, so
--- it is clear where one message ends and another begins.
-function ui.log(log)
-  -- Show as many of the newest messages as fit.
+-- The log is a list of rows, one per line of text; `head` marks the first
+-- row of a message. This says which rows are on screen when the newest
+-- `scroll` rows are scrolled out of view: as many as fit above that point.
+function ui.log_window(rows, scroll)
+  local last = #rows - scroll
   local room = ui.LOG_LINES * CELL
-  local first = #log + 1
+  local first = last + 1
   while first > 1 do
-    local need = #log[first - 1] * CELL + (first <= #log and LOG_GAP or 0)
+    -- A message that has rows above it on screen is set off by a gap.
+    local need = CELL + (first <= last and rows[first].head and LOG_GAP or 0)
     if need > room then
       break
     end
     room = room - need
     first = first - 1
   end
+  return first, last
+end
+
+-- The message log. Each message starts with a gold dash, its later lines are
+-- indented under the first, and a small gap separates it from the one before,
+-- so it is clear where one message ends and another begins.
+function ui.log(rows, scroll)
+  local first, last = ui.log_window(rows, scroll)
 
   local y = LOG_TOP * CELL
-  for i = first, #log do
-    sprite(BULLET, PANEL * CELL, y)
-    for _, line in ipairs(log[i]) do
-      text.white(line, (PANEL + 1) * CELL, y)
-      y = y + CELL
+  for i = first, last do
+    local row = rows[i]
+    if row.head then
+      if i > first then
+        y = y + LOG_GAP
+      end
+      sprite(BULLET, PANEL * CELL, y)
     end
-    y = y + LOG_GAP
+    text.white(row.text, (PANEL + 1) * CELL, y)
+    y = y + CELL
+  end
+
+  -- A scroll bar, once there is more than fits. It sits in the sliver of
+  -- background between the text and the frame.
+  if last - first + 1 < #rows then
+    local height = ui.LOG_LINES * CELL
+    local top = math.floor(height * (first - 1) / #rows)
+    local bottom = math.ceil(height * last / #rows)
+    fill((COLS - 1) * CELL, LOG_TOP * CELL + top, 3, math.max(bottom - top, 4), SCROLL_BAR)
   end
 end
 

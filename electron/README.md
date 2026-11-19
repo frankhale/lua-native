@@ -139,6 +139,7 @@ Everything on screen comes from the tilesheet in `assets/`, the text included.
 | Walk into something | Talk to a person, open a chest or door, strike a monster |
 | P                   | Drink a potion                                           |
 | Space               | Let a turn pass                                          |
+| PgUp, PgDn, wheel   | Scroll back through the message log                      |
 
 Walking onto a town, castle or cave enters it; walking off the edge of a town
 leaves it. The ship moored south of Brightwater is boarded by walking onto it.
@@ -146,8 +147,8 @@ leaves it. The ship moored south of Brightwater is boarded by walking onto it.
 The split between the two languages is the point of the demo:
 
 - **JavaScript is the machine.** `rpg/preload.cjs` loads the two tilesheets,
-  scales the canvas, forwards key presses, and calls the game's `update(dt)`
-  and `draw()` once per frame. It gives Lua three functions: `sprite` draws one
+  scales the canvas, forwards key presses and the mouse wheel, and calls the
+  game's `update(dt)` and `draw()` once per frame. It gives Lua three functions: `sprite` draws one
   tile, `fill` draws a rectangle, `screen` sets the size of the game screen.
 - **Lua is the game.** The maps, movement, line of sight, people, monsters,
   moons, the status panel and the text layout are all in `rpg/game`:
@@ -157,7 +158,7 @@ The split between the two languages is the point of the demo:
   | `main.lua`  | State, turns, movement, input, drawing the map              |
   | `atlas.lua` | The four maps as rows of text, and who and what stands on them |
   | `map.lua`   | A loaded map: cells, things, line of sight                  |
-  | `ui.lua`    | The frame, the status panel, the message log                |
+  | `ui.lua`    | The frame, the status panel, the scrolling message log      |
   | `text.lua`  | The bitmap fonts and word wrap                              |
 
 What it uses from lua-native beyond the canvas demo:
@@ -166,15 +167,15 @@ What it uses from lua-native beyond the canvas demo:
   that `require` each other. The context is created with `libraries: 'safe'`
   rather than `'sandbox'`, because `require` needs the `package` library and
   the files are the app's own.
-- **Lua functions held by JavaScript.** `update`, `draw`, `keypressed` and
-  `keyreleased` are fetched once with `get_global` and then called like any
-  other function, every frame and on every key press.
+- **Lua functions held by JavaScript.** `update`, `draw`, `keypressed`,
+  `keyreleased` and `wheelmoved` are fetched once with `get_global` and then
+  called like any other function, every frame and on every key press.
 - **`reset()` as a restart.** Restart, and saving any file in `rpg/game`,
   swap in a fresh Lua state and run `main.lua` again. The search path and the
   host functions carry over. A Lua error stops the game and shows the message
   and traceback under it; fixing the file starts it again.
 
-A frame of the game is 400 to 650 calls from Lua into JavaScript, one per tile
+A frame of the game is roughly 400 to 600 calls from Lua into JavaScript, one per tile
 and one per letter. The status line shows the count and the time Lua took.
 
 To change the world, edit `atlas.lua`. A map is a list of strings, `legend`

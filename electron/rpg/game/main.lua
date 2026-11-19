@@ -10,6 +10,7 @@
 --   update(dt)   once per frame, before draw()
 --   draw()       once per frame
 --   keypressed(key), keyreleased(key)
+--   wheelmoved(direction)   optional; 1 is a notch down, -1 a notch up
 
 local atlas = require('atlas')
 local Map = require('map')
@@ -18,8 +19,8 @@ local ui = require('ui')
 
 screen(ui.WIDTH, ui.HEIGHT)
 
-local VIEW = 11        -- tiles across and down
-local HALF = VIEW // 2
+local VIEW_W, VIEW_H = 15, 11  -- tiles across and down; odd, so the hero is central
+local HALF_W, HALF_H = VIEW_W // 2, VIEW_H // 2
 local TILE = 32        -- map tiles are drawn at twice their 16 pixels
 local ORIGIN = 16      -- the map starts one frame cell in
 
@@ -36,7 +37,8 @@ local game = {
   quest = nil,
   turn = 0,
   aboard = false,
-  log = {},
+  log = {},    -- one row per line of text, oldest first; see say()
+  scroll = 0,  -- how many of the newest rows are scrolled out of view
   stack = {},  -- where to return to when leaving a map
 }
 
@@ -45,15 +47,47 @@ local clock = 0
 local visible = {}  -- [view row][view column] -> can the hero see that cell
 local stale = true
 
+local HISTORY = 400 -- rows of log kept for scrolling back
 local last_said = nil
 
--- The log is a list of messages, each one a list of wrapped lines.
+-- Add a message to the log, wrapped into rows. `head` marks its first row.
 local function say(message)
   last_said = message
-  game.log[#game.log + 1] = text.wrap(message, ui.LOG_WIDTH)
-  while #game.log > ui.LOG_LINES do
-    table.remove(game.log, 1)
+  local log = game.log
+  for i, line in ipairs(text.wrap(message, ui.LOG_WIDTH)) do
+    log[#log + 1] = { text = line, head = i == 1 }
   end
+  -- Forget the oldest messages, a whole message at a time.
+  while #log > HISTORY do
+    repeat
+      table.remove(log, 1)
+    until log[1].head
+  end
+  game.scroll = 0 -- anything new brings the log back to the present
+end
+
+-- Scroll the log by rows: positive towards older ones. It stops once the
+-- oldest row is on screen.
+local function scroll_log(rows)
+  for _ = 1, math.abs(rows) do
+    if rows < 0 then
+      if game.scroll == 0 then
+        return
+      end
+      game.scroll = game.scroll - 1
+    else
+      local first = ui.log_window(game.log, game.scroll)
+      if first <= 1 then
+        return
+      end
+      game.scroll = game.scroll + 1
+    end
+  end
+end
+
+local function log_page()
+  local first, last = ui.log_window(game.log, game.scroll)
+  return math.max(1, last - first)
 end
 
 -- For walking into something solid. Leaning on a wall says so once.
@@ -457,7 +491,15 @@ function keypressed(key)
     end_turn()
   elseif key == 'p' then
     drink()
+  elseif key == 'pageup' then
+    scroll_log(log_page())
+  elseif key == 'pagedown' then
+    scroll_log(-log_page())
   end
+end
+
+function wheelmoved(direction)
+  scroll_log(-direction)
 end
 
 function keyreleased(key)
@@ -484,11 +526,11 @@ end
 
 local function look()
   local map = game.map
-  for row = 0, VIEW - 1 do
+  for row = 0, VIEW_H - 1 do
     local line = visible[row] or {}
     visible[row] = line
-    for col = 0, VIEW - 1 do
-      line[col] = map:sees(game.x, game.y, game.x + col - HALF, game.y + row - HALF)
+    for col = 0, VIEW_W - 1 do
+      line[col] = map:sees(game.x, game.y, game.x + col - HALF_W, game.y + row - HALF_H)
     end
   end
   stale = false
@@ -500,12 +542,12 @@ local function draw_map(alt)
     look()
   end
 
-  fill(ORIGIN, ORIGIN, VIEW * TILE, VIEW * TILE, '#000')
+  fill(ORIGIN, ORIGIN, VIEW_W * TILE, VIEW_H * TILE, '#000')
 
-  for row = 0, VIEW - 1 do
-    for col = 0, VIEW - 1 do
+  for row = 0, VIEW_H - 1 do
+    for col = 0, VIEW_W - 1 do
       if visible[row][col] then
-        local cell = map:cell(game.x + col - HALF, game.y + row - HALF) or map.outside
+        local cell = map:cell(game.x + col - HALF_W, game.y + row - HALF_H) or map.outside
         local x, y = ORIGIN + col * TILE, ORIGIN + row * TILE
         if cell.base then
           sprite(cell.base, x, y, TILE, alt)
@@ -516,8 +558,8 @@ local function draw_map(alt)
   end
 
   local function draw_at(id, map_x, map_y)
-    local col, row = map_x - game.x + HALF, map_y - game.y + HALF
-    if col >= 0 and col < VIEW and row >= 0 and row < VIEW and visible[row][col] then
+    local col, row = map_x - game.x + HALF_W, map_y - game.y + HALF_H
+    if col >= 0 and col < VIEW_W and row >= 0 and row < VIEW_H and visible[row][col] then
       sprite(id, ORIGIN + col * TILE, ORIGIN + row * TILE, TILE, alt)
     end
   end
@@ -529,7 +571,7 @@ local function draw_map(alt)
   for _, thing in ipairs(map.things) do
     draw_at(thing.sprite, thing.x, thing.y)
   end
-  sprite(game.aboard and SHIP or HERO, ORIGIN + HALF * TILE, ORIGIN + HALF * TILE, TILE, alt)
+  sprite(game.aboard and SHIP or HERO, ORIGIN + HALF_W * TILE, ORIGIN + HALF_H * TILE, TILE, alt)
 end
 
 function draw()

@@ -168,13 +168,13 @@ function openRpgWindow() {
     rpgWindow.focus();
     return;
   }
-  // The game screen is 768 x 384 and scales by whole device pixels. Open at
+  // The game screen is 800 x 384 and scales by whole device pixels. Open at
   // twice that size if the display has room, otherwise at one and a half
   // times, which is still a whole number of pixels on a high-density display.
   const room = screen.getPrimaryDisplay().workAreaSize;
-  const double = room.width >= 1600 && room.height >= 900;
+  const double = room.width >= 1640 && room.height >= 900;
   rpgWindow = new BrowserWindow({
-    width: double ? 1584 : 1200,
+    width: double ? 1632 : 1232,
     height: double ? 880 : 700,
     useContentSize: true,
     minWidth: 800,

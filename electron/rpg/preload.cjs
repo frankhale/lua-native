@@ -20,10 +20,10 @@ const sheets = [new Image(), new Image()];
 
 let canvas = null;
 let ctx = null;
-let screenWidth = 768;
+let screenWidth = 800;
 let screenHeight = 384;
 
-let game = null; // { update, draw, keypressed, keyreleased }: Lua functions
+let game = null; // { update, draw, keypressed, keyreleased, wheelmoved? }: Lua functions
 let lastFrame = 0;
 let hostCalls = 0;
 
@@ -113,6 +113,11 @@ function load() {
       }
       loaded[name] = fn;
     }
+    // Optional: a game that does not scroll anything need not define it.
+    const wheelmoved = lua.get_global('wheelmoved');
+    if (typeof wheelmoved === 'function') {
+      loaded.wheelmoved = wheelmoved;
+    }
     game = loaded;
     lastFrame = performance.now();
     listeners.loaded?.();
@@ -125,7 +130,7 @@ function load() {
 
 // Call into the game. An error stops it until the next load.
 function call(name, ...args) {
-  if (!game) {
+  if (!game?.[name]) {
     return;
   }
   try {
@@ -178,7 +183,10 @@ function frame(now) {
 
 const KEY_NAMES = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', ' ': 'space' };
 // Keys the page would otherwise act on by scrolling.
-const SCROLL_KEYS = new Set(['up', 'down', 'left', 'right', 'space']);
+const SCROLL_KEYS = new Set(['up', 'down', 'left', 'right', 'space', 'pageup', 'pagedown']);
+// Wheel travel, in pixels, that counts as one notch. A trackpad sends many
+// small moves; they add up to notches here.
+const WHEEL_NOTCH = 60;
 const down = new Set();
 
 function keyName(event) {
@@ -230,6 +238,21 @@ window.addEventListener('DOMContentLoaded', async () => {
       call('keyreleased', key);
     }
   });
+  let wheelTravel = 0;
+  canvas.addEventListener(
+    'wheel',
+    (event) => {
+      event.preventDefault();
+      wheelTravel += event.deltaY;
+      while (Math.abs(wheelTravel) >= WHEEL_NOTCH) {
+        const direction = Math.sign(wheelTravel);
+        wheelTravel -= direction * WHEEL_NOTCH;
+        call('wheelmoved', direction);
+      }
+    },
+    { passive: false },
+  );
+
   // A key released while the window is elsewhere would stay held forever.
   window.addEventListener('blur', () => {
     for (const key of down) {
