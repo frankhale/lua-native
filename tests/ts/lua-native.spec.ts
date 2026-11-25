@@ -3857,6 +3857,70 @@ describe('lua-native Node adapter', () => {
         expect(iter.next().done).toBe(true);
       });
 
+      // The cursor used to borrow the handle's data and keep it valid only by
+      // holding `this` — which is the handle only when `[Symbol.iterator]` is
+      // called as a method. Called detached, nothing rooted the data, and
+      // `next()` after the handle was collected read freed memory: a segfault
+      // on the debug build, three runs of three. Found by the WASM port, which
+      // answered where native crashed. The cursor now owns a share.
+      describe('a cursor outlives the handle it came from', () => {
+        const gcSettle = async () => {
+          expect(typeof global.gc, 'harness must provide --expose-gc').toBe('function');
+          for (let i = 0; i < 4; i++) {
+            await new Promise((r) => setTimeout(r, 10));
+            global.gc!();
+          }
+        };
+        // Mints the cursor in a frame that returns, so no local keeps the
+        // handle or its method reachable across the collection.
+        const detached = (lua: any, thisArg: unknown) => {
+          const t = lua.create_table([7, 8, 9]);
+          return t[Symbol.iterator].call(thisArg);
+        };
+
+        for (const [label, thisArg] of [
+          ['undefined', undefined],
+          ['a foreign object', {}],
+        ] as const) {
+          it(`when [Symbol.iterator] was called with ${label} as this`, async () => {
+            const lua = new lua_native.init({}, ALL_LIBS);
+            const iter = detached(lua, thisArg);
+            await gcSettle();
+            // Churn the Lua heap so a freed slot would be reused, not just read.
+            lua.execute_script('for i = 1, 500 do local _ = { i } end collectgarbage()');
+            await gcSettle();
+
+            expect(iter.next().value).toEqual([1, 7]);
+            expect([...iter]).toEqual([[2, 8], [3, 9]]);
+          });
+        }
+
+        it('when it was called as a method and the handle was then dropped', async () => {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          const iter = (() => lua.create_table([7, 8, 9])[Symbol.iterator]())();
+          await gcSettle();
+          expect([...iter]).toEqual([[1, 7], [2, 8], [3, 9]]);
+        });
+
+        it('and still releases the table once the cursor is gone too', async () => {
+          const lua = new lua_native.init({}, ALL_LIBS);
+          const kb = () => lua.execute_script<number>(
+            'collectgarbage() collectgarbage() return collectgarbage("count")');
+          const base = kb();
+          let cursors: unknown[] | null = [];
+          for (let i = 0; i < 300; i++) {
+            const t = lua.create_table(new Array(200).fill(1));
+            cursors.push(t[Symbol.iterator].call(undefined));
+          }
+          const held = kb();
+          cursors = null;
+          await gcSettle();
+          // A share that was never dropped would leave all 300 tables alive.
+          expect(held - base).toBeGreaterThan(500);
+          expect(kb() - base).toBeLessThan((held - base) / 10);
+        });
+      });
+
       it('refuses after reset() rather than reading the retired state', () => {
         const lua = new lua_native.init({}, ALL_LIBS);
         lua.execute_script('t = { a = 1, b = 2 }');
@@ -12375,6 +12439,111 @@ describe('lua-native Node adapter', () => {
         await expect(lua.call_async('y')).rejects.toThrow(/resume_async/);
         expect(lua.is_busy()).toBe(false);
       });
+
+      // The arguments were converted under a collector that closed before the
+      // driver's first step pushed them, so every callback they minted was
+      // swept as "never pushed" and Lua was handed a name that resolved to
+      // nothing. call() keeps its collector open across the push; these doors
+      // did not. Found by diffing against the WASM port (November 24, 2026).
+      describe('a JavaScript function as an argument', () => {
+        it('is callable from Lua, like call()', async () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          lua.execute_script('function apply(g) return g(4) end');
+          expect(lua.call('apply', (x: number) => x * 10)).toBe(40);
+          expect(await lua.call_async('apply', (x: number) => x * 10)).toBe(40);
+        });
+
+        it('is callable when nested in an object argument', async () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          lua.execute_script('function apply(t) return t.f(4) + t.inner.g(1) end');
+          expect(await lua.call_async('apply', {
+            f: (x: number) => x * 10, inner: { g: (x: number) => x + 1 },
+          })).toBe(42);
+        });
+
+        it('is still callable after the function has awaited', async () => {
+          const lua = mk();
+          lua.execute_script('function later(g) local n = fetchName(1) return g(n) end');
+          expect(await lua.call_async('later', (s: string) => s.toUpperCase())).toBe('USER-1');
+        });
+
+        it('still sweeps the callbacks of earlier arguments when a later one fails (CR-8 F1)', async () => {
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          lua.execute_script('function apply(g) return g(4) end');
+          const before = lua.info().bindingRefs.callbacks;
+          await expect(lua.call_async('apply', () => 1, { f: () => 2 }, Symbol('no')))
+            .rejects.toThrow(/Cannot convert a JavaScript Symbol/);
+          expect(lua.info().bindingRefs.callbacks).toBe(before);
+        });
+
+        it('sweeps a callback the first step never pushed', async () => {
+          // Held open across the drive, the collector also covers a step that
+          // is refused before its arguments reach the Lua stack.
+          const lua: any = new lua_native.init({}, ALL_LIBS);
+          const co = lua.create_coroutine('return function() end');
+          lua.resume(co);
+          const before = lua.info().bindingRefs.callbacks;
+          const res = await lua.resume_async(co, () => 1);
+          expect(res.error).toMatch(/cannot resume/);
+          expect(lua.info().bindingRefs.callbacks).toBe(before);
+        });
+      });
+
+      // A door checks for a run in flight on entry, then runs user JS — an
+      // argument's getter, a type converter, the `_coroutine` read — before it
+      // arms its own. A run started from that JS used to be overwritten: its
+      // promise never settled. The door now re-checks at the point it commits.
+      describe('a run started while the door converts its arguments', () => {
+        const gated = () => {
+          const box: any = {};
+          box.lua = new lua_native.init(
+            { gate: () => new Promise((r) => { box.release = r; }) }, ALL_LIBS);
+          box.arg = {
+            get a() { box.first = box.lua.execute_async('local v = gate()  return v'); return 1; },
+          };
+          return box;
+        };
+
+        it('call_async refuses, and the first run still settles', async () => {
+          const box = gated();
+          box.lua.execute_script('function id(x) ran = true  return "second ran" end');
+          await expect(box.lua.call_async('id', box.arg))
+            .rejects.toThrow(/busy with an async operation/);
+          expect(box.lua.is_busy()).toBe(true);
+          box.release(7);
+          expect(await box.first).toBe(7);
+          expect(box.lua.is_busy()).toBe(false);
+          expect(box.lua.get_global('ran')).toBeNull();
+        });
+
+        it('execute_async refuses, and the first run still settles', async () => {
+          const box = gated();
+          const opts = {
+            get chunkName() {
+              box.first = box.lua.execute_async('local v = gate()  return v');
+              return 'second';
+            },
+          };
+          await expect(box.lua.execute_async('ran = true  return "second ran"', opts))
+            .rejects.toThrow(/busy with an async operation/);
+          box.release(7);
+          expect(await box.first).toBe(7);
+          expect(box.lua.is_busy()).toBe(false);
+          expect(box.lua.get_global('ran')).toBeNull();
+        });
+
+        it('resume_async refuses, and leaves the coroutine unstarted', async () => {
+          const box = gated();
+          const co = box.lua.create_coroutine(
+            'return function() coroutine.yield("from the coroutine") end');
+          await expect(box.lua.resume_async(co, box.arg))
+            .rejects.toThrow(/busy with an async operation/);
+          expect(co.status).toBe('suspended');
+          box.release(7);
+          expect(await box.first).toBe(7);
+          expect((await box.lua.resume_async(co)).values).toEqual(['from the coroutine']);
+        });
+      });
     });
 
     describe('P1b: resume_async', () => {
@@ -12514,6 +12683,21 @@ describe('lua-native Node adapter', () => {
         expect(() => mk().resume_async({})).toThrow(/Invalid coroutine object/);
         expect(() => mk().resume_async()).toThrow(/requires a coroutine object/);
       });
+
+      it('a JavaScript function as a resume value is callable from Lua', async () => {
+        // See 'a JavaScript function as an argument' under call_async.
+        const lua = mk();
+        const co = lua.create_coroutine(`
+          return function(g)
+            local h = coroutine.yield(g(4))
+            return h.f(fetchUser(2))
+          end
+        `);
+        expect(await lua.resume_async(co, (x: number) => x * 10))
+          .toEqual({ status: 'suspended', values: [40] });
+        expect(await lua.resume_async(co, { f: (s: string) => s + '!' }))
+          .toEqual({ status: 'dead', values: ['user-2!'] });
+      });
     });
 
     describe('P1b: Symbol.asyncIterator', () => {
@@ -12601,6 +12785,72 @@ describe('lua-native Node adapter', () => {
         const co = lua.create_coroutine(
           'return function() coroutine.yield(1) coroutine.yield(2) end');
         expect([...co]).toEqual([1, 2]);
+      });
+
+      it('next(fn) hands Lua a callable function', async () => {
+        // See 'a JavaScript function as an argument' under call_async.
+        const lua: any = mk();
+        const co = lua.create_coroutine(
+          'return function(g) local h = coroutine.yield(g(4))  coroutine.yield(h(fetchUser(1))) end');
+        const it = co[Symbol.asyncIterator]();
+        expect(await it.next((x: number) => x * 10)).toEqual({ value: 40, done: false });
+        expect(await it.next((s: string) => s + '!')).toEqual({ value: 'user-1!', done: false });
+      });
+
+      // resume_async refused a second run; the cursor reached the same code
+      // without the check. Its run replaced the first one's promise and then
+      // drove the *first* run's thread: the first promise never settled, and
+      // the cursor's coroutine was reported dead though its body never ran.
+      describe('next() while another async run is in flight', () => {
+        const yielder = 'return function() coroutine.yield("from the coroutine") end';
+
+        it('is refused while execute_async is suspended, and both survive', async () => {
+          let release!: (v: unknown) => void;
+          const lua: any = new lua_native.init(
+            { gate: () => new Promise((r) => { release = r; }) }, ALL_LIBS);
+          const co = lua.create_coroutine(yielder);
+          const it = co[Symbol.asyncIterator]();
+          const first = lua.execute_async('local v = gate()  return v');
+
+          // A rejection, not a throw: the cursor settles a promise for
+          // everything, so `for await` sees it through its normal channel.
+          const step = it.next();
+          expect(step).toBeInstanceOf(Promise);
+          await expect(step).rejects.toThrow(/busy with an async operation/);
+          expect(co.status).toBe('suspended');
+          expect(lua.is_busy()).toBe(true);
+
+          release(1);
+          expect(await first).toBe(1);
+          // Refused, not broken: the same cursor drives the coroutine once the
+          // context is free, as the synchronous cursor does after its throw.
+          expect(await it.next()).toEqual({ value: 'from the coroutine', done: false });
+        });
+
+        it('is refused while a worker run owns the state', async () => {
+          const lua: any = mk();
+          const co = lua.create_coroutine(yielder);
+          const it = co[Symbol.asyncIterator]();
+          const worker = lua.execute_script_async('local n = 0  for i = 1, 2e6 do n = n + i end  return n');
+          // Before the fix this converted the argument and resumed a coroutine
+          // on the main thread while the worker ran the same lua_State.
+          await expect(it.next(() => 1)).rejects.toThrow(/busy with an async operation/);
+          expect(typeof (await worker)).toBe('number');
+          expect(lua.info().bindingRefs.callbacks).toBe(1);   // fetchUser alone
+          expect(await it.next()).toEqual({ value: 'from the coroutine', done: false });
+        });
+
+        it('for await surfaces the refusal as a rejection', async () => {
+          let release!: (v: unknown) => void;
+          const lua: any = new lua_native.init(
+            { gate: () => new Promise((r) => { release = r; }) }, ALL_LIBS);
+          const co = lua.create_coroutine(yielder);
+          const first = lua.execute_async('local v = gate()  return v');
+          await expect((async () => { for await (const _ of co) { /* */ } })())
+            .rejects.toThrow(/busy with an async operation/);
+          release('ok');
+          expect(await first).toBe('ok');
+        });
       });
     });
 

@@ -151,7 +151,7 @@
   },
   "assertion-strength": {
     "spec files scanned": "invariants.spec.ts, lua-native.spec.ts",
-    "toThrow assertions examined": 489,
+    "toThrow assertions examined": 496,
     "negative (.not) — exempt by design": 42,
     "BARE positive assertions": 0
   },
@@ -164,7 +164,7 @@
     "lua_pcall calls (core)": 8
   },
   "scanner-coverage": {
-    "binding: functions found": 196,
+    "binding: functions found": 197,
     "binding: Napi::Value SymbolIteratorKey(Napi::Env env);": "declaration",
     "binding: LuaTableRefData* TableRefDataFrom(const Napi::Value& value);": "declaration",
     "binding: LuaFunctionData* LuaFunctionDataFrom(const Napi::Value& value);": "declaration",

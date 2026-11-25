@@ -52,6 +52,17 @@ Napi::External<T> NewTaggedExternal(const Napi::Env env, T* data,
   return external;
 }
 
+// As above, for a payload the External does not own outright: the finalizer is
+// handed `hint` and releases that instead (see TableRefOwner).
+template <typename T, typename Hint, typename Finalizer>
+Napi::External<T> NewTaggedExternal(const Napi::Env env, T* data,
+                                           const napi_type_tag& tag,
+                                           Finalizer finalizer, Hint* hint) {
+  const auto external = Napi::External<T>::New(env, data, finalizer, hint);
+  external.TypeTag(&tag);
+  return external;
+}
+
 // Reads a marker External's payload, or nullptr if `value` is not an External
 // of exactly this kind. `CheckTypeTag` returns false (rather than throwing) for
 // an untagged or differently-branded External, so callers keep failing closed
@@ -655,6 +666,12 @@ Napi::Value TableHandleKeys(const Napi::CallbackInfo& info) {
   }
 }
 
+// How a table *handle's* data is owned: shared between the `_tableRef`
+// External, whose finalizer deletes its TableRefOwner, and every cursor minted
+// from the handle. The metatabled-table Proxy has no cursor and keeps the
+// plain single-owner form.
+using TableRefOwner = std::shared_ptr<LuaTableRefData>;
+
 // One iteration cursor over a table handle. Mirrors LuaCoroIterState below:
 // each `[Symbol.iterator]()` mints a fresh one, so two loops over the same
 // handle are independent.
@@ -669,10 +686,19 @@ Napi::Value TableHandleKeys(const Napi::CallbackInfo& info) {
 // half: values are converted one at a time instead of all at once, and a
 // value conversion is what mints handles and runs registered converters.
 //
-// The handle object is held strongly (an ObjectReference), matching the
-// coroutine iterator: nothing on the handle points back here, so no cycle.
+// **The cursor co-owns the handle's data; it does not borrow it.** `data` was a
+// raw pointer, kept valid only by `handle` below — and `handle` is `this`,
+// which is the table handle only when `[Symbol.iterator]` is called as a
+// method. `const f = h[Symbol.iterator]; const it = f.call(undefined)` left
+// nothing rooting the data, and once the handle was collected `it.next()` read
+// freed memory (a segfault, three runs of three). Found by the WASM port,
+// which roots the table on the cursor and so answered where native crashed.
+//
+// The handle object is still held strongly (an ObjectReference), matching the
+// coroutine iterator: nothing on the handle points back here, so no cycle. It
+// is no longer what keeps `data` valid.
 struct LuaTableIterState {
-  LuaTableRefData* data = nullptr;
+  TableRefOwner data;
   ContextLiveness liveness;
   Napi::ObjectReference handle;
   std::vector<lua_core::LuaPtr> keys;
@@ -782,9 +808,15 @@ Napi::Value TableIteratorSelf(const Napi::CallbackInfo& info) {
   return info.This();
 }
 
+// `info.Data()` is the handle's TableRefOwner, not the bare data the named
+// methods get: this is the one method whose result outlives the call, so it is
+// the one that needs a share to hand on. The owner itself is deleted by the
+// `_tableRef` External's finalizer, and this function roots that External
+// (`_tableOwner`), so it is valid for as long as the function can be called.
 Napi::Value TableHandleSymbolIterator(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  auto* data = static_cast<LuaTableRefData*>(info.Data());
+  const auto* owner = static_cast<TableRefOwner*>(info.Data());
+  const LuaTableRefData* data = owner ? owner->get() : nullptr;
   if (RejectIfWorkerBusy(env, data)) return env.Undefined();
   if (!data || data->table_ref.ref == LUA_NOREF) {
     Napi::Error::New(env, "table handle has been released").ThrowAsJavaScriptException();
@@ -793,7 +825,7 @@ Napi::Value TableHandleSymbolIterator(const Napi::CallbackInfo& info) {
 
   const TableIterOwner sp = std::make_shared<LuaTableIterState>();
   LuaTableIterState* state = sp.get();
-  state->data = data;
+  state->data = *owner;
   state->liveness = data->liveness;  // the handle already carries it
   if (info.This().IsObject()) state->handle = Napi::Persistent(info.This().As<Napi::Object>());
 
@@ -2869,9 +2901,14 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env handle_env, const int
   // the core call that minted the ref (get_global_ref, create_table,
   // create_environment, get_ref) and the External left the slot owned by
   // nobody (CR-9 F4).
-  auto data = std::make_unique<LuaTableRefData>(
+  //
+  // The data is shared rather than uniquely owned because a `for...of` cursor
+  // takes a share of it (see LuaTableIterState). The unique_ptr guards the
+  // External's share — the TableRefOwner — exactly as it used to guard the data.
+  auto owner = std::make_unique<TableRefOwner>(std::make_shared<LuaTableRefData>(
     runtime_, lua_core::LuaTableRef(registry_ref, runtime_->RawState()), this,
-    Liveness());
+    Liveness()));
+  LuaTableRefData* const data_ptr = owner->get();
 
   const Napi::Object handle = Napi::Object::New(handle_env);
 
@@ -2881,11 +2918,13 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env handle_env, const int
   // freed memory once the handle object is collected. Non-configurable so it
   // can't be deleted to free the data out from under the still-bound methods —
   // the same ownership discipline used for __luaFnOwner (H3 / L6).
-  const auto external = NewTaggedExternal(handle_env, data.get(), lua_tags::kTableRefData,
-    [](Napi::Env, const LuaTableRefData* d) { delete d; });
+  const auto external = NewTaggedExternal(handle_env, data_ptr, lua_tags::kTableRefData,
+    [](Napi::Env, const LuaTableRefData*, const TableRefOwner* o) { delete o; },
+    owner.get());
   // Ownership has transferred: from here a throw leaves the External unrooted,
-  // and its finalizer reclaims data_ptr (and the ref) when it is collected.
-  LuaTableRefData* const data_ptr = data.release();
+  // and its finalizer drops the owner — and with it data_ptr and the ref, once
+  // no cursor holds a share — when it is collected.
+  TableRefOwner* const owner_ptr = owner.release();
   DefineHiddenProp(handle_env, handle, "_tableRef", external, /*writable=*/false);
 
   const auto add_method = [&](const char* name,
@@ -2905,9 +2944,11 @@ Napi::Object LuaContext::CreateTableHandle(const Napi::Env handle_env, const int
   add_method("release", TableHandleRelease);
   // `for (const [k, v] of handle)`. Rooted like the named methods above: a
   // destructured `[Symbol.iterator]` keeps the handle data alive (H3 / L6).
+  // It is given the owner rather than data_ptr so the cursor it mints can take
+  // a share: rooting covers this function, not what it returns.
   {
     const Napi::Function fn = Napi::Function::New(handle_env, TableHandleSymbolIterator,
-                                                 "[Symbol.iterator]", data_ptr);
+                                                 "[Symbol.iterator]", owner_ptr);
     DefineHiddenProp(handle_env, fn, "_tableOwner", external, /*writable=*/false);
     (void)handle.Set(SymbolIteratorKey(handle_env), fn);
   }
@@ -3780,6 +3821,15 @@ int LuaContext::NextUserdataId() {
   return next_userdata_id_++;
 }
 
+namespace {
+
+// The AsyncInFlight refusal. One definition because two kinds of site say it:
+// RejectIfOccupied, which throws it, and the coroutine-driven doors, which
+// reject a promise with it at their commit point (see BeginAsyncRun).
+constexpr const char* kAsyncBusyMessage = "Lua context is busy with an async operation";
+
+}  // namespace
+
 // The single place that maps a claim to the state that answers it, and the
 // single place that turns a conflict into a JS error.
 //
@@ -3861,7 +3911,7 @@ bool LuaContext::RejectIfOccupied(const char* op,
   if (wants(Claim::AsyncInFlight) && is_busy_) {
     // Unchanged wording, and deliberately not parameterized by `op`: it predates
     // the occupancy model and a great many tests match on it verbatim.
-    reason = "Lua context is busy with an async operation";
+    reason = kAsyncBusyMessage;
     parameterized = false;
   } else if (wants(Claim::LuaExecuting) && runtime_ && runtime_->IsExecuting()) {
     reason = " cannot be called while Lua is executing (from inside a host "
@@ -3996,6 +4046,15 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
     return deferred.Promise();
   }
 
+  // The commit-point check (see BeginAsyncRun): the chunkName read above can be
+  // an accessor, and a run it started must not be overwritten by this one. The
+  // thread just created is dropped with `co`.
+  if (IsBusy()) {
+    const auto deferred = Napi::Promise::Deferred::New(env_);
+    deferred.Reject(Napi::Error::New(env_, kAsyncBusyMessage).Value());
+    return deferred.Promise();
+  }
+
   // Binding-owned thread: created for this run, released by FinishAsync.
   async_co_.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
   // Initial resume takes no arguments — a chunk has no parameters.
@@ -4009,6 +4068,19 @@ Napi::Value LuaContext::ExecuteAsync(const Napi::CallbackInfo& info) {
 //
 // Takes ownership of `thread`: FinishAsync releases it. `self` is the JS wrapper
 // to root for the run's duration.
+//
+// **The commit-point check.** One run at a time is this function's
+// precondition, and a door's entry check does not establish it: between that
+// check and here every door runs user JS (an argument's getter, a type
+// converter, the `_coroutine` or `chunkName` read, a __gc finalizer), and
+// `execute_async` may legitimately be started from any of it. Arming a second
+// run over the first replaces `async_deferred_`, so the first promise never
+// settles, and where the first run owns its thread `AsyncDrivenThread()` hands
+// the second run *that* thread to drive. So each door re-checks `IsBusy()`
+// after its last user JS and before it sets `async_co_` / `async_borrowed_`,
+// and rejects with kAsyncBusyMessage. The assert below is what makes a door
+// that forgets fail in the debug build the suite runs. Until November 24, 2026
+// no door had the check, and the async cursor had no entry check either.
 const lua_core::LuaThreadRef& LuaContext::AsyncDrivenThread() const {
   return async_co_ ? *async_co_ : async_borrowed_->thread_ref;
 }
@@ -4016,6 +4088,9 @@ const lua_core::LuaThreadRef& LuaContext::AsyncDrivenThread() const {
 Napi::Value LuaContext::BeginAsyncRun(const Napi::Object& self,
                                       const std::vector<lua_core::LuaPtr>& args,
                                       const char* arg_role) {
+  assert(!async_deferred_.has_value() && !is_busy_ &&
+         "BeginAsyncRun over a run in flight: the door skipped its "
+         "commit-point check");
   is_busy_ = true;
   ++async_generation_;  // invalidate any stale settlement from a prior run
   js_error_registry_.clear();
@@ -4145,6 +4220,18 @@ Napi::Value LuaContext::CallAsync(const Napi::CallbackInfo& info) {
   // info[0] would run before the guard is armed (CR-13 F1).
   std::optional<lua_core::LuaThreadRef> thread;
   std::vector<lua_core::LuaPtr> args;
+  // One collector spans every argument so a later argument's conversion failure
+  // sweeps the reclaimable callbacks minted by the earlier ones (CR-8 F1) —
+  // **and stays open across the drive at the bottom**, because that is where
+  // the arguments are pushed: BeginAsyncRun's first ResumeAsyncStep. Its sweep
+  // erases every callback not yet pushed, so closed any earlier it erases all
+  // of them, and a function argument reached Lua as a name that resolved to
+  // nothing ("Host function '__js_callback_N' not found"). The synchronous
+  // doors and OnAwaitSettled already hold theirs across the push. Unlike the
+  // CallScope below it is safe to hold: it raises no depth counter, and the
+  // drive returns to this frame when the run suspends, so it is never open
+  // across an await.
+  const JsCallbackCollectorScope collector(this);
   {
   const CallScope call_scope(this);
 
@@ -4155,18 +4242,13 @@ Napi::Value LuaContext::CallAsync(const Napi::CallbackInfo& info) {
   if (threw) return env_.Undefined();
   if (!func_ref) return reject(reject_reason);
 
-  // One collector spans every argument so a later argument's conversion failure
-  // sweeps the reclaimable callbacks minted by the earlier ones (CR-8 F1).
-  {
-    const JsCallbackCollectorScope collector(this);
-    args.reserve(info.Length() > 0 ? info.Length() - 1 : 0);
-    try {
-      for (size_t i = 1; i < info.Length(); ++i) {
-        args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
-      }
-    } catch (const std::exception& e) {
-      return reject(e.what());
+  args.reserve(info.Length() > 0 ? info.Length() - 1 : 0);
+  try {
+    for (size_t i = 1; i < info.Length(); ++i) {
+      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(info[i])));
     }
+  } catch (const std::exception& e) {
+    return reject(e.what());
   }
 
   std::variant<lua_core::LuaThreadRef, std::string> co = std::string();
@@ -4180,6 +4262,10 @@ Napi::Value LuaContext::CallAsync(const Napi::CallbackInfo& info) {
   }
   thread.emplace(std::move(std::get<lua_core::LuaThreadRef>(co)));
   }  // CallScope closes here — nothing below runs user JS before the drive
+
+  // The commit-point check (see BeginAsyncRun). `thread` and the converted
+  // arguments are dropped, and the collector sweeps the callbacks they minted.
+  if (IsBusy()) return reject(kAsyncBusyMessage);
 
   // Binding-owned, like execute_async: the thread wraps the target function
   // for this call alone and nothing else refers to it.
@@ -6702,6 +6788,10 @@ Napi::Value CoroAsyncIteratorNext(const Napi::CallbackInfo& info) {
   // held here would leave call_depth_ raised across the await — the reason
   // execute_async scopes only its chunk load (CR-10 F1). The argument conversion
   // inside ResumeCoroutineObjectAsync opens its own collector.
+  //
+  // No busy check here either, unlike CoroIteratorNext: ResumeCoroutineObjectAsync
+  // makes it, and answers with a rejected promise — which the `then` below
+  // passes through without calling the mapper, so `done` stays false.
   const Napi::Value promise =
     state->context->ResumeCoroutineObjectAsync(coro, args, state->context->Value());
   if (env.IsExceptionPending()) {
@@ -7116,6 +7206,19 @@ Napi::Value LuaContext::ResumeCoroutineObjectAsync(
     return deferred.Promise();
   };
 
+  // The entry check, here rather than in the callers so neither can skip it.
+  // resume_async never reaches it busy — its RejectIfBusy throws first, as
+  // every method's does. The async cursor's `next` has no check of its own and
+  // relies on this one; it gets a rejection because it settles a promise for
+  // everything, and it is not marked done, so the cursor works again once the
+  // context is free — what the synchronous cursor's throw leaves behind.
+  //
+  // Before anything else, and not only at the commit point below: a *worker*
+  // run may be what holds the context, and then the conversion's callback
+  // registration and the drive would both touch a state another thread is
+  // running. Without it `next()` during execute_script_async did exactly that.
+  if (IsBusy()) return reject(kAsyncBusyMessage);
+
   // Scoped like CallAsync's, and for the same two reasons: the marker read and
   // the argument conversion both run user JS and must be inside the guard
   // (CR-13 F1), and the guard must be released before the drive so call_depth_
@@ -7124,6 +7227,12 @@ Napi::Value LuaContext::ResumeCoroutineObjectAsync(
   // async pair cannot, because the scope has to end mid-function.
   LuaThreadData* thread_data = nullptr;
   std::vector<lua_core::LuaPtr> args;
+  // One collector spans every argument so a later argument's conversion
+  // failure sweeps the callbacks minted by the earlier ones (CR-8 F1), and
+  // stays open across the drive that pushes them — see CallAsync, which had
+  // the same early close and explains why this one may be held where the
+  // CallScope may not.
+  const JsCallbackCollectorScope collector(this);
   {
   const CallScope call_scope(this);
 
@@ -7145,20 +7254,19 @@ Napi::Value LuaContext::ResumeCoroutineObjectAsync(
     return reject("coroutine has been released");
   }
 
-  {
-    // One collector spans every argument so a later argument's conversion
-    // failure sweeps the callbacks minted by the earlier ones (CR-8 F1).
-    const JsCallbackCollectorScope collector(this);
-    args.reserve(args_js.size());
-    try {
-      for (const auto& arg : args_js) {
-        args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(arg)));
-      }
-    } catch (const std::exception& e) {
-      return reject(e.what());
+  args.reserve(args_js.size());
+  try {
+    for (const auto& arg : args_js) {
+      args.push_back(std::make_shared<lua_core::LuaValue>(NapiToCoreInstance(arg)));
     }
+  } catch (const std::exception& e) {
+    return reject(e.what());
   }
   }  // CallScope closes here — nothing below runs user JS before the drive
+
+  // The commit-point check (see BeginAsyncRun): the marker read and the
+  // conversion above ran user JS, which may have started a run of its own.
+  if (IsBusy()) return reject(kAsyncBusyMessage);
 
   // Borrowed, not owned: async_co_ stays disengaged so FinishAsync releases
   // nothing, and the coroutine object is rooted for the run because

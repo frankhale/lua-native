@@ -200,6 +200,32 @@ const PATTERNS = [
     },
   },
   {
+    id: 'table-cursor-outlives-handle',
+    describe: 'mint a table cursor with a foreign `this`, drop the handle, collect, then iterate',
+    // The cursor kept its table alive only through `this`, so a detached call
+    // left the handle's data unrooted: a use-after-free on `next()`, found by
+    // the WASM port in November 2026. Not reachable through HANDLES, whose
+    // `use` always calls a method as a method.
+    run: async () => {
+      const lua = new lua_native.init({}, ALL);
+      let n = 0;
+      for (const thisArg of [undefined, null, {}, 1]) {
+        let handle = lua.create_table([7, 8, 9]);
+        let start = handle[Symbol.iterator];
+        const cursor = start.call(thisArg);
+        handle = null;
+        start = null;
+        await collect();
+        lua.execute_script('for i = 1, 200 do local _ = { i } end collectgarbage()');
+        await collect();
+        await settle(() => { for (const entry of cursor) n += entry.length; });
+      }
+      // Four cursors, three entries each, two values per entry. Anything else
+      // means the loop refused or ended early and the pattern proved nothing.
+      return n === 24 ? n : 0;
+    },
+  },
+  {
     id: 'async-cursor-outlives-iterator',
     describe: 'the async coroutine cursor: drop the iterator mid-iteration, collect, keep going',
     // The handle kind §15.6 singles out — shared_ptr-owned state that can
