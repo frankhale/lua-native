@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "wasm-smoke",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "tools/wasm-smoke/serve.mjs"
+      ],
+      "port": 8377
+    }
+  ]
+}
