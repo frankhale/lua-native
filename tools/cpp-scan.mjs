@@ -120,7 +120,11 @@ export function topLevelFunctions(rawSrc) {
     const sigText = lines.slice(i, bodyStart + 1).join(' ');
     const parenAt = sigText.indexOf('(');
     const beforeParen = sigText.slice(0, parenAt);
-    const m = beforeParen.match(/([A-Za-z_~][A-Za-z0-9_]*(?:::[A-Za-z_~][A-Za-z0-9_]*)*)\s*$/);
+    const m = beforeParen.match(/([A-Za-z_~][A-Za-z0-9_]*(?:::[A-Za-z_~][A-Za-z0-9_]*)*)\s*$/)
+      // An operator has no identifier before its `(`: `Args::operator[](…)`.
+      // Without this it was named after its line number, which is a key that
+      // moves whenever anything above it does (first met in the WASM binding).
+      ?? beforeParen.match(/((?:[A-Za-z_~][A-Za-z0-9_]*::)*operator\s*[^\s(]+)\s*$/);
     const name = m ? m[1] : `<line ${i + 1}>`;
 
     fns.push({

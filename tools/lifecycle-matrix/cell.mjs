@@ -13,7 +13,7 @@
 // the replacement. CR-17 F1 was exactly that: stale handles aliasing live
 // tables, found by reading a column of successes rather than by any crash.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { HANDLES } from './handles.mjs';
 import { EVENTS, forceGc } from './events.mjs';
 

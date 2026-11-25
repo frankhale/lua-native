@@ -355,7 +355,9 @@ struct LuaTableRefData {
   ~LuaTableRefData() {
     table_ref.release();
   }
-  // Owned by exactly one N-API finalizer; a copy would release the same share.
+  // One instance per handle or Proxy; a copy would release the same share. A
+  // Proxy's is owned by exactly one N-API finalizer. A handle's is shared_ptr-
+  // owned by that finalizer and by each `for...of` cursor minted from it.
   LuaTableRefData(const LuaTableRefData&) = delete;
   LuaTableRefData& operator=(const LuaTableRefData&) = delete;
 
@@ -949,7 +951,9 @@ private:
     // door goes through it so they cannot drift apart in what they arm — the
     // divergence P1 was reported for. The caller must have set exactly one of
     // `async_co_` (owned) or `async_borrowed_` + `async_coro_obj_` (borrowed)
-    // beforehand.
+    // beforehand, and — before setting it — must have re-checked `IsBusy()`
+    // after the last user JS it ran: the commit-point check, explained at the
+    // definition and asserted there.
     // `arg_role` names `args` in a conversion-failure message and is forwarded
     // to LuaRuntime::ResumeAsyncStep, whose header carries the reasoning: this
     // is the opening step, so for call_async these are the caller's *arguments*

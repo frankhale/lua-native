@@ -149,6 +149,13 @@ export const CLAIM_CELLS = {
 // That is the finding, and ledgering it launders it into a feature
 // (`PERFORMANCE-PLAN` §8).
 export const CLAIM_LEDGER = [
+  {
+    match: /about 2 microseconds a call into the module|about 2 µs for the check/,
+    reason: 'The WASM target only: the native addon has no such check, so no cell that must also hold natively can ' +
+      'measure it. Measured by hand on November 25, 2026, release build, Node 24 on arm64: get_global 0.76 us without ' +
+      'it and 3.1 us with it, a Lua function call 0.45 and 2.7, an empty callback loop unchanged. A property of the ' +
+      'margin (64 KB of arguments); re-measure if LEAST in shell.js moves.',
+  },
   // --- not about time at all -----------------------------------------------
   {
     match: /is therefore a safe latency knob/i,

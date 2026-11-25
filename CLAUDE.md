@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 lua-native is a native Node.js addon (N-API) that embeds Lua 5.5 into JavaScript/TypeScript applications. It enables bidirectional data exchange and function calls between Node.js and Lua. The module is an ES module (`type: "module"` in package.json).
 
+**It ships two targets with one API** (since November 2026): the native addon for Node, and a WebAssembly build for browsers with **a second binding of its own** (`src/wasm/`, no N-API). `docs/WASM.md` is the reference. The one rule to carry everywhere: **a change to one binding is a change to both** — see "Two bindings" under Architecture.
+
 ## Build & Test Commands
 
 ```bash
@@ -77,6 +79,30 @@ npm run crossing-cost
 node tools/crossing-cost/run.mjs --control            # just the controls
 node tools/crossing-cost/run.mjs --claims             # just the documented claims
 
+# --- The WASM target (docs/WASM.md) ---
+
+# Lua for wasm32-emscripten, via the overlay triplet (NOT a bare vcpkg install)
+npm run vcpkg-lua-wasm
+
+# Build it: build-wasm/<config>/{node,web}/. Needs Emscripten 7.0.1.
+npm run build-wasm-debug
+npm run build-wasm-release
+
+# The suite on the WASM binding, judged against the ledger of permitted differences
+npm run verify-wasm
+node tools/wasm-verify/run.mjs --harnesses --closing   # + all ten instruments; fail on anything unruled
+
+# Run one thing against the WASM binding (any harness, or the suite)
+LUA_NATIVE_TARGET=wasm npm test
+LUA_NATIVE_TARGET=wasm-release npm run crossing-cost
+
+# The build that ships, in a browser: serves http://localhost:8377/
+npm run smoke-wasm
+node --expose-gc tools/wasm-smoke/run.mjs               # the same 27 cells under Node, as a check on the set
+
+# Does the packed tarball resolve to the right entry for Node and for a browser?
+npm run check-package
+
 # Clean build artifacts
 npm run clean
 ```
@@ -105,6 +131,8 @@ change to reach consumers — `prebuilds/` is gitignored, so the shipped binary 
 regenerated locally and published, never committed.
 
 **Important:** After C++ changes, you must `npm run build-debug` before running `npm test`. The debug build is required for testing — do not use prebuilt binaries.
+
+**After a change to `src/core/` or to either binding, also `npm run build-wasm-debug && npm run verify-wasm`.** The core is shared, so a core change is a change to the WASM target; and `verify-wasm` is the only thing that notices a behavioural fix made to one binding and not the other. It needs Emscripten 7.0.1 (`brew install emscripten`) and `npm run vcpkg-lua-wasm` once. The build refuses any other Emscripten version and refuses the stock-triplet Lua, for reasons in `triplets/wasm32-emscripten.cmake`. Output goes to `build-wasm/`, not `build/`, because `node-gyp rebuild` deletes `build/`.
 
 **Sanitizers (local, no CI required):** five harnesses cover the memory-safety /
 UB / data-race hazard classes the code reviews track. `test-cpp-asan` and
@@ -196,6 +224,18 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   were the two options no instrument could cover, and ruling on them found the
   E3 guard five doors short of its own claim. See
   `docs/reviews/UNSEARCHED-REGIONS-PLAN.md` §2.1.
+- **The source invariants are asked of the WASM binding too**, under ids
+  beginning `wasm:` (`tools/invariants/wasm-binding.mjs`): the same analyses,
+  called with that binding's file, and frozen separately so nothing there can
+  move a native answer. `wasm:brand-rule` is the counterpart of
+  `objectwrap-branding` where there is no ObjectWrap: every JS value cast to a
+  C++ pointer must come from a shell lookup that answers from one per-kind
+  `WeakMap`, and every shell method must check its receiver's private field
+  before touching private state. `binding-parity` requires the public surface
+  equal across `types.d.ts` and both bindings. Census F (retaining members) is
+  **not** extended: a new `val` member in `src/wasm/lua-wasm.h` needs a
+  `bindingRefs` counter and a `binding-balance` policy by hand
+  (`docs/CORRECTNESS.md` §15.6).
 - `npm run binding-balance` — the **binding's own** bookkeeping: do the
   `Napi::Reference`s the addon retains (callbacks, userdata wrappers, converters,
   searchers, class accessors, handlers) obey their declared lifetime policy, or
@@ -208,9 +248,11 @@ Part III (archive; superseded on its "no more tooling needed" conclusion).
   all its own: churning *fresh* registrations measures the API's contract, not a
   defect. Read `tools/binding-balance/policy.mjs` before extending it.
 
-**Lint (`npm run lint`).** `tools/lint/run.mjs` runs clang-tidy over both
-translation units with `/.clang-tidy` (and over the C++ test file for the
-naming rules only) and fails on any finding, on a TU that
+**Lint (`npm run lint`).** `tools/lint/run.mjs` runs clang-tidy over the two
+native translation units and the two of the WASM binding with `/.clang-tidy`
+(and over the C++ test file for the naming rules only; the WASM ones need
+Emscripten, and `--native-only` leaves them out and says so) and fails on any
+finding, on a TU that
 does not compile, and on a bare `NOLINT`. Run it after C++ changes. The rules:
 a new suppression is a `NOLINTNEXTLINE(<check>)` with its reason beside it;
 switching a check off is an edit to `/.clang-tidy` with the reason in that
@@ -266,17 +308,42 @@ The native code has a deliberate two-layer separation:
 
 Data flows: **JS ↔ N-API (LuaContext) ↔ Core (LuaRuntime) ↔ Lua state**
 
+### Two bindings
+
+The WASM target is **not** the binding above recompiled. It is a second one, written for the browser:
+
+| | Native | WASM |
+|---|---|---|
+| Binding | `src/lua-native.{h,cpp}` on N-API | `src/wasm/lua-wasm.{h,cpp}` on Embind's `emscripten::val` |
+| The JS-facing layer | `node-addon-api` | `src/wasm/js.{h,cpp}`, plus `src/wasm/shell.js` for what must be JavaScript. `stack.{h,cpp}` and `suspend.{h,cpp}` have no native twin: the engine-stack check and the suspension of deferred runs (JSPI) |
+| Loaded through | `index.js` | `browser.js` (the `browser` condition of the `exports` map) |
+| Core | `src/core/` | the same files, compiled unchanged |
+
+Data flows: **JS ↔ shell.js ↔ Embind (LuaContext) ↔ Core (LuaRuntime) ↔ Lua state**
+
+The port **kept the native names**, function for function, and each WASM function says which native one it is (`// Native: LuaContext::Foo.`). So:
+
+- **A change to one binding is a change to both.** A fix, a guard, a new option, a reworded error message. No code is shared between them, by decision (`docs/reviews/WASM-TARGET-PLAN.md` D2), so nothing carries a change across but you. Find the twin by name and make the same change.
+- **A new public method, option, handle method or export must land in both, and in `types.d.ts`.** `binding-parity` (in `check-invariants`) derives the surface from all three and goes red otherwise. It also freezes the list of functions that exist in only one binding, so a helper added to one side shows up as a row to re-freeze — read it and ask whether the other side needs it.
+- **One design rule is specific to the WASM binding: a JavaScript exception never unwinds through a WASM frame.** Anything that can run user JS (a property read, a call, `String(v)`) goes through a `js::` function, which catches in the shell and rethrows as a C++ `JsError`. Never call `val::operator()` or read a property off a user value directly.
+- **The ways the WASM target may differ from native are a closed list**, the table in `docs/WASM.md`. `tools/wasm-ledger.mjs` parses that table and an entry may only cite a row of it. A new difference is not ledgered into existence: fix it, or the owner adds a row. An entry awaiting that ruling goes in the ledger's `unruled` class.
+- **`LUA_NATIVE_TARGET`** (`wasm` / `wasm-release`) points the suite and every harness at the WASM binding's node variant. `tools/target.mjs` is the loader, and it *observes* which binding it got and refuses a mismatch, so a green run is never about the wrong binary.
+
+The **node** variant of the WASM build exists only so the suite and instruments can run; the **web** variant is what ships, and only `npm run smoke-wasm` executes it.
+
 ### Lua Reference Management
 
 Lua objects that cross the C++ boundary (functions, coroutines, userdata, metatabled tables) are stored in the Lua registry via `luaL_ref` and wrapped in ref structs (`LuaFunctionRef`, `LuaThreadRef`, `LuaUserdataRef`, `LuaTableRef`). These use move semantics — `release()` calls `luaL_unref`. The binding layer wraps these in `*Data` structs (e.g., `LuaFunctionData`) that pair the ref with a `shared_ptr<LuaRuntime>` to ensure correct destruction order.
 
 ### Module Entry Point
 
+`browser.js` is the browser entry: a one-line static re-export of `build-wasm/release/web/lua-native.mjs`, selected by the `browser` condition of `package.json`'s `exports` map. Like `prebuilds/`, the three files under `build-wasm/release/web/` are built locally and published, never committed. The `exports` map blocks deep imports it does not list, `prebuilds/` paths included.
+
 `index.js` is an ES module loader that tries multiple paths (node-gyp debug → node-gyp release → CMake layouts → `prebuilds/<platform>-<arch>/lua-native.node` → `node-gyp-build`) to find the compiled `.node` binary. It exports the native module as default. **Local build output deliberately precedes `prebuilds/`** so a freshly compiled binary always wins during development; the reverse order once had the suite testing a stale prebuild (CODE-REVIEW-2 P2). The published package ships prebuilds only — no `src/` or `binding.gyp` — so a consumer on an unshipped platform gets a "no prebuilt binary" error pointing at the issue tracker rather than a source build.
 
 ### Type Definitions
 
-`types.d.ts` contains the full TypeScript API. `index.d.ts` re-exports it. Key types: `LuaContext`, `LuaValue`, `LuaTable`, `LuaTableRef`, `LuaFunction`, `LuaCoroutine`, `MetatableDefinition`, `UserdataOptions`.
+`types.d.ts` contains the full TypeScript API. `index.d.ts` re-exports it. `browser.d.ts` re-exports it with bytecode restated as a `Uint8Array`. Key types: `LuaContext`, `LuaValue`, `LuaTable`, `LuaTableRef`, `LuaFunction`, `LuaCoroutine`, `MetatableDefinition`, `UserdataOptions`.
 
 ### Test Structure
 
@@ -304,16 +371,24 @@ Lua objects that cross the C++ boundary (functions, coroutines, userdata, metata
 
 ## Documentation
 
-Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, `REQUIRE.md`, `USERDATA.md`, `USERDATA-METHOD-BINDING.md`. Consult these before implementing a feature. **There is no roadmap document** — `FEATURE-HISTORY.md` and `BRIDGE-COMPARISON.md` read like backlogs but are *records*: every item in both is implemented apart from A5 (worker pool), which is a scope decision. New work should start from a concrete need, not from either survey.
+Detailed design docs live in `docs/`: `ASYNC.md`, `BYTECODE.md`, `FEATURES.md`, `REQUIRE.md`, `USERDATA.md`, `USERDATA-METHOD-BINDING.md`, `WASM.md`. Consult these before implementing a feature. **There is no roadmap document** — `FEATURE-HISTORY.md` and `BRIDGE-COMPARISON.md` read like backlogs but are *records*: every item in both is implemented apart from A5 (worker pool), which is a scope decision. New work should start from a concrete need, not from either survey.
 
 **`docs/README.md` is the index.** Everything at the top level of `docs/` is current; everything in `docs/reviews/` is frozen and is never an instruction. Two rules are recorded there and are worth following: a **filename states what a document is, never what state the work is in** (four files were renamed on August 4, 2026 because their names claimed open work that was finished), and anything that stops being current gets a superseded banner in its first screen **and** moves to `docs/reviews/`.
 
 ## Conventions
 
-- C++17 standard, compiled via node-gyp (`binding.gyp`)
+- C++17 standard, compiled via node-gyp (`binding.gyp`); the WASM target via
+  `em++`, driven by `tools/wasm-build/run.mjs`
+- **The three limits (`maxMemory`, `maxInstructions`, `timeout`) are
+  `std::uint64_t` in the core, not `size_t`** — `size_t` made them 32 bits
+  wide on the WASM target. A limit is a number the caller chose, not the size
+  of something in the address space
 - N-API version 8, with `NODE_ADDON_API_CPP_EXCEPTIONS` enabled
 - Supported platform targets: **macOS arm64 and Windows x64** (`binding.gyp`
   conditions on `OS` and declares no arch list).
+  A third target, browsers through WebAssembly, was added deliberately in
+  November 2026 (`docs/CORRECTNESS.md` §14's amendment); it is built and
+  verified on macOS and does not reopen anything below.
   **In practice this is a macOS project and there is no CI, and both are settled
   decisions — not gaps.** Do not raise the untested targets, the absence of CI,
   pre-push hooks, or `CODE-REVIEW-LEDGER` M5 as findings, risks, action items,

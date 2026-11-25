@@ -15,6 +15,42 @@ It also runs inside Electron, in the main process or in a renderer. The
 [Electron demo](electron/README.md) is a small app that shows both, and
 includes a tile-based RPG written in Lua.
 
+### Browsers (WebAssembly)
+
+The same package runs in a web page. There it is a WebAssembly build of the
+same Lua and the same core, with the same API:
+
+```js
+import lua_native from 'lua-native';   // the same line as under Node
+
+const lua = new lua_native.init({ print: console.log }, { libraries: 'safe' });
+lua.execute_script('print(6 * 7)');
+```
+
+A bundler's browser build resolves `lua-native` to the WebAssembly entry
+through the package's `exports` map; under Node the same import still loads
+the native addon. `vite build` needs no configuration for it.
+
+The [sample page](examples/browser/index.html) loads it with no bundler and
+runs a Lua script you can edit; the comment at its top says how to serve it.
+
+[Using lua-native in a Browser](#using-lua-native-in-a-browser) is the
+walkthrough.
+
+What is different in a page, in short:
+
+- **Bytecode is a `Uint8Array`**, not a `Buffer`.
+- **A running script holds its thread.** The two `*_async` worker doors share
+  it where the engine can suspend WebAssembly, and hold it where it cannot.
+  For heavy or parallel work, host the VM in a Web Worker.
+- **Files are virtual.** Give Lua its sources with `set_file_reader`,
+  `add_searcher` or `register_module`.
+
+[`docs/WASM.md`](docs/WASM.md) has the complete list of differences, which is
+closed, the browsers it was run in, and how deep Lua can recurse on each
+thread. Every measured cost figure elsewhere in this README and in
+`types.d.ts` was taken on the native addon and is a statement about it.
+
 ## Features
 
 - Execute Lua scripts and files from Node.js, Bun or Deno
@@ -69,7 +105,7 @@ NOTE: The supported targets are macOS (Apple Silicon/arm64) and Windows x64, and
 the published package ships a prebuilt binary for both — no C++ toolchain, no
 vcpkg, and no build step on install. Linux has not been tested.
 
-NOTE: The prebuilt binaries include Lua 5.5.0. If you need a
+NOTE: The prebuilt binaries include Lua 5.5.1. If you need a
 different Lua version, you will need to build from source.
 
 ## Building from Source
@@ -211,7 +247,7 @@ installed" and leaves the previous library in place) and printing the resulting
 addon is built against the static CRT (`/MT`), so it must link a static Lua.
 Windows has no deployment-target equivalent, so no overlay is involved there.
 
-vcpkg's `lua` port is currently **5.5.0**, which is what this project targets.
+vcpkg's `lua` port is currently **5.5.1**, which is what this project targets.
 The code uses Lua 5.5 APIs (`luaL_openselectedlibs`, the 5.5 `lua_gc` arities,
 native 64-bit integers), so it will **not** compile against Lua 5.4 or earlier.
 
@@ -955,7 +991,7 @@ const lua = new lua_native.init({}, {
 console.log(lua.info());
 // {
 //   version: 'Lua 5.5',
-//   release: 'Lua 5.5.0',
+//   release: 'Lua 5.5.1',
 //   versionNumber: 505,
 //   memoryBytes: 15022,
 //   memoryKB: 14.669921875,
@@ -3051,6 +3087,235 @@ A shared table is worth it once you have several contexts, updates over time,
 or contexts created at different points — it keeps the subscriber list and the
 "publish to everyone" step in one place.
 
+## Using lua-native in a Browser
+
+The WebAssembly build has the API the rest of this README describes. This
+section is what is particular to a page: loading it, keeping the page
+responsive, and giving Lua its files.
+
+It has been run in Chromium and Safari. Firefox has not been tested.
+
+### Step 1: Load It
+
+**With a bundler.** Install the package and import it:
+
+```bash
+npm install lua-native
+npm install --save-dev vite
+```
+
+```html
+<!-- index.html -->
+<!doctype html>
+<script type="module" src="./main.js"></script>
+```
+
+```js
+// main.js
+import lua_native from 'lua-native';
+
+const lua = new lua_native.init({}, { libraries: 'safe' });
+console.log(lua.execute_script('return 6 * 7'));  // 42
+```
+
+`npx vite` serves it and `npx vite build` builds it, with no configuration. The
+import waits for the WebAssembly to load, so `lua_native` is ready on the next
+line. A bundler that does not carry the `.wasm` file along needs
+`lua-native-core.wasm` served beside its output.
+
+**Without a bundler.** Serve `node_modules/lua-native` and point an import map at
+its browser entry:
+
+```html
+<script type="importmap">
+  { "imports": { "lua-native": "/node_modules/lua-native/browser.js" } }
+</script>
+<script type="module">
+  import lua_native from 'lua-native';
+
+  const lua = new lua_native.init({}, { libraries: 'safe' });
+  console.log(lua.execute_script('return 6 * 7'));  // 42
+</script>
+```
+
+The page has to come from a server, because a browser does not load modules
+from `file://`. Serve `.wasm` files as `application/wasm`. No cross-origin
+isolation headers are needed.
+
+### Step 2: Connect Lua to the Page
+
+Functions given to `init()` are Lua globals, values cross both ways, and
+`print` goes wherever you send it:
+
+```js
+const output = document.querySelector('#output');
+
+const lua = new lua_native.init(
+  {
+    setTitle: (text) => { document.title = text; },
+  },
+  { libraries: 'safe', timeout: 2000 },
+);
+
+lua.set_print_handler((text) => { output.textContent += text; });
+lua.set_global('user', { name: 'Ada', visits: 3 });
+
+const result = lua.execute_script(`
+  setTitle('Hello, ' .. user.name)
+  print('visit number', user.visits)
+  return { nextVisit = user.visits + 1 }
+`);
+console.log(result.nextVisit);  // 4
+```
+
+A Lua error is a JavaScript exception, and the context is still usable after
+one:
+
+```js
+try {
+  lua.execute_script('error("something went wrong")');
+} catch (error) {
+  console.error(error.message);
+}
+```
+
+Call `lua.dispose()` when you have finished with a context.
+
+### Step 3: Keep the Page Responsive
+
+Lua runs on the thread that started it. `execute_script()` holds the page until
+the script ends, so give it a `timeout` for anything you did not write
+yourself.
+
+For a longer script, use `execute_script_async()`. Where the browser can suspend
+WebAssembly (Chromium, Safari 27), the run gives the page a turn every few
+milliseconds, and `cancel()` can stop it:
+
+```js
+const runner = new lua_native.init({}, { libraries: 'safe', timeout: 60000 });
+
+cancelButton.onclick = () => runner.cancel();
+
+try {
+  const total = await runner.execute_script_async(`
+    local total = 0
+    for i = 1, 5e7 do total = total + i end
+    return total
+  `);
+  console.log(total);
+} catch (error) {
+  console.error(error.message);  // "execution cancelled" if it was
+}
+```
+
+- As under Node, the script cannot call JavaScript functions, the context
+  refuses other calls until the run ends, and `cancel()` needs a `timeout`,
+  `maxInstructions` or a counting hook to be set.
+- In a browser that cannot suspend WebAssembly, the run holds the page until it
+  ends or its `timeout` does.
+
+To wait for a `fetch` from Lua, use
+[`execute_async()`](#awaiting-javascript-promises-execute_async), which works as
+it does under Node:
+
+```js
+const loader = new lua_native.init(
+  { fetchText: async (url) => (await fetch(url)).text() },
+  { libraries: 'safe' },
+);
+const length = await loader.execute_async(`return #fetchText('data.txt')`);
+```
+
+### Step 4: Run Heavy Scripts in a Worker
+
+A Web Worker gives Lua a thread of its own:
+
+```js
+// lua-worker.js
+import lua_native from 'lua-native';
+
+const lua = new lua_native.init({}, { libraries: 'safe', timeout: 10000 });
+
+self.onmessage = ({ data }) => {
+  try {
+    self.postMessage({ id: data.id, value: lua.execute_script(data.script) });
+  } catch (error) {
+    self.postMessage({ id: data.id, error: error.message });
+  }
+};
+self.postMessage({ ready: true });
+```
+
+```js
+// main.js
+const worker = new Worker(new URL('./lua-worker.js', import.meta.url), { type: 'module' });
+
+worker.onmessage = ({ data }) => {
+  if (data.ready) worker.postMessage({ id: 1, script: 'return 6 * 7' });
+  else console.log(data);  // { id: 1, value: 42 }
+};
+```
+
+The worker says when it is ready because a message sent while it is still
+loading can be lost.
+
+- **Vite** needs to be told to build workers as modules:
+
+  ```js
+  // vite.config.mjs
+  export default { worker: { format: 'es' } };
+  ```
+
+- Without a bundler, import `/node_modules/lua-native/browser.js` in the worker:
+  an import map does not apply there.
+- Only data crosses between a worker and its page. Return plain values, not Lua
+  functions or table handles.
+- A worker has a smaller stack than a page, in Safari much smaller, so deeply
+  nested calls are refused sooner. It is an ordinary error.
+
+### Step 5: Give Lua Its Files
+
+A page has no disk. Register what `require` should find:
+
+```js
+const app = new lua_native.init({}, { libraries: 'safe' });
+
+// A module written in JavaScript.
+app.register_module('greeter', { hello: (name) => `Hello, ${name}` });
+
+// Modules written in Lua, from anywhere you can get their text.
+const sources = { util: 'return { double = function(n) return n * 2 end }' };
+app.add_searcher((name) => sources[name] ?? null);
+
+console.log(app.execute_script(`
+  local greeter, util = require('greeter'), require('util')
+  return greeter.hello('Ada') .. ' ' .. util.double(21)
+`));  // Hello, Ada 42
+```
+
+Searchers are synchronous, so fetch sources before Lua asks for them:
+
+```js
+const main = await (await fetch('game/main.lua')).text();
+app.execute_script(main);
+```
+
+`set_file_reader()` does the same for `dofile` and `loadfile`. Lua can also
+write to an in-memory filesystem, if its libraries include `io`, which lasts
+only as long as the page.
+
+### What Is Different in a Page
+
+- `compile()` returns a `Uint8Array` and not a `Buffer`. `load_bytecode()` takes
+  it back.
+- There is no process: `os.execute` has no shell and `io.popen` raises.
+- Types come from `browser.d.ts`. A project without `@types/node` needs
+  `skipLibCheck`.
+
+The [sample page](examples/browser/index.html) puts steps 1 and 2 together.
+[`docs/WASM.md`](docs/WASM.md) has every difference and how deep Lua can recurse
+on each thread, and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) has the limits.
+
 ## TypeScript Support
 
 The module includes comprehensive TypeScript definitions:
@@ -3561,7 +3826,7 @@ to call on a monitoring timer.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `version` | `string` | Lua version of the linked build, e.g. `'Lua 5.5'` |
-| `release` | `string` | Full version including the patch level, e.g. `'Lua 5.5.0'` |
+| `release` | `string` | Full version including the patch level, e.g. `'Lua 5.5.1'` |
 | `versionNumber` | `number` | Numeric form for comparisons: major × 100 + minor (e.g. `505`) |
 | `memoryBytes` | `number` | Memory currently held by the state — the same value as `get_memory_usage()` |
 | `memoryKB` | `number` | `memoryBytes / 1024` (fractional) |

@@ -2193,6 +2193,57 @@ variables. Outside execution the stack is `[]`, which is the honest answer to
 
 ---
 
+## Browser Target — WebAssembly (November 2026)
+
+The package ships a second target for browsers: the same core and the same Lua
+5.5 compiled to WebAssembly with Emscripten, behind the same API. A page writes
+`import lua_native from 'lua-native'` and gets it through the `browser`
+condition of `package.json`'s `exports` map; Node still gets the native addon
+from the same line. [`WASM.md`](WASM.md) is the reference; this section is the
+design in brief.
+
+**A second binding, not a recompilation.** The architecture overview above
+says the core never includes `<napi.h>` and that the N-API layer could be
+replaced with a different binding. This is that: `src/wasm/lua-wasm.{h,cpp}`
+is the binding rewritten against Embind's `emscripten::val`, with a thin layer
+(`js.{h,cpp}`) standing where `node-addon-api` stands natively and a
+JavaScript shell (`shell.js`) for what has to be JavaScript — the class
+objects, the handles' finalizers, the Proxy. No N-API is in it, real or
+emulated. The core is compiled unchanged.
+
+**Why not emulate N-API.** It was the first plan, and the owner ruled it out:
+the browser build should carry nothing whose only job is to imitate Node. The
+cost is permanent and was accepted knowingly — two bindings to keep the same —
+and it is the reason for the machinery below.
+
+**One rule carries the design: a JavaScript exception never unwinds through a
+WASM frame.** Every operation that can run user JavaScript goes through a
+function in the shell that catches and returns, and arrives in C++ as an
+ordinary exception. Lua's `longjmp` and C++ exceptions are both WASM-native,
+on every object including Lua's, because the other mode loses Lua's error
+value when it jumps through a C++ frame.
+
+**How the two are kept the same.** Not by sharing code, and not by review.
+The existing suite and all ten instruments run against the WASM binding under
+Node, judged against a ledger of differences that may cite only a closed list
+(`npm run verify-wasm`); the source invariants are asked of the second binding
+under their own ids; and a census requires the public surface — methods,
+options, handle methods, exports — to be equal in `types.d.ts`, the native
+binding and this one (`binding-parity`). The build that ships is then run in a
+browser with a fixed smoke set (`npm run smoke-wasm`).
+
+**What differs** is ten rows in [`WASM.md`](WASM.md), and nothing else is
+allowed to. The three a user meets first: bytecode is a `Uint8Array`; a
+running script holds its thread, so the two worker doors keep their signatures
+and run in a later task on the calling thread; and files are virtual.
+
+**Porting it found defects in the native target**, because every entry point
+was read beside its copy: a use-after-free in the table iterator, three in the
+async doors, and `timeout: Infinity` ending scripts at once. All are fixed in
+both.
+
+---
+
 ## Implementation Timeline
 
 | Feature | Complexity | Date |
@@ -2242,3 +2293,4 @@ variables. Outside execution the stack is `[]`, which is the honest answer to
 | Filesystem policy (`filesystem: 'deny'`) | Moderate | August 2026 |
 | Tables as Maps (`tableAs: 'map'`) | High | August 2026 |
 | Read-only debug introspection (`get_stack()` / `get_locals()`) | Moderate | August 2026 |
+| Browser target (WebAssembly build, second binding, same API) | High | November 2026 |

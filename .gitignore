@@ -50,6 +50,10 @@ bower_components
 # Compiled binary addons (https://nodejs.org/api/addons.html)
 build/
 
+# WASM target output (tools/wasm-build/run.mjs). Not under build/: node-gyp
+# rebuild deletes that directory.
+build-wasm/
+
 # Dependency directories
 node_modules/
 jspm_packages/

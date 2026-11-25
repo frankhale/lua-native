@@ -31,6 +31,7 @@ import {
 import { surfaceCensus } from './surface-census.mjs';
 import { perfClaims } from './perf-claims.mjs';
 import { livenessGuarding } from './liveness-guarding.mjs';
+import { WASM_INVARIANTS } from './wasm-binding.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const BINDING = join(ROOT, 'src/lua-native.cpp');
@@ -78,14 +79,17 @@ const USER_JS = new RegExp(
   + SPLIT_HELPERS.map((n) => `\\b${n}\\(`).join('|'));
 const CALL_SCOPE = /CallScope\s+[A-Za-z_]/;
 
-export function callScopeClassification() {
+// `path` and `userJs` default to the native binding. The WASM binding is the
+// same classification over its own file and its own spelling of "can run user
+// JS" (`wasm-binding.mjs`); the predicate is shared so the two cannot drift.
+export function callScopeClassification({ path = BINDING, userJs = USER_JS } = {}) {
   const out = {};
-  for (const fn of topLevelFunctions(readSource(BINDING))) {
+  for (const fn of topLevelFunctions(readSource(path))) {
     const lines = fn.body.split('\n');
     let firstJs = -1;
     let firstScope = -1;
     for (let i = 0; i < lines.length; i++) {
-      if (firstJs < 0 && USER_JS.test(lines[i])) firstJs = i;
+      if (firstJs < 0 && userJs.test(lines[i])) firstJs = i;
       if (firstScope < 0 && CALL_SCOPE.test(lines[i])) firstScope = i;
       if (firstJs >= 0 && firstScope >= 0) break;
     }
@@ -159,8 +163,8 @@ export function luaNextSites() {
 // operations declaring one* generative: which named operation asks for which
 // policy. The exception-escape and injection matrices both need this set, and
 // until now each carried its own copy that agreed with the source by luck.
-export function occupancyPolicySites() {
-  const src = stripComments(readSource(BINDING));
+export function occupancyPolicySites(path = BINDING) {
+  const src = stripComments(readSource(path));
   const out = {};
   const re = /RejectIfOccupied\(\s*(nullptr|"[^"]*")\s*,\s*lua_occupancy::(k[A-Za-z]+)/g;
   let m;
@@ -307,12 +311,14 @@ export function throwingCoreMethods() {
 // an unguarded call to a throwing core method, or an unguarded call to another
 // binding function that escapes. What matters is the fixpoint at the roots —
 // the functions nothing else calls, which are what N-API invokes.
-export function coreCallGuarding() {
+// `foreign` as in `livenessGuarding`: a bare-name match it accepts belongs to
+// another namespace and is not a call to the binding function of that name.
+export function coreCallGuarding({ path = BINDING, justified = JUSTIFIED_ESCAPES, foreign = null } = {}) {
   const throwing = throwingCoreMethods();
   if (throwing.length === 0) throw new Error('no throwing core methods found — the scan is broken');
   const coreCall = new RegExp(`(?:runtime|runtime_|rt)(?:->|\\.)(${throwing.join('|')})\\s*\\(`, 'g');
 
-  const fns = topLevelFunctions(readSource(BINDING));
+  const fns = topLevelFunctions(readSource(path));
   const guards = new Map(fns.map((f) => [f.name, tryGuardMap(f)]));
   const bare = (n) => (n.includes('::') ? n.slice(n.lastIndexOf('::') + 2) : n);
 
@@ -344,6 +350,7 @@ export function coreCallGuarding() {
       const re = new RegExp(`\\b${bare(other.name)}\\s*\\(`, 'g');
       for (const at of allMatches(f.body, re)) {
         if (at > 0 && /[A-Za-z0-9_]/.test(f.body[at - 1])) continue;
+        if (foreign && foreign.test(f.body.slice(Math.max(0, at - 24), at))) continue;
         called.add(other.name);
         if (!callers.has(other.name)) callers.set(other.name, []);
         callers.get(other.name).push({ caller: f.name, guarded: !!g[at] });
@@ -365,6 +372,7 @@ export function coreCallGuarding() {
         let hit = false;
         for (const at of allMatches(f.body, re)) {
           if (at > 0 && /[A-Za-z0-9_]/.test(f.body[at - 1])) continue;
+          if (foreign && foreign.test(f.body.slice(Math.max(0, at - 24), at))) continue;
           if (!g[at]) { hit = true; break; }
         }
         if (hit) { escapes.add(f.name); changed = true; break; }
@@ -392,7 +400,7 @@ export function coreCallGuarding() {
     } else {
       rows[key] = 'UNGUARDED_AND_PROPAGATES';
     }
-    if (JUSTIFIED_ESCAPES[key]) {
+    if (justified[key]) {
       rows[key] = rows[key] === 'GUARDED' || String(rows[key]).startsWith('CONTAINED')
         ? `STALE_JUSTIFICATION(${rows[key]})`   // it is contained now; drop the entry
         : 'JUSTIFIED_FALSE_POSITIVE';
@@ -592,9 +600,9 @@ export function assertionStrength() {
   return out;
 }
 
-export function scannerCoverage() {
+export function scannerCoverage(files = [['binding', BINDING], ['core', CORE]]) {
   const out = {};
-  for (const [label, path] of [['binding', BINDING], ['core', CORE]]) {
+  for (const [label, path] of files) {
     const src = readSource(path);
     out[`${label}: functions found`] = topLevelFunctions(src).length;
     const un = unattributedDefinitions(src);
@@ -680,6 +688,12 @@ export const INVARIANTS = [
     note: 'UNCLAIMED must stay 0 — a cost claim nobody has measured is how C1–C9 reached the shipped README and types.d.ts. Add a `tools/crossing-cost` Axis A cell, or a CLAIM_LEDGER entry with a reason; a false claim may never be ledgered, it gets fixed or deleted. If "claim-shaped lines examined" drops sharply, suspect the scanner before believing the zero.',
   },
 ];
+
+// The second binding's invariants (`wasm-binding.mjs`), under ids of their own
+// so that nothing about them can move a native answer. Imported here, at the
+// bottom, because that module calls the functions above: the import is hoisted
+// and the registration is not.
+INVARIANTS.push(...WASM_INVARIANTS);
 
 export const EXPECTED_PATH = join(ROOT, 'tools/invariants/expected.json');
 

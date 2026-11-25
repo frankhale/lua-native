@@ -3,6 +3,7 @@
 //   node tools/lint/run.mjs             # controls, then src/ and the C++ tests
 //   node tools/lint/run.mjs --control   # just the controls
 //   node tools/lint/run.mjs --verbose   # print every diagnostic in full
+//   node tools/lint/run.mjs --native-only   # leave out src/wasm (no Emscripten here)
 //
 // **Why this exists.** clang-tidy had been run against this tree before — from
 // an IDE, by hand, with whatever checks the IDE had on — and once did damage:
@@ -42,9 +43,18 @@ const require = createRequire(import.meta.url);
 const args = new Set(process.argv.slice(2));
 const VERBOSE = args.has('--verbose');
 const CONTROL_ONLY = args.has('--control');
+const NATIVE_ONLY = args.has('--native-only');
 
 const SOURCES = ['src/core/lua-runtime.cpp', 'src/lua-native.cpp'];
 const HEADERS = ['src/core/lua-runtime.h', 'src/lua-native.h', 'src/lua-async-worker.h'];
+// The second binding (`docs/reviews/WASM-TARGET-PLAN.md`, U10 and Phase 5). Its two
+// translation units compile only against the Emscripten sysroot, so they are
+// linted with the flags `em++` itself reports — the same configuration, the
+// same rules, a different compiler front end's idea of where <emscripten/val.h>
+// is. A run without `--native-only` that cannot find Emscripten fails: "clean"
+// has to mean both bindings, or it means less than it says.
+const WASM_SOURCES = ['src/wasm/js.cpp', 'src/wasm/stack.cpp', 'src/wasm/suspend.cpp', 'src/wasm/lua-wasm.cpp'];
+const WASM_HEADERS = ['src/wasm/js.h', 'src/wasm/lua-wasm.h'];
 const CONTROL = 'tools/lint/control.cpp';
 // Held to the naming rules only. The test suite is gtest macros end to end, and
 // the full check set reads those as findings; what the tests share with src/
@@ -143,6 +153,27 @@ function compileFlags() {
   return flags;
 }
 
+// What `em++` compiles the WASM binding with, as clang flags: the target, the
+// sysroot and its defines come from `em++ --cflags`, and the rest is what
+// tools/wasm-build/run.mjs adds.
+async function wasmCompileFlags() {
+  const { requireEmscripten, luaPaths, ToolchainError } = await import('../wasm-build/toolchain.mjs');
+  let lua;
+  try {
+    requireEmscripten();
+    lua = luaPaths();
+  } catch (error) {
+    if (!(error instanceof ToolchainError)) throw error;
+    fail(`cannot lint src/wasm: ${error.message}\n      Pass --native-only to lint the native target alone; the result then says so.`);
+  }
+  if (!fs.existsSync(path.join(lua.include, 'lua.hpp'))) {
+    fail(`cannot lint src/wasm: no Lua headers at ${lua.include}. Run \`npm run vcpkg-lua-wasm\`, or pass --native-only.`);
+  }
+  const cflags = tryExec('em++', ['--cflags', '-fwasm-exceptions']);
+  if (!cflags) fail('cannot lint src/wasm: `em++ --cflags` printed nothing. Pass --native-only to lint the native target alone.');
+  return ['-std=c++17', ...cflags.split(/\s+/).filter(Boolean), `-I${path.join(ROOT, 'src')}`, `-isystem${lua.include}`];
+}
+
 // `checks`, when given, is appended to the configuration's own list, so
 // '-*,x' narrows the run to x while keeping every CheckOption.
 function runTidy(clangTidy, file, flags, checks = null) {
@@ -188,7 +219,8 @@ function parse(output) {
 function listSuppressions() {
   const found = [];
   const bare = [];
-  for (const file of [...SOURCES, ...HEADERS]) {
+  const scanned = NATIVE_ONLY ? [...SOURCES, ...HEADERS] : [...SOURCES, ...HEADERS, ...WASM_SOURCES, ...WASM_HEADERS];
+  for (const file of scanned) {
     const lines = fs.readFileSync(path.join(ROOT, file), 'utf8').split('\n');
     lines.forEach((text, idx) => {
       // Only a marker that opens a comment and is followed by a check list or
@@ -239,8 +271,10 @@ if (CONTROL_ONLY) process.exit(0);
 // ---- the sources ----------------------------------------------------------
 
 const testFlags = [...flags, `-I${path.join(ROOT, 'vendor/googletest/googletest/include')}`];
+const wasmFlags = NATIVE_ONLY ? null : await wasmCompileFlags();
 const results = await Promise.all([
   ...SOURCES.map((file) => runTidy(clangTidy, file, flags)),
+  ...(wasmFlags ? WASM_SOURCES.map((file) => runTidy(clangTidy, file, wasmFlags)) : []),
   ...NAMING_ONLY.map((file) => runTidy(clangTidy, file, testFlags, NAMING_CHECKS)),
 ]);
 const all = new Map();
@@ -288,5 +322,8 @@ if (diagnostics.length || bare.length) {
   console.error('\nlint: FAILED');
   process.exit(1);
 }
-console.log(`\nlint: clean — ${SOURCES.length} translation units, ${HEADERS.length} headers, ` +
-  `${NAMING_ONLY.length} test file (naming only), 0 findings.`);
+const units = SOURCES.length + (wasmFlags ? WASM_SOURCES.length : 0);
+const headers = HEADERS.length + (wasmFlags ? WASM_HEADERS.length : 0);
+console.log(`\nlint: clean — ${units} translation units, ${headers} headers, ` +
+  `${NAMING_ONLY.length} test file (naming only), 0 findings.` +
+  (wasmFlags ? '' : '\n      NATIVE ONLY: src/wasm was not linted (--native-only).'));

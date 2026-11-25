@@ -671,7 +671,7 @@ export interface LuaStateInfo {
   /** Lua version of the linked build, e.g. `'Lua 5.5'`. */
   version: string;
 
-  /** Full version including the patch level, e.g. `'Lua 5.5.0'`. */
+  /** Full version including the patch level, e.g. `'Lua 5.5.1'`. */
   release: string;
 
   /** Numeric version for comparisons: major * 100 + minor (e.g. `505`). */
@@ -1313,7 +1313,7 @@ export interface LuaContext {
    * @example
    * lua.info();
    * // {
-   * //   version: 'Lua 5.5', release: 'Lua 5.5.0', versionNumber: 505,
+   * //   version: 'Lua 5.5', release: 'Lua 5.5.1', versionNumber: 505,
    * //   memoryBytes: 19532, memoryKB: 19.07,
    * //   memoryLimit: 0, maxInstructions: 0,
    * //   libraries: ['base', 'package', ...]

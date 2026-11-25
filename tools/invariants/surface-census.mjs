@@ -485,6 +485,11 @@ export const TRIGGER_DISPOSITION = [
   { match: /Lua version bump/i,
     verdict: 'MANUAL: the reference moves; nothing in this repository can detect '
       + 'that the vcpkg port changed underneath it' },
+  { match: /added to one binding and not the other/i,
+    verdict: 'FAILS-CLOSED: binding-parity reports MISSING / NOT NAMED and the suite goes red' },
+  { match: /new binding or build target/i,
+    verdict: 'MANUAL: no scan can tell that a directory of new code is a binding. '
+      + 'The WASM target is the worked example (reviews/WASM-TARGET-PLAN.md)' },
   { match: /new threading mode/i,
     verdict: 'MANUAL: would invalidate §15.2\'s race row and every instrument\'s '
       + 'single-threaded assumption; not a row a scan can score' },

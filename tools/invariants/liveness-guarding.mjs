@@ -109,8 +109,14 @@ function guardOffsets(body) {
 const IS_ENTRY = /\(\s*const\s+Napi::CallbackInfo\s*&/;
 const LIFECYCLE = /^LuaContext::(LuaContext|~LuaContext)$/;
 
-export function livenessGuarding() {
-  const src = readSource(BINDING);
+// `path` and `isEntry` default to the native binding; the WASM binding passes
+// its own file and its own callback shape (`wasm-binding.mjs`).
+//
+// `foreign`, when given, is tested against the text just before a bare-name
+// match: a match it accepts is some other namespace's function of the same
+// name and draws no edge. The native binding has no such collision.
+export function livenessGuarding({ path = BINDING, isEntry = IS_ENTRY, lifecycle = LIFECYCLE, foreign = null } = {}) {
+  const src = readSource(path);
   const lines = src.split('\n');
   const fns = topLevelFunctions(src);
   // The scanner reports positions, not signatures, so the declaration is the
@@ -131,10 +137,11 @@ export function livenessGuarding() {
       let m;
       while ((m = re.exec(f.body)) !== null) {
         if (m.index > 0 && /[A-Za-z0-9_]/.test(f.body[m.index - 1])) continue;
+        if (foreign && foreign.test(f.body.slice(Math.max(0, m.index - 24), m.index))) continue;
         if (!callSites.has(other.name)) callSites.set(other.name, []);
         callSites.get(other.name).push({
           caller: f.name,
-          guarded: LIFECYCLE.test(f.name)
+          guarded: lifecycle.test(f.name)
             || guardedBefore(f.name, m.index) || guardOffsets(f.body).length > 0,
         });
       }
@@ -147,7 +154,7 @@ export function livenessGuarding() {
 
   // Reachability from an entry point, so an internal helper is scored only when
   // JavaScript can actually get to it.
-  const entries = new Set(fns.filter((f) => IS_ENTRY.test(signature(f)) && !LIFECYCLE.test(f.name)).map((f) => f.name));
+  const entries = new Set(fns.filter((f) => isEntry.test(signature(f)) && !lifecycle.test(f.name)).map((f) => f.name));
   const reachable = new Set(entries);
   for (let changed = true; changed;) {
     changed = false;

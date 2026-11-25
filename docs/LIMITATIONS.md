@@ -524,7 +524,7 @@ nothing is going to be fixed; it is a fact about reach that an embedder should
 learn before porting rather than during.
 
 `lua-native` links **Lua 5.5** (`info().version` → `Lua 5.5`, release
-`Lua 5.5.0`, `versionNumber` 505), and that is the only version there is — the
+`Lua 5.5.1`, `versionNumber` 505), and that is the only version there is — the
 build resolves one `liblua.a` from vcpkg. There is no 5.4 build, no 5.1 build,
 and no LuaJIT. Comparable bridges sit a version or two back: wasmoon ships 5.4,
 fengari 5.3/5.4.
@@ -619,6 +619,39 @@ instead would put a destructive branch behind a forgotten argument.
 **`reset()` remains the tool for the other job** — retire this state and give me
 a fresh one — which releases everything the old state held without ending the
 context.
+
+---
+
+## 11. In a browser, five things are limited
+
+The WebAssembly target ([`WASM.md`](WASM.md)) has the same API and is held to
+the same suite. These are the limits a program can run into there; none of
+them applies to the native addon. `WASM.md` has the complete list of ways the
+two targets differ, including those that limit nothing: bytecode, for one, is a
+`Uint8Array` there and not a `Buffer`.
+
+| In a page | What to do about it |
+|---|---|
+| `execute_script_async` and `execute_file_async` share the calling thread and do not add one | Where the engine can suspend WebAssembly (Chromium, Safari 27) the page stays responsive and `cancel()` works as it does natively (with a limit or a counting hook set). Elsewhere they hold the thread; set `timeout`. For parallel work, host the VM in a Web Worker. |
+| There is no disk | `set_file_reader`, `add_searcher`, `register_module`. Lua can write to an in-memory filesystem that lasts as long as the page. |
+| `os.execute` has no shell and `io.popen` raises | Nothing; there is no process. |
+| A finalizer runs in a later task than the collection that caused it | `release()` a handle when the timing matters, as natively. |
+| In a thread with a small engine stack (a Safari worker above all), nested calls are refused before Lua's limit of 200 | Nothing breaks: it is an ordinary error and the context carries on. `WASM.md` has the depths. Each call into the module pays about 2 µs for the check. |
+
+**Not tested: Firefox.** The build has been run in Chromium and Safari only. It
+may work in Firefox; nobody has checked.
+
+**Not supported, by choice:**
+
+- **Threads.** Lua runs on the thread that loaded the module. Threads inside
+  the module would require every page using it to be cross-origin isolated. To
+  run Lua in parallel, load lua-native in a Web Worker; each worker has its own,
+  separate Lua.
+- **WASI**, and other WebAssembly hosts that are not browsers. The module needs
+  a JavaScript engine around it.
+- **The WebAssembly build under Node.** `import 'lua-native'` in Node loads the
+  native addon. The published WebAssembly files are for pages and Web Workers,
+  and are not a fallback on a platform that has no prebuilt addon.
 
 ---
 

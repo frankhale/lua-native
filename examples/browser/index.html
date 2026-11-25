@@ -1,0 +1,107 @@
+<!doctype html>
+<!--
+  lua-native in a web page.
+
+  A page has to be served; it cannot be opened as a file. From the repository root:
+
+    npm run build-wasm-release
+    python3 -m http.server 8000 --bind 127.0.0.1
+
+  then open http://localhost:8000/examples/browser/
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lua-native in a page</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea, pre { box-sizing: border-box; width: 100%; font: 14px/1.45 ui-monospace, monospace; padding: .75rem;
+    border: 1px solid #8888; border-radius: 6px; }
+  textarea { height: 22rem; resize: vertical; }
+  pre { min-height: 8rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  button { font: inherit; padding: .35rem 1rem; }
+</style>
+</head>
+<body>
+<h1>lua-native in a page</h1>
+<p id="status" role="status">Loading…</p>
+
+<label for="script">Lua script</label>
+<textarea id="script" spellcheck="false">
+print("Hello from " .. _VERSION)
+
+-- A JavaScript function, called from Lua.
+print("2 + 3 = " .. add(2, 3))
+
+-- A JavaScript object, read from Lua.
+print(page.title .. " (" .. page.width .. " px wide)")
+
+-- A Lua function: the first Fibonacci numbers.
+local function fib(n)
+  local out, a, b = {}, 0, 1
+  for i = 1, n do
+    out[i] = a
+    a, b = b, a + b
+  end
+  return out
+end
+
+-- An error raised in JavaScript is an ordinary error in Lua.
+local ok, err = pcall(add, "two", 3)
+print("pcall:", ok, err.message)
+
+-- What the script returns becomes a JavaScript value.
+return { fibonacci = fib(10), finished = true }
+</textarea>
+<p><button id="run" disabled>Run</button></p>
+
+<label for="output">Output</label>
+<pre id="output"></pre>
+
+<script type="module">
+  const status = document.getElementById('status');
+  const script = document.getElementById('script');
+  const output = document.getElementById('output');
+  const button = document.getElementById('run');
+  const write = (line) => { output.textContent += `${line}\n`; };
+
+  function run(lua_native) {
+    output.textContent = '';
+    // Functions given to init() are globals in Lua.
+    const lua = new lua_native.init({
+      add(a, b) {
+        if (typeof a !== 'number' || typeof b !== 'number') throw new TypeError('add() wants two numbers');
+        return a + b;
+      },
+    }, {
+      libraries: 'safe',
+      timeout: 5000,  // the script holds the page's thread: end it after five seconds
+    });
+    try {
+      lua.set_print_handler((text) => write(text.replace(/\n$/, '')));
+      lua.set_global('page', { title: document.title, width: window.innerWidth });
+      const result = lua.execute_script(script.value);
+      write(`\nreturned: ${JSON.stringify(result, null, 2)}`);
+    } catch (error) {
+      write(`\nerror: ${error.message}`);
+    } finally {
+      lua.dispose();
+    }
+  }
+
+  try {
+    // With a bundler, or an import map, this is `import lua_native from 'lua-native'`.
+    const { default: lua_native } = await import('../../browser.js');
+    status.textContent = 'Loaded.';
+    button.disabled = false;
+    button.addEventListener('click', () => run(lua_native));
+    run(lua_native);
+  } catch (error) {
+    status.textContent = `Could not load lua-native: ${error.message}. ` +
+      'Has it been built (npm run build-wasm-release), and is this page being served?';
+  }
+</script>
+</body>
+</html>

@@ -34,7 +34,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { buildCorpus } from './corpus.mjs';
 import { canon, canonOutcome } from './js-canonical.mjs';
 import { referenceLua, referenceVersion, embeddedVersion } from './reference.mjs';

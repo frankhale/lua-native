@@ -23,7 +23,7 @@
 // reports a perfectly flat series, and is indistinguishable from a container
 // that never leaks.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 
 export const PRODUCERS = [
   {

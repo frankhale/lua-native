@@ -7,7 +7,10 @@ deployment-target decision — **M5 is settled as of August 10, 2026**: the
 target is `13.5` and Lua is built to match via the overlay triplet. Step 1 is
 now a verification, not a change.
 
-**Supported targets: `darwin-arm64` and `win32-x64`.**
+**Supported targets: `darwin-arm64` and `win32-x64`, and — since November
+2026 — browsers, through a WebAssembly build that ships in the same package**
+(`docs/WASM.md`). The browser build is a second artifact with the same rule as
+the prebuilds: built locally, published, never committed. Step 2a is it.
 
 "Before publishing" is the preparation; "Publishing to npm" below is the
 publish itself. **Nothing enforces the order automatically** — there is no
@@ -96,6 +99,32 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
    Cross-building is not set up, so the Windows binary has to come from a
    Windows machine and be copied into `prebuilds/win32-x64/` by hand.
 
+2a. **Build the WebAssembly target, and verify it.** `build-wasm/` is
+   gitignored like `prebuilds/`, and `browser.js` re-exports
+   `build-wasm/release/web/lua-native.mjs` — so without this step the package
+   has a browser entry that imports a file that is not there, and a bundler
+   fails at build time for every browser consumer. It is built once, on the
+   macOS machine; it is not per-platform.
+
+   ```bash
+   npm run vcpkg-lua-wasm        # once per machine, and after a change to triplets/; the build refuses an older library
+   npm run build-wasm-debug      # the suite and the instruments run against this one
+   npm run build-wasm-release    # the one that ships; ends with its own 52-cell check
+   node tools/wasm-verify/run.mjs --harnesses --closing
+   npm run smoke-wasm            # then open http://localhost:8377/ in a browser, and in Safari
+   ```
+
+   `--closing` must exit 0: every way the browser build differs from the
+   native one is then a row of the closed list in `docs/WASM.md`, with nothing
+   waiting on a ruling. The smoke page must show every cell passing on the
+   main thread and in the Web Worker; it is the only thing that runs the build
+   that ships. Record the date and the browser versions in `docs/WASM.md`.
+
+   **Both the WASM build and the prebuild must postdate the last source
+   change, and they are built by different commands.** A fix made after
+   `build-wasm-release` and before `prebuildify` ships a browser build without
+   it. `ls -la build-wasm/release/web/ prebuilds/*/` shows the dates.
+
 3. **Keep one binary per platform directory, named `lua-native.node`.**
    `index.js` looks for `prebuilds/<platform>-<arch>/lua-native.node`
    explicitly, and only falls through to `node-gyp-build` as a last resort.
@@ -127,9 +156,14 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
    ```
 
 4. **Verify the packed tarball.** `npm pack --dry-run` and confirm it contains
-   exactly `index.js`, `index.d.ts`, `types.d.ts`, `package.json`, `README.md`,
-   `LICENSE`, and one `prebuilds/<platform>/lua-native.node` per supported
-   platform. The `files` list is prebuilds-only: **no `src/`, no `binding.gyp`,
+   exactly `index.js`, `index.d.ts`, `types.d.ts`, `browser.js`,
+   `browser.d.ts`, `package.json`, `README.md`, `LICENSE`, one
+   `prebuilds/<platform>/lua-native.node` per supported platform, and the three
+   files of `build-wasm/release/web/` — thirteen files with both prebuilds.
+   `npm run check-package` does this from a real tarball and goes further: it
+   unpacks it as a dependency of an empty project and checks that `lua-native`
+   resolves to `index.js` under Node and to `browser.js` under a browser
+   condition, in Node, in rolldown and through a `vite build`. The `files` list is prebuilds-only: **no `src/`, no `binding.gyp`,
    no `get_vcpkg_path.js`**, so a consumer on an unshipped platform cannot
    compile from the package and is sent to the issue tracker instead. That is
    the intended behaviour — it is also why step 2 is not optional.
@@ -173,8 +207,9 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
    all invoke `node-gyp rebuild`, which **wipes the other configuration's
    output**. Whatever you do last is what's on disk. Do the prebuild work
    (step 2) *after* the test runs, and **never run `npm run clean` afterwards** —
-   its `rmSync` list includes `prebuilds/`, so it deletes exactly the artifacts
-   you are about to publish.
+   its `rmSync` list includes `prebuilds/` and `build-wasm/`, so it deletes
+   exactly the artifacts you are about to publish. (`node-gyp rebuild` does not
+   touch `build-wasm/`, which is why the WASM output is not under `build/`.)
 
 ## Publishing to npm
 
@@ -247,10 +282,12 @@ normally honours `.gitignore` when deciding what to include — but an explicit
 there. That is why the gitignored binaries do ship.
 
 Confirm the version is what you intend and the contents match step 4 above —
-8 files: `index.js`, `index.d.ts`, `types.d.ts`, `package.json`, `README.md`,
-`LICENSE`, and the two `prebuilds/<platform>/lua-native.node` binaries. **A
-missing prebuild is silent here** — it just shows up as a shorter list, so
-count the platform directories rather than skimming.
+13 files: `index.js`, `index.d.ts`, `types.d.ts`, `browser.js`, `browser.d.ts`,
+`package.json`, `README.md`, `LICENSE`, the two
+`prebuilds/<platform>/lua-native.node` binaries, and the three files of
+`build-wasm/release/web/`. **A missing prebuild is silent here** — it just shows
+up as a shorter list, so count the platform directories rather than skimming.
+A stale one is more silent still: the list is the same length.
 
 ### 4. Publish
 
@@ -296,6 +333,86 @@ Then push the tag, so the published version is traceable to a commit:
 ```bash
 git push && git push --tags
 ```
+
+### Releasing 1.2.0
+
+What is particular to this release; the sections above are the procedure.
+Delete this section once 1.2.0 is out.
+
+Done on November 25, 2026, on the macOS machine:
+
+- The version is set in `package.json` and `package-lock.json`. **Do not run
+  `npm version`**: it would go to 1.3.0.
+- The macOS prebuild and the WASM release build are from the final source, and
+  the suites, the sanitizers, the WASM instruments and the browser smoke set
+  (Chromium 156 and Safari 27.2) have been run on it. Firefox has not.
+- The release notes are drafted in `RELEASE-NOTES-1.2.0.md`.
+
+Still to do, in this order:
+
+1. **Commit, and push the `wasm` branch.** The Windows machine has to build the
+   source that will be tagged.
+2. **Build the Windows prebuild.** The one in `prebuilds/win32-x64/` is from
+   November 18 and has none of this release's fixes. On Windows, from that
+   commit:
+
+   ```bash
+   npm install
+   npm run prebuildify
+   npx vitest run
+   ```
+
+   Run step 2's two `node -e` lines there, then copy
+   `prebuilds/win32-x64/lua-native.node` to the same path on the macOS machine.
+   Look at its date and hash after copying; the stale file looks the same.
+3. **Change no source after that.** The Windows step does not touch the WASM
+   build and needs no Emscripten: the one on the macOS machine is the one that
+   ships. If something does have to change (a fix MSVC asks for, say), this is
+   what has to be built again:
+
+   | Changed | Both prebuilds | WASM |
+   |---|---|---|
+   | `src/core/` | yes | yes |
+   | `src/lua-native.*`, `src/lua-async-worker.h`, `binding.gyp` | yes | no |
+   | `src/wasm/`, `tools/wasm-build/`, `triplets/lua-wasm-stack.h`, `triplets/wasm32-emscripten.cmake`, Emscripten | no | yes |
+   | `triplets/arm64-osx.cmake` | macOS only | no |
+
+   Do not run `npm run clean` or `git clean -xfd` on the macOS machine: each
+   deletes `prebuilds/` and `build-wasm/`. Publishing from Windows instead means
+   copying over the macOS `.node` file and the three files of
+   `build-wasm/release/web/`, which a clone does not have.
+4. **Merge to `main`, and tag the merged commit.** Switching branches gives
+   files new dates, so the date test above no longer says anything; that
+   `git diff wasm main -- src triplets binding.gyp` is empty does.
+
+   ```bash
+   git tag -a v1.2.0 -m "1.2.0"
+   ```
+
+5. **Check the package and publish** (sections 1, 3 and 4 above):
+
+   ```bash
+   npm run check-package
+   npm publish --dry-run      # 1.2.0, 13 files
+   npm publish --otp=123456
+   ```
+
+6. **Verify it** (section 5 above), for both entries: the consumer install under
+   Node, and `npx vite build` in a page that imports `lua-native`.
+7. **Push the tag, and create the GitHub release** from the notes, then delete
+   `RELEASE-NOTES-1.2.0.md`:
+
+   ```bash
+   git push origin v1.2.0
+   ```
+
+   ```bash
+   gh release create v1.2.0 --title v1.2.0 --notes-file RELEASE-NOTES-1.2.0.md
+   ```
+
+8. **Afterwards**, bring this document up to date: the registry's `latest` and
+   the list of tags above. `electron/package.json` depends on `^1.1.1`, so the
+   demo takes 1.2.0 on its next `npm update`.
 
 ### If a publish goes wrong
 

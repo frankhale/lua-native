@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 
 namespace lua_core {
 
@@ -312,6 +313,27 @@ KeyCrossing ClassifyKeyCrossing(const std::string& key) {
   }
   return KeyCrossing::Exact;
 }
+
+// The instant `ms` milliseconds from now, saturating at the clock's last one.
+//
+// `now() + milliseconds(ms)` is only defined while the sum fits the clock's
+// signed 64-bit count, and a caller's timeout need not: `timeout: Infinity`
+// arrives here as 2^64-1. That value read as a signed count is -1 ms, a
+// deadline already in the past, so every script long enough to reach the hook
+// was ended at once with "execution timeout" — and anything from roughly 292
+// years up overflowed on the way to nanoseconds. A timeout too far off to
+// represent is one that never fires, which is what it meant.
+std::chrono::steady_clock::time_point DeadlineAfter(const std::uint64_t ms) {
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point now = Clock::now();
+  const auto room =
+      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now);
+  if (room.count() <= 0 || ms >= static_cast<std::uint64_t>(room.count())) {
+    return Clock::time_point::max();
+  }
+  return now + std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(ms));
+}
+
 } // namespace
 
 int LuaRuntime::LibraryMask(const std::vector<std::string>& libraries) {
@@ -413,6 +435,10 @@ void LuaRuntime::ExecutionHook(lua_State* L, lua_Debug* ar) {
   // for line/call/return events alone therefore does not change when a cancel
   // is observed — matching the behavior before debug hooks existed.
   if (ar->event == LUA_HOOKCOUNT) {
+    // Before the checks: a cancel made while this was paused is seen at once.
+    if (runtime->pause_hook_ != nullptr) runtime->pause_hook_();
+    if (runtime->count_for_pause_only_) return;
+
     // Cooperative cancellation of a compute-bound loop.
     if (runtime->cancel_requested_.load(std::memory_order_relaxed)) {
       luaL_error(L, "execution cancelled");
@@ -421,7 +447,7 @@ void LuaRuntime::ExecutionHook(lua_State* L, lua_Debug* ar) {
 
     if (runtime->max_instructions_ > 0) {
       runtime->instruction_count_ +=
-          static_cast<size_t>(runtime->instruction_hook_interval_);
+          static_cast<std::uint64_t>(runtime->instruction_hook_interval_);
       if (runtime->instruction_count_ >= runtime->max_instructions_) {
         luaL_error(L, "instruction limit exceeded");
         return;  // unreachable
@@ -571,6 +597,12 @@ void LuaRuntime::InstallExecutionHook() {
     mask |= LUA_MASKCOUNT;
     interval = 1000;
   }
+  count_for_pause_only_ =
+      pause_hook_ != nullptr && interval == 0 && ((mask & LUA_MASKCOUNT) == 0 || debug_count_interval_ <= 0);
+  if (pause_hook_ != nullptr && interval == 0) {
+    mask |= LUA_MASKCOUNT;
+    interval = 1000;
+  }
   if ((mask & LUA_MASKCOUNT) && debug_count_interval_ > 0) {
     interval = interval > 0 ? std::min(interval, debug_count_interval_)
                             : debug_count_interval_;
@@ -588,19 +620,19 @@ void LuaRuntime::InstallExecutionHook() {
   }
 }
 
-void LuaRuntime::SetMaxInstructions(size_t limit) {
+void LuaRuntime::SetMaxInstructions(std::uint64_t limit) {
   max_instructions_ = limit;
   config_.max_instructions = limit;  // keep GetConfig() replayable
   InstallExecutionHook();
 }
 
-void LuaRuntime::SetTimeout(size_t ms) {
+void LuaRuntime::SetTimeout(std::uint64_t ms) {
   timeout_ms_ = ms;
   config_.timeout_ms = ms;  // keep GetConfig() replayable
   // Start the clock now as well: a timeout armed while something is already
   // running would otherwise be judged against a stale deadline and fire at once.
   if (ms > 0) {
-    deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    deadline_ = DeadlineAfter(ms);
   }
   InstallExecutionHook();
 }
@@ -608,8 +640,7 @@ void LuaRuntime::SetTimeout(size_t ms) {
 void LuaRuntime::BeginExecutionBudget() const {
   instruction_count_ = 0;
   if (timeout_ms_ > 0) {
-    deadline_ =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
+    deadline_ = DeadlineAfter(timeout_ms_);
   }
 }
 
@@ -1093,6 +1124,11 @@ void LuaRuntime::SetPropertyHandlers(PropertyGetter getter, PropertySetter sette
   property_setter_ = std::move(setter);
 }
 
+void LuaRuntime::SetPauseHook(const PauseHook hook) {
+  pause_hook_ = hook;
+  InstallExecutionHook();
+}
+
 void LuaRuntime::SetAsyncMode(bool enabled) { async_mode_ = enabled; }
 bool LuaRuntime::IsAsyncMode() const { return async_mode_; }
 
@@ -1143,6 +1179,15 @@ LuaRuntime* detail::OwningRuntime(lua_State* L) {
 std::shared_ptr<std::atomic<bool>> detail::StateOpenToken(lua_State* L) {
   if (const LuaRuntime* runtime = OwningRuntime(L)) return runtime->StateOpenFlag();
   return nullptr;
+}
+
+void detail::RequireStackHeadroom(const int depth) {
+  constexpr int kStride = 4;
+  if (stack_headroom == nullptr || depth == 0 || depth % kStride != 0) return;
+  if (!stack_headroom()) {
+    throw std::runtime_error("stack overflow: a value is nested too deeply to convert with the "
+                             "stack that is left");
+  }
 }
 
 void detail::UnrefRegistrySlot(lua_State* main_state, int ref) {
@@ -3384,6 +3429,13 @@ std::string LuaRuntime::ErrorValueToString(lua_State* L) const {
   }
   lua_pop(L, 1);  // pop the failed pcall result / non-string
   // Fallback that never runs user code (the error value is still at -1).
+  // A string is its own message: the protected call above can fail on one only
+  // for want of C stack, right where a "C stack overflow" is being reported.
+  if (lua_type(L, -1) == LUA_TSTRING) {
+    size_t len = 0;
+    const char* s = lua_tolstring(L, -1, &len);
+    return {s, len};
+  }
   std::string result = "(error object is a ";
   result += luaL_typename(L, -1);
   result += " value)";
@@ -3766,7 +3818,7 @@ bool LuaRuntime::StrictConversion(lua_State* L) {
 //
 // **This is where T1's design had to move to.** The option was drafted as a
 // binding-layer rendering switch: build a `Map` instead of an object. It cannot
-// be. `LuaTable` is a `std::unordered_map<std::string, LuaPtr>`, so the number
+// be. `LuaTable` is a `std::map<std::string, LuaPtr>`, so the number
 // key `1` and the string key `"1"` have already merged, and a boolean key has
 // already been dropped, by the time `CoreToNapiBuiltin` runs. Rendering a Map
 // from that would have produced a faithful-looking container holding data that
@@ -3979,6 +4031,7 @@ LuaPtr LuaRuntime::ToLuaValue(lua_State* L, const int index, const int depth) {
     msg += " levels";
     throw std::runtime_error(msg);
   }
+  detail::RequireStackHeadroom(depth);
   // Reserve headroom for this level's working set (metatable probe, key/value
   // during traversal). Lua only guarantees LUA_MINSTACK free slots and the raw
   // push APIs do not grow the stack, so deep/wide tables would otherwise overrun.
@@ -4152,6 +4205,7 @@ void LuaRuntime::PushLuaValue(lua_State* L, const LuaPtr& value, const int depth
     msg += " levels";
     throw std::runtime_error(msg);
   }
+  detail::RequireStackHeadroom(depth);
   // Reserve headroom before pushing (raw push APIs don't grow the stack). Each
   // recursion level ensures its own additional slots, so nested containers
   // accumulate the space they need instead of overrunning a full stack.
