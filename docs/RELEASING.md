@@ -214,7 +214,7 @@ cheerfully ship whatever is in the working tree. This checklist is the guard.
 ## Publishing to npm
 
 `lua-native` is an **unscoped, public** package. It is already on the registry —
-`latest` was `1.1.1` as of November 19, 2026; `npm view lua-native dist-tags`
+`latest` was `1.2.0` as of November 25, 2026; `npm view lua-native dist-tags`
 gives the current answer. Publishing happens from a
 maintainer's macOS machine, with the Windows binary copied in by hand (step 2),
 because `npm publish` packs whatever `prebuilds/` contains locally.
@@ -248,7 +248,7 @@ npm version major     # 1.1.0 -> 2.0.0
 `npm version` writes `package.json`, creates a commit and an annotated tag in
 one step. If you would rather control the commit yourself, edit the `version`
 field by hand and tag afterwards (`git tag -a v1.1.0 -m 'v1.1.0'`). Either way
-**tag it** — the repo has `v1.0.0`, `v1.1.0` and `v1.1.1` only, so `1.0.1` and
+**tag it** — the repo has `v1.0.0`, `v1.1.0`, `v1.1.1` and `v1.2.0` only, so `1.0.1` and
 `1.0.4` shipped without tags and there is no commit on record for what those users
 received.
 
@@ -333,86 +333,6 @@ Then push the tag, so the published version is traceable to a commit:
 ```bash
 git push && git push --tags
 ```
-
-### Releasing 1.2.0
-
-What is particular to this release; the sections above are the procedure.
-Delete this section once 1.2.0 is out.
-
-Done on November 25, 2026, on the macOS machine:
-
-- The version is set in `package.json` and `package-lock.json`. **Do not run
-  `npm version`**: it would go to 1.3.0.
-- The macOS prebuild and the WASM release build are from the final source, and
-  the suites, the sanitizers, the WASM instruments and the browser smoke set
-  (Chromium 156 and Safari 27.2) have been run on it. Firefox has not.
-- The release notes are drafted in `RELEASE-NOTES-1.2.0.md`.
-
-Still to do, in this order:
-
-1. **Commit, and push the `wasm` branch.** The Windows machine has to build the
-   source that will be tagged.
-2. **Build the Windows prebuild.** The one in `prebuilds/win32-x64/` is from
-   November 18 and has none of this release's fixes. On Windows, from that
-   commit:
-
-   ```bash
-   npm install
-   npm run prebuildify
-   npx vitest run
-   ```
-
-   Run step 2's two `node -e` lines there, then copy
-   `prebuilds/win32-x64/lua-native.node` to the same path on the macOS machine.
-   Look at its date and hash after copying; the stale file looks the same.
-3. **Change no source after that.** The Windows step does not touch the WASM
-   build and needs no Emscripten: the one on the macOS machine is the one that
-   ships. If something does have to change (a fix MSVC asks for, say), this is
-   what has to be built again:
-
-   | Changed | Both prebuilds | WASM |
-   |---|---|---|
-   | `src/core/` | yes | yes |
-   | `src/lua-native.*`, `src/lua-async-worker.h`, `binding.gyp` | yes | no |
-   | `src/wasm/`, `tools/wasm-build/`, `triplets/lua-wasm-stack.h`, `triplets/wasm32-emscripten.cmake`, Emscripten | no | yes |
-   | `triplets/arm64-osx.cmake` | macOS only | no |
-
-   Do not run `npm run clean` or `git clean -xfd` on the macOS machine: each
-   deletes `prebuilds/` and `build-wasm/`. Publishing from Windows instead means
-   copying over the macOS `.node` file and the three files of
-   `build-wasm/release/web/`, which a clone does not have.
-4. **Merge to `main`, and tag the merged commit.** Switching branches gives
-   files new dates, so the date test above no longer says anything; that
-   `git diff wasm main -- src triplets binding.gyp` is empty does.
-
-   ```bash
-   git tag -a v1.2.0 -m "1.2.0"
-   ```
-
-5. **Check the package and publish** (sections 1, 3 and 4 above):
-
-   ```bash
-   npm run check-package
-   npm publish --dry-run      # 1.2.0, 13 files
-   npm publish --otp=123456
-   ```
-
-6. **Verify it** (section 5 above), for both entries: the consumer install under
-   Node, and `npx vite build` in a page that imports `lua-native`.
-7. **Push the tag, and create the GitHub release** from the notes, then delete
-   `RELEASE-NOTES-1.2.0.md`:
-
-   ```bash
-   git push origin v1.2.0
-   ```
-
-   ```bash
-   gh release create v1.2.0 --title v1.2.0 --notes-file RELEASE-NOTES-1.2.0.md
-   ```
-
-8. **Afterwards**, bring this document up to date: the registry's `latest` and
-   the list of tags above. `electron/package.json` depends on `^1.1.1`, so the
-   demo takes 1.2.0 on its next `npm update`.
 
 ### If a publish goes wrong
 
