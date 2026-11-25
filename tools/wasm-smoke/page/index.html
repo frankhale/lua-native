@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lua-native: browser smoke set</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #1b1b1b; --dim: #666; --line: #ddd; --pass: #1a7f37; --fail: #cf222e; --warn: #9a6700; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #16181b; --fg: #e6e6e6; --dim: #9aa0a6; --line: #33373c; --pass: #57c26b; --fail: #ff7b72; --warn: #d9a441; } }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; margin: 0; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 24px 0 6px; }
+  p { margin: 4px 0; color: var(--dim); }
+  #verdict { font-weight: 600; color: var(--fg); }
+  table { border-collapse: collapse; width: 100%; max-width: 1100px; }
+  td { border-top: 1px solid var(--line); padding: 4px 8px 4px 0; vertical-align: top; }
+  td.status { white-space: nowrap; font-weight: 600; width: 1%; }
+  td.ms { white-space: nowrap; color: var(--dim); text-align: right; width: 1%; }
+  .pass { color: var(--pass); } .FAIL { color: var(--fail); } .INCONCLUSIVE { color: var(--warn); }
+  .detail { color: var(--dim); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<h1>lua-native: browser smoke set</h1>
+<p id="agent"></p>
+<p id="verdict">Loading <code>browser.js</code>…</p>
+<h2>Main thread</h2>
+<table id="main"></table>
+<h2>Web Worker</h2>
+<table id="worker"></table>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

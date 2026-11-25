@@ -1,5 +1,27 @@
 # WASM-TARGET-PLAN
 
+> **Superseded November 25, 2026 — executed, closed, and frozen.** All seven
+> closing conditions in §6 are met and this file is a record, not an
+> instruction. What outlived it:
+>
+> - **[`../WASM.md`](../WASM.md)** — the current reference for the target,
+>   including the closed list of permitted differences that was §1.1 here.
+>   `tools/wasm-ledger.mjs` reads that list from there now.
+> - **[`../CORRECTNESS.md`](../CORRECTNESS.md)** §14's amendment, §15.4, the
+>   two rows added to §15.6, and the WASM lines of §15.7.
+> - `CLAUDE.md`'s "Two bindings" section, which carries the rule that a change
+>   to one binding is a change to both.
+>
+> Paths in the body are as they were when each part was written: this file was
+> `docs/WASM-TARGET-PLAN.md`, and "§1.1" is the table now in `WASM.md`.
+>
+> **Still open with the owner**, none of them a closing condition, all listed
+> in `WASM.md`: the Safari worker's stack (Phase 4), state the whole module
+> shares (slice 2, decision 2), and `DataView` (slice 7, decision 5).
+>
+> Read it for the decisions (D0–D7), the as-built record of each slice and
+> phase, and the scored predictions in §7.
+
 **Written November 22, 2026; revised November 24, 2026. Phases 0 and 1 were
 run on November 24 and their record is in §2.3, §2.4, §3.1 and §4. The build
 target and the test switch exist, and **all seven slices of the binding
@@ -7,7 +29,17 @@ target and the test switch exist, and **all seven slices of the binding
 Under Node, 1,181 of the suite's 1,190 tests pass on it and all ten harnesses
 run on it with the native totals; the nine tests that do not pass are each
 accounted for under "Slice 7 — as built", which also lists what the owner still
-has to decide. Nothing has run in a browser yet (Phase 4). Slice 5 found two more defects in
+has to decide. **Phase 3 was finished on November 25:** every run now proves
+by observation which binding it is on, and the nine tests are in
+`tools/wasm-ledger.mjs` with six further differences beside them, judged by
+`npm run verify-wasm`. Seven of its entries were not rows of §1.1; the owner
+ruled on all seven the same day (Phase 3, "The rulings"): five became rows, and
+the 32-bit limits were ruled a defect and fixed in the core, which is the
+fourth exception to D7 and brought a native defect with it.
+**Phase 4 was done the same day:** `browser.js`, the `exports` map and a
+24-cell smoke set that passes on the main thread and in a Web Worker in
+Chromium and in Safari; Gecko was not run. Its finding is how little stack a
+Safari worker has (Phase 4, "As built"). Slice 5 found two more defects in
 the *native* binding; the owner had them fixed in a separate session the same
 day, the third exception to D7, and the port follows. Slice 3 also found a crash in the *native* binding, recorded
 under "Slice 3 — as built"; the owner had it fixed in the native binding the
@@ -23,8 +55,8 @@ One goal: **two targets with one user API.**
 
 | Target | Loaded by | Binding | Status |
 |---|---|---|---|
-| Native addon | Node, through `index.js` | N-API (`src/lua-native.cpp`) | Exists. Not changed by this work, apart from three defects it found there and the owner had fixed (D7). |
-| WASM module | A web browser, through a new `browser.js` | **No N-API.** A second binding written for the browser. | This plan. Phases 0 to 2 done: the binding is written and verified under Node. Not yet run in a browser. |
+| Native addon | Node, through `index.js` | N-API (`src/lua-native.cpp`) | Exists. Not changed by this work, apart from the defects it found there and the owner had fixed (D7). |
+| WASM module | A web browser, through a new `browser.js` | **No N-API.** A second binding written for the browser. | This plan. Phases 0 to 4 done: the binding is written, verified under Node with its differences ledgered, and run in two browser engines. Phase 5 is not started. |
 
 **What changed on November 24.** The first version of this plan recompiled the
 existing binding against emnapi, an implementation of Node-API on Emscripten.
@@ -205,7 +237,7 @@ from, loaded through or typed by is edited:
 | Not edited | What it is |
 |---|---|
 | `src/lua-native.{h,cpp}`, `src/lua-async-worker.h` | the N-API binding (defects fixed on the owner's word: the table iterator, "Slice 3 — as built", and the async doors, "Slice 5 — as built") |
-| `src/core/lua-runtime.{h,cpp}` | the core, shared by both targets (one `#include` added on the owner's word, below) |
+| `src/core/lua-runtime.{h,cpp}` | the core, shared by both targets (one `#include` added on the owner's word, below; and on November 25 the three limits widened to 64 bits and the timeout deadline made to saturate, Phase 3, "The rulings") |
 | `binding.gyp`, `CMakeLists.txt` | the native builds |
 | `index.js`, `index.d.ts`, `types.d.ts` | the loader and the public types |
 | `prebuildify` and the `prebuilds/` layout | how the addon ships |
@@ -263,6 +295,15 @@ not on this list and not in the ledger is a defect.
 | Files are virtual: `execute_file`, `compile_file` and `require` see an in-memory filesystem and `setFileReader`, not a disk | A page has no disk. |
 | `os` and `io` behave as Emscripten implements them (U7) | No process, no environment. |
 | Finalizers run in a later task than a GC (U5) | `FinalizationRegistry` semantics. |
+| Exhausting the JavaScript engine's stack while Lua is running ends the context | Nothing inside the module can catch the engine's `RangeError`. The shell detects it and the context refuses from then on; natively it is an ordinary error. |
+| The key order of a Lua table converted to a plain object differs | The core holds it in a hash map. The order is unspecified on both targets and follows the platform's string hash, which is not the same on a 64-bit build and a 32-bit one. |
+| Functions the binding hands out are strict JavaScript functions: no own `arguments` or `caller`, and `String(fn)` shows source | An ES module cannot define any other kind without `new Function`, which a page's content security policy may forbid. |
+| The `stack` of an error the binding constructs begins in the binding | The error is constructed inside the module, and `stack` is the engine's own text. The message, the name and the type are the same. |
+| An object forged with `Object.create(Promise.prototype)` is taken for a promise | JavaScript can ask only whether the prototype is on the chain. The engine's own test is reachable only through `then`, which has effects. |
+
+The last five rows were added on November 25, 2026, on the owner's ruling
+(Phase 3, "The rulings"). Each had been found during the port and recorded
+slice by slice; none was on this list until then.
 
 `import lua_native from 'lua-native'` stays the same line on both targets:
 `browser.js` uses top-level `await` to instantiate the module before exporting.
@@ -481,7 +522,7 @@ each has a written answer**, and a "no" on U1, U2 or U3 stops the plan.
 | U5 | **Confirmed different, and it cost nothing.** A finalizer does not run during `gc()`; it runs in a later task. The harnesses already yield between collections, for N-API's own queued finalizers, so `gc-stress`, `binding-balance` and `lifecycle-matrix` ran on this target unmodified and clean (slice 7). |
 | U6 | **Yes.** No `ASYNCIFY`. |
 | U7 | **No finding.** `capability-matrix` runs on this target with the native totals, 251 cells and 0 findings (slices 6 and 7), so none of them accepts and does nothing. What each of the five answers individually was not read off. |
-| U8 | **Yes under Node** (slice 5): an unbounded loop started through a deferred door is ended by its `timeout`. In a browser, not yet — Phase 4. |
+| U8 | **Yes under Node** (slice 5): an unbounded loop started through a deferred door is ended by its `timeout`. In a browser, yes (Phase 4): on the main thread and in a worker, in Chromium 156 and Safari 27.2. |
 | U9 | **No.** The stock library works only with the exception mode that fails U1. The overlay is one added flag. D5. |
 | U10 | **Yes**, with flags taken from `em++ --cflags -fwasm-exceptions`. |
 
@@ -769,7 +810,7 @@ shell's `try` is the only thing that can see the event:
 
 **Open with the owner.** Three things here are decisions, not implementation:
 
-1. **The difference itself.** Natively the context survives this; here it is
+1. **The difference itself.** *Ruled November 25: added to §1.1.* Natively the context survives this; here it is
    lost. §1.1 is a closed list and this is not on it. Either it is added —
    "exhausting the JavaScript stack while Lua is running ends the context" —
    or more is spent to narrow it (item 3).
@@ -1237,7 +1278,8 @@ above `Number.MAX_SAFE_INTEGER` and fail on that assertion alone.
 
 **Open with the owner** (with slice 2's three, which are unchanged):
 
-4. **The instruction limit's width.** Either accept the 2³²−1 ceiling and add
+4. **The instruction limit's width.** *Ruled November 25: all three limits
+   widened to 64 bits in the core (Phase 3, "The rulings").* Either accept the 2³²−1 ceiling and add
    it to §1.1, or widen `max_instructions_` and its counter in the core to 64
    bits on both targets, which is a core change and needs the owner's word
    (D7). Recommended: widen those two, and list the memory and timeout
@@ -1293,19 +1335,19 @@ accounted for.**
 - **Phase 5:** `npm run lint` and `check-invariants` do not read `src/wasm/`;
   `CLAUDE.md` does not mention the target.
 
-### Phase 3 — verification under Node (**runs done November 24, 2026; the ledger and the control are not**)
+### Phase 3 — verification under Node (**done November 25, 2026**)
 
 | Item | State |
 |---|---|
-| 1. The control proving a run is on the WASM module | **Not done.** `tools/target.mjs` selects the module; no run yet proves by observation which one it got. |
+| 1. The control proving a run is on the WASM module | **Done** November 25: `tools/target.mjs` observes the module in every process that loads it. "As built", below. |
 | 2. `npm test`, `gc-stress`, `binding-balance`, `lifecycle-matrix` | **Done**, during slice 7: 1,181 of 1,190 tests; the three instruments clean, unmodified. |
 | 3. `oracle` | **Done**: 2659 agree, 19 accepted, 0 disagree, the native totals. |
 | 4. `exception-matrix` | **Done**: 507 of 507 cells clean. |
 | 5. `roundtrip-matrix`, `exec-parity`, `cross-context`, `capability-matrix` | **Done**: each with the native totals. |
 | 6. `crossing-cost` | **Done** on the release build: 20 cells, 0 failures. It refuses on the debug build. |
-| `tools/wasm-ledger.mjs` | **Not done.** Nine suite tests fail on this target with nothing but "Slice 7 — as built" to say why, and three of them occupy the thread for a minute each. |
+| `tools/wasm-ledger.mjs` | **Done** November 25: eight entries, and `npm run verify-wasm` judges a run against them. It began with nine, seven of them in a third class, `unruled`; the owner ruled on all seven the same day. "As built" and "The rulings", below. |
 
-The results are under "Slice 7 — as built". The order below is the regression
+The November 24 results are under "Slice 7 — as built". The order below is the regression
 matrix from `CORRECTNESS.md` §15.7, run with `LUA_NATIVE_TARGET=wasm`:
 
 1. **Control first.** Every run proves it is on the WASM module before any
@@ -1333,7 +1375,180 @@ Not available on this target, stated once: the four native sanitizer harnesses.
 Whether Emscripten's own sanitizers are worth wiring is a separate question
 and not part of this plan.
 
-### Phase 4 — the browser (**not started**)
+#### As built (November 25, 2026)
+
+**Files.** `tools/target.mjs` gains the control. `tools/wasm-ledger.mjs` is the
+ledger and the functions that judge a run against it. `tools/wasm-verify/` is
+the runner (`npm run verify-wasm`) and the one-process probe it spawns. The
+suite gains one `beforeEach` that reads the ledger. Nothing in D7's table is
+touched, and no API is added to either binding.
+
+**The control is in the loader, so no run can go without it.** Every process
+that imports `tools/target.mjs` constructs a context, calls
+`compile('return 1')`, disposes the context, and compares what came back with
+what `LUA_NATIVE_TARGET` asked for: a `Buffer` is the N-API binding, a plain
+`Uint8Array` is this one, and anything else is refused. A mismatch throws from
+the import, so the suite fails to load and a harness never starts. Putting it
+in the loader and not in each of the thirteen importers means the two
+one-process-per-cell harnesses get it in every cell, and a fourteenth importer
+gets it without anyone remembering. It runs on a native run too, so a native
+result is proven native by the same observation. That it can say no is shown
+by `verify-wasm`'s controls, which load both modules in one process and hand
+each to the check under the other's name.
+
+**The ledger holds differences, and each is matched by something that runs.**
+An entry is one difference. It names the suite tests it accounts for, or
+carries a **probe**, or both. A probe is a few lines run on both targets, a
+process each, with both answers frozen in the entry. This is what lets the
+differences slices 2, 4 and 5 found by diffing scratch scripts — which are not
+in the repository and which no suite test touches — sit in the ledger under
+the stale rule. Without a probe each would have been a sentence nothing could
+ever contradict.
+
+| Verdict | When |
+|---|---|
+| accepted | A named test fails with the message the entry gives, or a named `not-run` test was skipped. |
+| red | A test does not pass and is not named; or a named test fails with a different message; or a test is skipped that the ledger does not hold back. |
+| STALE | A named test passes, or no longer exists; a `not-run` test ran; a probe sees the native answer on WASM. |
+| MOVED | A probe sees an answer that is neither frozen one, on either target. Red. |
+
+**The three D3 tests are held back, and the suite reads which from the
+ledger.** `LUA_NATIVE_TARGET=wasm npm test` no longer sits in them. A test that
+is never run cannot go stale by passing, so the ledger refuses such an entry
+unless a probe stands beside it. The D3 entry's probe sets a timer during a
+finite `execute_script_async` run and reports whether it fired before the run
+settled: it does natively and does not here.
+
+**A third class, which the plan did not have.** The plan names two classes,
+*target semantics* (a row of §1.1) and *defect*. Seven of the nine entries are
+neither: each is real and reproduces, none is on §1.1's closed list, and none
+has been called a defect. Slices 2, 4 and 5 each wrote "ledgered" beside
+theirs, but closing condition 2 rejects an entry whose reason is not a row of
+§1.1, and the rule this project's ledgers follow is that an undocumented
+difference is not ledgerable until it is fixed or specified. They are filed as
+`unruled`, each naming where its decision is recorded. An entry in the
+*target semantics* class cites a §1.1 row by its exact text, and the rows are
+parsed out of this file, so the ledger cannot add to the list.
+
+The ledger as first written, before the rulings below:
+
+| Entry | Class | Matched by |
+|---|---|---|
+| `bytecode-is-a-uint8array` | §1.1, D4 | 3 tests |
+| `deferred-doors-hold-the-thread` | §1.1, D3 | 3 tests held back, 1 probe |
+| `limits-are-32-bits-wide` | unruled: slice 7, decision 4 | 3 tests |
+| `js-stack-exhaustion-ends-the-context` | unruled: slice 2, decision 1 | 1 probe, run with `--stack-size=300` |
+| `converted-table-key-order` | unruled: slice 2 | 1 probe |
+| `strict-functions-lack-arguments-and-caller` | unruled: slice 2 | 1 probe |
+| `function-source-text` | unruled: slice 2 | 1 probe |
+| `binding-constructed-error-stack` | unruled: slice 4 | 1 probe |
+| `promise-asked-by-prototype-chain` | unruled: slice 5 | 1 probe |
+
+Three of §1.1's five rows have no entry: virtual files, `os` and `io`, and
+finalizer timing. None shows as a failing test or a differing cell under Node,
+where the verified variant has the real filesystem. A row is a permitted
+difference, not a required one. The first two are Phase 4's to observe.
+
+Slice 2's decisions 2 and 3 and slice 7's decision 5 are not ledger entries:
+none of them is a difference between the two targets as built. They are
+unchanged and still open.
+
+**Results**
+
+| Check | Result |
+|---|---|
+| `node tools/wasm-verify/run.mjs --control` | 28 of 28 controls fire: 7 on the target control, 8 on the ledger's own rules, 7 on the suite judge, 4 on the probe judge, 2 on the held-back list. |
+| `npm run verify-wasm`, debug and release builds | The same on both. 7 of 7 probes hold. Suite: 1,221 tests, **1,212 pass, 9 differ as ledgered, 0 red, 0 stale**. Exit 0. (1,221 and not slice 7's 1,190: this count includes the 31 tests of `invariants.spec.ts`, which read source and pass on any target.) |
+| `node tools/wasm-verify/run.mjs --harnesses` | Every instrument exits 0 on this target: `gc-stress` balanced; `binding-balance`, `lifecycle-matrix`, `cross-context` and `capability-matrix` 0 findings; `oracle` 2659 agree, 19 accepted, 0 disagree; `exception-matrix` 507 of 507; `roundtrip-matrix` 4,750 cells, 0 undocumented, 0 parity disagreements; `exec-parity` clean; `crossing-cost` on the release build, 20 cells, 0 failures, 0 vacuous. |
+| `node tools/wasm-verify/run.mjs --closing`, before the rulings | Exit 1, as it should be: 7 `unruled`, 0 `defect`. |
+| The first run of the verifier | Two probes MOVED, and both were the probes' own mistakes: one froze the wrong native answer for the error's stack, one called `type` in a context with no libraries. Recorded because the frozen native answer being checked *on the native target* is what caught them; a probe that only compared the two targets would have reported each as a difference. |
+| An unplanned red run | While this section was being written, a sentence in it moved a `perf-claims` count, `invariants.spec.ts` failed on both targets, and the verifier reported that test RED: failing, and not in the ledger. The sentence was reworded and nothing was re-frozen. It is the one time the suite judge has said no to a real run and not a synthetic one. |
+| **The native target, with the control now in its loader:** | |
+| `npm test` | 1,221 of 1,221 |
+| The ten instruments and `gc-stress`, no variable set | each exits 0 with the totals it had before |
+| `npm run check-invariants` | all match, nothing re-frozen |
+
+No C++ was changed, so `npm run lint` and `npm run test-cpp` were not re-run.
+
+#### The rulings (November 25, 2026)
+
+The owner ruled on all seven `unruled` entries the same day. "As built" above
+describes the ledger as it was first written; this is what it became.
+
+| Entry | Ruling | Effect |
+|---|---|---|
+| `limits-are-32-bits-wide` | **A defect. Fix it: widen all three limits.** | Core change, below. The entry went STALE on the next run — three tests "ledgered as failing, and it passes" — and was removed. |
+| `js-stack-exhaustion-ends-the-context` | A permitted difference. | Row added to §1.1. Slice 2's decision 1 is closed; its decisions 2 and 3 are not. |
+| `converted-table-key-order` | A permitted difference. | Row added to §1.1. |
+| `strict-functions-lack-arguments-and-caller`, `function-source-text` | Permitted, as one difference. | One row added to §1.1, cited by both entries. |
+| `binding-constructed-error-stack` | A permitted difference. | Row added to §1.1. |
+| `promise-asked-by-prototype-chain` | A permitted difference. | Row added to §1.1. |
+
+§1.1 has ten rows where it had five. The ledger has eight entries, all in the
+*target semantics* class, and the `unruled` class is empty. It stays in the
+ledger's vocabulary: the next difference found will need somewhere to wait.
+
+**The limits, and the fourth exception to D7.** `maxMemory`, `maxInstructions`
+and `timeout` are `std::uint64_t` in the core where they were `size_t`: the
+three `RuntimeConfig` fields, the allocator's limit, `max_instructions_` and
+its counter, `timeout_ms_`, and the setters and getters. A limit is a number
+the caller chose, not the size of anything in the address space. Natively the
+two types are the same width and the N-API binding is not edited. The WASM
+binding reads the three options through a 64-bit `LimitFromNumber` and holds
+them in 64-bit fields; `SizeLimitFromNumber` stays for the one remaining
+`size_t`, the `gc` step size. `Infinity` now saturates at 2⁶⁴−1 on both targets
+and the three tests pass on both.
+
+**A native defect, found before the change and not by it.** Before widening
+`timeout`, its behaviour at the new width was tried on the native target,
+which already has that width:
+
+| `timeout` | Native, before | WASM, before |
+|---|---|---|
+| `Infinity`, 2⁶³, 2⁶² | a two-million-iteration loop is ended at once with "execution timeout" | runs (clamped to 49 days) |
+| 10¹⁶, 10¹⁵, 2³²−1, 60000 | runs | runs |
+
+The core computed the deadline as `now() + std::chrono::milliseconds(ms)`.
+2⁶⁴−1 read as the signed count that type holds is minus one, a deadline already
+past; and anything beyond roughly 292 years overflows on its way to
+nanoseconds, which is undefined and happened to come out past for 2⁶² and
+future for 10¹⁶. The suite's test of `timeout: Infinity` is named `is not
+"unlimited by accident"`; it reads the limit back and runs `return 1 + 1`,
+which ends long before the count hook first fires, so it never met the
+deadline. The WASM target was right only because of the width this ruling
+removes, so widening without a fix would have carried the defect across.
+
+The owner was asked before the core was edited and chose to fix it: a new
+file-local `DeadlineAfter` returns the clock's last instant when the timeout
+does not fit before it, and both places that set `deadline_` use it. Native
+behaviour changes for those values only. Seven tests were added — six in the
+suite, which run a script long enough to be checked under each limit at
+`Infinity` and under three out-of-range timeouts, and one in the C++ suite —
+and the three that exercise the overflow were seen to fail on the unfixed
+native build first.
+
+**Results, after the rulings**
+
+| Check | Result |
+|---|---|
+| `npm run build-wasm-debug`, `npm run build-wasm-release` | both build; the build's own check 41 of 41 on each |
+| `node tools/wasm-verify/run.mjs --harnesses --closing` | **Exit 0.** 7 of 7 probes hold. Suite: 1,227 tests, 1,221 pass, 6 differ as ledgered, 0 red, 0 stale. Every instrument exits 0 with the totals it had. Closing condition 2: 8 *target semantics*, 0 `unruled`, 0 `defect`. |
+| The same, `--target=wasm-release --closing` | Exit 0, the same counts. |
+| The stale rule, on a real run | Between the fix and the ledger edit the verifier was run once: 3 STALE, "ledgered as failing, and it passes", exit 1. |
+| Native `npm test` | 1,227 of 1,227 (1,221 before the six new tests) |
+| Native `npm run test-cpp` | 287 of 287 (286 before the new one) |
+| `npm run test-cpp-asan` | 287 of 287 under ASan and UBSan, no report. Run with the fix in; the unfixed deadline arithmetic was not run under it. |
+| Native instruments and `gc-stress`, no variable set | each exits 0 with the totals it had |
+| `npm run lint` | 0 findings |
+| `npm run check-invariants` | one frozen answer moved and was re-frozen after reading it: the core's function count, 207 to 208, which is `DeadlineAfter` |
+
+**What Phase 3 leaves.** `CLAUDE.md` does not yet
+mention `verify-wasm`, the ledger or the control; that is Phase 5's edit, with
+the rest of the target's commands. The ledger reads §1.1 from this file, and
+Phase 5 moves that list to `docs/WASM.md`: `PERMITTED_DIFFERENCES` in
+`tools/wasm-ledger.mjs` is the one line to change when it does.
+
+### Phase 4 — the browser (**done November 25, 2026, in two engines; Gecko not run**)
 
 - **`browser.js`.** Instantiates the web variant with top-level `await` and
   exports the same default object as `index.js`. `browser.d.ts` per D4.
@@ -1355,7 +1570,141 @@ and not part of this plan.
   planned.
 - Record the release `.wasm` size, raw and gzip.
 
-### Phase 5 — instruments, documentation and release (**not started**)
+#### As built (November 25, 2026)
+
+**Files.** `browser.js` and `browser.d.ts` at the root, beside `index.js`.
+`package.json` gains the `exports` map and three entries in `files`.
+`tools/wasm-smoke/` is the smoke set, its page and worker, the server that
+serves them, and a Node run of the same set. `tools/wasm-package/` checks the
+packed tarball. Nothing in D7's table is touched.
+
+**`browser.js` is one line.** The web variant's shell already instantiates the
+module with a top-level `await` and exports the default object, so the entry
+is a static re-export of `build-wasm/release/web/lua-native.mjs`. Static so
+that a bundler follows it, and follows the glue's
+`new URL('lua-native-core.wasm', import.meta.url)` to the `.wasm`, with no
+plugin. The three web files ship from where the build writes them: `files`
+lists `build-wasm/release/web/*`, so there is no copy step that could go stale.
+The published path is the build's own; a tidier name would be a copy.
+
+**`browser.d.ts`** re-exports `types.d.ts` and restates `compile`,
+`compile_file` and `load_bytecode` with `Uint8Array` (D4). Checked with
+TypeScript 5.9.3 against a small consumer, including a line that must fail
+(`.toString('latin1', 0, 1)` on the result) and one that must still hold on the
+Node entry (`compile()` is a `Buffer`); and the same consumer with the browser
+result typed as a `Buffer` is refused. TypeScript is not a dependency of this
+repository, so that check is not a script.
+
+**The package** (`npm run check-package`). Packs the tree, unpacks the tarball
+as a dependency of an empty project outside the repository, and asks from
+there:
+
+| Check | Result |
+|---|---|
+| The tarball | 13 files: the four it had, `browser.js`, `browser.d.ts`, the three web files, the two prebuilds, `README.md`, `LICENSE`. No source, tooling or other build output. |
+| Under Node | `lua-native` is `index.js`; `lua-native/types.d.ts` and `lua-native/package.json` resolve. |
+| Under Node with `--conditions=browser` | `lua-native` is `browser.js`. |
+| Controls | `lua-native/prebuilds/…`, `lua-native/index.js` and the web shell by path are each `ERR_PACKAGE_PATH_NOT_EXPORTED`: the map is in effect, and D6's accepted consequence is real. |
+| rolldown 1.2.19, `platform: 'browser'` | Takes `browser.js`, the shell and the glue; not `index.js`; nothing from Node in the bundle. It leaves the `.wasm` reference as written, so that file has to be served beside the bundle. |
+| `vite build` 8.3.8, no configuration | Emits the `.wasm` as an asset, byte for byte the release one, and the script refers to the emitted name. |
+
+**The smoke set** is 24 cells in one module with no imports
+(`tools/wasm-smoke/set.mjs`), so the same file runs in a page, in a worker and
+under Node. The plan's list is all there — values each way, an error each way,
+a callback that throws, a coroutine, an awaited Promise, `timeout` on a busy
+loop, bytecode with no `Buffer` global, both D3 doors, a table reference
+dropped and collected, a file served by `set_file_reader` — and what the
+slices left for this phase is added: the exhaustion cells, the stack cell, the
+in-memory filesystem, `os` and `io`, and the three limits at `Infinity`.
+
+Two things keep it honest. **It is run on the native addon first**
+(`node --expose-gc tools/wasm-smoke/run.mjs`): a cell that is wrong about
+lua-native fails there, where the suite has already settled the answer. That
+caught one on its first run, a coroutine cell that passed a body where the API
+takes a script returning a function. **And its control** runs the set against a
+module whose every script answers nothing, on both targets, and requires all
+24 cells to fail.
+
+The page imports `/browser.js`, the package's real entry, runs the set on the
+main thread, runs it again in a module worker, and posts each result to the
+server that served it, which is how a browser that cannot be driven from here
+was read. The server sends no cross-origin isolation headers, and every report
+has `crossOriginIsolated: false`.
+
+**Results, November 25, 2026, macOS 27.2.1 on arm64**
+
+| Engine | Main thread | Web Worker |
+|---|---|---|
+| Chromium 156.0.8078.100 (V8), the Claude desktop app's browser pane | 24 of 24 | 24 of 24 |
+| Safari 27.2 (WebKit, JavaScriptCore) | 24 of 24 | 24 of 24 |
+| Node 24.22.3, native addon — the check on the set | 24 of 24 | |
+| Node 24.22.3, node variant of the release build | 24 of 24 | |
+
+No cell failed and none was inconclusive. **Gecko was not run**: Firefox is not
+installed on this machine. The debug web variant was not run in a browser.
+
+**What the two engines answered that Node could not:**
+
+| Question | Answer |
+|---|---|
+| Does each engine accept the module's exception-handling instructions (§8)? | Both load and run it. |
+| U8: does `timeout` end a busy loop on a page's main thread? | Yes, in both, on the main thread and in a worker, and through a deferred door. |
+| The later task a deferred door uses | The run settles before a timer set after the call fires, on both threads in both engines: the script holds its thread, as D3 says. |
+| The in-memory filesystem | A file Lua writes with `io.open` under `os.tmpname()` can be run by `execute_file` and `execute_file_async`; a missing path is refused. `set_file_reader` serves `dofile` with `filesystem: 'deny'`. |
+| U7, `os` and `io` | The same four answers everywhere: `os.getenv("HOME")` is `/home/web_user`; `os.execute()` is `false`, no shell; `os.execute("exit 3")` fails with status 52; `io.popen` raises. Each works or says no. |
+| Is a dropped table reference collected with no `gc()`? | Yes. The Lua table was freed within one round of allocation everywhere except the Safari worker, which took thirteen. |
+
+**The engine's stack is a different size on every thread, and one of them is
+small.** This is the finding of the phase.
+
+| Thread | Deepest chain of Lua C calls | JavaScript and Lua calling each other |
+|---|---|---|
+| Chromium, main | Lua's own limit (198) | Lua's own limit (198); the context survives |
+| Chromium, worker | Lua's own limit (198) | the engine's stack ends it at 132; the context is lost |
+| Safari, main | Lua's own limit (198) | Lua's own limit (198); the context survives |
+| **Safari, worker** | **the engine's stack ends it at 102**; the context is lost | the engine's stack ends it at 27; the context is lost |
+
+Every outcome is the fail-closed one slice 2 built: an `Error` and never a raw
+`WebAssembly.Exception`, the context either works or refuses, and a fresh
+context works afterwards. So nothing here is a defect, and the row added to
+§1.1 by the Phase 3 rulings covers it. But the advice this plan gives — host the VM in a
+Web Worker so a running script does not hold the page — puts it on the thread
+with the least stack. In a Safari worker, Lua code that recurses through C more
+than about a hundred deep (a `string.gsub` callback chain, nested
+`pcall`/metamethod calls) ends its context, where everywhere else it gets
+Lua's "C stack overflow" and carries on. A callback chain between JavaScript
+and Lua gets 27 levels.
+
+**Open with the owner.** Slice 2's decision 3 — a depth limit on this target —
+was left open with "not adopted here" because it is visible API and the hazard
+looked remote. These numbers are the evidence it lacked. The choices, none
+taken:
+
+1. Leave it, and document the Safari worker figure in `docs/WASM.md` (Phase 5).
+2. Lower Lua's C-call limit on this target (`LUAI_MAXCCALLS`, in the overlay
+   triplet), so Lua's own error arrives before the engine's on every thread
+   measured. It changes what a deep script sees on WASM and needs a row.
+3. Slice 2's nested-call limit for the JavaScript-and-Lua chain.
+
+**Not done, and stated so it is not assumed.**
+
+- `docs/WASM.md` does not exist yet. This phase's bullet says the run is
+  recorded there; it is recorded here, and Phase 5, which creates that file,
+  carries it over.
+- The run was driven from a tool session and not by hand. The built-in pane
+  was read through its accessibility tree; Safari was opened with `open -a` and
+  read from what its page posted back.
+- The bundles `check-package` builds are inspected, not executed in a browser.
+
+**Sizes of what ships**, release build:
+
+| File | Raw | gzip -9 |
+|---|---|---|
+| `lua-native-core.wasm` | 746,116 | 250,165 |
+| `lua-native-core.mjs` | 99,676 | 26,073 |
+| `lua-native.mjs` | 38,275 | 11,944 |
+
+### Phase 5 — instruments, documentation and release (**done November 25, 2026**)
 
 A second binding is surface no row in `CORRECTNESS.md` §15.6 anticipates, and
 four instruments read the native binding by path (§2.1). Each gets a ruling;
@@ -1391,6 +1740,96 @@ none is left reading one binding while two ship.
   working, not an obstacle to route around.
 - Move this file to `docs/reviews/` with a superseded banner when §6 is met.
 
+#### As built (November 25, 2026)
+
+**Each bullet above, and what became of it.**
+
+| Bullet | Outcome |
+|---|---|
+| `check-invariants` | **A ruling per invariant**, recorded at the top of `tools/invariants/wasm-binding.mjs`. Six are extended under ids beginning `wasm:`; `objectwrap-branding` has a counterpart, `wasm:brand-rule`; three read the core, the suite or the docs and are the same on either target; `surface-census` holds by parity. Census F is not carried, and §15.6 says so. |
+| A parity census | **`binding-parity`.** Context methods, shared-table methods, table-handle methods, Proxy traps, module exports and every option name, each derived from `types.d.ts`, the native binding and the WASM binding and required equal; plus the functions that exist in one binding's C++ and not the other's, frozen by name. |
+| `npm run lint` | Covers `src/wasm/` with the flags `em++ --cflags` reports. 4 translation units, 5 headers, 0 findings. `--native-only` leaves it out and says so. |
+| §15.6, §15.7, §14, §15.4 | Two rows added to §15.6 with dispositions, one `FAILS-CLOSED` and one `MANUAL`; the WASM lines added to §15.7; §14 carries the amendment and §15.4 the second target. |
+| `docs/WASM.md` | Written, and linked from `docs/README.md`. It holds the closed list, which the ledger now reads from there. |
+| `FEATURES.md`, `LIMITATIONS.md`, `README.md` | One section each. |
+| `docs/RELEASING.md` | Step 2a: the WASM build, its verification and the smoke page, before the tarball check. |
+| `CLAUDE.md` | The commands, the "Two bindings" section, `browser.js`, the limits' type. |
+| Measured claims | **Scoped, not re-measured.** One sentence in `README.md`: every measured cost figure there and in `types.d.ts` was taken on the native addon. No claim-shaped sentence was added to the shipped docs; `perf-claims` reports none. |
+| Move this file | Done, with the banner above. |
+
+**The analyses are shared and only the answers are separate.** The native
+invariants' functions take the binding's path and its spelling of "can run user
+JS" and "is an entry point" as parameters, defaulting to the native ones. The
+WASM invariants call those same functions. No native answer moved when they
+were parameterised, which was checked before anything was added.
+
+**What the extended invariants found.** Nothing in the binding. Asked of the
+WASM binding, `core-call-guarding` returns the native answer row for row — 55
+guarded, 5 contained by their callers, and the one justified false positive,
+for the same line of code. `liveness-guarding` returns a subset of the native
+rows. The occupancy policies are equal. `binding-parity` is equal on every
+surface. That is the expected result of a port that kept the native names and
+was diffed call for call while it was written, and it is worth less than it
+looks until the instrument is shown able to say otherwise:
+
+| Mutation, applied to the source and then restored | Reported |
+|---|---|
+| A public method dropped from the shell's list | `binding-parity`: MISSING from the wasm shell |
+| The receiver check removed from the context's method template | `wasm:brand-rule`: NO |
+| A struct pointer taken from a lookup with no kind map | `wasm:brand-rule`: UNGUARDED |
+| An occupancy policy changed in this binding only | `wasm:occupancy-policy-sites`: NO |
+| An option key renamed in this binding only | `binding-parity`: UNEXPLAINED |
+| A naming violation planted in `src/wasm/js.cpp` | `npm run lint`: 4 findings, FAILED |
+
+**What it found in the instruments.** Three false readings, each fixed in the
+instrument and recorded in `tools/README.md`: the shared C++ scanner named an
+operator definition after its line number; both call-graph analyses matched a
+callee by bare name and so took `js::Construct(` for a call to
+`LuaContext::Construct`, which scored two construction-only helpers as
+reachable from JavaScript; and the parity census's first draft reported four
+kinds of difference that were all its own.
+
+**One frozen native answer moved, as the plan required.** `surface-census`
+reads §15.6's trigger table out of `CORRECTNESS.md`, so adding the two rows
+moved its row count from 14 to 16 and two disposition counts by one each. No
+other native answer changed in this phase.
+
+**Closing condition 1** was checked here, since no earlier phase had: with
+`build-wasm/` deleted, `npm run build-wasm-release` produces both variants and
+its own check passes 41 of 41; the two `.wasm` files and the two glue files
+contain no `napi` or `emnapi` string; nothing under `src/wasm/`, `src/core/`
+or the build script includes an N-API header.
+
+**Not done, and stated so it is not assumed.**
+
+- **Census F for the WASM binding.** A new `emscripten::val` member that
+  retains a JS value does not fail closed. Recorded in §15.6 as a manual
+  trigger.
+- **The claims were not measured on WASM.** `crossing-cost` runs on the
+  release build and passes its 20 cells, which says each documented claim's
+  *shape* holds there; the figures in the docs remain the native ones.
+- **TypeScript is not a dependency**, so the check that `browser.d.ts` types a
+  consumer correctly was run by hand with a compiler from elsewhere on the
+  machine and is not a script.
+
+**Results, with everything rebuilt after the last source change**
+
+| Check | Result |
+|---|---|
+| `npm run check-invariants` | 20 invariants, all match: the 12 there were, 7 under `wasm:`, and `binding-parity` |
+| `npm run lint` | 4 translation units, 5 headers, 0 findings |
+| Native `npm test` | 1,236 of 1,236. The count grew by nine in this phase: eight new invariants, each a test, and one scanner control. |
+| `node tools/wasm-verify/run.mjs --harnesses --closing` | Exit 0. Suite: 1,236 tests, 1,230 pass, 6 differ as ledgered, 0 red, 0 stale. Every instrument exits 0 with the totals it had. 8 *target semantics*, 0 `unruled`, 0 `defect`. |
+| The same, `--target=wasm-release --closing` | Exit 0, the same counts. |
+| `node --expose-gc tools/wasm-smoke/run.mjs` | Controls fire; 24 of 24 on the native addon and on the node variant |
+| The smoke page, against the rebuilt module | 24 of 24 on the main thread and in a Web Worker, in Chromium 156 and Safari 27.2 |
+| `npm run check-package` | every check passes |
+| `npm run build-wasm-debug`, `npm run build-wasm-release` | 41 of 41 each |
+
+The native instruments were last run after the core change in Phase 3 and
+nothing they load has changed since. `npm run test-cpp` likewise: 287 of 287,
+and under ASan and UBSan.
+
 ### Phase 6 — threaded build (separate decision, not part of the closing condition)
 
 `-pthread`, a thread pool and the cross-origin isolation headers would let the
@@ -1417,17 +1856,17 @@ mode. Only worth doing if a real page needs it and cannot use a Web Worker.
 
 ## 6. Closing condition
 
-**State on November 24, 2026, after Phase 2:**
+**State on November 25, 2026, after Phase 5: all seven met.**
 
 | # | State |
 |---|---|
-| 1 | **Not yet checked as written.** Both variants build and the build's own check passes, 41 of 41; a build from a clean tree has not been run, and nothing has yet looked for N-API in what is linked. |
-| 2 | **Not met.** The suite and all ten harnesses run, and every non-passing test has a reason, but the reasons are in this document and not in a ledger, and three of the nine are not rows of §1.1 (the 32-bit limits). |
-| 3 | **Holds.** The three exceptions are the only edits; `npm test` (1221 of 1221), `npm run lint` and `npm run check-invariants` are green after slice 7. `npm run test-cpp` was last run after the iterator fix. |
-| 4 | **Not met.** Nothing has run in a browser. |
-| 5 | **Not met.** Phase 5. |
-| 6 | **Met but for the browser half of U8.** |
-| 7 | **Not met.** Phase 5. |
+| 1 | **Met.** From a deleted `build-wasm/`, `npm run build-wasm-release` produces both variants, 41 of 41; no `napi` or `emnapi` in either `.wasm` or either glue file, and no N-API header included by anything the target is built from. Phase 5, "As built". |
+| 2 | **Met.** `node tools/wasm-verify/run.mjs --harnesses --closing` exits 0: every non-passing test is in the ledger with a reason, zero stale entries, zero in the *defect* class, and all eight entries cite a row of the closed list. It stood at seven `unruled` entries until the owner ruled on them. Phase 3, "The rulings". |
+| 3 | **Holds, with four exceptions the owner approved.** The fourth is the limits and the deadline in `src/core/lua-runtime.{h,cpp}`. The native suite, `test-cpp`, `lint` and `check-invariants` are green. Two frozen native answers moved: the core's function count, 207 to 208 (the fourth exception), and `surface-census`'s trigger-row counts (the §15.6 rows Phase 5 was required to add). |
+| 4 | **Met.** 24 of 24 cells on the main thread and in a Web Worker, in Chromium 156.0.8078.100 and Safari 27.2. Phase 4, "As built". |
+| 5 | **Met.** Every invariant that reads the native binding has a ruling, and `binding-parity` is green. Phase 5, "As built". |
+| 6 | **Met**, U8's browser half included (Phase 4). |
+| 7 | **Met.** `docs/WASM.md` exists and §14 carries the amendment. |
 
 All of these, each checkable by running something:
 
@@ -1442,12 +1881,15 @@ All of these, each checkable by running something:
    exceptions the owner approved: the added `#include <cstdlib>` line in
    `src/core/lua-runtime.cpp`, the table-iterator fix in
    `src/lua-native.{h,cpp}` ("Slice 3 — as built"), and the async-door fixes
-   there ("Slice 5 — as built"). Without the
+   there ("Slice 5 — as built"). (A fourth was approved on November 25: the
+   limits' width and the timeout deadline in `src/core/lua-runtime.{h,cpp}`,
+   Phase 3, "The rulings".) Without the
    variable, `npm run build-debug && npm test && npm run test-cpp`,
    `npm run check-invariants` and `npm run lint` are green, and every frozen
    answer about the native binding in `tools/invariants/expected.json` is
    unchanged apart from what those two fixes moved — the only other
-   differences in that file are additions for the WASM binding.
+   differences in that file are additions for the WASM binding, and the core's
+   function count, which the fourth exception moved by one.
 4. The Phase 4 smoke set passes on the main thread and in a Web Worker, in two
    browser engines, with versions recorded.
 5. Every invariant that reads the native binding has a ruling for the WASM
@@ -1514,7 +1956,10 @@ November 22 set, which was written for the emnapi route.
     noticed only because every entry point was read beside its copy.
     **Scored: right.** Three: a use-after-free in the table iterator (slice
     3), and two in the async doors (slice 5). The session that fixed those
-    found a fourth of the same family.
+    found a fourth of the same family. Phase 3 found one more, in the core and
+    not the binding, and by the same mechanism: reading a native behaviour
+    beside its copy before changing the copy (`timeout: Infinity`, "The
+    rulings").
 11. The release `.wasm` is under 1.5 MB raw.
     **Scored: right.** 745 KB raw, 251 KB gzip.
 
@@ -1528,11 +1973,11 @@ November 22 set, which was written for the emnapi route.
 | On WASM a destructor runs in a frame Lua jumps through; natively it does not (§2.3) | The code is already written so that no such local is alive at a jump. Phase 3's `exception-matrix` run is the check, and the difference is recorded so a failure there is recognised. |
 | Someone installs the stock Lua library by habit | The build script reads the library's `longjmp` runtime and refuses it before linking, naming `npm run vcpkg-lua-wasm`; shown refusing the stock library on November 24, 2026. |
 | The stack is sized on the core alone, and a release build overflows without an error (§2.4) | 1 MiB against a measured need under 256 KiB; the seven stack cells run on every build, and since slice 2 they run against the real entry points. |
-| **The JavaScript engine's call stack runs out while Lua is running** (Slice 2). Nothing inside the module can catch it, and Lua's frames are abandoned mid-call | The shell detects it and refuses the context from then on, so it fails closed; 24 cells in the build's check hold that. It is not prevented, the context is lost where natively it survives, and damage to state the whole module shares is not detectable. Three decisions are open with the owner (Slice 2, "Open with the owner"). Browser stack sizes are unmeasured until Phase 4. |
-| The shipped module uses the legacy exception-handling instructions (§2.4) | It is what Phase 0 and Phase 1 measured. Which browsers accept it is a Phase 4 question; switching proposals means rebuilding Lua as well and re-running the cells. |
+| **The JavaScript engine's call stack runs out while Lua is running** (Slice 2). Nothing inside the module can catch it, and Lua's frames are abandoned mid-call | The shell detects it and refuses the context from then on, so it fails closed; 24 cells in the build's check hold that. It is not prevented, the context is lost where natively it survives, and damage to state the whole module shares is not detectable. Three decisions are open with the owner (Slice 2, "Open with the owner"). Browser stack sizes were measured in Phase 4: a Safari worker ends a chain of Lua C calls at 102 and a JavaScript-and-Lua chain at 27, and one decision is open on it (Phase 4, "Open with the owner"). |
+| The shipped module uses the legacy exception-handling instructions (§2.4) | It is what Phase 0 and Phase 1 measured. Chromium 156 and Safari 27.2 load and run it (Phase 4); Gecko was not run. Switching proposals means rebuilding Lua as well and re-running the cells. |
 | **Two bindings drift.** A fix or feature lands in one and not the other | The parity census (Phase 5) fails closed on surface; the suite and harnesses run against both for behaviour; `CLAUDE.md` carries the rule. Nothing limits it between runs, and no automation is proposed (§14). |
 | The second binding is as large as the first and has had none of its 23 review passes | It is not reviewed by reading: all ten instruments are pointed at it, and Phase 5 extends the source invariants to it. Prediction 9 expects them to find defects. |
-| The verified binary (node variant) is not the shipped one (web variant) | They differ only in filesystem backend and are linked from the same objects; Phase 4 exercises the shipped one directly. |
+| The verified binary (node variant) is not the shipped one (web variant) | They differ only in filesystem backend and are linked from the same objects; Phase 4 exercised the shipped one directly, through `browser.js`, with a 24-cell set that is first run on the native addon. |
 | The work reaches into the native target after all | D7 names the files, closing condition 3 checks them with `git diff`, and a core change needs the owner's word. |
 | "The same API" erodes one exception at a time | §1.1 is a closed list, and closing condition 2 rejects a ledger entry that is not on it. |
 | Adding `exports` breaks an existing consumer | D6 accepts it knowingly and narrows it to deep imports of `prebuilds/`; the two other published subpaths stay listed, and the release note names the change. |

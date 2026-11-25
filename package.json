@@ -4,9 +4,28 @@
   "author": "Frank Hale",
   "license": "MIT",
   "type": "module",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./browser.d.ts",
+        "default": "./browser.js"
+      },
+      "default": {
+        "types": "./index.d.ts",
+        "default": "./index.js"
+      }
+    },
+    "./index.js": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./index.d.ts": "./index.d.ts",
+    "./types.d.ts": "./types.d.ts",
+    "./package.json": "./package.json"
+  },
   "gypfile": false,
   "keywords": [
     "lua",
@@ -55,6 +74,9 @@
     "vcpkg-lua-wasm": "node tools/wasm-build/vcpkg-lua.mjs",
     "build-wasm-debug": "node tools/wasm-build/run.mjs debug",
     "build-wasm-release": "node tools/wasm-build/run.mjs release",
+    "verify-wasm": "node tools/wasm-verify/run.mjs",
+    "smoke-wasm": "node tools/wasm-smoke/serve.mjs",
+    "check-package": "node tools/wasm-package/run.mjs",
     "get-vcpkg-include": "node get_vcpkg_path.js include",
     "get-vcpkg-lib": "node get_vcpkg_path.js lib",
     "vcpkg-lua": "\"$VCPKG_ROOT/vcpkg\" remove lua:arm64-osx --recurse >/dev/null 2>&1; \"$VCPKG_ROOT/vcpkg\" install \"lua[tools]:arm64-osx\" --overlay-triplets=./triplets && otool -l \"$VCPKG_ROOT/installed/arm64-osx/lib/liblua.a\" | grep -m1 minos"
@@ -63,7 +85,10 @@
     "index.js",
     "index.d.ts",
     "types.d.ts",
-    "prebuilds/**/*"
+    "prebuilds/**/*",
+    "browser.js",
+    "browser.d.ts",
+    "build-wasm/release/web/*"
   ],
   "dependencies": {
     "node-addon-api": "^8.9.1",

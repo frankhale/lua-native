@@ -3,6 +3,7 @@
 #include <lua.hpp>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+#include <map>
 #include <memory>
 #include <stdexcept>
 
@@ -19,7 +21,10 @@ namespace lua_core {
 struct LuaValue;
 using LuaPtr = std::shared_ptr<LuaValue>;
 using LuaArray = std::vector<LuaPtr>;
-using LuaTable = std::unordered_map<std::string, LuaPtr>;
+// Ordered, so that a converted table's keys arrive in one order on every target:
+// a hash map's order is the platform's string hash, which is not the same on a
+// 64-bit build and a 32-bit one.
+using LuaTable = std::map<std::string, LuaPtr>;
 
 // A table key whose Lua type is carried explicitly, so a caller that knows the
 // intended type (e.g. the JS `LuaTableHandle` methods, which see whether the
@@ -40,6 +45,15 @@ using TableKey = std::variant<std::string, int64_t, double, bool>;
 class LuaRuntime;
 
 namespace detail {
+// Asked every few levels by the conversions that recurse once per level of
+// nesting. Null natively, where kMaxDepth alone bounds them; the WASM binding
+// sets it, because its frames are on a stack whose size it does not choose.
+// Set once, before any context exists.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): see above
+inline bool (*stack_headroom)() = nullptr;
+// Throws when `depth` is a level that asks and there is no room for more.
+void RequireStackHeadroom(int depth);
+
 // Unrefs `ref` from main_state's registry, unless a worker thread is mid-run
 // on that state — in which case it defers the unref to a queue drained after
 // the worker finishes (H9c). Defined in lua-runtime.cpp, where LuaRuntime is
@@ -223,14 +237,17 @@ struct LuaTableRef {
 
 struct MemoryAllocator {
   size_t current = 0;
-  size_t limit = 0;  // 0 = unlimited
+  // 64 bits on every target, like the two execution limits below: a limit is
+  // a number the caller chose, not a size of anything in this address space,
+  // and `size_t` made the three of them 32 bits wide on a 32-bit target.
+  std::uint64_t limit = 0;  // 0 = unlimited
 };
 
 struct RuntimeConfig {
   std::vector<std::string> libraries;
-  size_t max_memory = 0;        // 0 = unlimited
-  size_t max_instructions = 0;  // 0 = unlimited (VM instructions per execution)
-  size_t timeout_ms = 0;        // 0 = no wall-clock timeout (per execution)
+  std::uint64_t max_memory = 0;        // 0 = unlimited
+  std::uint64_t max_instructions = 0;  // 0 = unlimited (VM instructions per execution)
+  std::uint64_t timeout_ms = 0;        // 0 = no wall-clock timeout (per execution)
   // Clear `dofile`/`loadfile` after opening the libraries. They live in `base`,
   // so a caller who wants them gone cannot get there by omitting a library.
   // Set by the `sandbox` preset; see SandboxLibraries.
@@ -499,6 +516,13 @@ public:
   // Userdata support
   void SetUserdataGCCallback(UserdataGCCallback cb);
   void SetPropertyHandlers(PropertyGetter getter, PropertySetter setter);
+
+  // Called from the execution hook, every thousand VM instructions or sooner,
+  // while one is set; null for none. The WASM binding sets one for a run it can
+  // suspend, so that the thread it is sharing gets a turn. It must not touch
+  // this runtime and must return.
+  using PauseHook = void (*)();
+  void SetPauseHook(PauseHook hook);
 
   void SetAsyncMode(bool enabled);
   bool IsAsyncMode() const;
@@ -879,12 +903,12 @@ public:
       const std::string& chunk_name = "") const;
 
   [[nodiscard]] size_t GetMemoryUsage() const { return allocator_.current; }
-  [[nodiscard]] size_t GetMemoryLimit() const { return allocator_.limit; }
+  [[nodiscard]] std::uint64_t GetMemoryLimit() const { return allocator_.limit; }
 
   // Version identity of the linked Lua, for diagnostics:
   //
   //   GetVersion()        "Lua 5.5"   — LUA_VERSION, major.minor
-  //   GetRelease()        "Lua 5.5.0" — LUA_RELEASE, including the patch level
+  //   GetRelease()        "Lua 5.5.1" — LUA_RELEASE, including the patch level
   //   GetVersionNumber()  505         — LUA_VERSION_NUM (major * 100 + minor)
   //
   // Static: these are compile-time constants of the build, not per-state
@@ -934,8 +958,8 @@ public:
   // cancel() request, so a compute-bound loop can be interrupted cooperatively.
   // Best set at construction; a post-construction change applies to threads
   // created after. See SetTimeout for what "a single execution" means.
-  void SetMaxInstructions(size_t limit);
-  [[nodiscard]] size_t GetMaxInstructions() const { return max_instructions_; }
+  void SetMaxInstructions(std::uint64_t limit);
+  [[nodiscard]] std::uint64_t GetMaxInstructions() const { return max_instructions_; }
 
   // Wall-clock execution timeout: abort an execution that has been running for
   // more than `ms` real milliseconds with "execution timeout". 0 = no timeout.
@@ -970,8 +994,8 @@ public:
   // maxInstructions nor cancel() can abort a runaway finalizer (CR-11 F3). It
   // is a complement to maxInstructions, not a replacement — real time is the
   // more intuitive budget, instruction counts the more deterministic one.
-  void SetTimeout(size_t ms);
-  [[nodiscard]] size_t GetTimeout() const { return timeout_ms_; }
+  void SetTimeout(std::uint64_t ms);
+  [[nodiscard]] std::uint64_t GetTimeout() const { return timeout_ms_; }
 
   // True while Lua code may be executing on this runtime's C stack — i.e.
   // inside any ExecutionScope (see SetTimeout for the full list of bracketed
@@ -1226,6 +1250,11 @@ private:
   // reject concurrent access, so it must be atomic. Note: the main-thread
   // coroutine driver (execute_async) uses await_driver_mode_, not this flag.
   std::atomic<bool> async_mode_{false};
+  PauseHook pause_hook_ = nullptr;
+  // The count event is installed for pause_hook_ and nobody else. It must then
+  // change nothing but the pausing: without a limit or a counting debug hook, a
+  // run is one cancel() cannot reach, and that is the contract (types.d.ts).
+  bool count_for_pause_only_ = false;
 
   // H9c: guards the registry-unref deferral queue. worker_active_ is true only
   // between BeginWorkerUnrefDeferral / EndWorkerUnrefDeferral (a worker run).
@@ -1313,13 +1342,13 @@ private:
   // the VM instructions run in the current execution and resets at each entry
   // point; the hook increments it by instruction_hook_interval_ each time it
   // fires (LUA_MASKCOUNT granularity) and raises once max_instructions_ is hit.
-  size_t max_instructions_ = 0;             // 0 = unlimited
-  mutable size_t instruction_count_ = 0;    // instructions run this execution
+  std::uint64_t max_instructions_ = 0;           // 0 = unlimited
+  mutable std::uint64_t instruction_count_ = 0;  // instructions run this execution
   int instruction_hook_interval_ = 1000;    // count-hook firing granularity
 
   // Wall-clock timeout (see SetTimeout). deadline_ is the instant the current
   // execution must finish by; it is only read when timeout_ms_ > 0.
-  size_t timeout_ms_ = 0;                   // 0 = no timeout
+  std::uint64_t timeout_ms_ = 0;            // 0 = no timeout
   mutable std::chrono::steady_clock::time_point deadline_;
 
   // Debug hook state (see SetDebugHook). The callback lives behind a shared_ptr

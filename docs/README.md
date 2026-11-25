@@ -21,6 +21,7 @@ purpose: a reader who never opens this file still cannot mistake
 |---|---|
 | [`CORRECTNESS.md`](CORRECTNESS.md) | **The correctness posture.** What is covered and what is not, what reopens review (§15.6), the regression-run matrix (§15.7), the closing condition and what to search next (§15.10), and the binding platform scope (§14). The correctness programme is closed; this is its conclusion and operating manual. |
 | [`FEATURES.md`](FEATURES.md) | What the binding actually does today. The reference for behaviour. |
+| [`WASM.md`](WASM.md) | **The second target.** The WebAssembly build for browsers: how to load and build it, the closed list of ways it may differ from the native addon, the rule that a change to one binding is a change to both, and the browsers it was run in. |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | What it deliberately does **not** do, and what it does less completely than you might assume — the sandbox's real reach, binary strings, and the documented conversion losses. Every claim driven, not inferred. |
 
 ## Tooling
@@ -29,7 +30,7 @@ purpose: a reader who never opens this file still cannot mistake
 |---|---|
 | [`SANITIZERS.md`](SANITIZERS.md) | How to run the four sanitizer harnesses, and what each can and cannot see. |
 | [`DIFFERENTIAL-ORACLE.md`](DIFFERENTIAL-ORACLE.md) | How the oracle works and what it does not cover. |
-| [`../tools/README.md`](../tools/README.md) | The nine correctness harnesses, the one cost harness, and the conventions every instrument follows. Read before extending one. |
+| [`../tools/README.md`](../tools/README.md) | The nine correctness harnesses, the one cost harness, the tools that carry them to the WASM target, and the conventions every instrument follows. Read before extending one. |
 
 ## Design references
 
@@ -57,6 +58,7 @@ Current; changed when the feature changes.
 | [`UNSEARCHED-REGIONS-PLAN.md`](reviews/UNSEARCHED-REGIONS-PLAN.md) | The August 6, 2026 unsearched-region work (W1–W5), planned and executed the same day. Read for the execution records, three of which contradict the premise that motivated the work. Its closing condition survives in [`CORRECTNESS.md`](CORRECTNESS.md) §15.10. |
 | [`FIDELITY-AND-REACH-PLAN.md`](reviews/FIDELITY-AND-REACH-PLAN.md) | The August 7, 2026 fidelity and reach work. Three defects found by driving the addon (a silent key drop in the documented remedy for silent key drops, a wrong shipped type, and a JS→Lua loss `LIMITATIONS.md` §5 had no row for), plus `chunkName`, lazy table iteration, `filesystem: 'deny'`, `tableAs: 'map'` and read-only debug introspection. Read it for the six defects the machinery caught *while the work was happening* — that ratio is the argument for the machinery. |
 | [`CONTEXT-TEARDOWN-PLAN.md`](reviews/CONTEXT-TEARDOWN-PLAN.md) | The August 7, 2026 context-lifetime work: `dispose()`, the `liveness-guarding` census, and `LIMITATIONS.md` §10. Read §0 for a finding measured before it was designed for — and disproved in the direction that would have justified the most work. |
+| [`WASM-TARGET-PLAN.md`](reviews/WASM-TARGET-PLAN.md) | The November 22–25, 2026 browser target: a WebAssembly build with a second binding and no N-API. Read it for the decisions (D0–D7), the seven slices' as-built records, and its scored predictions — half of them wrong, including the one about where the defects would be found. Porting found five defects in the *native* target. What outlived it is [`WASM.md`](WASM.md) and [`CORRECTNESS.md`](CORRECTNESS.md) §14's amendment. |
 | [`PERFORMANCE-PLAN.md`](reviews/PERFORMANCE-PLAN.md) | The August 6, 2026 cost search, planned and executed the same day. Read for the four things it got wrong — two of them defects in the plan rather than in the harness or the product, including a control that would have failed against a correct classifier. The instrument is `tools/crossing-cost`. |
 
 **There is no roadmap document.** New work must not start from either survey's
@@ -67,7 +69,7 @@ task*: a `LuaRuntime` is single-threaded by construction, so parallelism means N
 contexts plus a scheduler, which userland can build over `execute_script_async`
 today.
 
-**Five plan documents have been written and executed, and all five are now in
+**Six plan documents have been written and executed, and all six are now in
 `reviews/`.** They are worth knowing about because between them they set the bar
 for the next one.
 
@@ -107,6 +109,18 @@ were **product work rather than an instrument** — three defects found by drivi
 the shipped addon, four options and one new read-only surface. It kept the
 format's most useful habit: three of its dated predictions were wrong, and the
 execution records say so and say how.
+
+[`reviews/WASM-TARGET-PLAN.md`](reviews/WASM-TARGET-PLAN.md) (November 22–25,
+2026) is the sixth and the only one that changed the project's scope, which is
+why it opens with a decision record and why
+[`CORRECTNESS.md`](CORRECTNESS.md) §14 carries an amendment. It is also the
+only one not executed the day it was written: it was rewritten once, when the
+owner ruled out its premise, and ran over two days. What it adds to the bar is
+a rule for a plan whose product is a second copy of something: **the closing
+condition has to include a closed list of the ways the copy may differ**, kept
+where a program reads it and only the owner extends it. Seven differences were
+found that were on no list; each had been written down the day it was found
+with the word "ledgered" beside it, and none had been decided.
 
 ---
 

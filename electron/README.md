@@ -193,6 +193,11 @@ loader reports a row of the wrong width or an unknown character by name.
   `.node` file outside it (`asarUnpack` in electron-builder). The same goes for
   `rpg/game`: Lua's `require` opens files itself and cannot see inside an
   archive.
+- **Bundling.** Keep lua-native external in the main process and in a preload:
+  a bundle that inlines it cannot find the `.node` file. From 1.2.0, a
+  renderer page built for the browser (`vite build`, say) gets the WebAssembly
+  build instead, which runs but has no disk and no worker threads. For the
+  native addon there, load it in a preload, as these demos do.
 - **`await app.whenReady()` at the top level of `main.mjs` hangs.** Electron
   waits for an ES module entry point to finish loading before it fires `ready`,
   so that await never resolves. Use `.then()`, as `main.mjs` does.

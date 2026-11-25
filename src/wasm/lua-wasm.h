@@ -1,6 +1,6 @@
 // The WASM binding: `LuaContext` over `lua_core::LuaRuntime`, written against
 // `emscripten::val`. The browser target's counterpart of `src/lua-native.h`,
-// with no N-API, real or emulated (`docs/WASM-TARGET-PLAN.md` D1, D2).
+// with no N-API, real or emulated (`docs/reviews/WASM-TARGET-PLAN.md` D1, D2).
 //
 // **This is a port, not a design.** Each member below mirrors the member of
 // the same name in the native binding — the same checks in the same order with
@@ -81,9 +81,11 @@ inline constexpr Claim kRetireState = kExclusive | Claim::Resetting;
 
 // Native: ContextInitOptions.
 struct ContextInitOptions {
-  size_t max_memory = 0;
-  size_t max_instructions = 0;
-  size_t timeout_ms = 0;
+  // 64 bits, as the core holds them. The native struct says `size_t`, which is
+  // the same width there and half of it here.
+  std::uint64_t max_memory = 0;
+  std::uint64_t max_instructions = 0;
+  std::uint64_t timeout_ms = 0;
   bool has_max_memory = false;
   bool has_max_instructions = false;
   bool has_timeout = false;
@@ -275,6 +277,13 @@ struct LuaWorkerRun {
   // persistent reference to the wrapping object does.
   val context_ref;
   Deferred deferred;
+
+  // **No native counterpart.** What Execute leaves for the completion, and, for
+  // a run that can be suspended, the stack it has to itself (src/wasm/suspend.h).
+  bool suspendable = false;
+  std::unique_ptr<char[]> stack;
+  lua_core::ScriptResult result;
+  std::optional<std::string> failure;
 };
 
 // Native: UserdataEntry. A JS object standing behind a Lua userdata.
@@ -416,6 +425,25 @@ class LuaContext final {
     ~CallScope() { --ctx->call_depth_; }
     CallScope(const CallScope&) = delete;
     CallScope& operator=(const CallScope&) = delete;
+  };
+
+  // **No native counterpart.** One level of a core value becoming a JS one. The
+  // recursion carries no depth of its own, and here it needs one, to ask
+  // whether the engine's stack has room (stack.h).
+  struct ConvertScope {
+    int& depth;
+    explicit ConvertScope(int& d) : depth(d) {
+      // Asked before counting: a constructor that throws runs no destructor.
+      try {
+        lua_core::detail::RequireStackHeadroom(depth);
+      } catch (const std::exception& e) {
+        throw js::MakeError(e.what());
+      }
+      ++depth;
+    }
+    ~ConvertScope() { --depth; }
+    ConvertScope(const ConvertScope&) = delete;
+    ConvertScope& operator=(const ConvertScope&) = delete;
   };
 
   // Native: LuaContext::JsCallbackCollectorScope.
@@ -648,6 +676,7 @@ class LuaContext final {
   std::unordered_map<uint64_t, val> js_error_registry_;
   uint64_t next_js_error_id_ = 1;
   int call_depth_ = 0;
+  int convert_depth_ = 0;  // see ConvertScope
   bool in_reset_ = false;
 
   std::vector<std::string>* js_callback_collector_ = nullptr;

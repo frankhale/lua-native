@@ -1,7 +1,7 @@
 // The WASM binding's view of JavaScript: what `node-addon-api` is to the
 // native binding, written over `emscripten::val`.
 //
-// It exists to hold one rule in one place (`docs/WASM-TARGET-PLAN.md` D2,
+// It exists to hold one rule in one place (`docs/reviews/WASM-TARGET-PLAN.md` D2,
 // rule 2): **a JavaScript exception never unwinds through a WASM frame.** Any
 // operation that can run user JS — a property read (a getter, a Proxy trap), a
 // call, `String(v)`, `instanceof` — goes through a function on the shell's

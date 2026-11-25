@@ -18,7 +18,7 @@
 //
 // The native target is not touched by anything here: node-gyp, `binding.gyp`
 // and `index.js` neither know nor care that this script exists
-// (`docs/WASM-TARGET-PLAN.md` D7).
+// (`docs/reviews/WASM-TARGET-PLAN.md` D7).
 //
 // It ends by running `check.mjs` against what it built, because a build script
 // that reports success should show the thing it built doing something.
@@ -37,7 +37,7 @@ import {
 // nesting at LUAI_MAXCCALLS (200), so the question "how much is enough" has an
 // answer that can be measured: the deepest chains a script can build before Lua
 // itself refuses. `check.mjs` builds them on every run. See STACK-SIZE in
-// `docs/WASM-TARGET-PLAN.md` §2.4 for the measurement behind this number.
+// `docs/reviews/WASM-TARGET-PLAN.md` §2.4 for the measurement behind this number.
 export const STACK_SIZE = 1024 * 1024;
 
 // Passed at compile and at link, in both variants. `-sSUPPORT_LONGJMP=wasm` is
@@ -48,7 +48,9 @@ const COMMON = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm'];
 const CONFIGS = {
   debug: {
     compile: ['-O0', '-g'],
-    link: ['-O0', '-g', '-sASSERTIONS=1', '-sSTACK_OVERFLOW_CHECK=2'],
+    link: ['-O0', '-g', '-sASSERTIONS=1', '-sSTACK_OVERFLOW_CHECK=2',
+      // Where the checked stack is, for the shell to put the limits back to.
+      '-sEXPORTED_FUNCTIONS=_emscripten_stack_get_base,_emscripten_stack_get_end'],
   },
   release: {
     compile: ['-O2'],
@@ -64,6 +66,8 @@ const VARIANTS = {
 const SOURCES = [
   'src/core/lua-runtime.cpp',
   'src/wasm/js.cpp',
+  'src/wasm/stack.cpp',
+  'src/wasm/suspend.cpp',
   'src/wasm/lua-wasm.cpp',
 ];
 
@@ -129,7 +133,9 @@ async function main() {
       // What the shell needs to notice, and tidy up after, a JavaScript
       // exception that unwound WASM frames ("foreign exceptions" in
       // src/wasm/shell.js): a view of the module's memory and its stack pointer.
-      '-sEXPORTED_RUNTIME_METHODS=HEAPU32,stackSave,stackRestore',
+      '-sEXPORTED_RUNTIME_METHODS=HEAPU32,stackSave,stackRestore,wasmTable',
+      // The shell adds one function to the table: the one that suspends.
+      '-sALLOW_TABLE_GROWTH=1',
       `-sSTACK_SIZE=${stackSize}`,
       ...flags,
       '-o', path.join(dir, 'lua-native-core.mjs'),

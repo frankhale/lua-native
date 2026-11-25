@@ -14,9 +14,9 @@
 //      measured nothing and fails as vacuous.
 //   3. Is each variant what it claims to be? The node variant must read a real
 //      file; the web variant must contain no Node imports.
-//   4. When the JavaScript engine's own stack runs out while Lua is running,
-//      does that fail closed? (The exhaustion cells, further down; nothing
-//      inside the module can catch that, so the shell has to.)
+//   4. When the JavaScript engine's own stack is running out while Lua is
+//      running, is that an ordinary error that the context survives? (The
+//      exhaustion cells, further down.)
 //
 // The node variant is executed. **The web variant is not** — Node cannot load
 // a module built for `web,worker` — so for it this checks only that the
@@ -199,10 +199,10 @@ for (const [name, { script, floor }] of Object.entries(STACK_CELLS)) {
 // is natively. A `RangeError` raised above Lua's frames cannot be stopped by
 // C++ (`catch (...)` does not catch a JavaScript exception here) and Lua's
 // protected calls do not see it, so it unwinds them without their bookkeeping.
-// What the binding owes the caller is that this **fails closed**: an error,
-// never a raw `WebAssembly.Exception` and never a wrong answer; a context that
-// afterwards either works or says it cannot be used; and a module that other
-// contexts can go on using.
+// So it is kept from happening ("headroom" in shell.js, and stack.cpp): what
+// the caller sees is an ordinary error and a context that works afterwards.
+// Should it happen regardless, the shell still fails closed; the control below
+// is what runs that.
 //
 // Each cell runs one scenario at one engine stack size, which is what moves
 // the point of exhaustion around: into user JS, into the glue, into Lua.
@@ -214,6 +214,15 @@ for (const [name, { script, floor }] of Object.entries(STACK_CELLS)) {
 // existed.
 const EXHAUSTION_STACK_KB = [200, 300, 400, 500, 600, 700, 800];
 const UNWOUND = /can no longer be used/;
+
+// Since November 25, 2026 the module asks for headroom before it needs it, so
+// **no context may be lost in any of these**: the refusal is an ordinary error
+// and the same context carries on. A cell in which nothing was refused, or in
+// which Lua's own limit did the refusing, measured nothing.
+//
+// Control: the same scenario with the question answered yes every time must
+// lose its context, or the cells prove nothing about the question.
+const REFUSED = /Maximum call stack size exceeded|C stack overflow/;
 
 const classify = (error) => {
   if (error instanceof WebAssembly.Exception) return 'RAW WebAssembly.Exception';
@@ -233,15 +242,15 @@ const aftermath = (module, lua) => {
     else notes.push('same context still works');
   } catch (error) {
     const kind = classify(error);
-    if (kind !== 'refused as unwound') { ok = false; notes.push(`same context then threw ${kind}`); }
-    else notes.push('same context refuses');
+    ok = false;
+    notes.push(`same context then threw ${kind}`);
   }
   // A fresh context, made to go deep: a module whose stack pointer was left
   // where the unwinding found it has less stack than it thinks.
   try {
     const fresh = new module.init({}, { libraries: 'all' });
     const r = fresh.execute_script(STACK_CELLS['stack: string.gsub callback'].script);
-    const fine = Array.isArray(r) && r.length === 3 && r[0] === false && r[1] >= 100 && /overflow/.test(r[2]);
+    const fine = Array.isArray(r) && r.length === 3 && r[0] === false && r[1] >= 10 && /overflow/.test(r[2]);
     if (!fine) { ok = false; notes.push(`a fresh context got ${JSON.stringify(r)?.slice(0, 80)} from the gsub chain`); }
     else notes.push('a fresh context goes deep');
   } catch (error) {
@@ -262,17 +271,15 @@ const EXHAUSTION = {
   'mutual recursion': (module) => {
     const lua = new module.init({ reenter }, { libraries: 'all' });
     let outcome;
-    let ok = true;
+    let ok = false;
     try {
       const r = lua.execute_script(REENTER_SCRIPT);
       const shaped = Array.isArray(r) && r.length === 3 && r[0] === false && typeof r[2] === 'string';
-      if (shaped && /overflow/.test(r[2])) outcome = `Lua refused at depth ${r[1]}`;
-      else if (shaped && /Maximum call stack size exceeded/.test(r[2])) outcome = `pcall saw the RangeError at depth ${r[1]}`;
-      else if (shaped && UNWOUND.test(r[2])) outcome = `pcall saw the refusal at depth ${r[1]}`;
-      else { ok = false; outcome = `WRONG ANSWER ${JSON.stringify(r)?.slice(0, 100)}`; }
+      ok = shaped && REFUSED.test(r[2]);
+      outcome = ok ? `refused at depth ${r[1]}: ${r[2].slice(0, 60)}` : `WRONG ANSWER ${JSON.stringify(r)?.slice(0, 100)}`;
+      if (ok && r[1] >= 190) { ok = false; outcome = `VACUOUS — ${outcome}`; }
     } catch (error) {
       outcome = `threw ${classify(error)}`;
-      ok = !/RAW|UNEXPECTED/.test(outcome);
     }
     const after = aftermath(module, lua);
     return { ok: ok && after.ok, detail: [outcome, ...after.notes].join('; ') };
@@ -285,57 +292,76 @@ const EXHAUSTION = {
       reenter: (f) => { try { return f(); } catch { swallowed++; return 'swallowed'; } },
     }, { libraries: 'all' });
     let outcome;
-    let ok = true;
+    let ok = false;
     try {
       const r = lua.execute_script(REENTER_SCRIPT);
-      // Lua's own limit raises through the JS frame as an error and is
-      // swallowed like any other, so the chain returns the marker.
-      const shaped = Array.isArray(r) && r.length === 3 && r[0] === true && r[2] === 'swallowed';
-      if (shaped) outcome = `returned after ${swallowed} swallowed error(s), depth ${r[1]}`;
-      else { ok = false; outcome = `WRONG ANSWER ${JSON.stringify(r)?.slice(0, 100)}`; }
+      ok = Array.isArray(r) && r.length === 3 && r[0] === true && r[2] === 'swallowed' && swallowed > 0 && r[1] < 190;
+      outcome = ok ? `returned after ${swallowed} swallowed error(s), depth ${r[1]}` : `WRONG ANSWER ${JSON.stringify(r)?.slice(0, 100)}`;
     } catch (error) {
       outcome = `threw ${classify(error)}`;
-      ok = !/RAW|UNEXPECTED/.test(outcome);
     }
     const after = aftermath(module, lua);
     return { ok: ok && after.ok, detail: [outcome, ...after.notes].join('; ') };
   },
-  // Lua recursing through C on its own, with an engine stack too small for it
-  // to reach Lua's limit — twelve times, each in a context of its own. No JS
-  // is involved, so the engine's check fires inside WASM and the frames go
-  // without so much as a destructor; the module's stack pointer is left where
-  // they were. Unrepaired, each run costs the module that much stack for good:
-  // measured at 150 KB, 150,384 bytes a run, and the seventh run aborted the
-  // module for every context in it. (Control: with the shell's `stackRestore`
-  // call removed, this cell fails and no other does.)
+  // Lua recursing through C on its own, in a thread whose stack is too small
+  // for it to reach Lua's limit — twelve times in one context. No JS is
+  // involved, so only Lua's own C-call limit can refuse (lua-wasm-stack.h).
   'Lua recursing alone, repeated': {
-    sizes: [80, 100, 150],
+    sizes: [150, 170, 190],
     body: (module) => {
-      const kinds = {};
-      for (let i = 0; i < 12; i++) {
-        let kind;
-        try {
-          const lua = new module.init({}, { libraries: 'all' });
-          const r = lua.execute_script(STACK_CELLS['stack: string.gsub callback'].script);
-          kind = Array.isArray(r) && r.length === 3 && r[0] === false && /overflow/.test(r[2])
-            ? 'Lua refused' : `WRONG ANSWER ${JSON.stringify(r)?.slice(0, 60)}`;
-        } catch (error) {
-          kind = classify(error);
-        }
-        kinds[kind] = (kinds[kind] ?? 0) + 1;
-      }
-      const tally = Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ');
-      const bad = Object.keys(kinds).find(k => /RAW|UNEXPECTED|WRONG/.test(k));
-      if (!bad && !kinds.RangeError) return { ok: false, detail: `VACUOUS — the engine stack never ran out: ${tally}` };
-      // The module must still answer, from a context that was not involved.
-      let fresh;
+      const lua = new module.init({}, { libraries: 'all' });
+      const depths = [];
       try {
-        fresh = new module.init({}, { libraries: 'all' }).execute_script('return 6 * 7');
+        for (let i = 0; i < 12; i++) {
+          const r = lua.execute_script(STACK_CELLS['stack: string.gsub callback'].script);
+          if (!(Array.isArray(r) && r.length === 3 && r[0] === false && /C stack overflow/.test(r[2]))) {
+            return { ok: false, detail: `WRONG ANSWER ${JSON.stringify(r)?.slice(0, 60)}` };
+          }
+          depths.push(r[1]);
+        }
       } catch (error) {
-        fresh = classify(error);
+        return { ok: false, detail: `threw ${classify(error)} after ${depths.length} run(s)` };
       }
-      return { ok: !bad && fresh === 42, detail: `12 runs: ${tally}; a fresh context answered ${JSON.stringify(fresh)}` };
+      const detail = `12 runs in one context: refused at ${[...new Set(depths)].join(', ')}`;
+      if (Math.min(...depths) >= 190) return { ok: false, detail: `VACUOUS — ${detail}` };
+      return { ok: Math.min(...depths) > 10, detail };
     },
+  },
+  // A value nested as deeply as a conversion allows, each way, with ever less
+  // stack to do it in: the conversions recurse with no Lua call to refuse them.
+  //
+  // Not asked of the debug build. Freeing such a value recurses too, with
+  // nothing able to refuse partway, and needs no more stack than building it
+  // did — except at -O0, where each level is 29 standard-library frames.
+  'deep values from the edge of the JS stack': (module, config) => {
+    if (config === 'debug') return { ok: true, detail: 'not run on a debug build; see the comment' };
+    const lua = new module.init({}, { libraries: 'all' });
+    let deep = {};
+    for (let i = 0; i < 90; i++) deep = { a: deep };
+    lua.set_global('deep', deep);
+    const seen = {};
+    let tries = 0;
+    const kindOf = (error) => (REFUSED.test(error?.message) || /nested too deeply/.test(error?.message) ? 'refused' : classify(error));
+    const attempt = () => {
+      for (const door of [() => lua.get_global('deep'), () => lua.set_global('copy', deep)]) {
+        let kind = 'converted';
+        try { door(); } catch (error) { kind = kindOf(error); }
+        seen[kind] = (seen[kind] ?? 0) + 1;
+      }
+    };
+    const dive = () => {
+      try { dive(); } catch (overflow) {
+        if (++tries % 8 === 0 && tries < 8000) { try { attempt(); } catch { /* the edge itself */ } }
+        throw overflow;
+      }
+    };
+    try { dive(); } catch { /* the RangeError that started the unwinding */ }
+    const detail = Object.entries(seen).map(([k, n]) => `${n} ${k}`).join(', ');
+    const kinds = Object.keys(seen);
+    const bad = kinds.find(k => k !== 'refused' && k !== 'converted');
+    if (!bad && kinds.length < 2) return { ok: false, detail: `VACUOUS — ${detail}` };
+    const after = aftermath(module, lua);
+    return { ok: !bad && after.ok, detail: [detail, ...after.notes].join('; ') };
   },
   // JS recursing on its own to the limit, then calling into Lua from each of
   // the last frames on the way back out: the calls that start with almost no
@@ -354,13 +380,14 @@ const EXHAUSTION = {
     // Nothing in the handler may call a function: at the edge that call is
     // itself the overflow, and the first draft of this cell recorded nothing
     // for exactly that reason. Outcomes are stored raw and classified after.
-    const raw = new Array(600);
+    const TRIES = 6000;  // far enough back out that the last of them succeed
+    const raw = new Array(TRIES);
     let tries = 0;
     const dive = () => {
       try {
         dive();
       } catch (overflow) {
-        if (tries < 600) {
+        if (tries < TRIES) {
           try { raw[tries] = { value: lua.execute_script(script) }; } catch (error) { raw[tries] = { error }; }
           tries++;
         }
@@ -371,17 +398,17 @@ const EXHAUSTION = {
     const seen = {};
     for (let i = 0; i < tries; i++) {
       const kind = 'error' in raw[i]
-        ? classify(raw[i].error)
+        ? (/C stack overflow/.test(raw[i].error?.message) ? 'Lua refused' : classify(raw[i].error))
         : (raw[i].value === 40 ? 'answered' : `WRONG ANSWER ${JSON.stringify(raw[i].value)?.slice(0, 40)}`);
       seen[kind] = (seen[kind] ?? 0) + 1;
     }
     const kinds = Object.keys(seen);
-    const bad = kinds.find(k => /RAW|UNEXPECTED|WRONG/.test(k));
+    const bad = kinds.find(k => /RAW|UNEXPECTED|WRONG|unwound/.test(k));
     const tally = Object.entries(seen).map(([k, n]) => `${n} ${k}`).join(', ');
     // A run in which every call failed, or none did, never had a call that
     // began near the edge and ran out partway.
-    if (!bad && kinds.length < 2) {
-      return { ok: false, detail: `VACUOUS — ${tries} calls, all alike: ${tally}` };
+    if (!bad && (kinds.length < 2 || !kinds.includes('answered'))) {
+      return { ok: false, detail: `VACUOUS — ${tries} calls, none on each side of the refusal: ${tally}` };
     }
     const after = aftermath(module, lua);
     return { ok: !bad && after.ok, detail: [`${tries} calls: ${tally}`, ...after.notes].join('; ') };
@@ -393,14 +420,78 @@ for (const [scenario, spec] of Object.entries(EXHAUSTION)) {
   for (const kb of spec.sizes ?? EXHAUSTION_STACK_KB) {
     const name = `exhaustion at ${kb} KB: ${scenario}`;
     CELL_NODE_ARGS[name] = [`--stack-size=${kb}`];
-    CELLS[name] = (lua, module) => body(module);
+    CELLS[name] = (lua, module, config) => body(module, config);
   }
 }
 
+// The shell as built, except that the headroom question is always answered yes.
+const CONTROL = 'control: with no headroom question, mutual recursion at 500 KB ends the context';
+CELL_NODE_ARGS[CONTROL] = ['--stack-size=500'];
+CELLS[CONTROL] = (lua, module) => {
+  const r = EXHAUSTION['mutual recursion'](module);
+  return { ok: !r.ok && UNWOUND.test(r.detail.replace('refused as unwound', 'can no longer be used')), detail: r.detail };
+};
+// An engine that cannot suspend WebAssembly: the run holds the thread, as it
+// did everywhere before November 25, 2026, and answers the same.
+const NO_JSPI = 'deferred run: an engine that cannot suspend runs it to the end';
+CELLS[NO_JSPI] = async (lua) => {
+  let turns = 0;
+  const timer = setInterval(() => { turns++; }, 1);
+  const value = await lua.execute_script_async('local x = 0; for i = 1, 2e7 do x = x + i end; return x');
+  clearInterval(timer);
+  return { ok: value === 200000010000000 && turns <= 1, detail: `${value}, ${turns} turns of the event loop` };
+};
+CELLS['deferred run: suspends, and Lua\'s own C-call limit applies inside it'] = async (lua) => {
+  let turns = 0;
+  const timer = setInterval(() => { turns++; }, 1);
+  const r = await lua.execute_script_async(`
+    local x = 0; for i = 1, 2e7 do x = x + i end
+    local depth = 0
+    local function f() depth = depth + 1; return (string.gsub("x", "x", f)) end
+    local ok, e = pcall(f)
+    return ok, depth, tostring(e), x`);
+  clearInterval(timer);
+  const ok = turns > 1 && r[0] === false && r[1] >= 190 && /C stack overflow/.test(r[2]) && r[3] === 200000010000000;
+  return { ok, detail: `refused at depth ${r[1]}, ${turns} turns of the event loop` };
+};
+// The C stack overflow again, suspended at the bottom of it: the most of its
+// own stack a run can have in use when something else runs.
+CELLS['deferred run: suspended at the deepest, with the module in use meanwhile'] = async (lua, module) => {
+  const busy = new module.init({ reenter }, { libraries: 'all' });
+  let calls = 0;
+  let wrong = 0;
+  const timer = setInterval(() => {
+    const r = busy.execute_script(STACK_CELLS['stack: string.gsub callback'].script);
+    if (r[0] !== false || r[1] < 190) wrong++;
+    calls++;
+  }, 1);
+  const r = await lua.execute_script_async(`
+    local function deep(n)
+      if n == 0 then local s = 0; for i = 1, 1e7 do s = s + 1 end; return s end
+      local r
+      string.gsub("x", "x", function() r = deep(n - 1) end)
+      return r + 1
+    end
+    return deep(180)`);
+  clearInterval(timer);
+  return { ok: r === 10000180 && calls > 1 && wrong === 0, detail: `${r}; ${calls} calls to the limit in another context, ${wrong} wrong` };
+};
+const controlShell = (entry) => {
+  const source = fs.readFileSync(entry, 'utf8');
+  const changed = source.replace(/const hasHeadroom = \(\) => \{/, '$&\n  return true;');
+  if (changed === source) throw new Error('control: hasHeadroom is not where it was in shell.js');
+  const copy = path.join(path.dirname(entry), `lua-native.control.${process.pid}.mjs`);
+  fs.writeFileSync(copy, changed);
+  process.on('exit', () => fs.rmSync(copy, { force: true }));
+  return copy;
+};
+
 async function runCell(config, name) {
-  const entry = path.join(REPO, 'build-wasm', config, 'node', 'lua-native.mjs');
+  let entry = path.join(REPO, 'build-wasm', config, 'node', 'lua-native.mjs');
+  if (name === CONTROL) entry = controlShell(entry);
+  if (name === NO_JSPI) delete WebAssembly.Suspending;
   const module = (await import(url.pathToFileURL(entry).href)).default;
-  return CELLS[name](new module.init({ reenter }, { libraries: 'all' }), module);
+  return CELLS[name](new module.init({ reenter }, { libraries: 'all' }), module, config);
 }
 
 function checkWebVariant(config) {

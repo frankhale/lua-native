@@ -4,7 +4,7 @@
 // (`tools/wasm-build/run.mjs`), once per variant, so the relative import below
 // resolves to that variant's own module. It is the one file a loader imports.
 //
-// It holds only what has to be JavaScript (`docs/WASM-TARGET-PLAN.md` D2):
+// It holds only what has to be JavaScript (`docs/reviews/WASM-TARGET-PLAN.md` D2):
 //
 //   - `host`: the guarded primitives every C++ -> JS operation goes through, so
 //     that a JavaScript exception never unwinds through a WASM frame;
@@ -57,10 +57,59 @@ const isView = ArrayBuffer.isView;
 const isArray = Array.isArray;
 const dateGetTime = Date.prototype.getTime;
 const promisePrototype = Promise.prototype;
-const isPrototypeOf = Object.prototype.isPrototypeOf;
+const promiseResolve = Promise.resolve;
+const promiseThen = Promise.prototype.then;
+const getPrototypeOf = Object.getPrototypeOf;
+const hasOwn = Object.hasOwn;
+const ignore = () => {};
+const objectPrototype = Object.prototype;
+const arrayPrototype = Array.prototype;
 const asIntN = BigInt.asIntN;
 const asUintN = BigInt.asUintN;
 const ERRORS = [Error, TypeError, RangeError];
+const captureStackTrace = Error.captureStackTrace;
+
+// An error the binding constructs, its `stack` beginning at the JavaScript
+// that called in, as it does natively. `door` is the function the caller
+// called: everything from it inward is the binding's. It is named by identity
+// and not by source URL because a bundler may put this file and the caller's
+// in one. An engine without `captureStackTrace` keeps the stack it made.
+//
+// `door` must be on the call stack: for one that is not, the engine's answer
+// is a stack with no frames at all.
+//
+// V8 skips JavaScript frames up to `door` and no WASM frame, so those are cut
+// from the text, and the limit is raised while it looks so that they do not
+// use it up. Reading `stack` runs `Error.prepareStackTrace` if there is one,
+// which can throw and can answer with anything; either leaves the stack alone.
+const ErrorCtor = Error;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const WASM_FRAME = /^\s+at .*wasm-function\[/;
+const WASM_FRAMES = 64;  // more than a debug build puts between two JS frames
+const makeError = (Ctor, message, door) => {
+  const error = new Ctor(message);
+  if (typeof captureStackTrace !== 'function') return error;
+  try {
+    const limit = getOwnPropertyDescriptor(ErrorCtor, 'stackTraceLimit');
+    const raise = limit !== undefined && limit.writable === true &&
+      typeof limit.value === 'number' && limit.value > 0;
+    if (raise) ErrorCtor.stackTraceLimit = limit.value + WASM_FRAMES;
+    try {
+      captureStackTrace(error, door);
+    } finally {
+      if (raise) ErrorCtor.stackTraceLimit = limit.value;
+    }
+    const { stack } = error;
+    const header = `${error.name}: ${message}\n`;
+    if (!raise || typeof stack !== 'string' || !stack.startsWith(header)) return error;
+    const frames = stack.slice(header.length).split('\n');
+    let first = 0;
+    while (first < frames.length && WASM_FRAME.test(frames[first])) ++first;
+    error.stack = (header + frames.slice(first, first + limit.value).join('\n')).trimEnd();
+  } catch { /* the stack it was made with will do */ }
+  return error;
+};
+
 const encoder = new TextEncoder();
 // `ignoreBOM: true` keeps a leading U+FEFF, which the default strips.
 const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
@@ -154,6 +203,36 @@ const entriesBegunAt = core.entryCounterAddress() >>> 2;  // an index into HEAPU
 const stackBase = core.stackSave();
 let depth = 0;
 let stackAbandoned = false;
+// The door of the innermost call into the module (see makeError).
+let currentDoor;
+
+// --- headroom -----------------------------------------------------------------
+//
+// The engine's stack running out inside the module is the one thing above that
+// cannot be put right, so it is not let happen. Before each call into the
+// module, and every few levels of anything in it that recurses (stack.cpp),
+// this asks whether there is still room; the answer no is an ordinary error.
+//
+// The question is a call with that many arguments, which the engine must find
+// room for and which does nothing. Running out of stack *here* is a RangeError
+// in JavaScript with nothing of the module's above it, so it is caught. The
+// callee is a builtin so that no engine can inline the call and its frame away.
+//
+// How much room is enough is measured, not assumed, once per module (see
+// "calibration", at the end): a frame is several times larger in one engine
+// than in another. Until then it is this, which is generous for the
+// calibration's own shallow run.
+const FRAME_UNITS = 32;  // Lua C levels' worth of stack to keep in hand
+let headroom = new Array(8192).fill(0);
+const hasHeadroom = () => {
+  try {
+    reflectApply(isArray, undefined, headroom);
+    return true;
+  } catch {
+    return false;
+  }
+};
+core.stackHeadroom = hasHeadroom;
 
 const UNWOUND =
   'lua-native: this Lua context can no longer be used. A JavaScript exception (most ' +
@@ -162,14 +241,19 @@ const UNWOUND =
 
 // `state` is the record of the context the call belongs to, or undefined for a
 // call that belongs to none yet (construction) or no longer (finalization).
-const enter = (state, object, name, args) => {
-  if (state !== undefined && state.unwound) throw new Error(UNWOUND);
+// `door` is the function the caller called, or undefined when there is none.
+const enter = (state, object, name, args, door) => {
+  if (state !== undefined && state.unwound) throw makeError(Error, UNWOUND, door ?? enter);
+  // What the engine would have said a moment later, while it still costs nothing.
+  if (!hasHeadroom()) throw new RangeError('Maximum call stack size exceeded');
   if (depth === 0 && stackAbandoned) {
     core.stackRestore(stackBase);
     stackAbandoned = false;
   }
   // Read through `core` each time: growing the memory replaces the view.
   const begun = core.HEAPU32[entriesBegunAt];
+  const outerDoor = currentDoor;
+  currentDoor = door ?? enter;
   ++depth;
   try {
     return object[name](args);
@@ -182,8 +266,108 @@ const enter = (state, object, name, args) => {
     throw error;
   } finally {
     --depth;
+    currentDoor = outerDoor;
   }
 };
+
+// --- suspension -----------------------------------------------------------------
+//
+// A deferred run (`execute_script_async`, `execute_file_async`) holds the only
+// thread there is. Where the engine has JavaScript Promise Integration, the run
+// gives it back every few milliseconds: the whole call into the module is
+// suspended, the event loop has its turn, and the call goes on where it was.
+// Nothing of JavaScript's may be on the stack between, and nothing is: these
+// runs are refused every callback into JavaScript, as on a worker.
+//
+// The engine keeps the call's frames. It does not keep the module's *own* stack,
+// which is a region of its memory with one pointer into it, and anything else
+// that runs meanwhile would write over it. So such a run has a region to
+// itself, and the pointer is switched at each of the four places control
+// crosses. That is done from WASM, by the few instructions below, because when a
+// suspended call goes on the engine goes straight back into WASM:
+//
+//   run(run, top)  restore(top); execute(run); restore(0)
+//   pause()        sp = save(); suspend(); restore(sp)
+//
+// A `restore` of 0 means the module's main stack, with nothing on it: control
+// leaves such a run only for the event loop.
+const SUSPENSION = new U8([
+  0, 97, 115, 109, 1, 0, 0, 0, 1, 17, 4, 96, 0, 0, 96, 1, 127, 0, 96, 0, 1, 127, 96, 2, 127, 127,
+  0, 2, 44, 4, 1, 101, 4, 115, 97, 118, 101, 0, 2, 1, 101, 7, 114, 101, 115, 116, 111, 114, 101, 0,
+  1, 1, 101, 7, 101, 120, 101, 99, 117, 116, 101, 0, 1, 1, 101, 5, 112, 97, 117, 115, 101, 0, 0, 3,
+  3, 2, 3, 0, 7, 15, 2, 3, 114, 117, 110, 0, 4, 5, 112, 97, 117, 115, 101, 0, 5, 10, 31, 2, 14, 0,
+  32, 1, 16, 1, 32, 0, 16, 2, 65, 0, 16, 1, 11, 14, 1, 1, 127, 16, 0, 33, 0, 16, 3, 32, 0, 16, 1,
+  11]);
+const { Suspending, promising } = WebAssembly;
+
+// The event loop's next turn. `setTimeout` is the last resort: a browser makes
+// nested ones wait four milliseconds, which is half of every slice.
+const nextTurn = (() => {
+  const immediate = globalThis.setImmediate;
+  if (typeof immediate === 'function') return (go) => { immediate(go); };
+  if (typeof MessageChannel !== 'function') return laterTask;
+  const waiting = [];
+  const { port1, port2 } = new MessageChannel();
+  port1.onmessage = () => { waiting.shift()(); };
+  // Every fourth is a timer all the same: a Safari worker runs a message before
+  // any timer that is due, so a run that only posted messages starved them, and
+  // a cancel() from one never came.
+  let turns = 0;
+  return (go) => {
+    turns += 1;
+    if (turns % 4 === 0) {
+      laterTask(go);
+    } else {
+      waiting.push(go);
+      port2.postMessage(null);
+    }
+  };
+})();
+
+// The stacks of the runs in flight: [bottom, top].
+const regions = new Set();
+// A debug build checks the stack pointer against limits, which move with it.
+const setLimits = core.___set_stack_limits;
+const mainBottom = setLimits === undefined ? 0 : core._emscripten_stack_get_end();
+const mainTop = setLimits === undefined ? 0 : core._emscripten_stack_get_base();
+
+const switchStack = (sp) => {
+  if (setLimits !== undefined) {
+    let bottom = mainBottom;
+    let top = mainTop;
+    for (const region of regions) {
+      if (sp !== 0 && sp >= region[0] && sp <= region[1]) [bottom, top] = region;
+    }
+    setLimits(top, bottom);
+  }
+  core.stackRestore(sp === 0 ? stackBase : sp);
+};
+
+// Runs `run`'s script to its end, suspending as it goes; a promise of that.
+// Undefined where the engine cannot.
+const suspendableExecute = (() => {
+  if (typeof Suspending !== 'function' || typeof promising !== 'function') return undefined;
+  try {
+    const table = core.wasmTable;
+    const { exports } = new WebAssembly.Instance(new WebAssembly.Module(SUSPENSION), {
+      e: {
+        save: () => core.stackSave(),
+        restore: switchStack,
+        execute: table.get(core.LuaWorkerRun.executeEntry()),
+        pause: new Suspending(() => {
+          switchStack(0);
+          return new PromiseCtor(nextTurn);
+        }),
+      },
+    });
+    table.grow(1);
+    table.set(table.length - 1, exports.pause);
+    core.LuaWorkerRun.setPause(table.length - 1);
+    return promising(exports.run);
+  } catch {
+    return undefined;  // refused by a content security policy, or not all there
+  }
+})();
 
 // Frees a C++ object when the JS object that stands for it is collected — the
 // role an N-API finalizer plays natively. It runs in a later task than the
@@ -256,12 +440,29 @@ const iteratorTables = new WeakMap();
 const ObjectCtor = Object;
 const receiverOf = (self) => (self === undefined || self === null ? globalThis : ObjectCtor(self));
 
+// What a function the binding hands out looks like natively: V8 makes one that
+// is not strict, so it has own `arguments` and `caller`, and its source text is
+// `[native code]`. A module's functions are all strict, so the two properties
+// are defined by hand with V8's descriptors, and a Proxy with no traps hides
+// the source: the one ordinary callable whose text an engine will not show,
+// that still passes `this` through. (A bound function would not.) What cannot
+// be had is the name inside that text. The handler has no prototype, so
+// nothing put on Object.prototype can become a trap.
+const NO_TRAPS = freeze({ __proto__: null });
+const nativeFunction = (body) => {
+  defineHidden(body, 'arguments', null, false);
+  defineHidden(body, 'caller', null, false);
+  const fn = new ProxyCtor(body, NO_TRAPS);
+  defineProperty(body.prototype, 'constructor', { value: fn, writable: true, enumerable: false, configurable: true });
+  return fn;
+};
+
 // A function that answers with its receiver: an iterator's own
 // `[Symbol.iterator]` or `[Symbol.asyncIterator]`.
 const selfFunction = (name) => {
   const fn = function () { return receiverOf(this); };
   defineProperty(fn, 'name', { value: name, configurable: true });
-  return fn;
+  return nativeFunction(fn);
 };
 const weakMapGet = WeakMap.prototype.get;
 
@@ -279,12 +480,15 @@ const taggedData = (owners, owner) =>
 
 // A function that looks like the N-API function it stands for: named `name`,
 // reporting length 0, with a `prototype`. `rootKey` is the hidden property
-// that roots `owner` on it.
-const handleFunction = (name, rootKey, owner, body) => {
+// that roots `owner` on it. `rootedFunction` is the same without the N-API
+// look, for a function no caller can reach.
+const rootedFunction = (name, rootKey, owner, body) => {
   defineProperty(body, 'name', { value: name, configurable: true });
   defineHidden(body, rootKey, owner, false);
   return body;
 };
+const handleFunction = (name, rootKey, owner, body) =>
+  nativeFunction(rootedFunction(name, rootKey, owner, body));
 
 const TABLE_METHODS = ['get', 'get_ref', 'set', 'has', 'length', 'pairs', 'ipairs', 'keys', 'release'];
 const TABLE_TRAPS = {
@@ -317,7 +521,7 @@ const host = {
     }
   },
   newError(type, message) {
-    return new ERRORS[type](message);
+    return makeError(ERRORS[type], message, currentDoor ?? host.newError);
   },
 
   // --- classification: no user code ----------------------------------------
@@ -332,13 +536,33 @@ const host = {
     if (brand(dateGetTime, value)) return 3;
     return isArray(value) ? 1 : 0;
   },
-  // N-API asks V8 whether the value *is* a promise. The nearest question JS
-  // can ask without running user code is whether the intrinsic prototype is on
-  // its chain; a Proxy's `getPrototypeOf` trap is the one way that can throw.
+  // N-API asks V8 whether the value *is* a promise. JavaScript has two ways to
+  // put that question to the engine, and each has an effect on one of the two
+  // answers, so they are used where they have none:
+  //
+  //   `Promise.resolve` hands a promise back as itself and does nothing to it.
+  //   On anything else it reads `then` and adopts it, so it is asked only of
+  //   an object that has none of its own.
+  //   `then` refuses anything else before doing anything. On a promise it
+  //   attaches a reaction and consults its species.
+  //
+  // Neither is cheap, and almost every value here is a plain object or an array,
+  // so those two are told by their prototype and not asked. Anything else is:
+  // a promise made in another realm (an iframe's) has that realm's prototype, and
+  // the engine knows it for a promise all the same. A Proxy's traps can throw.
   isPromise(value) {
     try {
-      return typeof value === 'object' && value !== null &&
-        reflectApply(isPrototypeOf, promisePrototype, [value]);
+      if (typeof value !== 'object' || value === null) return false;
+      const proto = getPrototypeOf(value);
+      if (proto === objectPrototype || proto === arrayPrototype) return false;
+      if (proto === promisePrototype && !hasOwn(value, 'then') && !hasOwn(value, 'constructor')) {
+        const same = reflectApply(promiseResolve, PromiseCtor, [value]);
+        if (same === value) return true;
+        reflectApply(promiseThen, same, [undefined, ignore]);
+      }
+      // A subclass, another realm's, one with properties of its own, or not one.
+      reflectApply(promiseThen, value, [undefined, ignore]);
+      return true;
     } catch {
       return false;
     }
@@ -368,10 +592,10 @@ const host = {
   // `luaFunction`, reports length 0, and has a `prototype`.
   luaFunction(handle, state) {
     const fn = function luaFunction(...args) {
-      return unwrap(enter(state, handle, 'call', args));
+      return unwrap(enter(state, handle, 'call', args, luaFunction));
     };
     defineHidden(fn, '__luaFnOwner', mintOwner(functionOwners, handle), false);
-    return fn;
+    return nativeFunction(fn);
   },
   // Native: CreateTableHandle's JS half. A plain object whose own enumerable
   // properties are its nine methods, plus the iterator and the hidden marker.
@@ -380,14 +604,14 @@ const host = {
     const object = {};
     defineHidden(object, '_tableRef', owner, false);
     for (const name of TABLE_METHODS) {
-      object[name] = handleFunction(name, '_tableOwner', owner, function (...args) {
-        return unwrap(enter(state, handle, name, args));
+      object[name] = handleFunction(name, '_tableOwner', owner, function door(...args) {
+        return unwrap(enter(state, handle, name, args, door));
       });
     }
     // The C++ side wants two things an N-API callback reads off its `info`:
     // `this`, and something that keeps the table alive under the iterator.
-    object[symbolIterator] = handleFunction('[Symbol.iterator]', '_tableOwner', owner, function () {
-      return unwrap(enter(state, handle, 'iterator', [receiverOf(this), owner]));
+    object[symbolIterator] = handleFunction('[Symbol.iterator]', '_tableOwner', owner, function door() {
+      return unwrap(enter(state, handle, 'iterator', [receiverOf(this), owner], door));
     });
     return object;
   },
@@ -401,8 +625,8 @@ const host = {
     const handler = {};
     for (const trap in TABLE_TRAPS) {
       const method = TABLE_TRAPS[trap];
-      handler[trap] = handleFunction(trap, '_tableOwner', owner, function (...args) {
-        return unwrap(enter(state, handle, method, args));
+      handler[trap] = rootedFunction(trap, '_tableOwner', owner, function door(...args) {
+        return unwrap(enter(state, handle, method, args, door));
       });
     }
     return new ProxyCtor(target, handler);
@@ -442,8 +666,8 @@ const host = {
     iteratorTables.set(owner, tableOwner);
     const iterator = {};
     defineHidden(iterator, '__tableIterOwner', rootFor(owner), false);
-    iterator.next = handleFunction('next', '__tableIterOwner', rootFor(owner), function (...args) {
-      return unwrap(enter(state, handle, 'next', args));
+    iterator.next = handleFunction('next', '__tableIterOwner', rootFor(owner), function door(...args) {
+      return unwrap(enter(state, handle, 'next', args, door));
     });
     iterator[symbolIterator] = selfFunction('[Symbol.iterator]');
     return iterator;
@@ -463,12 +687,12 @@ const host = {
   coroutineObject(thread, binding, asyncBinding, status, state) {
     const coro = { _coroutine: mintOwner(threadOwners, thread), status };
     coro[symbolIterator] = handleFunction(
-      '[Symbol.iterator]', '__coroBindingOwner', mintOwner(undefined, binding), function () {
-        return unwrap(enter(state, binding, 'iterator', [receiverOf(this)]));
+      '[Symbol.iterator]', '__coroBindingOwner', mintOwner(undefined, binding), function door() {
+        return unwrap(enter(state, binding, 'iterator', [receiverOf(this)], door));
       });
     coro[symbolAsyncIterator] = handleFunction(
-      '[Symbol.asyncIterator]', '__coroBindingOwner', mintOwner(undefined, asyncBinding), function () {
-        return unwrap(enter(state, asyncBinding, 'asyncIterator', [receiverOf(this)]));
+      '[Symbol.asyncIterator]', '__coroBindingOwner', mintOwner(undefined, asyncBinding), function door() {
+        return unwrap(enter(state, asyncBinding, 'asyncIterator', [receiverOf(this)], door));
       });
     return coro;
   },
@@ -481,16 +705,16 @@ const host = {
     if (isAsync) {
       // The async `next` hands C++ the owner as well: the function that maps
       // the settled step must root the cursor, and can outlive this one.
-      iterator.next = handleFunction('next', '__coroIterOwner', rootFor(owner), function (...args) {
-        return unwrap(enter(state, handle, 'asyncNext', [owner, args]));
+      iterator.next = handleFunction('next', '__coroIterOwner', rootFor(owner), function door(...args) {
+        return unwrap(enter(state, handle, 'asyncNext', [owner, args], door));
       });
     } else {
-      iterator.next = handleFunction('next', '__coroIterOwner', rootFor(owner), function (...args) {
-        return unwrap(enter(state, handle, 'next', args));
+      iterator.next = handleFunction('next', '__coroIterOwner', rootFor(owner), function door(...args) {
+        return unwrap(enter(state, handle, 'next', args, door));
       });
     }
-    iterator.return = handleFunction('return', '__coroIterOwner', rootFor(owner), function (...args) {
-      return unwrap(enter(state, handle, 'return', args));
+    iterator.return = handleFunction('return', '__coroIterOwner', rootFor(owner), function door(...args) {
+      return unwrap(enter(state, handle, 'return', args, door));
     });
     if (isAsync) {
       iterator[symbolAsyncIterator] = selfFunction('[Symbol.asyncIterator]');
@@ -502,8 +726,8 @@ const host = {
   // Native: the `mapper` CoroAsyncIteratorNext hands to `then`.
   coroAsyncMapper(owner) {
     const { handle, state } = reflectApply(weakMapGet, coroIterators, [owner]);
-    return handleFunction('next', '__coroIterOwner', rootFor(owner), function (...args) {
-      return unwrap(enter(state, handle, 'map', args));
+    return handleFunction('next', '__coroIterOwner', rootFor(owner), function door(...args) {
+      return unwrap(enter(state, handle, 'map', args, door));
     });
   },
   // Native: Napi::Promise::Deferred. The intrinsic constructor, so a patched
@@ -521,18 +745,18 @@ const host = {
   awaitCallbacks(cookie, state) {
     const owner = mintOwner(undefined, cookie);
     const make = (name, method) => {
-      const fn = function (...args) {
+      const fn = function door(...args) {
         if (state.unwound) {
           const run = state.run;
           state.run = undefined;
           if (run !== undefined) run.reject(new Error(UNWOUND));
           return undefined;
         }
-        return unwrap(enter(state, cookie, method, args));
+        return unwrap(enter(state, cookie, method, args, door));
       };
       defineProperty(fn, 'name', { value: name, configurable: true });
       defineHidden(fn, '__cookie', owner, true);
-      return fn;
+      return nativeFunction(fn);
     };
     return [make('onResolve', 'resolve'), make('onReject', 'reject')];
   },
@@ -556,14 +780,40 @@ const host = {
   // Native: `worker->Queue()`. The run is taken up in a later task, as a
   // worker's completion is; see D3 in the plan for what differs.
   schedule(run, state, deferred) {
-    laterTask(() => {
+    const settle = (method, door) => {
       try {
-        unwrap(enter(state, run, 'run', []));
+        unwrap(enter(state, run, method, [], door));
       } catch (error) {
         deferred.reject(error);
       } finally {
         try { enter(undefined, run, 'delete'); } catch { /* nothing left to release it with */ }
       }
+    };
+    laterTask(function door() {
+      let top = 0;
+      // 0 when there is no memory for a stack: run it without.
+      if (suspendableExecute !== undefined && !state.unwound) top = run.stackTop();
+      if (top === 0) {
+        settle('run', door);
+        return;
+      }
+      const region = [run.stackBottom(), top];
+      regions.add(region);
+      const over = suspendableExecute(run.address(), top);
+      reflectApply(promiseThen, over, [
+        () => {
+          regions.delete(region);
+          settle('finish', undefined);
+        },
+        (error) => {
+          // As in `enter`: frames were unwound that could not clean up. The
+          // run's struct is one of the things that cannot be trusted now.
+          regions.delete(region);
+          switchStack(0);
+          state.unwound = true;
+          deferred.reject(error instanceof WasmException ? new Error(UNWOUND, { cause: error }) : error);
+        },
+      ]);
     });
   },
 
@@ -596,7 +846,7 @@ const host = {
       // takes bytes fails on one with this message. Kept, not improved on: a
       // program must meet the same answer on both targets (plan, D2). In place
       // as a silent conversion from slice 1 until slice 6's diff found it.
-      throw new ERRORS[0]('Invalid argument');
+      throw host.newError(0, 'Invalid argument');
     } catch (error) {
       thrown = { value: error };
       return FAILED;
@@ -737,12 +987,24 @@ const CONTEXT_METHODS = [
 // (`#<LuaContext>` in its own error messages), and a `name` property set
 // afterwards does not change that.
 const NO_NEW = "Class constructors cannot be invoked without 'new'";
+//
+// The public face is a Proxy (nativeFunction), so `ctor` is what a construction
+// is made from when nothing subclasses it: the engine cannot name an object
+// after a Proxy.
 const nativeClass = (Impl, ctor) => {
   const proto = Impl.prototype;
   delete proto.constructor;
-  defineProperty(proto, 'constructor', { value: ctor, writable: true, enumerable: false, configurable: true });
   ctor.prototype = proto;
-  return ctor;
+  Impl.door = ctor;
+  return nativeFunction(ctor);
+};
+const newTargetOf = (target, face, ctor) => (target === face ? ctor : target);
+
+// A method as `InstanceMethod` makes one, with a `prototype` as every N-API
+// function has.
+const defineMethod = (Impl, name, method) => {
+  defineProperty(method, 'name', { value: name, configurable: true });
+  defineHidden(Impl.prototype, name, nativeFunction(method), false);
 };
 
 class LuaContextImpl {
@@ -754,28 +1016,28 @@ class LuaContextImpl {
 
   constructor(...args) {
     this.#state.self = new WeakRefCtor(this);
-    const handle = enter(undefined, core.LuaContext, 'create', { args, state: this.#state });
+    const handle = enter(undefined, core.LuaContext, 'create', { args, state: this.#state }, LuaContextImpl.door);
     if (handle === null) throw takePending();
     this.#core = handle;
     handles.register(this, handle);
     // Native: SubscribeSharedTables, the constructor's last step. It pushes
     // each shared value through this object's own public `set_global`, so it
     // has to come after the line that makes this object a context.
-    unwrap(enter(this.#state, handle, 'subscribe_shared', args));
+    unwrap(enter(this.#state, handle, 'subscribe_shared', args, LuaContextImpl.door));
   }
+
+  // The public constructor, which is what the caller called (nativeClass).
+  static door;
 
   static {
     for (const name of CONTEXT_METHODS) {
-      const method = {
-        [name](...args) {
-          // What V8 says when a native method is called on the wrong receiver.
-          if (typeof this !== 'object' || this === null || !(#core in this)) {
-            throw new TypeError('Illegal invocation');
-          }
-          return unwrap(enter(this.#state, this.#core, name, args));
-        },
-      }[name];
-      defineHidden(LuaContextImpl.prototype, name, method, false);
+      defineMethod(LuaContextImpl, name, function method(...args) {
+        // What V8 says when a native method is called on the wrong receiver.
+        if (typeof this !== 'object' || this === null || !(#core in this)) {
+          throw makeError(TypeError, 'Illegal invocation', method);
+        }
+        return unwrap(enter(this.#state, this.#core, name, args, method));
+      });
     }
   }
 }
@@ -807,16 +1069,22 @@ const throwMessage = (error) => {
   }
 };
 
+// Asked by each of the two doors to the constructor, which a caller cannot
+// reach any other way.
+const checkInitial = (args, door) => {
+  const initial = args[0];
+  if (initial !== undefined && initial !== null && typeof initial !== 'object') {
+    throw makeError(TypeError, 'createSharedTable(initial) requires an object', door);
+  }
+};
+
 class SharedTableImpl {
   #value;
   #subscribers = [];
 
   constructor(...args) {
     const initial = args[0];
-    if (args.length > 0 && initial !== undefined && initial !== null) {
-      if (typeof initial !== 'object') {
-        throw new TypeError('createSharedTable(initial) requires an object');
-      }
+    if (initial !== undefined && initial !== null) {
       // Held, not copied: mutating it directly and calling sync() is supported.
       this.#value = initial;
     } else {
@@ -825,23 +1093,23 @@ class SharedTableImpl {
   }
 
   // What V8 says when a native method is called on the wrong receiver.
-  static #check(receiver) {
+  static #check(receiver, door) {
     if (typeof receiver !== 'object' || receiver === null || !(#value in receiver)) {
-      throw new TypeError('Illegal invocation');
+      throw makeError(TypeError, 'Illegal invocation', door);
     }
   }
 
   static #pushValue(context, name, value) {
     const setter = context.set_global;
     if (typeof setter !== 'function') {
-      throw new Error(
+      throw makeError(Error,
         "shared table subscriber's set_global is not a function; it has been " +
-        'shadowed by an own property on the context');
+        'shadowed by an own property on the context', currentDoor ?? SharedTableImpl.#pushValue);
     }
     reflectApply(setter, context, [name, value]);
   }
 
-  #propagate() {
+  #propagate(door) {
     // Snapshot the live subscribers first, pruning collected ones: a push runs
     // user JS, which could subscribe another context while this iterates.
     const targets = [];
@@ -867,9 +1135,9 @@ class SharedTableImpl {
     }
 
     if (failed > 0) {
-      throw new Error(
+      throw makeError(Error,
         `shared table update failed for ${failed} of ${targets.length} contexts (${failures}). ` +
-        'The JS-side value was updated; call sync() to retry.');
+        'The JS-side value was updated; call sync() to retry.', door);
     }
   }
 
@@ -888,48 +1156,113 @@ class SharedTableImpl {
     };
 
     const methods = {
-      get(...args) {
-        SharedTableImpl.#check(this);
+      get: function door(...args) {
+        SharedTableImpl.#check(this, door);
         if (args.length < 1 || typeof args[0] !== 'string') {
-          throw new TypeError('get(key) requires a string key');
+          throw makeError(TypeError, 'get(key) requires a string key', door);
         }
         return this.#value[args[0]];
       },
-      set(...args) {
-        SharedTableImpl.#check(this);
+      set: function door(...args) {
+        SharedTableImpl.#check(this, door);
         if (args.length < 2 || typeof args[0] !== 'string') {
-          throw new TypeError('set(key, value) requires a string key and a value');
+          throw makeError(TypeError, 'set(key, value) requires a string key and a value', door);
         }
         reflectSet(this.#value, args[0], args[1]);
-        this.#propagate();  // a failed push throws after every other context is updated
+        this.#propagate(door);  // a failed push throws after every other context is updated
         return undefined;
       },
-      sync() {
-        SharedTableImpl.#check(this);
-        this.#propagate();
+      sync: function door() {
+        SharedTableImpl.#check(this, door);
+        this.#propagate(door);
         return undefined;
       },
     };
     for (const name of Object.keys(methods)) {
-      defineHidden(SharedTableImpl.prototype, name, methods[name], false);
+      defineMethod(SharedTableImpl, name, methods[name]);
     }
   }
 }
 
-const LuaContext = nativeClass(LuaContextImpl, function LuaContext(...args) {
-  if (new.target === undefined) throw new TypeError(NO_NEW);
-  return reflectConstruct(LuaContextImpl, args, new.target);
+const ContextFace = nativeClass(LuaContextImpl, function LuaContext(...args) {
+  if (new.target === undefined) throw makeError(TypeError, NO_NEW, LuaContext);
+  return reflectConstruct(LuaContextImpl, args, newTargetOf(new.target, ContextFace, LuaContext));
 });
-const SharedTable = nativeClass(SharedTableImpl, function SharedTable(...args) {
-  if (new.target === undefined) throw new TypeError(NO_NEW);
-  return reflectConstruct(SharedTableImpl, args, new.target);
+const SharedTableFace = nativeClass(SharedTableImpl, function SharedTable(...args) {
+  if (new.target === undefined) throw makeError(TypeError, NO_NEW, SharedTable);
+  checkInitial(args, SharedTable);
+  return reflectConstruct(SharedTableImpl, args, newTargetOf(new.target, SharedTableFace, SharedTable));
 });
 
-function createSharedTable(...args) {
-  return args.length > 0 ? new SharedTable(args[0]) : new SharedTable();
-}
+const createSharedTable = nativeFunction(function createSharedTable(...args) {
+  checkInitial(args, createSharedTable);
+  return args.length > 0 ? new SharedTableFace(args[0]) : new SharedTableFace();
+});
+
+// --- calibration ----------------------------------------------------------------
+//
+// How much of the engine's stack one Lua C level takes, as the number of call
+// arguments that take as much: what is left is measured at two depths of a
+// chain that re-enters Lua through string.gsub, and the difference divided.
+const argumentsLeft = () => {
+  // Whole blocks first, each held by the frame of the call that follows it;
+  // an engine limits the arguments of one call to well under its stack.
+  const block = new Array(16384).fill(0);
+  let blocks = 0;
+  let rest = 0;
+  const dig = () => {
+    ++blocks;
+    reflectApply(dig, undefined, block);
+  };
+  try { dig(); } catch { /* as intended */ }
+  // Then, under one block fewer, what a last call can still take.
+  const last = (left) => {
+    if (left > 0) return reflectApply(last, undefined, [left - 1, ...block]);
+    for (let bit = 8192; bit >= 16; bit >>= 1) {
+      try {
+        reflectApply(isArray, undefined, new Array(rest + bit).fill(0));
+        rest += bit;
+      } catch { /* too many */ }
+    }
+    return undefined;
+  };
+  const whole = blocks > 2 ? blocks - 2 : 0;
+  try { last(whole); } catch { /* as far as it got */ }
+  return whole * (block.length + 1) + rest;
+};
+
+const calibrate = () => {
+  const LEVELS = 16;
+  const left = [];
+  const lua = new LuaContextImpl(
+    { mark: () => { left.push(argumentsLeft()); } }, { libraries: ['base', 'string'] });
+  lua.execute_script(`
+    local function go(n)
+      if n == 0 then return mark() end
+      return (string.gsub("x", "x", function() go(n - 1) end))
+    end
+    go(1)
+    go(1 + ${LEVELS})`);
+  lua.dispose();
+  return (left[0] - left[1]) / LEVELS;
+};
+
+// Bounded both ways, so that nothing odd about the measurement (a caller
+// already deep when it imported this, an engine that moved a frame between the
+// two) can make the margin useless or the module unusable.
+//
+// LEAST is a floor on the whole margin, and has nothing to do with Lua: V8
+// compiles a function the first time it runs, on the caller's stack, and fails
+// the call with the same RangeError if that does not fit. A margin of 40 KB lost
+// contexts to it and one of 48 KB did not (November 25, 2026; V8 in Node 24).
+const LEAST = 8192;  // 64 KB
+const MOST = 1024;   // 8 KB a level
+let perLevel = MOST / 2;
+try { perLevel = calibrate(); } catch { /* the middle of the range */ }
+const margin = Math.max(LEAST, Math.ceil(Math.min(perLevel, MOST) * FRAME_UNITS) || 0);
+headroom = new Array(margin).fill(0);
 
 export default {
-  init: LuaContext,
+  init: ContextFace,
   createSharedTable,
 };

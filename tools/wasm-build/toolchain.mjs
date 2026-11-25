@@ -2,7 +2,7 @@
 // where the toolchain is, which version it is, and whether a `liblua.a` is the
 // one the module can link against. Nothing here builds anything.
 //
-// Why these checks exist is `docs/WASM-TARGET-PLAN.md` §2.3 and D5.
+// Why these checks exist is `docs/reviews/WASM-TARGET-PLAN.md` §2.3 and D5.
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -88,7 +88,7 @@ export function luaLongjmpRuntime(lib) {
   const wasm = ['__wasm_longjmp', '__c_longjmp'].filter(s => symbols.has(s));
   const js = ['emscripten_longjmp', 'getTempRet0'].filter(s => symbols.has(s));
   const runtime = wasm.length && !js.length ? 'wasm' : js.length && !wasm.length ? 'emscripten' : 'unknown';
-  return { runtime, symbols: [...wasm, ...js] };
+  return { runtime, symbols: [...wasm, ...js], asksForCCallLimit: symbols.has('lua_native_max_c_calls') };
 }
 
 export function requireOverlayLua() {
@@ -98,6 +98,14 @@ export function requireOverlayLua() {
     throw new ToolchainError(
       `${paths.lib} references the '${found.runtime}' longjmp runtime (${found.symbols.join(', ') || 'no longjmp symbols'}).\n` +
       `The module needs the overlay triplet's library. A bare 'vcpkg install lua:${TRIPLET}' produces the other one.\n` +
+      `Run: npm run vcpkg-lua-wasm`
+    );
+  }
+  // Without it Lua's limit is the constant 200, and a thread with a smaller
+  // stack loses the context instead of raising "C stack overflow".
+  if (!found.asksForCCallLimit) {
+    throw new ToolchainError(
+      `${paths.lib} was built without triplets/lua-wasm-stack.h: its C-call limit is a constant.\n` +
       `Run: npm run vcpkg-lua-wasm`
     );
   }

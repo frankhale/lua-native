@@ -1,9 +1,11 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import vm from 'node:vm';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import lua_native from '../../tools/target.mjs';
+import lua_native, { observed } from '../../tools/target.mjs';
+import { notRunOn, testKey } from '../../tools/wasm-ledger.mjs';
 
 /** This spec is an ES module: derive paths from import.meta.url, never CJS
  *  __dirname, and never URL.pathname (which yields "/C:/..." on Windows). */
@@ -49,6 +51,31 @@ afterEach(() => {
     + 'restore it — this is process-global and silently corrupts every later test '
     + '(CR-15 F5 / CR-20 F5). Restore it in a `finally`.',
   ).toBeUndefined();
+});
+
+/**
+ * Tests that cannot be *run* on the binding under test.
+ *
+ * Empty on the native target, where this hook does nothing. On the WASM
+ * target (`LUA_NATIVE_TARGET=wasm`) three tests start `while true do end`
+ * through a deferred door and cancel it from a timer; there the script has the
+ * only thread, so the timer never fires and each test would hold the run for
+ * a minute before failing (`docs/reviews/WASM-TARGET-PLAN.md` D3).
+ *
+ * The list is not kept here. It is `tools/wasm-ledger.mjs`'s `not-run`
+ * entries, each with its reason, and `npm run verify-wasm` requires that the
+ * tests skipped are exactly those — a test skipped here for any other reason
+ * is a red run there. Every other difference on that target is left to fail,
+ * and is judged against the same ledger.
+ */
+const NOT_RUN_HERE = notRunOn(observed);
+
+beforeEach((ctx) => {
+  if (NOT_RUN_HERE.size === 0) return;
+  const chain: string[] = [];
+  for (let s = ctx.task.suite; s && s !== ctx.task.file; s = s.suite) chain.unshift(s.name);
+  const why = NOT_RUN_HERE.get(testKey(chain, ctx.task.name));
+  if (why) ctx.skip(why);
 });
 
 describe('lua-native Node adapter', () => {
@@ -5336,6 +5363,30 @@ describe('lua-native Node adapter', () => {
           // Saturated, not wrapped to 0: 0 is the "no limit" sentinel.
           expect(reported).toBeGreaterThan(Number.MAX_SAFE_INTEGER);
           expect(lua.execute_script<number>('return 1 + 1')).toBe(2);
+        });
+
+        // The test above reads the limit back and runs three instructions. A
+        // limit is enforced from the count hook, which first fires a thousand
+        // instructions in, so it never met one. `timeout: Infinity` was not
+        // unlimited by accident — it was *expired* by accident: 2^64-1 ms read
+        // as a signed count is a deadline in the past, and every script long
+        // enough to reach the hook ended with "execution timeout". Found
+        // November 25, 2026, while widening the limits for the WASM target.
+        it(`${key}: Infinity does not end a script that runs long enough to be checked`, () => {
+          const lua = new lua_native.init({}, { libraries: 'all', [key]: Infinity });
+          expect(lua.execute_script<number>(
+            'local x = 0; for i = 1, 2e6 do x = x + i end; return x')).toBe(2000001000000);
+        });
+      }
+
+      // Short of Infinity the sum still has to fit the clock: anything past
+      // roughly 292 years overflowed on its way to nanoseconds.
+      for (const timeout of [2 ** 63, 2 ** 62, 1e16]) {
+        it(`timeout: ${timeout} ms is a deadline that never arrives, not one already past`, () => {
+          const lua = new lua_native.init({}, { libraries: 'all', timeout });
+          expect(lua.info().timeout).toBe(timeout);
+          expect(lua.execute_script<number>(
+            'local x = 0; for i = 1, 2e6 do x = x + i end; return x')).toBe(2000001000000);
         });
       }
 
@@ -13348,4 +13399,164 @@ describe('lua-native Node adapter', () => {
     });
   });
 
+  // Four ways the WASM binding once answered differently (docs/WASM.md, "The
+  // permitted differences"). Each is the same on both targets now.
+  describe('same on both targets', () => {
+    it('gives the event loop its turn during execute_script_async', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      let turns = 0;
+      const timer = setInterval(() => { turns++; }, 1);
+      expect(await lua.execute_script_async('local x = 0; for i = 1, 3e7 do x = x + i end; return x')).toBe(450000015000000);
+      clearInterval(timer);
+      expect(turns).toBeGreaterThan(2);
+    });
+
+    it('defers a handle finalizer that runs in the middle of a deferred run', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      lua.execute_script('keep = {}');
+      const handles = Array.from({ length: 50 }, () => lua.execute_script('return function() return 1 end') as any);
+      const run = lua.execute_script_async('local t = {}; for i = 1, 5e6 do t[i % 100] = { i } end; return #t');
+      const timer = setInterval(() => {
+        handles.length = Math.max(0, handles.length - 5);
+        (globalThis as any).gc?.();
+      }, 1);
+      expect(await run).toBe(99);
+      clearInterval(timer);
+      expect(lua.execute_script('return 6 * 7')).toBe(42);
+    });
+
+    it('refuses the context while a deferred run is in the middle, and not others', async () => {
+      const lua = new lua_native.init({}, ALL_LIBS);
+      const other = new lua_native.init({}, ALL_LIBS);
+      const run = lua.execute_script_async('local x = 0; for i = 1, 3e7 do x = x + i end; return x');
+      let seen = '';
+      let answer: unknown;
+      const timer = setInterval(() => {
+        try { lua.execute_script('return 1'); } catch (e: any) { seen = e.message; }
+        answer = other.execute_script('return 1');
+      }, 1);
+      await run;
+      clearInterval(timer);
+      expect(seen).toMatch(/busy|async/i);
+      expect(answer).toBe(1);
+      expect(() => lua.reset()).not.toThrow();
+    });
+
+    it('converts a table with its keys in byte order', () => {
+      const lua = new lua_native.init({}, {});
+      const keys = (script: string) => Object.keys(lua.execute_script(script) as object).join();
+      expect(keys('return {one=1,two=2,three=3,four=4,five=5,six=6,seven=7,eight=8}'))
+        .toBe('eight,five,four,one,seven,six,three,two');
+      expect(keys('return {b=1,B=1,["é"]=1,a=1,[""]=1}')).toBe(',B,a,b,é');
+    });
+
+    it('hands out functions that look native', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const table = lua.create_table({ a: 1 });
+      const iterator = table[Symbol.iterator]();
+      const coro = lua.create_coroutine('return function() end');
+      const shared: any = lua_native.createSharedTable({});
+      const functions: Record<string, any> = {
+        luaFunction: lua.execute_script('return function() end'),
+        get: table.get,
+        '[Symbol.iterator]': table[Symbol.iterator],
+        next: iterator.next,
+        return: coro[Symbol.iterator]().return,
+        gc: lua.gc,
+        sync: shared.sync,
+        createSharedTable: lua_native.createSharedTable,
+        LuaContext: lua_native.init,
+        SharedTable: shared.constructor,
+      };
+      const value = (v: any) => ({ value: v, writable: false, enumerable: false, configurable: false });
+      for (const [name, fn] of Object.entries(functions)) {
+        expect(Object.getOwnPropertyDescriptor(fn, 'arguments'), name).toEqual(value(null));
+        expect(Object.getOwnPropertyDescriptor(fn, 'caller'), name).toEqual(value(null));
+        expect(fn.name).toBe(name);
+        expect(fn.length, name).toBe(0);
+        expect(fn.prototype.constructor, name).toBe(fn);
+        expect(String(fn), name).toMatch(/\[native code\]/);
+      }
+      expect(lua.constructor).toBe(lua_native.init);
+      expect(lua).toBeInstanceOf(lua_native.init);
+      class Sub extends (lua_native.init as any) {}
+      const sub: any = new Sub({}, {});
+      expect(Object.getPrototypeOf(sub)).toBe(Sub.prototype);
+      expect(sub.execute_script('return 1')).toBe(1);
+    });
+
+    it('begins the stack of an error it constructs at the caller', () => {
+      const lua: any = new lua_native.init({}, ALL_LIBS);
+      const first = (error: any) => String(error.stack).split('\n').find(line => /^\s+at /.test(line));
+      const thrownBy = (fn: () => unknown) => { try { fn(); } catch (e) { return e; } throw new Error('did not throw'); };
+      const shared: any = lua_native.createSharedTable({});
+      const doors: Record<string, () => unknown> = {
+        method: () => lua.set_global(),
+        constructor: () => new (lua_native.init as any)({}, { libraries: 5 }),
+        'no new': () => (lua_native.init as any)(),
+        receiver: () => lua.gc.call({}),
+        shared: () => shared.get(),
+        createSharedTable: () => (lua_native as any).createSharedTable(5),
+        'table handle': () => lua.create_table({}).get(),
+      };
+      for (const [name, door] of Object.entries(doors)) {
+        function marker() { return door(); }
+        expect(first(thrownBy(marker)), name).toMatch(/lua-native\.spec/);
+      }
+      // Nested: the frame is the callback's, not the outer caller's.
+      const nested: any = new lua_native.init({ cb: () => {
+        function innerCaller() { lua.set_global(); }
+        return first(thrownBy(innerCaller));
+      } }, {});
+      expect(nested.execute_script('return cb()')).toMatch(/innerCaller/);
+      // A hostile formatter changes nothing but its own answer.
+      const had = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+      const limit = Error.stackTraceLimit;
+      try {
+        (Error as any).prepareStackTrace = () => { throw new Error('formatter'); };
+        expect(() => lua.set_global()).toThrow(/Expected string name/);
+        delete (Error as any).prepareStackTrace;
+        expect(lua.execute_script('return 7')).toBe(7);
+      } finally {
+        if (had) Object.defineProperty(Error, 'prepareStackTrace', had);
+      }
+      expect(Error.stackTraceLimit).toBe(limit);
+    });
+
+    it('knows a promise made in another realm', async () => {
+      const foreign = (code: string) => vm.runInNewContext(code);
+      class Instance { x = 1; then = 'not a function'; }
+      const lua: any = new lua_native.init({
+        resolved: () => foreign('Promise.resolve(5)'),
+        rejected: () => foreign('Promise.reject(new Error("from elsewhere"))'),
+        sub: () => foreign('(class S extends Promise {}).resolve(6)'),
+        bare: () => Object.setPrototypeOf(Object.assign(Promise.resolve(1), {}), null),
+        plain: () => foreign('({ a: 1 })'),
+        instance: () => new Instance(),
+      }, ALL_LIBS);
+      expect(await lua.execute_async('return resolved(), sub(), plain().a, instance().x')).toEqual([5, 6, 1, 1]);
+      await expect(lua.execute_async('return rejected()')).rejects.toThrow(/from elsewhere/);
+      await expect(lua.execute_async('return bare()')).rejects.toThrow(/no callable 'then'/);
+      expect(() => lua.execute_script('return resolved()')).toThrow(/returned a Promise/);
+    });
+
+    it('asks the engine what a promise is', async () => {
+      class Sub extends Promise<any> {}
+      const own: any = Promise.resolve(3);
+      own.then = own.then.bind(own);
+      let touched = 0;
+      const lua: any = new lua_native.init({
+        forged: () => Object.create(Promise.prototype),
+        forgedThen: () => Object.create(Promise.prototype, { then: { get() { touched++; return () => {}; } } }),
+        real: () => Promise.resolve(1),
+        sub: () => Sub.resolve(2),
+        own: () => own,
+      }, ALL_LIBS);
+      expect(await lua.execute_async('return type(forged()), type(forgedThen()), real(), sub(), own()'))
+        .toEqual(['table', 'table', 1, 2, 3]);
+      expect(touched).toBe(0);
+      expect(lua.execute_script('return type(forged())')).toBe('table');
+      expect(() => lua.execute_script('return real()')).toThrow(/returned a Promise/);
+    });
+  });
 });

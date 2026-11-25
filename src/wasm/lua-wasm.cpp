@@ -3,6 +3,8 @@
 // the same name, and "native:" names where the reasoning lives.
 
 #include "lua-wasm.h"
+#include "stack.h"
+#include "suspend.h"
 
 #include <emscripten/bind.h>
 
@@ -702,6 +704,18 @@ std::optional<size_t> SizeLimitFromNumber(const double num) {
   return static_cast<size_t>(num);
 }
 
+// The same rule for the three limits a context is built with, which the core
+// holds in 64 bits on every target. Natively this is SizeLimitFromNumber,
+// because `size_t` is that wide there; here `size_t` is 32 bits, and reading a
+// limit through it made `Infinity` saturate at 2^32-1 — a real ceiling of
+// about 4.29 billion instructions (docs/reviews/WASM-TARGET-PLAN.md, slice 7).
+std::optional<std::uint64_t> LimitFromNumber(const double num) {
+  if (!(num >= 0)) return std::nullopt;  // negative, or NaN
+  constexpr auto kLimitExclusive = static_cast<double>(std::numeric_limits<std::uint64_t>::max());
+  if (num >= kLimitExclusive) return std::numeric_limits<std::uint64_t>::max();
+  return static_cast<std::uint64_t>(num);
+}
+
 // Native: ConvertBuiltinType.
 std::optional<lua_core::LuaValue> ConvertBuiltinType(
     const val& value, const int depth,
@@ -772,11 +786,11 @@ lua_core::LuaValue NumberToCore(const double num) {
 // **The order of the reads is part of the behaviour**: an options object with
 // getters observes it.
 
-bool ReadLimitOption(const val& options, const char* key, size_t& value, bool& present) {
+bool ReadLimitOption(const val& options, const char* key, std::uint64_t& value, bool& present) {
   if (!js::Has(options, key)) return true;
   const val raw = js::Get(options, key);
   if (js::IsNumber(raw)) {
-    const auto limit = SizeLimitFromNumber(raw.as<double>());
+    const auto limit = LimitFromNumber(raw.as<double>());
     if (!limit) {
       js::ThrowRangeError(std::string(key) + " must be a non-negative number");
       return false;
@@ -1381,23 +1395,68 @@ class WorkerRunScope {
   lua_core::LuaRuntime* runtime_;
 };
 
-// Native: a worker's Execute, then its OnOK or OnError. Never leaves a JS
-// exception pending: every outcome settles the promise.
-val WorkerRun(const LuaWorkerRun& run, const Args& /*info*/) {
-  lua_core::ScriptResult result;
-  std::optional<std::string> failure;
+// Arms the runtime's pause hook for a run the shell can suspend.
+class PauseScope {
+ public:
+  PauseScope(lua_core::LuaRuntime* runtime, const bool suspendable) : runtime_(runtime) {
+    if (suspendable) runtime_->SetPauseHook(&js::PauseIfDue);
+    js::StartSlice();
+  }
+  ~PauseScope() { runtime_->SetPauseHook(nullptr); }
+  PauseScope(const PauseScope&) = delete;
+  PauseScope& operator=(const PauseScope&) = delete;
+
+ private:
+  lua_core::LuaRuntime* runtime_;
+};
+
+// Native: a worker's Execute. Runs no user JS, so it may be suspended: the
+// shell calls it through suspend.h's export when the engine can.
+void WorkerExecute(LuaWorkerRun& run) {
   try {
     const WorkerRunScope scope(run.runtime.get());
-    result = run.is_file ? run.runtime->ExecuteFile(run.source)
-                         : run.runtime->ExecuteScript(run.source, run.chunk_name);
+    const PauseScope pausing(run.runtime.get(), run.suspendable);
+    run.result = run.is_file ? run.runtime->ExecuteFile(run.source)
+                             : run.runtime->ExecuteScript(run.source, run.chunk_name);
   } catch (const std::exception& e) {
-    failure = e.what();
+    run.failure = e.what();
   }
+}
 
+// WorkerExecute as a table entry, which is how the shell calls it with nothing
+// of JavaScript's on the stack between.
+void WorkerExecuteEntry(LuaWorkerRun* run) { WorkerExecute(*run); }
+
+double WorkerExecuteEntryIndex() {
+  return static_cast<double>(reinterpret_cast<uintptr_t>(&WorkerExecuteEntry));
+}
+
+double WorkerAddress(const LuaWorkerRun& run) {
+  return static_cast<double>(reinterpret_cast<uintptr_t>(&run));
+}
+
+// The top of a stack of the run's own, or 0 if there is no memory for one.
+double WorkerStackTop(LuaWorkerRun& run) {
+  // As large as the module's (STACK_SIZE in tools/wasm-build/run.mjs).
+  constexpr size_t kBytes = size_t{1024} * 1024;
+  run.stack.reset(new (std::nothrow) char[kBytes]);
+  if (!run.stack) return 0;
+  run.suspendable = true;
+  const auto top = reinterpret_cast<uintptr_t>(run.stack.get()) + kBytes;
+  return static_cast<double>(top & ~uintptr_t{15});
+}
+
+double WorkerStackBottom(const LuaWorkerRun& run) {
+  return static_cast<double>(reinterpret_cast<uintptr_t>(run.stack.get()));
+}
+
+// Native: a worker's OnOK or OnError. Never leaves a JS exception pending:
+// every outcome settles the promise.
+val WorkerFinish(LuaWorkerRun& run, const Args& /*info*/) {
   // OnError: an exception out of Execute.
-  if (failure) {
+  if (run.failure) {
     run.context->ClearBusy();
-    run.deferred.Reject(js::NewErrorValue(*failure));
+    run.deferred.Reject(js::NewErrorValue(*run.failure));
     return val::undefined();
   }
 
@@ -1407,19 +1466,25 @@ val WorkerRun(const LuaWorkerRun& run, const Args& /*info*/) {
   run.context->ClearBusy();
   const LuaContext::CallScope call_scope(run.context);
 
-  if (std::holds_alternative<std::string>(result)) {
-    run.deferred.Reject(js::NewErrorValue(std::get<std::string>(result)));
+  if (std::holds_alternative<std::string>(run.result)) {
+    run.deferred.Reject(js::NewErrorValue(std::get<std::string>(run.result)));
     return val::undefined();
   }
   // Marshalling can throw; reject rather than unwind (CR-8 F4).
   try {
     run.deferred.Resolve(
-      run.context->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(result)));
+      run.context->ResultsToJs(std::get<std::vector<lua_core::LuaPtr>>(run.result)));
   } catch (const std::exception& e) {
     run.deferred.Reject(js::NewErrorValue(
       std::string("failed to convert async result: ") + e.what()));
   }
   return val::undefined();
+}
+
+// Both, on the spot: what an engine that cannot suspend gets.
+val WorkerRun(LuaWorkerRun& run, const Args& info) {
+  WorkerExecute(run);
+  return WorkerFinish(run, info);
 }
 
 }  // namespace
@@ -2878,7 +2943,8 @@ void LuaContext::ClearBusy() {
 void LuaContext::ScheduleWorkerRun(const bool is_file, std::string source,
                                    std::string chunk_name, const Deferred& deferred) {
   auto run = std::make_unique<LuaWorkerRun>(LuaWorkerRun{
-    runtime_, is_file, std::move(source), std::move(chunk_name), this, Self(), deferred});
+    runtime_, is_file, std::move(source), std::move(chunk_name), this, Self(), deferred,
+    false, nullptr, {}, std::nullopt});
   js::Host().call<void>("schedule", val(run.get(), emscripten::allow_raw_pointers()),
                         shell_state_, deferred.Record());
   // NOLINTNEXTLINE(bugprone-unused-return-value): the shell deletes it after the run
@@ -3426,8 +3492,8 @@ val LuaContext::Cancel(const Args& /*info*/) {
     // A deferred run (execute_script_async / execute_file_async) has been
     // accepted. Natively it is running on a worker and this interrupts it at
     // the next instruction-count check, when one is installed. Here the run
-    // has not started — it cannot be running while this is — so the request is
-    // waiting for it when it does (plan, D3).
+    // either has not started or is suspended in that same check, and sees the
+    // request when it goes on.
     runtime_->RequestCancel();
   }
   return val::undefined();
@@ -4932,6 +4998,7 @@ lua_core::LuaValue LuaContext::NapiToCoreImpl(const val& value, const int depth)
     throw std::runtime_error("Value nesting depth exceeds the maximum of "
       + std::to_string(lua_core::LuaRuntime::kMaxDepth) + " levels");
   }
+  lua_core::detail::RequireStackHeadroom(depth);
 
   const js::Kind type = js::KindOf(value);
   if (type == js::Kind::Function) {
@@ -5031,6 +5098,7 @@ val LuaContext::TableRefToMap(const lua_core::LuaTableRef& ref, const int depth)
         "cannot be materialized; read it in place with get_global_ref().");
   }
 
+  const ConvertScope scope(convert_depth_);
   std::vector<std::pair<lua_core::LuaPtr, lua_core::LuaPtr>> pairs;
   try {
     pairs = runtime_->TablePairs(ref.ref);
@@ -5103,6 +5171,7 @@ val LuaContext::StringToNapi(const std::string& v) const {
 
 // Native: LuaContext::ArrayToNapi.
 val LuaContext::ArrayToNapi(const lua_core::LuaArray& v) {
+  const ConvertScope scope(convert_depth_);
   val arr = val::array();
   for (size_t i = 0; i < v.size(); ++i) {
     js::Set(arr, std::to_string(i), CoreToNapi(*v[i]));
@@ -5112,6 +5181,7 @@ val LuaContext::ArrayToNapi(const lua_core::LuaArray& v) {
 
 // Native: LuaContext::TableToNapi.
 val LuaContext::TableToNapi(const lua_core::LuaTable& v) {
+  const ConvertScope scope(convert_depth_);
   val obj = val::object();
   for (const auto& [k, value] : v) {
     js::Set(obj, k, CoreToNapi(*value));
@@ -5232,6 +5302,7 @@ val LuaContext::CoreToNapiBuiltin(const lua_core::LuaValue& value) {
 EMSCRIPTEN_BINDINGS(lua_native) {
   using lua_wasm::LuaContext;
   emscripten::function("attachHost", &js::AttachHost);
+  lua_core::detail::stack_headroom = &js::StackHeadroom;
   emscripten::function("entryCounterAddress", &LuaContext::EntryCounterAddress);
   emscripten::class_<LuaContext>("LuaContext")
     .class_function("create", &LuaContext::Create, emscripten::return_value_policy::take_ownership())
@@ -5326,7 +5397,13 @@ EMSCRIPTEN_BINDINGS(lua_native) {
     .function("reject", &HandleEntry<&lua_wasm::OnAwaitRejectStatic, AwaitCookie>);
   using lua_wasm::LuaWorkerRun;
   emscripten::class_<LuaWorkerRun>("LuaWorkerRun")
-    .function("run", &HandleEntry<&lua_wasm::WorkerRun, const LuaWorkerRun>);
+    .function("run", &HandleEntry<&lua_wasm::WorkerRun, LuaWorkerRun>)
+    .function("finish", &HandleEntry<&lua_wasm::WorkerFinish, LuaWorkerRun>)
+    .function("stackTop", &lua_wasm::WorkerStackTop)
+    .function("stackBottom", &lua_wasm::WorkerStackBottom)
+    .function("address", &lua_wasm::WorkerAddress)
+    .class_function("executeEntry", &lua_wasm::WorkerExecuteEntryIndex)
+    .class_function("setPause", &js::SetPause);
   emscripten::class_<LuaTableIterState>("LuaTableIterator")
     .function("next", &HandleEntry<&lua_wasm::TableIteratorNext, LuaTableIterState>);
 }

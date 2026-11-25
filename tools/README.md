@@ -22,7 +22,9 @@ tools/
                           top-level functions, try-block regions)
   invariants/             lists that used to live in comments, generated and frozen
                           (incl. surface-census.mjs: is each harness below
-                           pointed at everything it should be?)
+                           pointed at everything it should be? and
+                           wasm-binding.mjs: the same questions asked of the
+                           second binding, and whether the two agree)
   exception-matrix/       can a C++ exception escape into the process?
   diff-oracle/            does lua-native agree with stock Lua?
   roundtrip-matrix/       does a JS value survive the crossing into Lua and back?
@@ -38,8 +40,17 @@ tools/
   lint/                   not a search either: clang-tidy over src/, with the
                           checked-in /.clang-tidy
   target.mjs              which build the suite and the harnesses load
-                          (native unless LUA_NATIVE_TARGET says otherwise)
+                          (native unless LUA_NATIVE_TARGET says otherwise),
+                          and the control that observes which one answered
   wasm-build/             builds the WASM target; not a search
+  wasm-ledger.mjs         every known difference between the two bindings,
+                          each with its reason
+  wasm-verify/            not a search: judges a run on the WASM target
+                          against that ledger
+  wasm-smoke/             not a search: the browser smoke set, its page and
+                          worker, and the server that collects the results
+  wasm-package/           not a search: does the packed tarball resolve to
+                          the right entry for Node and for a browser?
 ```
 
 | Harness | Run | What it searches | Docs |
@@ -183,11 +194,125 @@ error** (a typo must not mean `native`). It is an environment variable because
 `exception-matrix` and `lifecycle-matrix` run one process per cell and children
 inherit it. `index.js` was not edited to make this work.
 
-The WASM binding (`docs/WASM-TARGET-PLAN.md`, Phase 2) has every method the
+**The loader's say-so is not the proof.** A run that was really on the other
+binary reports a clean column that searched nothing, so every process that
+imports `target.mjs` also *observes* the module it got and refuses to go on if
+that disagrees with what was asked for (November 25, 2026). The observation
+uses no API added for the purpose: `compile('return 1')` answers with a
+`Buffer` from the N-API binding and a plain `Uint8Array` from the WASM one. It
+runs on a native run as well, so a native result is proven native the same
+way. Because it lives in the loader, the one-process-per-cell harnesses get it
+in every cell. `target.mjs` exports the result as `observed`.
+
+The WASM binding (`docs/reviews/WASM-TARGET-PLAN.md`, Phase 2) has every method the
 native one has, and all ten harnesses run under `LUA_NATIVE_TARGET=wasm` with
 the native target's totals. One caveat: `crossing-cost` needs
 `LUA_NATIVE_TARGET=wasm-release`, because on the unoptimised build its control
 `product/injected-slowdown` fails and it refuses to proceed.
+
+## Reading a run on the second target: `wasm-ledger.mjs` and `wasm-verify/`
+
+```bash
+npm run verify-wasm                                   # controls, ledger, probes, suite (debug build)
+node tools/wasm-verify/run.mjs --control              # just the controls
+node tools/wasm-verify/run.mjs --target=wasm-release  # the release build
+node tools/wasm-verify/run.mjs --harnesses            # ...then every instrument above
+node tools/wasm-verify/run.mjs --closing              # also fail on what is not yet ruled on
+```
+
+Not an eleventh search. The suite and the ten instruments do the searching;
+this is the rule for reading their answer when the module under them is the
+WASM one. `LUA_NATIVE_TARGET=wasm npm test` on its own shows six red tests and
+three skipped ones; whether that is the expected nine is what this decides.
+
+**`wasm-ledger.mjs` is the list of differences**, one entry per difference and
+not per test. An entry names the suite tests it accounts for, or carries a
+**probe** — a few lines run on both targets, a process each, with both answers
+frozen — or both. That second form is why the differences found by diffing
+scratch scripts during the port, which no suite test touches, are held to the
+stale rule like everything else: a probe that sees the native answer on WASM is
+STALE, and one that sees a third answer is MOVED.
+
+Its rules are the ledger conventions above, plus three this ledger needed:
+
+- **A ledgered test must fail the way the entry says.** Each carries the
+  message it fails with, so a test that starts failing for a second reason is
+  not hidden behind the first.
+- **The permitted differences are a closed list, read out of the document.**
+  An entry in the `target-semantics` class cites a row of `docs/WASM.md`'s table by
+  its exact text, and the rows are parsed from that file. A ledger cannot grow
+  the list; the owner does, in the document.
+- **A third class, `unruled`.** A reproducible difference that is not on that
+  list and has not been called a defect is neither of the plan's two classes.
+  Filing it as target semantics would launder it, which is the "never ledger an
+  undocumented defect" rule; filing it as a defect would call a hash order a
+  bug. Each says where its open decision is recorded. A run reports them every
+  time and `--closing` fails on them. The first version of the ledger had
+  seven; the owner ruled on all of them the day it was written, so the class
+  is empty and stays in the vocabulary for the next one.
+
+**A test can be held back from WASM altogether**, and the suite reads which
+from the ledger rather than keeping a list. Three were, until November 25,
+2026: each cancels an unbounded deferred run from a timer, and the script had
+the only thread. Such a run is suspended now and all three run. A never-run test
+cannot go stale by passing, so the ledger refuses such an entry unless a probe
+stands beside it, and the verifier requires that the tests skipped are exactly
+those.
+
+The verifier's first run reported two probes MOVED and both were the probes'
+own mistakes — one froze the wrong native answer, one ran without the library
+it called. Worth recording because it is the "dirt must be in the subject"
+convention working on the day it was written: the frozen native answer is
+checked on the native target, so a probe that is wrong about native says so
+instead of reporting a difference that is not there.
+
+## The browser: `wasm-smoke/` and `wasm-package/`
+
+```bash
+npm run smoke-wasm                           # serve the smoke page: http://localhost:8377/
+node --expose-gc tools/wasm-smoke/run.mjs    # the same set under Node: controls, then both targets
+npm run check-package                        # pack, unpack as a dependency, resolve
+```
+
+Node cannot load the web variant, so the one build that ships was, until
+November 25, 2026, the one build nothing had executed. `wasm-smoke/` is how it
+is run (`docs/reviews/WASM-TARGET-PLAN.md`, Phase 4).
+
+`set.mjs` is the set: 27 cells, each one thing a page does with lua-native,
+written against the public API in a module with no imports, so the same file
+runs on a page's main thread, in a Web Worker and under Node. The page imports
+`/browser.js` — the package's real entry, not a file in the build directory —
+runs the set on both threads, and posts each result to the server, which
+prints a line per report and keeps the whole of it in `build-wasm/smoke/`.
+That is how a browser that cannot be driven from a terminal is still read from
+one: `open -a Safari http://localhost:8377/`, then read the file.
+
+Three conventions from above, as they apply to something that is not a search:
+
+- **The set is checked on the native addon first.** `run.mjs` runs every cell
+  against `index.js`, where the suite has already settled what is right, and
+  then against the node variant. A cell that is wrong about lua-native fails
+  on the first. One did, the day it was written.
+- **Its control** runs the set against a module whose scripts all answer
+  nothing and requires every cell to fail.
+- **A cell branches on the target only by a row of that same table**, and names
+  the row. The target is observed from `compile()`, as `target.mjs` does it.
+
+A cell has a third outcome, INCONCLUSIVE, which only the collection cell can
+report: a browser has no `gc()`, and when it collects a dropped handle is its
+own business. It has not been needed; every engine tried collected within the
+cell's budget.
+
+The server sends no cross-origin isolation headers on purpose. The target is
+built not to need them, and a server that sent them would hide it if it did.
+
+`wasm-package/` asks the other browser question: what does a consumer get?
+It runs `npm pack`, unpacks the tarball as `node_modules/lua-native` of an
+empty project outside the repository, and resolves `lua-native` from there —
+under Node, under Node with `--conditions=browser`, under rolldown, and
+through a `vite build` with no configuration. Its controls are refusals: an
+`exports` map blocks every path it does not list, so a deep import of
+`prebuilds/` must now fail, and if it resolves the map is not in effect.
 
 ## The WASM build: `wasm-build/`
 
@@ -220,7 +345,7 @@ of them by returning a wrong answer with no error at all.
 
 The exhaustion cells ask about the *other* stack, the JavaScript engine's. On
 this target a `RangeError` raised while Lua is running unwinds Lua's frames
-without Lua or C++ being able to catch it (`docs/WASM-TARGET-PLAN.md`, "Slice
+without Lua or C++ being able to catch it (`docs/reviews/WASM-TARGET-PLAN.md`, "Slice
 2 — as built"), so the shell detects it and refuses the context from then on.
 Each cell runs one scenario under one `--stack-size` and requires that it fail
 closed: an error and never a bare `WebAssembly.Exception` or a wrong answer, a
@@ -229,8 +354,62 @@ contexts can still use. Their dirty controls are recorded beside them in
 `check.mjs`. **Every number in them is Node's**; a browser's stack is a
 different size.
 
-**The web variant is validated but not executed** — Node cannot load it;
-running it is the browser smoke set.
+**The web variant is validated but not executed here** — Node cannot load it.
+Running it is `wasm-smoke/`, above.
+
+## The invariants and the second binding: `invariants/wasm-binding.mjs`
+
+Every invariant that reads a binding used to read `src/lua-native.cpp` by
+path. Each now has a ruling for `src/wasm/`, recorded at the top of
+`wasm-binding.mjs`:
+
+- **Extended**, under an id beginning `wasm:` — the CallScope classification,
+  the occupancy policy set, the exception surface, core-call guarding,
+  liveness guarding and the scanner's own coverage. Each calls the *native
+  invariant's own function* with the WASM binding's file and its spelling of
+  the same things, so the analysis is shared and only the answers are
+  separate. Nothing there can move a native answer.
+- **A counterpart, not a copy** — `wasm:brand-rule` for `objectwrap-branding`.
+  There is no ObjectWrap and no type tag on that target; the rule they
+  implement (a JS-supplied value is what it claims to be only by something JS
+  cannot forge) is asked of what stands in for them: per-kind `WeakMap`s
+  behind every pointer cast, and private-field checks on every receiver.
+- **By parity** — `surface-census`, whose universes come from the public types
+  and the native binding. They hold for the second binding exactly as far as
+  its surface is the native one, and `binding-parity` is that requirement
+  computed: methods, options, handle methods, traps and exports derived from
+  `types.d.ts` and from each binding, required equal, plus every function
+  that exists in one binding's C++ and not the other's, frozen by name.
+- **Not carried, and said so** — census F. A `val` member that retains a JS
+  value is not derived; `binding-balance` under `LUA_NATIVE_TARGET=wasm` covers
+  the containers that exist.
+
+Three things this cost to learn, each a false reading before it was a rule:
+
+- **A shared scanner meets new syntax.** `val Args::operator[](…)` has no
+  identifier before its `(`, so `cpp-scan.mjs` named it after its line number
+  — a frozen key that moves with every edit above it. The scanner names
+  operators now, and the suite has the control.
+- **A bare-name call graph meets a namespace.** Both call-graph analyses find a
+  call by the callee's bare name. The WASM binding has `js::Construct` beside
+  `LuaContext::Construct`, so every function that builds a JS object was
+  scored as calling the context's constructor, and two construction-only
+  helpers were reported reachable from JavaScript on that edge alone. The
+  analyses take a `foreign` pattern for it; the native binding has no such
+  collision and passes none.
+- **The first draft of the parity census reported four kinds of difference
+  and every one was its own**: methods defined in an object literal the regex did not look
+  in, options read by a helper that takes the key as an argument, `next` and
+  `return` counted as table methods because the iterators use the same
+  registration helper. Every one reproduced, and none was in the subject.
+
+That it can report real dirt was shown by mutating the sources, one change at
+a time, and restoring them: a method dropped from the shell's list
+(`binding-parity`: MISSING), the receiver check removed from the context's
+method template (`wasm:brand-rule`: NO), a pointer cast pointed at a lookup
+with no kind map (UNGUARDED), an occupancy policy changed in one binding
+(`wasm:occupancy-policy-sites`: NO), an option key renamed in one binding
+(`binding-parity`: UNEXPLAINED).
 
 ## The static check: `lint/`
 
@@ -240,8 +419,12 @@ node tools/lint/run.mjs --control    # just the controls
 node tools/lint/run.mjs --verbose    # every diagnostic with its source line
 ```
 
-clang-tidy over both translation units and the three headers, using the one
-configuration in `/.clang-tidy`, plus `tests/cpp/lua-native-test.cpp` held to
+clang-tidy over the native binding's two translation units and three headers
+and the WASM binding's two and two, using the one configuration in
+`/.clang-tidy` — the WASM ones with the flags `em++ --cflags` reports, since
+they compile only against the Emscripten sysroot. `--native-only` leaves them
+out and the result line says so; without it, a missing Emscripten is a failed
+run and not a smaller clean one. Also `tests/cpp/lua-native-test.cpp`, held to
 the **naming rules only** — the suite is gtest macros end to end, which the full
 check set reads as findings. Exit 0 means zero findings. It is not counted
 among the ten instruments above — it searches no boundary and runs no code —

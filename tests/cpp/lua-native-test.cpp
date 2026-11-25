@@ -3132,6 +3132,28 @@ TEST(LuaRuntimeTimeout, SetTimeoutAppliesAndIsReplayable) {
   ASSERT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(after));
 }
 
+// A timeout too large for the clock is one that never fires. It used to be one
+// that had already fired: 2^64-1 ms read as a signed count is -1 ms, and
+// anything past roughly 292 years overflowed on the way to nanoseconds.
+TEST(LuaRuntimeTimeout, TimeoutTooLargeForTheClockNeverFires) {
+  const char* long_enough = "local s = 0 for i = 1, 200000 do s = s + i end return s";
+  for (const std::uint64_t ms :
+       {std::numeric_limits<std::uint64_t>::max(), std::uint64_t{1} << 63, std::uint64_t{1} << 62}) {
+    RuntimeConfig config;
+    config.libraries = LuaRuntime::AllLibraries();
+    config.timeout_ms = ms;
+    LuaRuntime at_construction(config);
+    EXPECT_EQ(at_construction.GetTimeout(), ms);
+    auto res = at_construction.ExecuteScript(long_enough);
+    EXPECT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(res)) << "timeout_ms = " << ms;
+
+    LuaRuntime set_later(LuaRuntime::AllLibraries());
+    set_later.SetTimeout(ms);
+    auto later = set_later.ExecuteScript(long_enough);
+    EXPECT_TRUE(std::holds_alternative<std::vector<LuaPtr>>(later)) << "SetTimeout(" << ms << ")";
+  }
+}
+
 TEST(LuaRuntimeTimeout, ErrorIsCatchableFromLuaPcall) {
   LuaRuntime rt = MakeTimedRuntime(100);
 

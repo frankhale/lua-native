@@ -216,6 +216,36 @@ than a permanent property of the project. If cross-platform support or CI is
 ever wanted, reopen it deliberately — but nothing should reopen it implicitly,
 and no review pass should reopen it at all.
 
+### Amendment: a second target, WASM in a browser (November 2026)
+
+**Decided by the project owner, deliberately, and it is narrow.** The clause
+above anticipated exactly this: a reopening that is an act and not a drift.
+`reviews/WASM-TARGET-PLAN.md` D0 is that act, and `docs/WASM.md` is the current
+description of what it produced.
+
+What changed:
+
+- The project ships **two targets**: the native addon, for Node, and a
+  WebAssembly module with its own binding (`src/wasm/`), for browsers. The
+  second carries no N-API, real or emulated.
+- "macOS-only" now describes **where the project is built and verified**, not
+  what it runs on. The WASM target is verified under Node on macOS and was run
+  in two browser engines on macOS (`docs/WASM.md` has the versions).
+
+What did **not** change, and is still closed on the terms above:
+
+- **Windows.** The untested native target is still not a gap.
+- **CI, in every form.** Nothing in the WASM work runs without someone running
+  it. `npm run verify-wasm`, the smoke page and `npm run check-package` are
+  commands, and §15.7 says when to run them.
+- **Other browsers and other hosts.** Gecko was not run because Firefox is not
+  on the machine; WASI and non-browser WASM hosts are out of scope. Neither is
+  a finding. If a future pass finds itself listing engines the smoke set has
+  not seen, it has rediscovered this paragraph.
+
+A reader who meets `src/wasm/`, `browser.js` or an `exports` map and wonders
+whether the scope decision eroded: it did not. It was amended, once, here.
+
 ---
 
 # 15. The exit record (August 4, 2026)
@@ -375,6 +405,16 @@ pairing.
 **macOS/arm64. There is no CI, and neither is a gap** — see §14, which is
 binding on this point and supersedes HISTORY §1.5, HISTORY §3 and HISTORY §10 criterion 5.
 
+**Since November 2026 there are two targets** (§14's amendment): the native
+addon, and a WASM module for browsers with a binding of its own. Both are built
+and verified on macOS/arm64. Everything in §15.1–§15.3 was established on the
+native target; what carries it to the second is run and not argued — the same
+suite and the same instruments, pointed at the WASM module under Node
+(`npm run verify-wasm`), the source invariants asked of the second binding
+under ids of their own, and a census that requires the two public surfaces to
+be equal (§15.6). The permitted differences between the targets are a closed
+list in `docs/WASM.md`.
+
 ## 15.5 The definition of "serious"
 
 Unchanged from HISTORY §10, and it is what makes the exit falsifiable:
@@ -407,6 +447,8 @@ is a trigger, and the trigger names the instrument to extend:
 | A new occupancy policy | nothing — the generative `assert` will fire |
 | A Lua version bump | `diff-oracle` (both modes) — the reference moves |
 | A new threading mode | everything, plus a reconsideration of §15.2's race row |
+| **A door, option or handle method added to one binding and not the other** | **nothing — `binding-parity` reports `MISSING` / `NOT NAMED` and the suite goes red until the other binding has it** |
+| **A new binding or build target** | **everything in §15.7 under that target; a ruling per source invariant (`tools/invariants/wasm-binding.mjs` is the pattern); and a ledger of its differences from the native target, each one a row the owner added to a closed list** |
 
 The rows that say "nothing" are the ones worth noticing: for four classes the
 mechanism now fails closed without anyone deciding to look.
@@ -539,6 +581,46 @@ one. It does now:
 > half is what the table was missing, and it is the half that is cheap to add
 > and easy to forget, because it ships as a flag rather than as a function.
 
+**A second binding (November 24–25, 2026), and the two rows it added.** The
+WASM target is surface no row above anticipated: not a new place in the
+existing binding and not a new rule at one, but a second copy of every place.
+The criterion still holds — it is a new way for every value and call to cross
+— and the table had no row for it because nobody had imagined the binding
+being plural.
+
+The first new row is `FAILS-CLOSED` and is the one that matters day to day.
+**A change to one binding is a change to both**, and `binding-parity`
+(`tools/invariants/wasm-binding.mjs`) is what makes forgetting that visible: it
+derives the context's methods, the shared table's, a table handle's, the Proxy
+traps, the module's exports and every option name from `types.d.ts`, from the
+native binding and from the WASM binding, and requires them equal. It also
+freezes by name every function that exists in one binding's C++ and not the
+other's, so a helper that lands on one side is a row in a diff.
+
+The second is `MANUAL`: no scan can tell that a directory of new code is a
+binding. What it asks for is what the WASM work did, and
+`reviews/WASM-TARGET-PLAN.md` is the worked example — including the two things
+that turned out to matter most, neither of which was in its first draft: a
+**control that observes which module a run is on** (`tools/target.mjs`), since
+a run on the wrong binary reports a clean column that searched nothing; and a
+**closed list of permitted differences** that a ledger may cite and may not
+extend (`tools/wasm-ledger.mjs`).
+
+**What is not carried to the second binding, stated so the gap stays
+visible.** The row "a new member that retains a JS value" is `COMPUTED` by
+census F for the native binding only. On the WASM binding a retained value is
+an `emscripten::val` member, and nothing derives those. What covers it is
+behavioural: `info().bindingRefs` reports the same thirteen containers there,
+and `binding-balance` searches them under `LUA_NATIVE_TARGET=wasm`. That
+covers every container that exists; it does not fail closed on a new one with
+no counter. A `val` member added to `src/wasm/lua-wasm.h` is therefore a
+manual trigger: give it a counter and a `binding-balance` policy, as its
+native twin has.
+
+**The count of rows where a human decides has gone from four to five** with
+the `MANUAL` row above, and the paragraph higher up that calls four "the only
+four" was true when written. `surface-census` freezes the current tally.
+
 ## 15.7 Regression mode
 
 ```bash
@@ -557,10 +639,21 @@ npm run crossing-cost                                 # after conversion/door ch
 node tools/gc-stress/run.mjs                          # after handle/finalizer changes: the aggregate registry balance
 npm run test-ts-asan                                  # before a release
 npm run test-harness-asan                             # before a release: the adversarial paths instrumented
+
+# The second target. A change to the core or to either binding is a change to it.
+npm run build-wasm-debug && npm run verify-wasm       # after any change to src/core, src/wasm or src/lua-native.*
+node tools/wasm-verify/run.mjs --harnesses --closing  # before a release: every instrument above, on the WASM target
+npm run check-package                                 # after a change to package.json, browser.js or what ships
+npm run smoke-wasm                                    # before a release: the shipped build, in a browser (by hand)
 ```
 
 The suite and the invariants are the always-run pair; the harnesses are keyed to
-what changed. `test-ts-asan` is the highest-value sanitizer and the one to run
+what changed. **`verify-wasm` joins that pair for any C++ change**: it is the
+suite again on the other target, judged against the ledger of permitted
+differences, and it is the only thing that notices a fix made to one binding
+and not the other when the surface did not change. The sanitizer harnesses do
+not exist for the WASM target; they instrument the native one, and the core is
+the same source in both. `test-ts-asan` is the highest-value sanitizer and the one to run
 before shipping.
 
 **`crossing-cost` is deliberately split across that line.** Its `perf-claims`

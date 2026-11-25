@@ -80,6 +80,16 @@ describe('invariant scanner: positive controls', () => {
     expect(guardedness('  // try {\n  const char* s = "try {";\n  boom();')).toBe(false);
   });
 
+  // First met in the WASM binding (`val Args::operator[](…) const`). With no
+  // identifier before its `(`, an operator was named after its line number —
+  // a frozen key that moves whenever anything above it does.
+  it('names an operator definition by its operator, not by its line', () => {
+    const fns = topLevelFunctions(
+      'val Args::operator[](const uint32_t index) const {\n  return list[index];\n}\n'
+      + 'bool operator==(const A& a, const A& b) {\n  return a.x == b.x;\n}\n');
+    expect(fns.map((f) => f.name)).toEqual(['Args::operator[]', 'operator==']);
+  });
+
   it('finds top-level function definitions and skips declarations', () => {
     const src = [
       'void Declared(int a);',

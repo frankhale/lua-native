@@ -1,4 +1,5 @@
-# Overlay triplet: vcpkg's community `wasm32-emscripten` plus one flag.
+# Overlay triplet: vcpkg's community `wasm32-emscripten` plus one flag
+# and one force-included header.
 #
 # Deliberately named `wasm32-emscripten` so it shadows the stock triplet and
 # installs to `installed/wasm32-emscripten`, for the reason
@@ -12,7 +13,10 @@
 # runs. The core has `catch` blocks in its Lua C frames, so that mode is out.
 # With this flag Lua's `longjmp` uses WASM exception-handling instructions and
 # the module is built with `-fwasm-exceptions`. Measurements:
-# `docs/WASM-TARGET-PLAN.md` §2.3 (Phase 0, November 24, 2026).
+# `docs/reviews/WASM-TARGET-PLAN.md` §2.3 (Phase 0, November 24, 2026).
+#
+# The force-included header makes Lua's C-call limit a question the module
+# answers; `lua-wasm-stack.h` says why.
 #
 # NOT STICKY: vcpkg only sees this when `--overlay-triplets` points at this
 # directory. A bare `vcpkg install lua:wasm32-emscripten` rebuilds the stock
@@ -25,8 +29,8 @@
 # applies VCPKG_C_FLAGS / VCPKG_CXX_FLAGS, and without it they are dropped
 # without a word.
 
-set(VCPKG_C_FLAGS "-sSUPPORT_LONGJMP=wasm")
-set(VCPKG_CXX_FLAGS "-sSUPPORT_LONGJMP=wasm")
+set(VCPKG_C_FLAGS "-sSUPPORT_LONGJMP=wasm -include ${CMAKE_CURRENT_LIST_DIR}/lua-wasm-stack.h")
+set(VCPKG_CXX_FLAGS "-sSUPPORT_LONGJMP=wasm -include ${CMAKE_CURRENT_LIST_DIR}/lua-wasm-stack.h")
 
 set(VCPKG_ENV_PASSTHROUGH_UNTRACKED EMSCRIPTEN_ROOT EMSDK PATH)
 
