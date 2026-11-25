@@ -31,7 +31,7 @@
 //      globals, no shared registry, no callback bleed.
 
 import { platform } from 'node:os';
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { VALUES } from '../roundtrip-matrix/values.mjs';
 
 // The only Lua-created userdata reachable without a library beyond `io` is a

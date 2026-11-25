@@ -13,7 +13,7 @@
 // it surfaced, whether the marker ever appeared, and whether repeating the
 // operation strands anything.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { FRAMES } from './frames.mjs';
 import { KINDS, MARKER } from './kinds.mjs';
 

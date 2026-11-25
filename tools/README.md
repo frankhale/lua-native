@@ -37,6 +37,9 @@ tools/
                           so a sanitizer has something to watch
   lint/                   not a search either: clang-tidy over src/, with the
                           checked-in /.clang-tidy
+  target.mjs              which build the suite and the harnesses load
+                          (native unless LUA_NATIVE_TARGET says otherwise)
+  wasm-build/             builds the WASM target; not a search
 ```
 
 | Harness | Run | What it searches | Docs |
@@ -164,6 +167,70 @@ route around it: `info().bindingRefs` ships, `binding-balance` searches it, and
 lifetime policy. The gap is recorded here rather than deleted because "an
 instrument cannot decide this, a person must" is a real category and this is what
 its resolution looks like.
+
+## Which build is under test: `target.mjs`
+
+Every harness and the suite import `tools/target.mjs` rather than `index.js`.
+With `LUA_NATIVE_TARGET` unset it hands back `index.js`'s default export — the
+same object, not a copy — so nothing about a native run changed when the file
+was introduced (November 24, 2026). `LUA_NATIVE_TARGET=wasm` loads the node
+variant of the debug WASM build and `wasm-release` the release one.
+
+Two rules, both there so a green run cannot be about the wrong binary: **there
+is no fallback** (a WASM target that is not built is an error naming the path,
+never a quiet return to the native addon), and **an unknown value is an
+error** (a typo must not mean `native`). It is an environment variable because
+`exception-matrix` and `lifecycle-matrix` run one process per cell and children
+inherit it. `index.js` was not edited to make this work.
+
+The WASM binding (`docs/WASM-TARGET-PLAN.md`, Phase 2) has every method the
+native one has, and all ten harnesses run under `LUA_NATIVE_TARGET=wasm` with
+the native target's totals. One caveat: `crossing-cost` needs
+`LUA_NATIVE_TARGET=wasm-release`, because on the unoptimised build its control
+`product/injected-slowdown` fails and it refuses to proceed.
+
+## The WASM build: `wasm-build/`
+
+```bash
+npm run vcpkg-lua-wasm       # Lua for wasm32-emscripten, via the overlay triplet
+npm run build-wasm-debug     # build-wasm/debug/{node,web}/
+npm run build-wasm-release   # build-wasm/release/{node,web}/
+```
+
+`run.mjs` compiles the core and `src/wasm/lua-wasm.cpp` with `em++` and links
+two variants from the same objects: **node** (real filesystem; exists only so
+this directory's instruments can run against the target) and **web** (the one
+that ships). It refuses any Emscripten but the recorded version, and refuses a
+`liblua.a` built by the stock triplet — a bare `vcpkg install
+lua:wasm32-emscripten` produces one, and the reason it will not do is in
+`triplets/wasm32-emscripten.cmake`.
+
+Output goes to `build-wasm/`, **not `build/`**: `node-gyp rebuild` deletes
+`build/` first, so a WASM build kept there would vanish on every
+`npm run build-debug`.
+
+It ends by running `check.mjs` against what it built, on the convention above
+that a clean report must be able to come out dirty. The stack cells are the
+part worth knowing about: the WASM stack cannot grow, and a release build has
+no overflow check, so each cell builds the deepest call chain of one kind that
+Lua allows and requires Lua's own `C stack overflow` — a trap fails, and so
+does a return that never got deep. Their dirty control is a build
+(`node tools/wasm-build/run.mjs release --stack-size=131072`), which fails two
+of them by returning a wrong answer with no error at all.
+
+The exhaustion cells ask about the *other* stack, the JavaScript engine's. On
+this target a `RangeError` raised while Lua is running unwinds Lua's frames
+without Lua or C++ being able to catch it (`docs/WASM-TARGET-PLAN.md`, "Slice
+2 — as built"), so the shell detects it and refuses the context from then on.
+Each cell runs one scenario under one `--stack-size` and requires that it fail
+closed: an error and never a bare `WebAssembly.Exception` or a wrong answer, a
+context that afterwards works or says it cannot be used, and a module other
+contexts can still use. Their dirty controls are recorded beside them in
+`check.mjs`. **Every number in them is Node's**; a browser's stack is a
+different size.
+
+**The web variant is validated but not executed** — Node cannot load it;
+running it is the browser smoke set.
 
 ## The static check: `lint/`
 

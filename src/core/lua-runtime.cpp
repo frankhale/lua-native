@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 
 namespace lua_core {
 

@@ -28,7 +28,7 @@
 // would end the run, which is an acceptable trade for a value-comparison
 // harness that the exception matrix already covers from the other side.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { canon } from '../diff-oracle/js-canonical.mjs';
 import { VALUES } from './values.mjs';
 import { DOORS } from './doors.mjs';

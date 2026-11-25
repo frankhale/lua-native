@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import lua_native from '../../index.js';
+import lua_native from '../../tools/target.mjs';
 
 /** This spec is an ES module: derive paths from import.meta.url, never CJS
  *  __dirname, and never URL.pathname (which yields "/C:/..." on Windows). */

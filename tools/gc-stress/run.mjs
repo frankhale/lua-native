@@ -28,7 +28,7 @@
 // been added since, including the async coroutine cursor, whose state is
 // shared_ptr-owned and can outlive its iterator.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { HANDLES } from '../lifecycle-matrix/handles.mjs';
 import { forceGc } from '../lifecycle-matrix/events.mjs';
 

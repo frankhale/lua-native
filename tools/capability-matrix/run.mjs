@@ -32,7 +32,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { CONFIGS, EXPECTED_LIBRARIES, LIBRARY_PROBE, luaLibraryNames } from './configs.mjs';
 import { ENTRY_POINTS, BYTECODE_DOORS, SCRATCH, seedScratch } from './doors.mjs';
 

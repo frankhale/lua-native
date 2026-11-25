@@ -19,7 +19,7 @@
 // preamble dominates is recorded as such in `accepted.mjs` rather than
 // special-cased here.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { DOORS } from '../roundtrip-matrix/doors.mjs';
 import { calibrateReps, timePerCall, fmtNs } from './measure.mjs';
 import { classify } from './classify.mjs';

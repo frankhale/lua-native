@@ -32,7 +32,7 @@
 //   reclaim  For containers claiming a GC-driven reclaim path: mint the
 //            reclaimable form, drop it, collect, require baseline.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { forceGc } from '../lifecycle-matrix/events.mjs';
 import { CONTAINERS, NOT_COUNTED, POLICIES, byField as policyFor } from './policy.mjs';
 import { PRODUCERS, byField as producerFor } from './producers.mjs';

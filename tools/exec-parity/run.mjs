@@ -61,7 +61,7 @@
 //     presentation; the message body ahead of it is what must agree, and does
 //     or does not on its own.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { buildCorpus } from '../diff-oracle/corpus.mjs';
 import { canon } from '../diff-oracle/js-canonical.mjs';
 import { ACCEPTED_DIVERGENCES, divergenceReason } from './accepted.mjs';

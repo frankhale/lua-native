@@ -28,7 +28,7 @@
 // predicted that an absolute number in shipped docs is a claim nothing here can
 // defend; C6 is the instance.
 
-import lua_native from '../../index.js';
+import lua_native from '../target.mjs';
 import { calibrateReps, timePerCall, fmtNs } from './measure.mjs';
 import { classify, ratioVerdict } from './classify.mjs';
 
